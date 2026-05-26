@@ -53,3 +53,12 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Coverage tool local/runtime artifacts
+__pycache__/
+*.pyc
+*.zip
+dop/
+dop_review_test/
+review/
+*.log

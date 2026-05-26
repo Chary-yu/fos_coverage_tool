@@ -1,0 +1,223 @@
+﻿/* 覆盖率分析增强控件样式表 */
+
+/* 强制使每一行代码容器成为独占整行的浮动块，确保控件完美在右侧本行对齐 */
+pre.source > span[id^="L"] {
+    float: left !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
+    min-height: 24px !important;
+    line-height: 24px !important;
+    position: relative !important;
+    padding-right: 10px !important;
+}
+
+/* 浮动元素会导致父容器高度塌陷，使用伪元素完美闭合清除浮动 */
+pre.source::after {
+    content: "" !important;
+    display: table !important;
+    clear: both !important;
+}
+
+/* 覆盖率分析交互面板 */
+.coverage-analysis-panel {
+    position: absolute !important;
+    top: 1px !important;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 12px;
+    vertical-align: middle;
+    user-select: none;
+    background: rgba(255, 255, 255, 0.95);
+    border: 1px solid #e0e0e0;
+    border-radius: 4px;
+    padding: 0 6px;
+    height: 22px; /* 与行高匹配，略小于行高 */
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    transition: all 0.2s ease-in-out;
+    z-index: 10 !important; /* 确保悬浮在所有代码层级之上 */
+}
+
+/* 多行跨行表单面板样式 */
+.coverage-analysis-panel.multiline {
+    top: 2px !important; /* 在多行模式下垂直对齐微调 */
+    align-items: center !important;
+    padding: 3px 6px !important;
+    box-sizing: border-box !important;
+}
+
+.coverage-analysis-panel:hover {
+    border-color: #b0b0b0;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.1);
+    background: #ffffff;
+}
+
+/* Older genhtml pages keep their original <pre> text flow; controls are an overlay. */
+.coverage-analysis-panel.legacy-overlay {
+    position: absolute !important;
+    display: inline-flex !important;
+    vertical-align: middle !important;
+    height: 20px !important;
+    z-index: 20 !important;
+}
+
+/* 状态下拉选择框 */
+.coverage-analysis-select {
+    height: 18px;
+    padding: 0 16px 0 6px;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+    background-color: #fafafa;
+    color: #333;
+    font-size: 11px;
+    cursor: pointer;
+    outline: none;
+    transition: border-color 0.2s;
+    appearance: none;
+    -webkit-appearance: none;
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 12 12'%3E%3Cpath fill='%23666' d='M6 8.825L1.175 4 2.59 2.585 6 6l3.41-3.415L10.825 4z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 4px center;
+    background-size: 8px;
+}
+
+.coverage-analysis-select:focus {
+    border-color: #0076ff;
+}
+
+/* 输入文本框 */
+.coverage-analysis-input {
+    height: 16px;
+    width: 120px;
+    padding: 0 5px;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+    font-size: 11px;
+    color: #333;
+    outline: none;
+    transition: all 0.2s;
+}
+
+/* 确认人文本框专用宽度 */
+.coverage-analysis-input.reviewer-input {
+    width: 65px !important;
+}
+
+.coverage-analysis-input:focus {
+    border-color: #0076ff;
+    box-shadow: 0 0 0 2px rgba(0, 118, 255, 0.15);
+}
+
+.coverage-analysis-input::placeholder {
+    color: #999;
+    font-style: italic;
+}
+
+/* 多行输入文本框 (textarea) */
+textarea.coverage-analysis-input.multiline {
+    height: calc(100% - 6px) !important;
+    min-height: 36px !important;
+    resize: none !important;
+    padding: 4px 6px !important;
+    line-height: 1.4 !important;
+    box-sizing: border-box !important;
+    word-break: break-all !important;
+    white-space: pre-wrap !important;
+}
+
+/* 连续未覆盖区间 (基本块) 标识徽章样式 */
+.coverage-block-badge {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 9px;
+    font-weight: bold;
+    color: #ff3b30;
+    background-color: rgba(255, 59, 48, 0.08);
+    border: 1px solid rgba(255, 59, 48, 0.18);
+    border-radius: 3px;
+    padding: 0 4px;
+    height: 14px;
+    line-height: 13px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    white-space: nowrap;
+}
+
+/* 保存按钮 */
+.coverage-analysis-btn {
+    height: 18px;
+    padding: 0 8px;
+    border: none;
+    border-radius: 3px;
+    background-color: #0076ff;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 45px;
+}
+
+.coverage-analysis-btn:hover {
+    background-color: #0063d6;
+}
+
+.coverage-analysis-btn:active {
+    background-color: #0052b3;
+    transform: scale(0.96);
+}
+
+.coverage-analysis-btn.saving {
+    background-color: #ff9500;
+    cursor: not-allowed;
+}
+
+.coverage-analysis-btn.saved {
+    background-color: #34c759;
+}
+
+.coverage-analysis-btn.error {
+    background-color: #ff3b30;
+}
+
+.coverage-inherit-btn {
+    height: 18px;
+    padding: 0 7px;
+    border: 1px solid #c7d8ff;
+    border-radius: 3px;
+    background-color: #eef4ff;
+    color: #1f5fbf;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 42px;
+}
+
+.coverage-inherit-btn:hover {
+    background-color: #dfeaff;
+    border-color: #9fbcff;
+}
+
+
+/* 动态表头统计行比例多级颜色高亮样式 */
+.coverage-ratio-low {
+    color: #ff3b30 !important;   /* 默认 0% 为红色 */
+    font-weight: bold;
+}
+
+.coverage-ratio-med {
+    color: #ff9500 !important;   /* 0% ~ 100% 之间为橙黄色 */
+    font-weight: bold;
+}
+
+.coverage-ratio-hi {
+    color: #34c759 !important;    /* 100% 全部确认完变亮绿色 */
+    font-weight: bold;
+}
