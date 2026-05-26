@@ -13,6 +13,9 @@ import json
 import shutil
 import re
 import hashlib
+import csv
+import io
+from datetime import datetime
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -36,6 +39,12 @@ ASSET_VERSION = "dop-lineNum-rowfix-20260526"
 def calc_file_path_hash(file_path):
     """Return a stable compact key for the full report file path."""
     return hashlib.md5(str(file_path).encode("utf-8")).hexdigest()
+
+
+def row_value(row, key, index):
+    if isinstance(row, dict):
+        return row.get(key)
+    return row[index]
 
 
 def load_config():
@@ -254,6 +263,108 @@ class DatabaseManager:
             print(f"[DB Error] Save failed: {e}")
             return False
 
+    def export_report(self, report_type="detail", project_name=None):
+        try:
+            try:
+                self.conn.ping(reconnect=True)
+            except AttributeError:
+                pass
+
+            cursor = self.conn.cursor()
+            where_sql = ""
+            params = []
+            if project_name:
+                where_sql = "WHERE project_name = %s"
+                params.append(project_name)
+
+            if report_type == "detail":
+                headers = [
+                    "project_name", "file_path", "line_number", "reviewer", "status",
+                    "coverage_method", "uncovered_reason", "updated_at"
+                ]
+                sql = f"""
+                    SELECT project_name, file_path, line_number, reviewer, status,
+                           coverage_method, uncovered_reason, updated_at
+                    FROM coverage_analysis
+                    {where_sql}
+                    ORDER BY project_name, file_path, line_number
+                """
+                cursor.execute(sql, params)
+                rows = cursor.fetchall()
+                data = []
+                for row in rows:
+                    data.append([
+                        row_value(row, "project_name", 0),
+                        row_value(row, "file_path", 1),
+                        row_value(row, "line_number", 2),
+                        row_value(row, "reviewer", 3),
+                        row_value(row, "status", 4),
+                        row_value(row, "coverage_method", 5),
+                        row_value(row, "uncovered_reason", 6),
+                        row_value(row, "updated_at", 7),
+                    ])
+            elif report_type == "file_summary":
+                headers = [
+                    "project_name", "file_path", "review_total", "confirmed_total",
+                    "coverable_total", "uncoverable_total", "unconfirmed_total",
+                    "confirmed_rate", "coverable_rate", "uncoverable_rate", "last_updated"
+                ]
+                sql = f"""
+                    SELECT project_name, file_path,
+                           COUNT(*) AS review_total,
+                           SUM(CASE WHEN status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
+                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS coverable_total,
+                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
+                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS unconfirmed_total,
+                           ROUND(SUM(CASE WHEN status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
+                           ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS coverable_rate,
+                           ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS uncoverable_rate,
+                           MAX(updated_at) AS last_updated
+                    FROM coverage_analysis
+                    {where_sql}
+                    GROUP BY project_name, file_path
+                    ORDER BY project_name, file_path
+                """
+                summary_params = ["未确认", "可覆盖", "无法覆盖", "未确认", "未确认", "可覆盖", "无法覆盖"] + params
+                cursor.execute(sql, summary_params)
+                rows = cursor.fetchall()
+                data = [[row_value(row, header, idx) for idx, header in enumerate(headers)] for row in rows]
+            elif report_type == "project_summary":
+                headers = [
+                    "project_name", "review_total", "confirmed_total",
+                    "coverable_total", "uncoverable_total", "unconfirmed_total",
+                    "confirmed_rate", "coverable_rate", "uncoverable_rate", "file_total", "last_updated"
+                ]
+                sql = f"""
+                    SELECT project_name,
+                           COUNT(*) AS review_total,
+                           SUM(CASE WHEN status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
+                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS coverable_total,
+                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
+                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS unconfirmed_total,
+                           ROUND(SUM(CASE WHEN status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
+                           ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS coverable_rate,
+                           ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS uncoverable_rate,
+                           COUNT(DISTINCT file_path_hash) AS file_total,
+                           MAX(updated_at) AS last_updated
+                    FROM coverage_analysis
+                    {where_sql}
+                    GROUP BY project_name
+                    ORDER BY project_name
+                """
+                summary_params = ["未确认", "可覆盖", "无法覆盖", "未确认", "未确认", "可覆盖", "无法覆盖"] + params
+                cursor.execute(sql, summary_params)
+                rows = cursor.fetchall()
+                data = [[row_value(row, header, idx) for idx, header in enumerate(headers)] for row in rows]
+            else:
+                raise ValueError("Unsupported report type")
+
+            cursor.close()
+            return headers, data
+        except Exception as e:
+            print(f"[DB Error] Export failed: {e}")
+            raise
+
 
 db_manager = None
 
@@ -273,8 +384,26 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         parsed_url = urllib.parse.urlparse(self.path)
-        if parsed_url.path == "/api/coverage":
-            query_params = urllib.parse.parse_qs(parsed_url.query)
+        query_params = urllib.parse.parse_qs(parsed_url.query)
+        if parsed_url.path == "/api/coverage/export":
+            report_type = query_params.get("type", ["detail"])[0]
+            project_name = query_params.get("project", [""])[0] or None
+
+            if report_type not in ("detail", "file_summary", "project_summary"):
+                self.send_error_response(400, "Unsupported export type. Use detail, file_summary, or project_summary")
+                return
+
+            try:
+                headers, rows = db_manager.export_report(report_type, project_name)
+            except Exception:
+                self.send_error_response(500, "Failed to export report")
+                return
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            project_part = project_name or "all"
+            filename = f"coverage_{report_type}_{project_part}_{timestamp}.csv"
+            self.send_csv_response(filename, headers, rows)
+        elif parsed_url.path == "/api/coverage":
             project_name = query_params.get("project", [""])[0]
             file_path = query_params.get("file", [""])[0]
 
@@ -325,6 +454,23 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.end_headers()
         self.wfile.write(json.dumps(data).encode("utf-8"))
+
+    def send_csv_response(self, filename, headers, rows):
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(headers)
+        for row in rows:
+            writer.writerow(["" if value is None else value for value in row])
+        data = ("\ufeff" + output.getvalue()).encode("utf-8")
+
+        safe_filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename)
+        self.send_response(200)
+        self.send_cors_headers()
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def send_error_response(self, status_code, message):
         self.send_json_response(status_code, {"status": "error", "message": message})

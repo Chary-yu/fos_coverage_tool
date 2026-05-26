@@ -87,3 +87,34 @@ python enhance_coverage.py server
 *   **多工程平滑共存**：一张表容纳成百上千个工程的数据，极佳地支持了全公司覆盖率审计的集中化管理。
 *   **全自动热升级**：一旦您在 `config` 中指定了库，微服务会自动校验并补齐类似 `reviewer` 等核心字段，无需 DBA 协助。
 *   **不占用渲染带宽**：所有渲染均由浏览器客户端解析 JS 完成，API 交互采取极轻量 JSON 数据，零开销，极佳适配超大型工程。
+
+---
+
+## 4. 后台导出 CSV 报表
+
+启动服务后，可以从后台直接导出数据库中的填写结果。CSV 使用 UTF-8 BOM，Excel 可直接打开。
+
+### 明细记录
+```bash
+curl -o coverage_detail.csv "http://127.0.0.1:9528/api/coverage/export?type=detail"
+```
+
+### 文件维度汇总
+```bash
+curl -o coverage_file_summary.csv "http://127.0.0.1:9528/api/coverage/export?type=file_summary"
+```
+
+### 项目维度汇总
+```bash
+curl -o coverage_project_summary.csv "http://127.0.0.1:9528/api/coverage/export?type=project_summary"
+```
+
+### 只导出某个项目
+```bash
+curl -o gemini_detail.csv "http://127.0.0.1:9528/api/coverage/export?type=detail&project=Gemini-NOS"
+```
+
+如果通过 Nginx 访问，地址换成：
+```bash
+curl -o coverage_detail.csv "http://服务器IP/api/coverage/export?type=detail"
+```
