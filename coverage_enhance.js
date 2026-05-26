@@ -4,7 +4,7 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'dop-lineNum-rowfix2-20260526';
+    const ENHANCE_VERSION = 'dop-blockscope-20260526';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖'];
@@ -58,31 +58,39 @@
                 return modernLines;
             }
 
-            function findSameLineCodeSpan(lineNumSpan) {
+            function getSameLineInfo(lineNumSpan) {
                 let node = lineNumSpan.nextSibling;
+                let codeSpan = null;
+                let lineText = '';
                 while (node) {
                     if (node.nodeType === Node.TEXT_NODE && node.nodeValue.includes('\n')) {
-                        return null;
+                        lineText += node.nodeValue.substring(0, node.nodeValue.indexOf('\n'));
+                        break;
                     }
                     if (node.nodeType === Node.ELEMENT_NODE) {
                         if (node.matches('.lineNum')) {
-                            return null;
+                            break;
                         }
                         if (node.matches('.lineCov, .lineNoCov, .tlaGNC, .tlaUNC, .tlaBgGNC, .tlaBgUNC')) {
-                            return node;
+                            codeSpan = node;
                         }
+                        lineText += node.innerText || '';
+                    } else if (node.nodeType === Node.TEXT_NODE) {
+                        lineText += node.nodeValue;
                     }
                     node = node.nextSibling;
                 }
-                return null;
+                return { codeSpan, lineText };
             }
 
             return Array.from(pre.querySelectorAll('span.lineNum')).map((lineNumSpan, index) => {
                 const lineNum = parseInt(lineNumSpan.innerText, 10);
-                const codeSpan = findSameLineCodeSpan(lineNumSpan) || lineNumSpan;
+                const sameLineInfo = getSameLineInfo(lineNumSpan);
+                const codeSpan = sameLineInfo.codeSpan || lineNumSpan;
                 return {
                     span: codeSpan,
                     lineNumSpan,
+                    rawText: sameLineInfo.lineText || codeSpan.innerText || '',
                     lineNum: Number.isNaN(lineNum) ? index + 1 : lineNum,
                     legacyInline: true
                 };
@@ -90,13 +98,21 @@
         }
 
         const allLines = collectSourceLines(preSource);
-        const isLegacyReport = allLines.some(item => item.legacyInline);
-        let currentBlock = [];
+        const countedUncoveredLines = new Set();
 
-        function flushCurrentBlock() {
-            if (currentBlock.length > 0) {
-                blocks.push(currentBlock);
-                currentBlock = [];
+        function addBlock(block) {
+            const uniqueBlock = [];
+            const seen = new Set();
+            block.forEach(item => {
+                if (!item || !isUncoveredLine(item) || seen.has(item.lineNum)) {
+                    return;
+                }
+                seen.add(item.lineNum);
+                uniqueBlock.push(item);
+                countedUncoveredLines.add(item.lineNum);
+            });
+            if (uniqueBlock.length > 0) {
+                blocks.push(uniqueBlock);
             }
         }
 
@@ -109,91 +125,93 @@
         }
 
         function getLineText(item) {
-            return item.span.innerText || '';
+            return item.rawText || item.span.innerText || '';
+        }
+
+        function getCodeText(item) {
+            const lineText = getLineText(item);
+            const colonIndex = lineText.indexOf(':');
+            return (colonIndex >= 0 ? lineText.substring(colonIndex + 1) : lineText).trim();
         }
 
         function isControlFlowLine(item) {
-            return CONTROL_FLOW_REGEX.test(getLineText(item));
+            return CONTROL_FLOW_REGEX.test(getCodeText(item));
         }
 
-        if (isLegacyReport) {
-            for (let i = 0; i < allLines.length; i++) {
-                const item = allLines[i];
-                if (!isUncoveredLine(item)) {
-                    continue;
+        function isFunctionEntryLine(item) {
+            const codeText = getCodeText(item)
+                .replace(/\/\*.*?\*\//g, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (!codeText || isControlFlowLine(item) || codeText.endsWith(';')) {
+                return false;
+            }
+            if (/^(return|typedef|struct|enum|union)\b/.test(codeText)) {
+                return false;
+            }
+            return /^[A-Za-z_][\w\s\*]*\s+[A-Za-z_]\w*\s*\([^;]*\)\s*(\{|$)/.test(codeText);
+        }
+
+        function isIgnorableStructuralLine(item) {
+            const text = getCodeText(item);
+            return text === '' || /^[{}]+;?$/.test(text);
+        }
+
+        function shouldStartSemanticBlock(item) {
+            return isControlFlowLine(item) || isFunctionEntryLine(item);
+        }
+
+        function buildSemanticBlock(startIndex) {
+            const start = allLines[startIndex];
+            const block = [start];
+            const startIsFunction = isFunctionEntryLine(start);
+            let consumedUntil = startIndex;
+
+            for (let j = startIndex + 1; j < allLines.length; j++) {
+                const next = allLines[j];
+                if (isCoveredLine(next)) {
+                    break;
                 }
 
-                totalUncovered++;
-                if (!isControlFlowLine(item)) {
-                    blocks.push([item]);
-                    continue;
-                }
-
-                const block = [item];
-                let consumedUntil = i;
-                for (let j = i + 1; j < allLines.length; j++) {
-                    const next = allLines[j];
-                    if (isCoveredLine(next)) {
-                        break;
-                    }
-                    if (!isUncoveredLine(next)) {
-                        const nextText = getLineText(next);
-                        if (/^\s*(\{|\})?\s*$/.test(nextText) || /[\{\}]/.test(nextText)) {
-                            continue;
-                        }
-                        break;
-                    }
-                    if (isControlFlowLine(next)) {
+                if (isUncoveredLine(next)) {
+                    if (isControlFlowLine(next) || isFunctionEntryLine(next)) {
                         break;
                     }
                     block.push(next);
-                    totalUncovered++;
                     consumedUntil = j;
-                }
-                blocks.push(block);
-                i = consumedUntil;
-            }
-        } else {
-        allLines.forEach(item => {
-            const { span, lineNum, legacyInline } = item;
-            const isUncovered = isUncoveredLine(item);
-            const isCovered = isCoveredLine(item);
-
-            if (isUncovered) {
-                totalUncovered++;
-                if (legacyInline) {
-                    flushCurrentBlock();
-                    blocks.push([{ span, lineNum, legacyInline }]);
-                    return;
+                    continue;
                 }
 
-                const lineText = span.innerText || '';
-                const hasControlFlow = CONTROL_FLOW_REGEX.test(lineText);
-                if (hasControlFlow) {
-                    flushCurrentBlock();
-                    blocks.push([{ span, lineNum, legacyInline }]);
-                } else {
-                    currentBlock.push({ span, lineNum, legacyInline });
+                if (isControlFlowLine(next) || isFunctionEntryLine(next)) {
+                    break;
                 }
-                return;
+                if (startIsFunction && !isIgnorableStructuralLine(next)) {
+                    continue;
+                }
+                if (!isIgnorableStructuralLine(next)) {
+                    break;
+                }
             }
 
-            if (isCovered) {
-                flushCurrentBlock();
-                return;
-            }
-
-            const lineText = span.innerText || '';
-            if (/[\{\}]/.test(lineText)) {
-                flushCurrentBlock();
-            }
-        });
+            return { block, consumedUntil };
         }
 
-        // 最后的结算
-        if (currentBlock.length > 0) {
-            blocks.push(currentBlock);
+        for (let i = 0; i < allLines.length; i++) {
+            const item = allLines[i];
+            if (!isUncoveredLine(item) || countedUncoveredLines.has(item.lineNum)) {
+                continue;
+            }
+
+            if (shouldStartSemanticBlock(item)) {
+                const { block, consumedUntil } = buildSemanticBlock(i);
+                addBlock(block);
+                i = Math.max(i, consumedUntil);
+            } else {
+                addBlock([item]);
+            }
         }
+
+        totalUncovered = countedUncoveredLines.size;
 
         if (totalUncovered === 0) {
             console.log('[CoverageEnhance] No uncovered lines found.');
