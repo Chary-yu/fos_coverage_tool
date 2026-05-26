@@ -4,7 +4,7 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'dop-lineNum-inherit-20260525';
+    const ENHANCE_VERSION = 'dop-lineNum-rowfix-20260526';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖'];
@@ -58,12 +58,28 @@
                 return modernLines;
             }
 
+            function findSameLineCodeSpan(lineNumSpan) {
+                let node = lineNumSpan.nextSibling;
+                while (node) {
+                    if (node.nodeType === Node.TEXT_NODE && node.nodeValue.includes('\n')) {
+                        return null;
+                    }
+                    if (node.nodeType === Node.ELEMENT_NODE) {
+                        if (node.matches('.lineNum')) {
+                            return null;
+                        }
+                        if (node.matches('.lineCov, .lineNoCov, .tlaGNC, .tlaUNC, .tlaBgGNC, .tlaBgUNC')) {
+                            return node;
+                        }
+                    }
+                    node = node.nextSibling;
+                }
+                return null;
+            }
+
             return Array.from(pre.querySelectorAll('span.lineNum')).map((lineNumSpan, index) => {
                 const lineNum = parseInt(lineNumSpan.innerText, 10);
-                let codeSpan = lineNumSpan.nextElementSibling;
-                if (!codeSpan || !codeSpan.matches('.lineCov, .lineNoCov, .tlaGNC, .tlaUNC, .tlaBgGNC, .tlaBgUNC')) {
-                    codeSpan = lineNumSpan;
-                }
+                const codeSpan = findSameLineCodeSpan(lineNumSpan) || lineNumSpan;
                 return {
                     span: codeSpan,
                     lineNumSpan,
@@ -329,7 +345,10 @@
                 const defaultX = codeStartX + sampleWidth * 120;
                 const codeEndX = codeRect.left + ctx.measureText(codeText).width;
                 const left = window.scrollX + Math.max(defaultX, codeEndX + 24, lineRect.right + 24);
-                const top = window.scrollY + lineRect.top - 1;
+                const rowTop = Math.min(lineRect.top, codeRect.top);
+                const rowBottom = Math.max(lineRect.bottom, codeRect.bottom);
+                const panelHeight = panel.offsetHeight || 20;
+                const top = window.scrollY + rowTop + Math.max(0, (rowBottom - rowTop - panelHeight) / 2);
 
                 panel.style.setProperty('left', `${left}px`, 'important');
                 panel.style.setProperty('top', `${top}px`, 'important');

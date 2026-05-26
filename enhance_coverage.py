@@ -30,7 +30,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "coverage_config.json")
 JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
 CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
-ASSET_VERSION = "dop-lineNum-inherit-20260525"
+ASSET_VERSION = "dop-lineNum-rowfix-20260526"
 
 
 def calc_file_path_hash(file_path):
