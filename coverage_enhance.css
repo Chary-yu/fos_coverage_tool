@@ -74,12 +74,8 @@ pre.source::after {
     cursor: pointer;
     outline: none;
     transition: border-color 0.2s;
-    appearance: none;
-    -webkit-appearance: none;
-    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 12 12'%3E%3Cpath fill='%23666' d='M6 8.825L1.175 4 2.59 2.585 6 6l3.41-3.415L10.825 4z'/%3E%3C/svg%3E");
-    background-repeat: no-repeat;
-    background-position: right 4px center;
-    background-size: 8px;
+    appearance: auto;
+    -webkit-appearance: menulist;
 }
 
 .coverage-analysis-select:focus {

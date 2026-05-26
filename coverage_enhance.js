@@ -4,7 +4,7 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'dop-lineNum-rowfix-20260526';
+    const ENHANCE_VERSION = 'dop-lineNum-rowfix2-20260526';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖'];
@@ -345,8 +345,9 @@
                 const defaultX = codeStartX + sampleWidth * 120;
                 const codeEndX = codeRect.left + ctx.measureText(codeText).width;
                 const left = window.scrollX + Math.max(defaultX, codeEndX + 24, lineRect.right + 24);
-                const rowTop = Math.min(lineRect.top, codeRect.top);
-                const rowBottom = Math.max(lineRect.bottom, codeRect.bottom);
+                const anchorRect = startLineItem.span === lineNumEl ? lineRect : codeRect;
+                const rowTop = anchorRect.top;
+                const rowBottom = anchorRect.bottom;
                 const panelHeight = panel.offsetHeight || 20;
                 const top = window.scrollY + rowTop + Math.max(0, (rowBottom - rowTop - panelHeight) / 2);
 
