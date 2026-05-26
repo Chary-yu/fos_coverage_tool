@@ -4,7 +4,7 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'dop-blockscope-20260526';
+    const ENHANCE_VERSION = 'dop-resize-blockscope-20260526';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖'];
@@ -157,10 +157,6 @@
             return text === '' || /^[{}]+;?$/.test(text);
         }
 
-        function shouldStartSemanticBlock(item) {
-            return isControlFlowLine(item) || isFunctionEntryLine(item);
-        }
-
         function buildSemanticBlock(startIndex) {
             const start = allLines[startIndex];
             const block = [start];
@@ -202,7 +198,7 @@
                 continue;
             }
 
-            if (shouldStartSemanticBlock(item)) {
+            if (isFunctionEntryLine(item)) {
                 const { block, consumedUntil } = buildSemanticBlock(i);
                 addBlock(block);
                 i = Math.max(i, consumedUntil);
@@ -273,7 +269,7 @@
                 panel.style.left = `${absoluteCol}ch`;
             }
 
-            if (isMultiLine) {
+            if (isMultiLine && !isLegacyInline) {
                 // 完美契合 Block 的多行物理高度 (每行 24px)
                 panel.style.height = `${block.length * 24 - 4}px`;
             }
@@ -294,19 +290,13 @@
             reviewerInput.className = 'coverage-analysis-input reviewer-input';
             reviewerInput.placeholder = '确认人';
 
-            // 条件覆盖方法 (多行时使用 textarea，单行时使用 input)
-            const methodInput = document.createElement(isMultiLine ? 'textarea' : 'input');
-            if (!isMultiLine) {
-                methodInput.type = 'text';
-            }
+            // 条件覆盖方法
+            const methodInput = document.createElement('textarea');
             methodInput.className = 'coverage-analysis-input' + (isMultiLine ? ' multiline' : '');
             methodInput.placeholder = '条件覆盖方法';
 
-            // 无条件覆盖原因 (多行时使用 textarea，单行时使用 input)
-            const reasonInput = document.createElement(isMultiLine ? 'textarea' : 'input');
-            if (!isMultiLine) {
-                reasonInput.type = 'text';
-            }
+            // 无条件覆盖原因
+            const reasonInput = document.createElement('textarea');
             reasonInput.className = 'coverage-analysis-input' + (isMultiLine ? ' multiline' : '');
             reasonInput.placeholder = '无条件覆盖原因';
 
@@ -374,13 +364,54 @@
                 panel.style.setProperty('visibility', 'visible', 'important');
             }
 
+            let legacyRowSpacer = null;
+            let legacySpacerHeight = -1;
+
+            function ensureLegacyRowSpacer() {
+                if (!legacyRowSpacer) {
+                    legacyRowSpacer = document.createElement('span');
+                    legacyRowSpacer.className = 'coverage-row-spacer';
+                    legacyRowSpacer.setAttribute('aria-hidden', 'true');
+                    startLineItem.span.appendChild(legacyRowSpacer);
+                }
+                return legacyRowSpacer;
+            }
+
+            function syncLegacyRowHeight() {
+                if (!legacyRowSpacer) {
+                    return;
+                }
+                const lineNumEl = startLineItem.lineNumSpan || startLineItem.span.previousElementSibling || startLineItem.span;
+                const lineRect = lineNumEl.getBoundingClientRect();
+                const panelHeight = Math.ceil(panel.getBoundingClientRect().height || panel.offsetHeight || 0);
+                const lineHeight = Math.ceil(lineRect.height || parseFloat(window.getComputedStyle(preSource).lineHeight) || 20);
+                const nextHeight = panelHeight > lineHeight + 6 ? panelHeight + 4 : 0;
+                if (nextHeight !== legacySpacerHeight) {
+                    legacySpacerHeight = nextHeight;
+                    legacyRowSpacer.style.height = `${nextHeight}px`;
+                    requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+                }
+            }
+
             // 追加控件。旧 genhtml 的源码区是 <pre> 文本流，不能把控件插入其中，否则会破坏原始排版。
             if (isLegacyInline) {
                 panel.style.setProperty('visibility', 'hidden', 'important');
+                ensureLegacyRowSpacer();
                 document.body.appendChild(panel);
-                requestAnimationFrame(positionLegacyPanel);
-                window.addEventListener('load', positionLegacyPanel);
+                const syncAndPosition = () => {
+                    syncLegacyRowHeight();
+                    positionLegacyPanel();
+                };
+                requestAnimationFrame(syncAndPosition);
+                window.addEventListener('load', syncAndPosition);
                 window.addEventListener('resize', positionLegacyPanel);
+                if (window.ResizeObserver) {
+                    const resizeObserver = new ResizeObserver(syncAndPosition);
+                    resizeObserver.observe(panel);
+                } else {
+                    panel.addEventListener('mouseup', syncAndPosition);
+                    panel.addEventListener('input', syncAndPosition);
+                }
             } else {
                 startLineItem.span.appendChild(panel);
             }

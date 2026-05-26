@@ -33,7 +33,8 @@ pre.source::after {
     border: 1px solid #e0e0e0;
     border-radius: 4px;
     padding: 0 6px;
-    height: 22px; /* 与行高匹配，略小于行高 */
+    min-height: 22px;
+    height: auto;
     box-shadow: 0 1px 3px rgba(0,0,0,0.05);
     transition: all 0.2s ease-in-out;
     z-index: 10 !important; /* 确保悬浮在所有代码层级之上 */
@@ -42,7 +43,7 @@ pre.source::after {
 /* 多行跨行表单面板样式 */
 .coverage-analysis-panel.multiline {
     top: 2px !important; /* 在多行模式下垂直对齐微调 */
-    align-items: center !important;
+    align-items: flex-start !important;
     padding: 3px 6px !important;
     box-sizing: border-box !important;
 }
@@ -58,8 +59,18 @@ pre.source::after {
     position: absolute !important;
     display: inline-flex !important;
     vertical-align: middle !important;
-    height: 20px !important;
+    min-height: 20px !important;
+    height: auto !important;
     z-index: 20 !important;
+}
+
+.coverage-row-spacer {
+    display: inline-block !important;
+    width: 0 !important;
+    min-width: 0 !important;
+    overflow: hidden !important;
+    vertical-align: top !important;
+    visibility: hidden !important;
 }
 
 /* 状态下拉选择框 */
@@ -84,7 +95,8 @@ pre.source::after {
 
 /* 输入文本框 */
 .coverage-analysis-input {
-    height: 16px;
+    height: 18px;
+    min-height: 18px;
     width: 120px;
     padding: 0 5px;
     border: 1px solid #ccc;
@@ -93,6 +105,13 @@ pre.source::after {
     color: #333;
     outline: none;
     transition: all 0.2s;
+    line-height: 16px;
+    box-sizing: border-box;
+}
+
+textarea.coverage-analysis-input {
+    resize: both;
+    overflow: auto;
 }
 
 /* 确认人文本框专用宽度 */
@@ -112,9 +131,9 @@ pre.source::after {
 
 /* 多行输入文本框 (textarea) */
 textarea.coverage-analysis-input.multiline {
-    height: calc(100% - 6px) !important;
+    height: 42px !important;
     min-height: 36px !important;
-    resize: none !important;
+    resize: both !important;
     padding: 4px 6px !important;
     line-height: 1.4 !important;
     box-sizing: border-box !important;
@@ -191,7 +210,7 @@ textarea.coverage-analysis-input.multiline {
     font-weight: 600;
     cursor: pointer;
     display: inline-flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: center;
     min-width: 42px;
 }
