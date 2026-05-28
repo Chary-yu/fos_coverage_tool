@@ -4,11 +4,13 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'dop-redundant-status-20260528';
+    const ENHANCE_VERSION = 'dop-lazy-render-20260528';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖', '冗余代码'];
     const CONFIRMED_STATUS_SET = new Set(['可覆盖', '无法覆盖', '冗余代码']);
+    const RENDER_BATCH_SIZE = 80;
+    const RENDER_PROGRESS_MIN_BLOCKS = 300;
 
     // 控制流分支关键字侦测正则 (边界隔离)
     const CONTROL_FLOW_REGEX = /\b(if|else|for|while|do|switch|case|default)\b/;
@@ -254,8 +256,61 @@
             return grip;
         }
 
+        function createRenderProgress(totalBlocks) {
+            if (totalBlocks < RENDER_PROGRESS_MIN_BLOCKS) {
+                return null;
+            }
+            const progress = document.createElement('div');
+            progress.className = 'coverage-render-progress';
+            progress.setAttribute('role', 'status');
+            progress.innerText = `Coverage controls: 0/${totalBlocks}`;
+            document.body.appendChild(progress);
+            return progress;
+        }
+
+        function scheduleNextRender(callback) {
+            if (window.requestIdleCallback) {
+                window.requestIdleCallback(callback, { timeout: 120 });
+            } else {
+                setTimeout(callback, 0);
+            }
+        }
+
+        function renderControlsInBatches(onComplete) {
+            let index = 0;
+            const totalBlocks = blocks.length;
+            const progress = createRenderProgress(totalBlocks);
+            const startedAt = performance.now();
+
+            function renderBatch() {
+                const end = Math.min(index + RENDER_BATCH_SIZE, totalBlocks);
+                for (; index < end; index++) {
+                    renderBlockPanel(blocks[index]);
+                }
+
+                if (progress) {
+                    const percent = totalBlocks > 0 ? ((index * 100) / totalBlocks).toFixed(1) : '100.0';
+                    progress.innerText = `Coverage controls: ${index}/${totalBlocks} (${percent}%)`;
+                }
+
+                if (index < totalBlocks) {
+                    scheduleNextRender(renderBatch);
+                    return;
+                }
+
+                if (progress) {
+                    const elapsed = ((performance.now() - startedAt) / 1000).toFixed(1);
+                    progress.innerText = `Coverage controls ready: ${totalBlocks} (${elapsed}s)`;
+                    setTimeout(() => progress.remove(), 1500);
+                }
+                onComplete();
+            }
+
+            scheduleNextRender(renderBatch);
+        }
+
         // 3. 构建并注入表单 DOM，仅在 Block 的第一行注入
-        blocks.forEach(block => {
+        function renderBlockPanel(block) {
             const startLineItem = block[0];
             const startLineNum = startLineItem.lineNum;
             const endLineNum = block[block.length - 1].lineNum;
@@ -530,10 +585,12 @@
                     saveBtn.className = 'coverage-analysis-btn';
                 }
             });
-        });
+        }
 
-        // 4. 异步拉取并回显已有数据
-        fetchLineAnalysis(filePath);
+        renderControlsInBatches(function() {
+            // 4. 异步拉取并回显已有数据
+            fetchLineAnalysis(filePath);
+        });
     });
 
     function findPreviousFilledPanel(currentLineNum) {

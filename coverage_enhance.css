@@ -242,6 +242,21 @@ textarea.coverage-analysis-input.multiline {
     border-color: #9fbcff;
 }
 
+.coverage-render-progress {
+    position: fixed !important;
+    top: 10px !important;
+    right: 12px !important;
+    z-index: 99999 !important;
+    padding: 6px 10px !important;
+    border: 1px solid #c7d8ff !important;
+    border-radius: 4px !important;
+    background: rgba(255, 255, 255, 0.96) !important;
+    color: #1f5fbf !important;
+    font: 12px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif !important;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12) !important;
+    pointer-events: none !important;
+}
+
 
 /* 动态表头统计行比例多级颜色高亮样式 */
 .coverage-ratio-low {
