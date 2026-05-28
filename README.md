@@ -116,6 +116,7 @@ curl -o gemini_detail.csv "http://127.0.0.1:9528/api/coverage/export?type=detail
 
 ### 全量进度导出
 `full_*` 报表以 `inject` 阶段同步的全量未覆盖行索引为基准，可以体现未填写行和整体进展。
+全量索引同步按文件刷新并分批写入数据库，适合大规模工程；如果某个文件本次已经没有未覆盖行，或旧文件不再出现在报告中，对应旧索引会被自动清理。
 
 ```bash
 curl -o coverage_full_detail.csv "http://127.0.0.1:9528/api/coverage/export?type=full_detail"

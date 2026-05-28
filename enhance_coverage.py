@@ -197,6 +197,12 @@ class DatabaseManager:
             conn.select_db(self.config["database"])
         return conn
 
+    def ensure_index(self, cursor, table_name, index_name, create_sql):
+        cursor.execute(f"SHOW INDEX FROM {table_name} WHERE Key_name = %s", (index_name,))
+        if not cursor.fetchall():
+            print(f"[DB] Creating index {index_name} on {table_name}...")
+            cursor.execute(create_sql)
+
     def init_database(self):
         """自动检查并初始化数据库、数据表以及升级字段"""
         try:
@@ -292,11 +298,16 @@ class DatabaseManager:
                 block_end_line INT NOT NULL,
                 block_type VARCHAR(64) NOT NULL DEFAULT 'single',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE KEY ukey_line_index (project_name, file_path_hash, line_number)
+                UNIQUE KEY ukey_line_index (project_name, file_path_hash, line_number),
+                KEY idx_line_index_project (project_name),
+                KEY idx_line_index_project_file (project_name, file_path_hash)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
             """
             print("[DB] Creating coverage_line_index table if not exists...")
             cursor.execute(index_table_sql)
+            self.conn.commit()
+            self.ensure_index(cursor, "coverage_line_index", "idx_line_index_project", "CREATE INDEX idx_line_index_project ON coverage_line_index (project_name)")
+            self.ensure_index(cursor, "coverage_line_index", "idx_line_index_project_file", "CREATE INDEX idx_line_index_project_file ON coverage_line_index (project_name, file_path_hash)")
             self.conn.commit()
 
             cursor.close()
@@ -379,7 +390,7 @@ class DatabaseManager:
             print(f"[DB Error] Save failed: {e}")
             return False
 
-    def sync_line_index(self, project_name, records):
+    def sync_line_index(self, project_name, records, batch_size=5000):
         try:
             try:
                 self.conn.ping(reconnect=True)
@@ -387,42 +398,87 @@ class DatabaseManager:
                 pass
 
             cursor = self.conn.cursor()
-            cursor.execute("DELETE FROM coverage_line_index WHERE project_name = %s", (project_name,))
+            records_by_file = {}
+            for rec in records:
+                records_by_file.setdefault(rec["file_path_hash"], []).append(rec)
+
+            insert_sql = """
+            INSERT INTO coverage_line_index
+                (project_name, file_path, file_path_hash, line_number, line_text,
+                 block_start_line, block_end_line, block_type)
+            VALUES
+                (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                file_path = VALUES(file_path),
+                line_text = VALUES(line_text),
+                block_start_line = VALUES(block_start_line),
+                block_end_line = VALUES(block_end_line),
+                block_type = VALUES(block_type),
+                created_at = CURRENT_TIMESTAMP
+            """
+            synced_total = 0
             if records:
-                sql = """
-                INSERT INTO coverage_line_index
-                    (project_name, file_path, file_path_hash, line_number, line_text,
-                     block_start_line, block_end_line, block_type)
-                VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    file_path = VALUES(file_path),
-                    line_text = VALUES(line_text),
-                    block_start_line = VALUES(block_start_line),
-                    block_end_line = VALUES(block_end_line),
-                    block_type = VALUES(block_type),
-                    created_at = CURRENT_TIMESTAMP
-                """
-                payload = [
-                    (
-                        project_name,
-                        rec["file_path"],
-                        rec["file_path_hash"],
-                        rec["line_number"],
-                        rec["line_text"],
-                        rec["block_start_line"],
-                        rec["block_end_line"],
-                        rec["block_type"]
+                for file_hash, file_records in records_by_file.items():
+                    cursor.execute(
+                        "DELETE FROM coverage_line_index WHERE project_name = %s AND file_path_hash = %s",
+                        (project_name, file_hash)
                     )
-                    for rec in records
-                ]
-                cursor.executemany(sql, payload)
-            self.conn.commit()
+                    for start in range(0, len(file_records), batch_size):
+                        batch = file_records[start:start + batch_size]
+                        payload = [
+                            (
+                                project_name,
+                                rec["file_path"],
+                                rec["file_path_hash"],
+                                rec["line_number"],
+                                rec["line_text"],
+                                rec["block_start_line"],
+                                rec["block_end_line"],
+                                rec["block_type"]
+                            )
+                            for rec in batch
+                        ]
+                        cursor.executemany(insert_sql, payload)
+                        synced_total += len(batch)
+                    self.conn.commit()
             cursor.close()
-            print(f"[DB] Synced {len(records)} uncovered line index record(s) for project '{project_name}'.")
+            print(f"[DB] Synced {synced_total} uncovered line index record(s) across {len(records_by_file)} file(s) for project '{project_name}'.")
             return True
         except Exception as e:
             print(f"[DB Error] Line index sync failed: {e}")
+            return False
+
+    def delete_line_index_file(self, project_name, file_path_hash):
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "DELETE FROM coverage_line_index WHERE project_name = %s AND file_path_hash = %s",
+                (project_name, file_path_hash)
+            )
+            self.conn.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            print(f"[DB Error] Line index file cleanup failed: {e}")
+            return False
+
+    def prune_line_index_project_files(self, project_name, active_file_hashes):
+        if not active_file_hashes:
+            return True
+        try:
+            cursor = self.conn.cursor()
+            placeholders = ",".join(["%s"] * len(active_file_hashes))
+            sql = f"""
+                DELETE FROM coverage_line_index
+                WHERE project_name = %s
+                  AND file_path_hash NOT IN ({placeholders})
+            """
+            cursor.execute(sql, [project_name] + list(active_file_hashes))
+            self.conn.commit()
+            cursor.close()
+            return True
+        except Exception as e:
+            print(f"[DB Error] Line index stale-file cleanup failed: {e}")
             return False
 
     def export_report(self, report_type="detail", project_name=None):
@@ -785,7 +841,16 @@ def inject_coverage_report(input_dir, output_dir):
 
     config = load_config()
     project_name = config.get("project_name", "Gemini-NOS")
-    line_index_records = []
+    index_manager = None
+    indexed_records = 0
+    indexed_files = 0
+    active_file_hashes = set()
+    try:
+        index_manager = DatabaseManager(config, exit_on_error=False)
+    except Exception as e:
+        print(f"[Warning] Failed to initialize database for full coverage line index: {e}")
+        print("[Warning] Inject will continue, but full export requires a successful line-index sync.")
+
     injected_count = 0
     for root, dirs, files in os.walk(real_output_html):
         for file in files:
@@ -803,7 +868,16 @@ def inject_coverage_report(input_dir, output_dir):
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
 
-                line_index_records.extend(extract_line_index_records(content, rel_path, project_name))
+                report_file_path = extract_report_file_path(content, rel_path)
+                report_file_hash = calc_file_path_hash(report_file_path)
+                active_file_hashes.add(report_file_hash)
+                file_line_index_records = extract_line_index_records(content, rel_path, project_name)
+                if index_manager:
+                    if file_line_index_records and index_manager.sync_line_index(project_name, file_line_index_records):
+                        indexed_records += len(file_line_index_records)
+                        indexed_files += 1
+                    elif not file_line_index_records:
+                        index_manager.delete_line_index_file(project_name, report_file_hash)
 
                 if "coverage_enhance.js" in content:
                     new_content = re.sub(r'(href="[^"]*coverage_enhance\.css)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', content)
@@ -820,17 +894,13 @@ def inject_coverage_report(input_dir, output_dir):
                     injected_count += 1
 
     print(f"[Injector] Non-destructively enhanced {injected_count} html report file(s) in: {output_dir}")
-    if line_index_records:
-        try:
-            manager = DatabaseManager(config, exit_on_error=False)
-            manager.sync_line_index(project_name, line_index_records)
-            if manager.conn:
-                manager.conn.close()
-        except Exception as e:
-            print(f"[Warning] Failed to sync full coverage line index: {e}")
-            print("[Warning] Inject completed, but full export requires a successful line-index sync.")
+    if index_manager:
+        index_manager.prune_line_index_project_files(project_name, active_file_hashes)
+        if index_manager.conn:
+            index_manager.conn.close()
+        print(f"[Injector] Synced full coverage line index: {indexed_records} record(s) across {indexed_files} file(s).")
     else:
-        print("[Injector] No uncovered line index records found to sync.")
+        print("[Injector] Full coverage line index was not synced because database initialization failed.")
 
 
 def run_server():
