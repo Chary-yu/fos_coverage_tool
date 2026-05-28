@@ -55,6 +55,38 @@
   "project_name": "您的新工程名字 (例如 Gemini-Next)"
 }
 ```
+
+---
+
+## 5. 跨版本继承分析结果
+
+如果下一版本的函数内容没有变化，并且仍然存在未覆盖行，可以把上一版本已经确认过的分析结果继承到新版本。推荐每个分支或周期使用独立的 `project_name`，例如：
+
+```json
+{
+  "project_name": "onesensor_main_202605"
+}
+```
+
+新版本分析时，将 `project_name` 改为新的版本名并先执行 `inject`，让脚本同步新版本的全量未覆盖行索引：
+
+```bash
+python enhance_coverage.py inject --dir /opt/coverage_reports/raw --out /home/coverage_tool/review
+```
+
+然后执行继承命令：
+
+```bash
+python enhance_coverage.py inherit --from onesensor_main_202605 --to onesensor_main_202606
+```
+
+继承规则：
+
+* 只继承目标版本仍然未覆盖的行；
+* 只继承目标版本尚未填写的行，不覆盖人工已经填写的新结论；
+* 只在同一文件、同一函数内容 hash、同一代码文本及其在函数内出现顺序一致时继承；
+* 函数内容发生变化时不会自动继承，避免把旧结论套到已经修改过的代码上；
+* 状态为“未确认”的旧记录不会继承。
 > [!TIP]
 > *   多个工程可以**共用同一个 MySQL 数据库**（套件会自动在 `coverage_analysis` 表中通过 `project_name` 做物理数据区隔）；
 > *   您也可以为新工程**指定一个全新的 `database` 名字**，`enhance_coverage.py` 在检测到该数据库不存在时，会**极其聪明地在 MySQL 中自动执行 CREATE DATABASE 和建表逻辑**，无需手动导表结构！

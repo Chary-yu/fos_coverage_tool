@@ -42,6 +42,11 @@ def calc_file_path_hash(file_path):
     return hashlib.md5(str(file_path).encode("utf-8")).hexdigest()
 
 
+def calc_text_hash(value):
+    """Return a stable hash for normalized source text."""
+    return hashlib.md5(str(value).encode("utf-8")).hexdigest()
+
+
 def row_value(row, key, index):
     if isinstance(row, dict):
         return row.get(key)
@@ -76,6 +81,17 @@ def is_function_entry_text(code_text):
     return FUNC_ENTRY_RE.search(code_text) is not None
 
 
+def extract_function_name(code_text):
+    code_text = re.sub(r'/\*.*?\*/', '', code_text).strip()
+    code_text = re.sub(r'\s+', ' ', code_text)
+    match = re.search(r'([A-Za-z_]\w*)\s*\([^;]*\)\s*(\{|$)', code_text)
+    return match.group(1) if match else ""
+
+
+def normalize_code_for_hash(code_text):
+    return re.sub(r'\s+', ' ', (code_text or '').strip())
+
+
 def extract_report_file_path(content, fallback_path):
     title_match = re.search(r'<title[^>]*>(.*?)</title>', content, re.I | re.S)
     if title_match:
@@ -102,8 +118,39 @@ def extract_line_index_records(content, fallback_path, project_name):
             "line_number": int(match.group(1)),
             "line_text": code_text,
             "is_uncovered": re.search(r'\b(lineNoCov|tlaUNC|tlaBgUNC)\b', tail) is not None,
-            "code_text": code_text
+            "code_text": code_text,
+            "function_name": "",
+            "function_hash": "",
+            "code_line_hash": calc_text_hash(normalize_code_for_hash(code_text)),
+            "code_occurrence": 1
         })
+
+    function_ranges = []
+    current_start = None
+    for index, item in enumerate(lines):
+        if is_function_entry_text(item["code_text"]):
+            if current_start is not None:
+                function_ranges.append((current_start, index - 1))
+            current_start = index
+    if current_start is not None:
+        function_ranges.append((current_start, len(lines) - 1))
+
+    for start, end in function_ranges:
+        function_name = extract_function_name(lines[start]["code_text"])
+        function_body = "\n".join(
+            normalize_code_for_hash(line["code_text"])
+            for line in lines[start:end + 1]
+            if normalize_code_for_hash(line["code_text"])
+        )
+        function_hash = calc_text_hash(function_body)
+        occurrence_by_line_hash = {}
+        for line in lines[start:end + 1]:
+            code_line_hash = calc_text_hash(normalize_code_for_hash(line["code_text"]))
+            occurrence_by_line_hash[code_line_hash] = occurrence_by_line_hash.get(code_line_hash, 0) + 1
+            line["function_name"] = function_name
+            line["function_hash"] = function_hash
+            line["code_line_hash"] = code_line_hash
+            line["code_occurrence"] = occurrence_by_line_hash[code_line_hash]
 
     records = []
     counted = set()
@@ -134,7 +181,11 @@ def extract_line_index_records(content, fallback_path, project_name):
                 "line_text": block_item["line_text"],
                 "block_start_line": block_start,
                 "block_end_line": block_end,
-                "block_type": block_type
+                "block_type": block_type,
+                "function_name": block_item["function_name"],
+                "function_hash": block_item["function_hash"],
+                "code_line_hash": block_item["code_line_hash"],
+                "code_occurrence": block_item["code_occurrence"]
             })
     return records
 
@@ -202,6 +253,12 @@ class DatabaseManager:
         if not cursor.fetchall():
             print(f"[DB] Creating index {index_name} on {table_name}...")
             cursor.execute(create_sql)
+
+    def ensure_column(self, cursor, table_name, column_name, alter_sql):
+        cursor.execute(f"SHOW COLUMNS FROM {table_name} LIKE %s", (column_name,))
+        if not cursor.fetchall():
+            print(f"[DB] Adding column {column_name} to {table_name}...")
+            cursor.execute(alter_sql)
 
     def init_database(self):
         """自动检查并初始化数据库、数据表以及升级字段"""
@@ -297,17 +354,27 @@ class DatabaseManager:
                 block_start_line INT NOT NULL,
                 block_end_line INT NOT NULL,
                 block_type VARCHAR(64) NOT NULL DEFAULT 'single',
+                function_name VARCHAR(256) DEFAULT '',
+                function_hash CHAR(32) DEFAULT '',
+                code_line_hash CHAR(32) DEFAULT '',
+                code_occurrence INT NOT NULL DEFAULT 1,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE KEY ukey_line_index (project_name, file_path_hash, line_number),
                 KEY idx_line_index_project (project_name),
-                KEY idx_line_index_project_file (project_name, file_path_hash)
+                KEY idx_line_index_project_file (project_name, file_path_hash),
+                KEY idx_line_index_inherit (project_name(64), file_path_hash, function_hash, code_line_hash, code_occurrence)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
             """
             print("[DB] Creating coverage_line_index table if not exists...")
             cursor.execute(index_table_sql)
             self.conn.commit()
+            self.ensure_column(cursor, "coverage_line_index", "function_name", "ALTER TABLE coverage_line_index ADD COLUMN function_name VARCHAR(256) DEFAULT '' AFTER block_type")
+            self.ensure_column(cursor, "coverage_line_index", "function_hash", "ALTER TABLE coverage_line_index ADD COLUMN function_hash CHAR(32) DEFAULT '' AFTER function_name")
+            self.ensure_column(cursor, "coverage_line_index", "code_line_hash", "ALTER TABLE coverage_line_index ADD COLUMN code_line_hash CHAR(32) DEFAULT '' AFTER function_hash")
+            self.ensure_column(cursor, "coverage_line_index", "code_occurrence", "ALTER TABLE coverage_line_index ADD COLUMN code_occurrence INT NOT NULL DEFAULT 1 AFTER code_line_hash")
             self.ensure_index(cursor, "coverage_line_index", "idx_line_index_project", "CREATE INDEX idx_line_index_project ON coverage_line_index (project_name)")
             self.ensure_index(cursor, "coverage_line_index", "idx_line_index_project_file", "CREATE INDEX idx_line_index_project_file ON coverage_line_index (project_name, file_path_hash)")
+            self.ensure_index(cursor, "coverage_line_index", "idx_line_index_inherit", "CREATE INDEX idx_line_index_inherit ON coverage_line_index (project_name(64), file_path_hash, function_hash, code_line_hash, code_occurrence)")
             self.conn.commit()
 
             cursor.close()
@@ -405,15 +472,20 @@ class DatabaseManager:
             insert_sql = """
             INSERT INTO coverage_line_index
                 (project_name, file_path, file_path_hash, line_number, line_text,
-                 block_start_line, block_end_line, block_type)
+                 block_start_line, block_end_line, block_type,
+                 function_name, function_hash, code_line_hash, code_occurrence)
             VALUES
-                (%s, %s, %s, %s, %s, %s, %s, %s)
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 file_path = VALUES(file_path),
                 line_text = VALUES(line_text),
                 block_start_line = VALUES(block_start_line),
                 block_end_line = VALUES(block_end_line),
                 block_type = VALUES(block_type),
+                function_name = VALUES(function_name),
+                function_hash = VALUES(function_hash),
+                code_line_hash = VALUES(code_line_hash),
+                code_occurrence = VALUES(code_occurrence),
                 created_at = CURRENT_TIMESTAMP
             """
             synced_total = 0
@@ -434,7 +506,11 @@ class DatabaseManager:
                                 rec["line_text"],
                                 rec["block_start_line"],
                                 rec["block_end_line"],
-                                rec["block_type"]
+                                rec["block_type"],
+                                rec.get("function_name", ""),
+                                rec.get("function_hash", ""),
+                                rec.get("code_line_hash", ""),
+                                rec.get("code_occurrence", 1)
                             )
                             for rec in batch
                         ]
@@ -480,6 +556,114 @@ class DatabaseManager:
         except Exception as e:
             print(f"[DB Error] Line index stale-file cleanup failed: {e}")
             return False
+
+    def inherit_analysis(self, source_project, target_project, batch_size=1000):
+        """Copy reviewed analysis from an earlier project to unchanged functions in a later project."""
+        if not source_project or not target_project or source_project == target_project:
+            raise ValueError("source_project and target_project must be different")
+
+        unconfirmed_status = "\u672a\u786e\u8ba4"
+        try:
+            try:
+                self.conn.ping(reconnect=True)
+            except AttributeError:
+                pass
+
+            cursor = self.conn.cursor()
+            source_sql = """
+                SELECT si.file_path, si.function_hash, si.code_line_hash, si.code_occurrence,
+                       a.reviewer, a.status, a.coverage_method, a.uncovered_reason
+                FROM coverage_analysis a
+                JOIN coverage_line_index si
+                  ON si.project_name = a.project_name
+                 AND si.file_path_hash = a.file_path_hash
+                 AND si.line_number = a.line_number
+                WHERE a.project_name = %s
+                  AND si.project_name = %s
+                  AND si.function_hash <> ''
+                  AND si.code_line_hash <> ''
+                  AND a.status <> %s
+            """
+            cursor.execute(source_sql, (source_project, source_project, unconfirmed_status))
+            source_rows = cursor.fetchall()
+
+            source_by_key = {}
+            for row in source_rows:
+                key = (
+                    row_value(row, "file_path", 0),
+                    row_value(row, "function_hash", 1),
+                    row_value(row, "code_line_hash", 2),
+                    row_value(row, "code_occurrence", 3),
+                )
+                source_by_key.setdefault(key, row)
+
+            target_sql = """
+                SELECT ti.file_path, ti.file_path_hash, ti.line_number,
+                       ti.function_hash, ti.code_line_hash, ti.code_occurrence
+                FROM coverage_line_index ti
+                LEFT JOIN coverage_analysis existing
+                  ON existing.project_name = ti.project_name
+                 AND existing.file_path_hash = ti.file_path_hash
+                 AND existing.line_number = ti.line_number
+                WHERE ti.project_name = %s
+                  AND ti.function_hash <> ''
+                  AND ti.code_line_hash <> ''
+                  AND existing.id IS NULL
+            """
+            cursor.execute(target_sql, (target_project,))
+            target_rows = cursor.fetchall()
+
+            payload = []
+            for row in target_rows:
+                key = (
+                    row_value(row, "file_path", 0),
+                    row_value(row, "function_hash", 3),
+                    row_value(row, "code_line_hash", 4),
+                    row_value(row, "code_occurrence", 5),
+                )
+                source = source_by_key.get(key)
+                if not source:
+                    continue
+                payload.append((
+                    target_project,
+                    row_value(row, "file_path", 0),
+                    row_value(row, "file_path_hash", 1),
+                    row_value(row, "line_number", 2),
+                    row_value(source, "reviewer", 4) or "",
+                    row_value(source, "status", 5) or unconfirmed_status,
+                    row_value(source, "coverage_method", 6) or "",
+                    row_value(source, "uncovered_reason", 7) or "",
+                ))
+
+            insert_sql = """
+                INSERT INTO coverage_analysis
+                    (project_name, file_path, file_path_hash, line_number,
+                     reviewer, status, coverage_method, uncovered_reason)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    file_path = VALUES(file_path)
+            """
+            inherited = 0
+            for start in range(0, len(payload), batch_size):
+                batch = payload[start:start + batch_size]
+                if not batch:
+                    continue
+                cursor.executemany(insert_sql, batch)
+                self.conn.commit()
+                inherited += len(batch)
+
+            cursor.close()
+            return {
+                "source_project": source_project,
+                "target_project": target_project,
+                "source_reviewed_records": len(source_rows),
+                "target_unfilled_records": len(target_rows),
+                "inherited_records": inherited
+            }
+        except Exception as e:
+            print(f"[DB Error] Inherit failed: {e}")
+            raise
 
     def export_report(self, report_type="detail", project_name=None):
         try:
@@ -934,6 +1118,8 @@ def print_help():
     print("    - Scan and inject custom interactive forms into HTML reports.")
     print("  python scripts/enhance_coverage.py server")
     print("    - Start local bridge server for MySQL persistence.")
+    print("  python scripts/enhance_coverage.py inherit --from <old_project> --to <new_project>")
+    print("    - Reuse reviewed analysis for unchanged functions in a later project/version.")
 
 
 if __name__ == "__main__":
@@ -965,6 +1151,31 @@ if __name__ == "__main__":
         inject_coverage_report(dir_path, out_path)
     elif cmd == "server":
         run_server()
+    elif cmd == "inherit":
+        source_project = None
+        target_project = None
+        for i in range(len(sys.argv)):
+            if sys.argv[i] == "--from" and i + 1 < len(sys.argv):
+                source_project = sys.argv[i + 1]
+            if sys.argv[i] == "--to" and i + 1 < len(sys.argv):
+                target_project = sys.argv[i + 1]
+
+        if not source_project or not target_project:
+            print("[Error] inherit requires --from <old_project> and --to <new_project>.")
+            print_help()
+            sys.exit(1)
+
+        config = load_config()
+        print(f"[Inherit] Source project: {source_project}")
+        print(f"[Inherit] Target project: {target_project}")
+        manager = DatabaseManager(config)
+        result = manager.inherit_analysis(source_project, target_project)
+        if manager.conn:
+            manager.conn.close()
+        print("[Inherit] Completed.")
+        print(f"[Inherit] Source reviewed records: {result['source_reviewed_records']}")
+        print(f"[Inherit] Target unfilled records: {result['target_unfilled_records']}")
+        print(f"[Inherit] Inherited records: {result['inherited_records']}")
     else:
         print_help()
         sys.exit(1)
