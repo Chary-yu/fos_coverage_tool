@@ -123,6 +123,21 @@ python3 enhance_coverage.py inject \
 * 注入前端 JS/CSS 控件；
 * 将未覆盖行索引同步到数据库，用于全量导出和跨版本继承。
 
+执行过程中会输出进度，例如：
+
+```text
+[Injector] Found 1200 .gcov.html file(s). Starting injection and line-index sync...
+[Injector] Progress 38/1200 (3.2%) elapsed=18.4s eta=563.1s uncovered=42 index=synced total_indexed=12580 file=xxx/yyy.c.gcov.html
+```
+
+字段含义：
+
+* `Progress`：当前处理文件数 / 总文件数；
+* `uncovered`：当前文件识别到的未覆盖行索引数；
+* `index`：当前文件索引是否已同步到数据库，`synced` 表示已同步；
+* `total_indexed`：本次累计同步的未覆盖行索引数；
+* `eta`：按当前处理速度估算的剩余时间。
+
 注意：执行 `inject` 前，请确认 `coverage_config.json` 中的 `project_name` 已经改成当前版本对应的名字。
 
 ---

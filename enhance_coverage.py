@@ -16,6 +16,7 @@ import hashlib
 import csv
 import io
 import html
+import time
 from datetime import datetime
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -1035,49 +1036,78 @@ def inject_coverage_report(input_dir, output_dir):
         print(f"[Warning] Failed to initialize database for full coverage line index: {e}")
         print("[Warning] Inject will continue, but full export requires a successful line-index sync.")
 
-    injected_count = 0
+    print(f"[Injector] Scanning report files under: {real_output_html}")
+    gcov_files = []
     for root, dirs, files in os.walk(real_output_html):
-        for file in files:
+        dirs.sort()
+        for file in sorted(files):
             if file.endswith(".gcov.html"):
                 file_path = os.path.join(root, file)
-                
                 rel_path = os.path.relpath(file_path, real_output_html)
-                depth = len(rel_path.split(os.sep)) - 1
-                prefix = "../" * depth
+                gcov_files.append((file_path, rel_path))
 
-                css_tag = f'<link rel="stylesheet" type="text/css" href="{prefix}coverage_enhance.css?v={ASSET_VERSION}">\n'
-                js_tag = f'<script type="text/javascript" src="{prefix}coverage_enhance.js?v={ASSET_VERSION}"></script>\n'
-                inject_code = f"{css_tag}{js_tag}</head>"
+    total_files = len(gcov_files)
+    if total_files == 0:
+        print("[Injector] No .gcov.html files found. Nothing to inject.")
+        if index_manager and index_manager.conn:
+            index_manager.conn.close()
+        return
 
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
+    print(f"[Injector] Found {total_files} .gcov.html file(s). Starting injection and line-index sync...")
+    started_at = time.time()
+    injected_count = 0
+    updated_count = 0
+    for file_index, (file_path, rel_path) in enumerate(gcov_files, start=1):
+        depth = len(rel_path.split(os.sep)) - 1
+        prefix = "../" * depth
 
-                report_file_path = extract_report_file_path(content, rel_path)
-                report_file_hash = calc_file_path_hash(report_file_path)
-                active_file_hashes.add(report_file_hash)
-                file_line_index_records = extract_line_index_records(content, rel_path, project_name)
-                if index_manager:
-                    if file_line_index_records and index_manager.sync_line_index(project_name, file_line_index_records):
-                        indexed_records += len(file_line_index_records)
-                        indexed_files += 1
-                    elif not file_line_index_records:
-                        index_manager.delete_line_index_file(project_name, report_file_hash)
+        css_tag = f'<link rel="stylesheet" type="text/css" href="{prefix}coverage_enhance.css?v={ASSET_VERSION}">\n'
+        js_tag = f'<script type="text/javascript" src="{prefix}coverage_enhance.js?v={ASSET_VERSION}"></script>\n'
+        inject_code = f"{css_tag}{js_tag}</head>"
 
-                if "coverage_enhance.js" in content:
-                    new_content = re.sub(r'(href="[^"]*coverage_enhance\.css)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', content)
-                    new_content = re.sub(r'(src="[^"]*coverage_enhance\.js)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', new_content)
-                    if new_content != content:
-                        with open(file_path, 'w', encoding='utf-8') as f:
-                            f.write(new_content)
-                    continue
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
 
-                if "</head>" in content:
-                    new_content = content.replace("</head>", inject_code, 1)
-                    with open(file_path, 'w', encoding='utf-8') as f:
-                        f.write(new_content)
-                    injected_count += 1
+        report_file_path = extract_report_file_path(content, rel_path)
+        report_file_hash = calc_file_path_hash(report_file_path)
+        active_file_hashes.add(report_file_hash)
+        file_line_index_records = extract_line_index_records(content, rel_path, project_name)
+        file_index_synced = False
+        if index_manager:
+            if file_line_index_records and index_manager.sync_line_index(project_name, file_line_index_records):
+                indexed_records += len(file_line_index_records)
+                indexed_files += 1
+                file_index_synced = True
+            elif not file_line_index_records:
+                index_manager.delete_line_index_file(project_name, report_file_hash)
 
-    print(f"[Injector] Non-destructively enhanced {injected_count} html report file(s) in: {output_dir}")
+        if "coverage_enhance.js" in content:
+            new_content = re.sub(r'(href="[^"]*coverage_enhance\.css)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', content)
+            new_content = re.sub(r'(src="[^"]*coverage_enhance\.js)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', new_content)
+            if new_content != content:
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(new_content)
+                updated_count += 1
+        elif "</head>" in content:
+            new_content = content.replace("</head>", inject_code, 1)
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            injected_count += 1
+
+        elapsed = time.time() - started_at
+        percent = file_index * 100.0 / total_files
+        rate = file_index / elapsed if elapsed > 0 else 0
+        remaining = (total_files - file_index) / rate if rate > 0 else 0
+        index_status = "synced" if file_index_synced else "empty" if not file_line_index_records else "skipped"
+        print(
+            f"[Injector] Progress {file_index}/{total_files} ({percent:.1f}%) "
+            f"elapsed={elapsed:.1f}s eta={remaining:.1f}s "
+            f"uncovered={len(file_line_index_records)} index={index_status} "
+            f"total_indexed={indexed_records} file={rel_path}",
+            flush=True
+        )
+
+    print(f"[Injector] Non-destructively enhanced {injected_count} new html report file(s), updated {updated_count} existing enhanced file(s) in: {output_dir}")
     if index_manager:
         index_manager.prune_line_index_project_files(project_name, active_file_hashes)
         if index_manager.conn:
