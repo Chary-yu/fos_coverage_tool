@@ -4,7 +4,7 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'dop-lazy-render-20260528';
+    const ENHANCE_VERSION = 'dop-legacy-align-refresh-20260528';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖', '冗余代码'];
@@ -18,6 +18,9 @@
     let totalUncovered = 0;       // 物理未覆盖代码行总数
     let blocks = [];              // 合并与隔离切分后的 Block 列表 (元素为 [{span, lineNum}])
     let panelsMap = new Map();     // startLine -> {select, reviewerInput, methodInput, reasonInput, saveBtn, block}
+    let legacyPanelSyncers = [];
+    let legacyRefreshRequested = false;
+    let requestLegacyPanelRefresh = function() {};
 
     document.addEventListener('DOMContentLoaded', function() {
         // 1. 自动提取当前文件的相对路径
@@ -276,6 +279,33 @@
             }
         }
 
+        function runLegacyPanelRefresh() {
+            legacyPanelSyncers.forEach(syncer => syncer());
+        }
+
+        requestLegacyPanelRefresh = function(repeatCount = 2) {
+            if (legacyPanelSyncers.length === 0) {
+                return;
+            }
+            if (legacyRefreshRequested) {
+                return;
+            }
+            legacyRefreshRequested = true;
+
+            function refreshFrame(left) {
+                requestAnimationFrame(() => {
+                    runLegacyPanelRefresh();
+                    if (left > 1) {
+                        refreshFrame(left - 1);
+                    } else {
+                        legacyRefreshRequested = false;
+                    }
+                });
+            }
+
+            refreshFrame(repeatCount);
+        };
+
         function renderControlsInBatches(onComplete) {
             let index = 0;
             const totalBlocks = blocks.length;
@@ -287,6 +317,7 @@
                 for (; index < end; index++) {
                     renderBlockPanel(blocks[index]);
                 }
+                requestLegacyPanelRefresh(2);
 
                 if (progress) {
                     const percent = totalBlocks > 0 ? ((index * 100) / totalBlocks).toFixed(1) : '100.0';
@@ -303,6 +334,7 @@
                     progress.innerText = `Coverage controls ready: ${totalBlocks} (${elapsed}s)`;
                     setTimeout(() => progress.remove(), 1500);
                 }
+                requestLegacyPanelRefresh(4);
                 onComplete();
             }
 
@@ -500,10 +532,11 @@
                     syncLegacyRowHeight();
                     positionLegacyPanel();
                 };
+                legacyPanelSyncers.push(syncAndPosition);
                 onPanelResize = syncAndPosition;
                 requestAnimationFrame(syncAndPosition);
                 window.addEventListener('load', syncAndPosition);
-                window.addEventListener('resize', positionLegacyPanel);
+                window.addEventListener('resize', syncAndPosition);
                 if (window.ResizeObserver) {
                     const resizeObserver = new ResizeObserver(syncAndPosition);
                     resizeObserver.observe(panel);
@@ -739,6 +772,7 @@
                     }
                 });
             }
+            requestLegacyPanelRefresh(4);
             updateHeaderStatistics();
         })
         .catch(err => {
@@ -748,6 +782,7 @@
                 panel.saveBtn.classList.add('error');
                 panel.saveBtn.title = '无法连接到本地持久化服务，请检查 enhance_coverage.py 服务是否在运行。';
             });
+            requestLegacyPanelRefresh(4);
             updateHeaderStatistics();
         });
     }
@@ -794,6 +829,7 @@
                 console.log(`[CoverageEnhance] Successfully saved block range L${block[0].lineNum}-${block[block.length - 1].lineNum}`);
                 
                 updateHeaderStatistics();
+                requestLegacyPanelRefresh(3);
                 
                 setTimeout(() => {
                     if (btn.className.includes('saved')) {
