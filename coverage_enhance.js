@@ -4,10 +4,11 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'dop-resize-handle-20260528';
+    const ENHANCE_VERSION = 'dop-redundant-status-20260528';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
-    const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖'];
+    const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖', '冗余代码'];
+    const CONFIRMED_STATUS_SET = new Set(['可覆盖', '无法覆盖', '冗余代码']);
 
     // 控制流分支关键字侦测正则 (边界隔离)
     const CONTROL_FLOW_REGEX = /\b(if|else|for|while|do|switch|case|default)\b/;
@@ -560,7 +561,7 @@
         // 统计已分析确认的行数 (只要 Block 首行分析被保存，其所覆盖的所有物理行数均计入)
         panelsMap.forEach((panel, startLineNum) => {
             const status = panel.select.value;
-            if (status === '可覆盖' || status === '无法覆盖') {
+            if (CONFIRMED_STATUS_SET.has(status)) {
                 confirmedCount += panel.block.length;
             }
         });

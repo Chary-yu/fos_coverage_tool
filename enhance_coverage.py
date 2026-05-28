@@ -33,7 +33,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "coverage_config.json")
 JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
 CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
-ASSET_VERSION = "dop-resize-handle-20260528"
+ASSET_VERSION = "dop-redundant-status-20260528"
 
 
 def calc_file_path_hash(file_path):
@@ -306,8 +306,8 @@ class DatabaseManager:
             elif report_type == "file_summary":
                 headers = [
                     "project_name", "file_path", "review_total", "confirmed_total",
-                    "coverable_total", "uncoverable_total", "unconfirmed_total",
-                    "confirmed_rate", "coverable_rate", "uncoverable_rate", "last_updated"
+                    "coverable_total", "uncoverable_total", "redundant_total", "unconfirmed_total",
+                    "confirmed_rate", "coverable_rate", "uncoverable_rate", "redundant_rate", "last_updated"
                 ]
                 sql = f"""
                     SELECT project_name, file_path,
@@ -315,25 +315,27 @@ class DatabaseManager:
                            SUM(CASE WHEN status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
                            SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS coverable_total,
                            SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
+                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS redundant_total,
                            SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS unconfirmed_total,
                            ROUND(SUM(CASE WHEN status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
                            ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS coverable_rate,
                            ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS uncoverable_rate,
+                           ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS redundant_rate,
                            MAX(updated_at) AS last_updated
                     FROM coverage_analysis
                     {where_sql}
                     GROUP BY project_name, file_path
                     ORDER BY project_name, file_path
                 """
-                summary_params = ["未确认", "可覆盖", "无法覆盖", "未确认", "未确认", "可覆盖", "无法覆盖"] + params
+                summary_params = ["未确认", "可覆盖", "无法覆盖", "冗余代码", "未确认", "未确认", "可覆盖", "无法覆盖", "冗余代码"] + params
                 cursor.execute(sql, summary_params)
                 rows = cursor.fetchall()
                 data = [[row_value(row, header, idx) for idx, header in enumerate(headers)] for row in rows]
             elif report_type == "project_summary":
                 headers = [
                     "project_name", "review_total", "confirmed_total",
-                    "coverable_total", "uncoverable_total", "unconfirmed_total",
-                    "confirmed_rate", "coverable_rate", "uncoverable_rate", "file_total", "last_updated"
+                    "coverable_total", "uncoverable_total", "redundant_total", "unconfirmed_total",
+                    "confirmed_rate", "coverable_rate", "uncoverable_rate", "redundant_rate", "file_total", "last_updated"
                 ]
                 sql = f"""
                     SELECT project_name,
@@ -341,10 +343,12 @@ class DatabaseManager:
                            SUM(CASE WHEN status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
                            SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS coverable_total,
                            SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
+                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS redundant_total,
                            SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS unconfirmed_total,
                            ROUND(SUM(CASE WHEN status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
                            ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS coverable_rate,
                            ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS uncoverable_rate,
+                           ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS redundant_rate,
                            COUNT(DISTINCT file_path_hash) AS file_total,
                            MAX(updated_at) AS last_updated
                     FROM coverage_analysis
@@ -352,7 +356,7 @@ class DatabaseManager:
                     GROUP BY project_name
                     ORDER BY project_name
                 """
-                summary_params = ["未确认", "可覆盖", "无法覆盖", "未确认", "未确认", "可覆盖", "无法覆盖"] + params
+                summary_params = ["未确认", "可覆盖", "无法覆盖", "冗余代码", "未确认", "未确认", "可覆盖", "无法覆盖", "冗余代码"] + params
                 cursor.execute(sql, summary_params)
                 rows = cursor.fetchall()
                 data = [[row_value(row, header, idx) for idx, header in enumerate(headers)] for row in rows]
