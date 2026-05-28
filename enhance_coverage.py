@@ -15,6 +15,7 @@ import re
 import hashlib
 import csv
 import io
+import html
 from datetime import datetime
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -47,6 +48,97 @@ def row_value(row, key, index):
     return row[index]
 
 
+CONTROL_FLOW_RE = re.compile(r'\b(if|else|for|while|do|switch|case|default)\b')
+FUNC_ENTRY_RE = re.compile(r'^[A-Za-z_][\w\s\*]*\s+[A-Za-z_]\w*\s*\([^;]*\)\s*(\{|$)')
+
+
+def strip_html_text(value):
+    value = re.sub(r'<[^>]+>', '', value)
+    return html.unescape(value).replace('\r', '').strip()
+
+
+def get_code_text(line_text):
+    colon_index = line_text.find(':')
+    return (line_text[colon_index + 1:] if colon_index >= 0 else line_text).strip()
+
+
+def is_control_flow_text(code_text):
+    return CONTROL_FLOW_RE.search(code_text) is not None
+
+
+def is_function_entry_text(code_text):
+    code_text = re.sub(r'/\*.*?\*/', '', code_text).strip()
+    code_text = re.sub(r'\s+', ' ', code_text)
+    if not code_text or code_text.endswith(';') or is_control_flow_text(code_text):
+        return False
+    if re.match(r'^(return|typedef|struct|enum|union)\b', code_text):
+        return False
+    return FUNC_ENTRY_RE.search(code_text) is not None
+
+
+def extract_report_file_path(content, fallback_path):
+    title_match = re.search(r'<title[^>]*>(.*?)</title>', content, re.I | re.S)
+    if title_match:
+        title_text = strip_html_text(title_match.group(1))
+        lcov_match = re.search(r'LCOV\s+-\s+.*?\s+-\s+(.+)$', title_text)
+        if lcov_match:
+            return lcov_match.group(1).strip()
+    return fallback_path.replace(os.sep, '/').replace('.gcov.html', '')
+
+
+def extract_line_index_records(content, fallback_path, project_name):
+    file_path = extract_report_file_path(content, fallback_path)
+    file_path_hash = calc_file_path_hash(file_path)
+    line_pattern = re.compile(r'<span class="lineNum">\s*(\d+)\s*</span>(.*?)(?=<span class="lineNum">|</pre>)', re.S)
+    lines = []
+    for match in line_pattern.finditer(content):
+        tail = match.group(2)
+        line_text = strip_html_text(tail)
+        code_text = get_code_text(line_text)
+        lines.append({
+            "project_name": project_name,
+            "file_path": file_path,
+            "file_path_hash": file_path_hash,
+            "line_number": int(match.group(1)),
+            "line_text": code_text,
+            "is_uncovered": re.search(r'\b(lineNoCov|tlaUNC|tlaBgUNC)\b', tail) is not None,
+            "code_text": code_text
+        })
+
+    records = []
+    counted = set()
+    for index, item in enumerate(lines):
+        if not item["is_uncovered"] or item["line_number"] in counted:
+            continue
+
+        block = [item]
+        block_type = "function_entry" if is_function_entry_text(item["code_text"]) else "control_flow" if is_control_flow_text(item["code_text"]) else "single"
+        if block_type == "function_entry":
+            for next_item in lines[index + 1:]:
+                if is_control_flow_text(next_item["code_text"]) or is_function_entry_text(next_item["code_text"]):
+                    break
+                if next_item["is_uncovered"]:
+                    block.append(next_item)
+
+        block_start = block[0]["line_number"]
+        block_end = block[-1]["line_number"]
+        for block_item in block:
+            if block_item["line_number"] in counted:
+                continue
+            counted.add(block_item["line_number"])
+            records.append({
+                "project_name": block_item["project_name"],
+                "file_path": block_item["file_path"],
+                "file_path_hash": block_item["file_path_hash"],
+                "line_number": block_item["line_number"],
+                "line_text": block_item["line_text"],
+                "block_start_line": block_start,
+                "block_end_line": block_end,
+                "block_type": block_type
+            })
+    return records
+
+
 def load_config():
     """从配置文件加载配置，若不存在则使用默认配置"""
     default_config = {
@@ -74,12 +166,15 @@ def load_config():
 
 class DatabaseManager:
     """MySQL 数据库管理层，处理连接、建库、建表以及存取操作"""
-    def __init__(self, config):
+    def __init__(self, config, exit_on_error=True):
         self.config = config["mysql"]
+        self.exit_on_error = exit_on_error
         if not db_module:
             print("[CRITICAL] Missing MySQL driver. Please install PyMySQL to enable database support:")
             print("           pip install pymysql")
-            sys.exit(1)
+            if self.exit_on_error:
+                sys.exit(1)
+            raise RuntimeError("Missing MySQL driver")
         self.conn = None
         self.init_database()
 
@@ -185,11 +280,32 @@ class DatabaseManager:
                 self.conn.commit()
                 print("[DB] Hash unique index ready.")
 
+            index_table_sql = """
+            CREATE TABLE IF NOT EXISTS coverage_line_index (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                project_name VARCHAR(128) NOT NULL,
+                file_path VARCHAR(512) NOT NULL,
+                file_path_hash CHAR(32) NOT NULL,
+                line_number INT NOT NULL,
+                line_text TEXT,
+                block_start_line INT NOT NULL,
+                block_end_line INT NOT NULL,
+                block_type VARCHAR(64) NOT NULL DEFAULT 'single',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY ukey_line_index (project_name, file_path_hash, line_number)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            """
+            print("[DB] Creating coverage_line_index table if not exists...")
+            cursor.execute(index_table_sql)
+            self.conn.commit()
+
             cursor.close()
             print("[DB] Database initialization complete.")
         except Exception as e:
             print(f"[CRITICAL] Database initialization failed: {e}")
-            sys.exit(1)
+            if self.exit_on_error:
+                sys.exit(1)
+            raise
 
     def fetch_records(self, project_name, file_path):
         """拉取指定项目与文件的覆盖率分析结论"""
@@ -261,6 +377,52 @@ class DatabaseManager:
             return True
         except Exception as e:
             print(f"[DB Error] Save failed: {e}")
+            return False
+
+    def sync_line_index(self, project_name, records):
+        try:
+            try:
+                self.conn.ping(reconnect=True)
+            except AttributeError:
+                pass
+
+            cursor = self.conn.cursor()
+            cursor.execute("DELETE FROM coverage_line_index WHERE project_name = %s", (project_name,))
+            if records:
+                sql = """
+                INSERT INTO coverage_line_index
+                    (project_name, file_path, file_path_hash, line_number, line_text,
+                     block_start_line, block_end_line, block_type)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    file_path = VALUES(file_path),
+                    line_text = VALUES(line_text),
+                    block_start_line = VALUES(block_start_line),
+                    block_end_line = VALUES(block_end_line),
+                    block_type = VALUES(block_type),
+                    created_at = CURRENT_TIMESTAMP
+                """
+                payload = [
+                    (
+                        project_name,
+                        rec["file_path"],
+                        rec["file_path_hash"],
+                        rec["line_number"],
+                        rec["line_text"],
+                        rec["block_start_line"],
+                        rec["block_end_line"],
+                        rec["block_type"]
+                    )
+                    for rec in records
+                ]
+                cursor.executemany(sql, payload)
+            self.conn.commit()
+            cursor.close()
+            print(f"[DB] Synced {len(records)} uncovered line index record(s) for project '{project_name}'.")
+            return True
+        except Exception as e:
+            print(f"[DB Error] Line index sync failed: {e}")
             return False
 
     def export_report(self, report_type="detail", project_name=None):
@@ -360,6 +522,113 @@ class DatabaseManager:
                 cursor.execute(sql, summary_params)
                 rows = cursor.fetchall()
                 data = [[row_value(row, header, idx) for idx, header in enumerate(headers)] for row in rows]
+            elif report_type == "full_detail":
+                full_where_sql = ""
+                full_params = []
+                if project_name:
+                    full_where_sql = "WHERE i.project_name = %s"
+                    full_params.append(project_name)
+                headers = [
+                    "project_name", "file_path", "line_number", "line_text",
+                    "block_start_line", "block_end_line", "block_type",
+                    "fill_status", "status", "reviewer", "coverage_method",
+                    "uncovered_reason", "updated_at"
+                ]
+                sql = f"""
+                    SELECT i.project_name, i.file_path, i.line_number, i.line_text,
+                           i.block_start_line, i.block_end_line, i.block_type,
+                           CASE WHEN a.id IS NULL THEN %s ELSE %s END AS fill_status,
+                           COALESCE(a.status, '') AS status,
+                           COALESCE(a.reviewer, '') AS reviewer,
+                           COALESCE(a.coverage_method, '') AS coverage_method,
+                           COALESCE(a.uncovered_reason, '') AS uncovered_reason,
+                           a.updated_at
+                    FROM coverage_line_index i
+                    LEFT JOIN coverage_analysis a
+                      ON a.project_name = i.project_name
+                     AND a.file_path_hash = i.file_path_hash
+                     AND a.line_number = i.line_number
+                    {full_where_sql}
+                    ORDER BY i.project_name, i.file_path, i.line_number
+                """
+                cursor.execute(sql, ["未填写", "已填写"] + full_params)
+                rows = cursor.fetchall()
+                data = [[row_value(row, header, idx) for idx, header in enumerate(headers)] for row in rows]
+            elif report_type == "full_file_summary":
+                full_where_sql = ""
+                full_params = []
+                if project_name:
+                    full_where_sql = "WHERE i.project_name = %s"
+                    full_params.append(project_name)
+                headers = [
+                    "project_name", "file_path", "total_uncovered", "filled_total",
+                    "unfilled_total", "confirmed_total", "coverable_total",
+                    "uncoverable_total", "redundant_total", "fill_rate",
+                    "confirmed_rate", "last_updated"
+                ]
+                sql = f"""
+                    SELECT i.project_name, i.file_path,
+                           COUNT(*) AS total_uncovered,
+                           SUM(CASE WHEN a.id IS NULL THEN 0 ELSE 1 END) AS filled_total,
+                           SUM(CASE WHEN a.id IS NULL THEN 1 ELSE 0 END) AS unfilled_total,
+                           SUM(CASE WHEN a.id IS NOT NULL AND a.status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
+                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS coverable_total,
+                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
+                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS redundant_total,
+                           ROUND(SUM(CASE WHEN a.id IS NULL THEN 0 ELSE 1 END) * 100.0 / COUNT(*), 2) AS fill_rate,
+                           ROUND(SUM(CASE WHEN a.id IS NOT NULL AND a.status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
+                           MAX(a.updated_at) AS last_updated
+                    FROM coverage_line_index i
+                    LEFT JOIN coverage_analysis a
+                      ON a.project_name = i.project_name
+                     AND a.file_path_hash = i.file_path_hash
+                     AND a.line_number = i.line_number
+                    {full_where_sql}
+                    GROUP BY i.project_name, i.file_path
+                    ORDER BY i.project_name, i.file_path
+                """
+                summary_params = ["未确认", "可覆盖", "无法覆盖", "冗余代码", "未确认"] + full_params
+                cursor.execute(sql, summary_params)
+                rows = cursor.fetchall()
+                data = [[row_value(row, header, idx) for idx, header in enumerate(headers)] for row in rows]
+            elif report_type == "full_project_summary":
+                full_where_sql = ""
+                full_params = []
+                if project_name:
+                    full_where_sql = "WHERE i.project_name = %s"
+                    full_params.append(project_name)
+                headers = [
+                    "project_name", "file_total", "total_uncovered", "filled_total",
+                    "unfilled_total", "confirmed_total", "coverable_total",
+                    "uncoverable_total", "redundant_total", "fill_rate",
+                    "confirmed_rate", "last_updated"
+                ]
+                sql = f"""
+                    SELECT i.project_name,
+                           COUNT(DISTINCT i.file_path_hash) AS file_total,
+                           COUNT(*) AS total_uncovered,
+                           SUM(CASE WHEN a.id IS NULL THEN 0 ELSE 1 END) AS filled_total,
+                           SUM(CASE WHEN a.id IS NULL THEN 1 ELSE 0 END) AS unfilled_total,
+                           SUM(CASE WHEN a.id IS NOT NULL AND a.status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
+                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS coverable_total,
+                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
+                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS redundant_total,
+                           ROUND(SUM(CASE WHEN a.id IS NULL THEN 0 ELSE 1 END) * 100.0 / COUNT(*), 2) AS fill_rate,
+                           ROUND(SUM(CASE WHEN a.id IS NOT NULL AND a.status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
+                           MAX(a.updated_at) AS last_updated
+                    FROM coverage_line_index i
+                    LEFT JOIN coverage_analysis a
+                      ON a.project_name = i.project_name
+                     AND a.file_path_hash = i.file_path_hash
+                     AND a.line_number = i.line_number
+                    {full_where_sql}
+                    GROUP BY i.project_name
+                    ORDER BY i.project_name
+                """
+                summary_params = ["未确认", "可覆盖", "无法覆盖", "冗余代码", "未确认"] + full_params
+                cursor.execute(sql, summary_params)
+                rows = cursor.fetchall()
+                data = [[row_value(row, header, idx) for idx, header in enumerate(headers)] for row in rows]
             else:
                 raise ValueError("Unsupported report type")
 
@@ -393,8 +662,8 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
             report_type = query_params.get("type", ["detail"])[0]
             project_name = query_params.get("project", [""])[0] or None
 
-            if report_type not in ("detail", "file_summary", "project_summary"):
-                self.send_error_response(400, "Unsupported export type. Use detail, file_summary, or project_summary")
+            if report_type not in ("detail", "file_summary", "project_summary", "full_detail", "full_file_summary", "full_project_summary"):
+                self.send_error_response(400, "Unsupported export type. Use detail, file_summary, project_summary, full_detail, full_file_summary, or full_project_summary")
                 return
 
             try:
@@ -514,6 +783,9 @@ def inject_coverage_report(input_dir, output_dir):
     shutil.copy2(CSS_SOURCE_PATH, os.path.join(real_output_html, "coverage_enhance.css"))
     print(f"[Injector] Copied static resources to: {real_output_html}")
 
+    config = load_config()
+    project_name = config.get("project_name", "Gemini-NOS")
+    line_index_records = []
     injected_count = 0
     for root, dirs, files in os.walk(real_output_html):
         for file in files:
@@ -531,6 +803,8 @@ def inject_coverage_report(input_dir, output_dir):
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
 
+                line_index_records.extend(extract_line_index_records(content, rel_path, project_name))
+
                 if "coverage_enhance.js" in content:
                     new_content = re.sub(r'(href="[^"]*coverage_enhance\.css)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', content)
                     new_content = re.sub(r'(src="[^"]*coverage_enhance\.js)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', new_content)
@@ -546,6 +820,17 @@ def inject_coverage_report(input_dir, output_dir):
                     injected_count += 1
 
     print(f"[Injector] Non-destructively enhanced {injected_count} html report file(s) in: {output_dir}")
+    if line_index_records:
+        try:
+            manager = DatabaseManager(config, exit_on_error=False)
+            manager.sync_line_index(project_name, line_index_records)
+            if manager.conn:
+                manager.conn.close()
+        except Exception as e:
+            print(f"[Warning] Failed to sync full coverage line index: {e}")
+            print("[Warning] Inject completed, but full export requires a successful line-index sync.")
+    else:
+        print("[Injector] No uncovered line index records found to sync.")
 
 
 def run_server():

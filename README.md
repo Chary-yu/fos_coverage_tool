@@ -114,6 +114,21 @@ curl -o coverage_project_summary.csv "http://127.0.0.1:9528/api/coverage/export?
 curl -o gemini_detail.csv "http://127.0.0.1:9528/api/coverage/export?type=detail&project=Gemini-NOS"
 ```
 
+### 全量进度导出
+`full_*` 报表以 `inject` 阶段同步的全量未覆盖行索引为基准，可以体现未填写行和整体进展。
+
+```bash
+curl -o coverage_full_detail.csv "http://127.0.0.1:9528/api/coverage/export?type=full_detail"
+curl -o coverage_full_file_summary.csv "http://127.0.0.1:9528/api/coverage/export?type=full_file_summary"
+curl -o coverage_full_project_summary.csv "http://127.0.0.1:9528/api/coverage/export?type=full_project_summary"
+```
+
+只导出某个项目：
+
+```bash
+curl -o gemini_full_project_summary.csv "http://127.0.0.1:9528/api/coverage/export?type=full_project_summary&project=Gemini-NOS"
+```
+
 如果通过 Nginx 访问，地址换成：
 ```bash
 curl -o coverage_detail.csv "http://服务器IP/api/coverage/export?type=detail"
