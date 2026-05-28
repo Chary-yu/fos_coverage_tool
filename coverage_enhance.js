@@ -4,7 +4,7 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'dop-resize-blockscope-20260526';
+    const ENHANCE_VERSION = 'dop-resize-handle-20260528';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖'];
@@ -216,6 +216,43 @@
 
         console.log(`[CoverageEnhance] Total uncovered lines: ${totalUncovered}. Consolidated into ${blocks.length} block(s).`);
 
+        function createResizeGrip(textarea, onResize) {
+            const grip = document.createElement('span');
+            grip.className = 'coverage-resize-grip';
+            grip.title = '拖拽调整输入框大小';
+
+            grip.addEventListener('mousedown', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+
+                const startX = e.clientX;
+                const startY = e.clientY;
+                const startWidth = textarea.offsetWidth;
+                const startHeight = textarea.offsetHeight;
+                textarea.classList.add('resizing');
+
+                function onMouseMove(moveEvent) {
+                    const nextWidth = Math.max(120, startWidth + moveEvent.clientX - startX);
+                    const nextHeight = Math.max(24, startHeight + moveEvent.clientY - startY);
+                    textarea.style.setProperty('width', `${nextWidth}px`, 'important');
+                    textarea.style.setProperty('height', `${nextHeight}px`, 'important');
+                    onResize();
+                }
+
+                function onMouseUp() {
+                    textarea.classList.remove('resizing');
+                    document.removeEventListener('mousemove', onMouseMove);
+                    document.removeEventListener('mouseup', onMouseUp);
+                    onResize();
+                }
+
+                document.addEventListener('mousemove', onMouseMove);
+                document.addEventListener('mouseup', onMouseUp);
+            });
+
+            return grip;
+        }
+
         // 3. 构建并注入表单 DOM，仅在 Block 的第一行注入
         blocks.forEach(block => {
             const startLineItem = block[0];
@@ -299,6 +336,9 @@
             const reasonInput = document.createElement('textarea');
             reasonInput.className = 'coverage-analysis-input' + (isMultiLine ? ' multiline' : '');
             reasonInput.placeholder = '无条件覆盖原因';
+            let onPanelResize = function() {};
+            const methodResizeGrip = createResizeGrip(methodInput, () => onPanelResize());
+            const reasonResizeGrip = createResizeGrip(reasonInput, () => onPanelResize());
 
             // 徽章渲染逻辑 (只在合并区间大于 1 行时才展示跨行徽章，避免视觉冗余)
             let badgeSpan = null;
@@ -324,7 +364,9 @@
             panel.appendChild(select);
             panel.appendChild(reviewerInput);
             panel.appendChild(methodInput);
+            panel.appendChild(methodResizeGrip);
             panel.appendChild(reasonInput);
+            panel.appendChild(reasonResizeGrip);
             if (badgeSpan) {
                 panel.appendChild(badgeSpan);
             }
@@ -402,6 +444,7 @@
                     syncLegacyRowHeight();
                     positionLegacyPanel();
                 };
+                onPanelResize = syncAndPosition;
                 requestAnimationFrame(syncAndPosition);
                 window.addEventListener('load', syncAndPosition);
                 window.addEventListener('resize', positionLegacyPanel);
@@ -414,6 +457,7 @@
                 }
             } else {
                 startLineItem.span.appendChild(panel);
+                onPanelResize = function() {};
             }
 
             // 存储该 Block 面板的映射，key 设为首行行号
