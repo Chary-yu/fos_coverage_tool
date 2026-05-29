@@ -88,6 +88,33 @@ def is_function_entry_text(code_text):
     return FUNC_ENTRY_RE.search(code_text) is not None
 
 
+def strip_line_comment(code_text):
+    return re.sub(r'//.*$', '', code_text or '').strip()
+
+
+def is_jump_text(code_text):
+    return re.match(r'^(return|goto|break|continue)\b', strip_line_comment(code_text)) is not None
+
+
+def is_structural_text(code_text):
+    text = strip_line_comment(code_text)
+    return text == '' or re.match(r'^[{}]+;?$', text) is not None
+
+
+def is_simple_auto_group_text(code_text):
+    text = strip_line_comment(code_text)
+    text = re.sub(r'/\*.*?\*/', '', text).strip()
+    if not text or is_control_flow_text(text) or is_function_entry_text(text) or is_jump_text(text):
+        return False
+    if re.match(r'^[{}]+;?$', text) or re.match(r'^(case\b.*:|default\s*:|[A-Za-z_]\w*\s*:)$', text):
+        return False
+    if not text.endswith(';'):
+        return False
+    has_assignment = re.search(r'(^|[^=!<>])=([^=]|$)', text) is not None or re.search(r'(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=)', text) is not None
+    is_simple_declaration = re.match(r'^(?:const\s+|static\s+|volatile\s+|register\s+|unsigned\s+|signed\s+|struct\s+\w+\s+|enum\s+\w+\s+|union\s+\w+\s+|[A-Za-z_]\w*\s+)+[*\s]*[A-Za-z_]\w*(?:\s*=\s*[^;]+)?\s*;$', text) is not None
+    return has_assignment or is_simple_declaration
+
+
 def extract_function_name(code_text):
     code_text = re.sub(r'/\*.*?\*/', '', code_text).strip()
     code_text = re.sub(r'\s+', ' ', code_text)
@@ -176,7 +203,19 @@ def extract_line_index_records(content, fallback_path, project_name):
                 if is_control_flow_text(next_item["code_text"]) or is_function_entry_text(next_item["code_text"]):
                     break
                 if next_item["is_uncovered"]:
+                    if block_type == "function_entry" and not is_simple_auto_group_text(next_item["code_text"]):
+                        break
+                    if block_type != "function_entry" and (
+                        not is_simple_auto_group_text(item["code_text"]) or
+                        not is_simple_auto_group_text(next_item["code_text"])
+                    ):
+                        break
                     block.append(next_item)
+                    continue
+                if block_type != "function_entry":
+                    break
+                if not is_structural_text(next_item["code_text"]):
+                    break
 
         block_start = block[0]["line_number"]
         block_end = block[-1]["line_number"]

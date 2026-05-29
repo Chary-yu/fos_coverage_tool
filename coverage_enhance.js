@@ -4,7 +4,7 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'dop-straight-block-20260529';
+    const ENHANCE_VERSION = 'dop-safe-segment-20260529';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖', '冗余代码'];
@@ -163,6 +163,33 @@
             return text === '' || /^[{}]+;?$/.test(text);
         }
 
+        function stripLineComment(text) {
+            return text.replace(/\/\/.*$/, '').trim();
+        }
+
+        function isJumpLine(item) {
+            return /^(return|goto|break|continue)\b/.test(stripLineComment(getCodeText(item)));
+        }
+
+        function isSimpleAutoGroupLine(item) {
+            const text = stripLineComment(getCodeText(item))
+                .replace(/\/\*.*?\*\//g, '')
+                .trim();
+            if (!text || isControlFlowLine(item) || isFunctionEntryLine(item) || isJumpLine(item)) {
+                return false;
+            }
+            if (/^[{}]+;?$/.test(text) || /^(case\b.*:|default\s*:|[A-Za-z_]\w*\s*:)$/.test(text)) {
+                return false;
+            }
+            if (!text.endsWith(';')) {
+                return false;
+            }
+            const hasAssignment = /(^|[^=!<>])=([^=]|$)/.test(text) ||
+                /\b(\+=|-=|\*=|\/=|%=|&=|\|=|\^=|<<=|>>=)\b/.test(text);
+            const isSimpleDeclaration = /^(?:const\s+|static\s+|volatile\s+|register\s+|unsigned\s+|signed\s+|struct\s+\w+\s+|enum\s+\w+\s+|union\s+\w+\s+|[A-Za-z_]\w*\s+)+[*\s]*[A-Za-z_]\w*(?:\s*=\s*[^;]+)?\s*;$/.test(text);
+            return hasAssignment || isSimpleDeclaration;
+        }
+
         function buildSemanticBlock(startIndex) {
             const start = allLines[startIndex];
             const block = [start];
@@ -179,11 +206,20 @@
                     if (isControlFlowLine(next) || isFunctionEntryLine(next)) {
                         break;
                     }
+                    if (startIsFunction && !isSimpleAutoGroupLine(next)) {
+                        break;
+                    }
+                    if (!startIsFunction && (!isSimpleAutoGroupLine(start) || !isSimpleAutoGroupLine(next))) {
+                        break;
+                    }
                     block.push(next);
                     consumedUntil = j;
                     continue;
                 }
 
+                if (!startIsFunction) {
+                    break;
+                }
                 if (isControlFlowLine(next) || isFunctionEntryLine(next)) {
                     break;
                 }
