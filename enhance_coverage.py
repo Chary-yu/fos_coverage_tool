@@ -362,6 +362,7 @@ class DatabaseManager:
                 project_name VARCHAR(128) NOT NULL,
                 file_path VARCHAR(512) NOT NULL,
                 file_path_hash CHAR(32) NOT NULL,
+                source_file_name VARCHAR(255) DEFAULT '',
                 line_number INT NOT NULL,
                 line_text TEXT,
                 block_start_line INT NOT NULL,
@@ -375,7 +376,7 @@ class DatabaseManager:
                 UNIQUE KEY ukey_line_index (project_name, file_path_hash, line_number),
                 KEY idx_line_index_project (project_name),
                 KEY idx_line_index_project_file (project_name, file_path_hash),
-                KEY idx_line_index_inherit (project_name(64), source_file_name(128), function_hash, code_line_hash, code_occurrence)
+                KEY idx_line_index_inherit (project_name(32), source_file_name(64), function_hash, code_line_hash, code_occurrence)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
             """
             print("[DB] Creating coverage_line_index table if not exists...")
@@ -402,7 +403,7 @@ class DatabaseManager:
                 inherit_index_rows = []
             if not inherit_index_rows:
                 print("[DB] Creating index idx_line_index_inherit on coverage_line_index...")
-                cursor.execute("CREATE INDEX idx_line_index_inherit ON coverage_line_index (project_name(64), source_file_name(128), function_hash, code_line_hash, code_occurrence)")
+                cursor.execute("CREATE INDEX idx_line_index_inherit ON coverage_line_index (project_name(32), source_file_name(64), function_hash, code_line_hash, code_occurrence)")
             self.conn.commit()
 
             cursor.close()
