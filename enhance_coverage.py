@@ -48,6 +48,12 @@ def calc_text_hash(value):
     return hashlib.md5(str(value).encode("utf-8")).hexdigest()
 
 
+def get_source_file_name(file_path):
+    """Return the stable source filename used for cross-build inheritance."""
+    normalized = str(file_path or "").replace("\\", "/").rstrip("/")
+    return normalized.rsplit("/", 1)[-1]
+
+
 def row_value(row, key, index):
     if isinstance(row, dict):
         return row.get(key)
@@ -106,6 +112,7 @@ def extract_report_file_path(content, fallback_path):
 def extract_line_index_records(content, fallback_path, project_name):
     file_path = extract_report_file_path(content, fallback_path)
     file_path_hash = calc_file_path_hash(file_path)
+    source_file_name = get_source_file_name(file_path)
     line_pattern = re.compile(r'<span class="lineNum">\s*(\d+)\s*</span>(.*?)(?=<span class="lineNum">|</pre>)', re.S)
     lines = []
     for match in line_pattern.finditer(content):
@@ -116,6 +123,7 @@ def extract_line_index_records(content, fallback_path, project_name):
             "project_name": project_name,
             "file_path": file_path,
             "file_path_hash": file_path_hash,
+            "source_file_name": source_file_name,
             "line_number": int(match.group(1)),
             "line_text": code_text,
             "is_uncovered": re.search(r'\b(lineNoCov|tlaUNC|tlaBgUNC)\b', tail) is not None,
@@ -180,6 +188,7 @@ def extract_line_index_records(content, fallback_path, project_name):
                 "project_name": block_item["project_name"],
                 "file_path": block_item["file_path"],
                 "file_path_hash": block_item["file_path_hash"],
+                "source_file_name": block_item["source_file_name"],
                 "line_number": block_item["line_number"],
                 "line_text": block_item["line_text"],
                 "block_start_line": block_start,
@@ -286,6 +295,7 @@ class DatabaseManager:
                 project_name VARCHAR(128) NOT NULL,
                 file_path VARCHAR(512) NOT NULL,
                 file_path_hash CHAR(32) NOT NULL,
+                source_file_name VARCHAR(255) DEFAULT '',
                 line_number INT NOT NULL,
                 reviewer VARCHAR(128) DEFAULT '' COMMENT '确认人',
                 status VARCHAR(64) NOT NULL DEFAULT '未确认',
@@ -365,7 +375,7 @@ class DatabaseManager:
                 UNIQUE KEY ukey_line_index (project_name, file_path_hash, line_number),
                 KEY idx_line_index_project (project_name),
                 KEY idx_line_index_project_file (project_name, file_path_hash),
-                KEY idx_line_index_inherit (project_name(64), file_path_hash, function_hash, code_line_hash, code_occurrence)
+                KEY idx_line_index_inherit (project_name(64), source_file_name(128), function_hash, code_line_hash, code_occurrence)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
             """
             print("[DB] Creating coverage_line_index table if not exists...")
@@ -375,9 +385,24 @@ class DatabaseManager:
             self.ensure_column(cursor, "coverage_line_index", "function_hash", "ALTER TABLE coverage_line_index ADD COLUMN function_hash CHAR(32) DEFAULT '' AFTER function_name")
             self.ensure_column(cursor, "coverage_line_index", "code_line_hash", "ALTER TABLE coverage_line_index ADD COLUMN code_line_hash CHAR(32) DEFAULT '' AFTER function_hash")
             self.ensure_column(cursor, "coverage_line_index", "code_occurrence", "ALTER TABLE coverage_line_index ADD COLUMN code_occurrence INT NOT NULL DEFAULT 1 AFTER code_line_hash")
+            self.ensure_column(cursor, "coverage_line_index", "source_file_name", "ALTER TABLE coverage_line_index ADD COLUMN source_file_name VARCHAR(255) DEFAULT '' AFTER file_path_hash")
             self.ensure_index(cursor, "coverage_line_index", "idx_line_index_project", "CREATE INDEX idx_line_index_project ON coverage_line_index (project_name)")
             self.ensure_index(cursor, "coverage_line_index", "idx_line_index_project_file", "CREATE INDEX idx_line_index_project_file ON coverage_line_index (project_name, file_path_hash)")
-            self.ensure_index(cursor, "coverage_line_index", "idx_line_index_inherit", "CREATE INDEX idx_line_index_inherit ON coverage_line_index (project_name(64), file_path_hash, function_hash, code_line_hash, code_occurrence)")
+            cursor.execute("SHOW INDEX FROM coverage_line_index WHERE Key_name = 'idx_line_index_inherit'")
+            inherit_index_rows = cursor.fetchall()
+            inherit_index_columns = []
+            for row in inherit_index_rows:
+                if isinstance(row, dict):
+                    inherit_index_columns.append(row.get("Column_name"))
+                else:
+                    inherit_index_columns.append(row[4])
+            if inherit_index_rows and inherit_index_columns != ["project_name", "source_file_name", "function_hash", "code_line_hash", "code_occurrence"]:
+                print("[DB] Rebuilding idx_line_index_inherit for basename-based inheritance...")
+                cursor.execute("DROP INDEX idx_line_index_inherit ON coverage_line_index")
+                inherit_index_rows = []
+            if not inherit_index_rows:
+                print("[DB] Creating index idx_line_index_inherit on coverage_line_index...")
+                cursor.execute("CREATE INDEX idx_line_index_inherit ON coverage_line_index (project_name(64), source_file_name(128), function_hash, code_line_hash, code_occurrence)")
             self.conn.commit()
 
             cursor.close()
@@ -474,13 +499,14 @@ class DatabaseManager:
 
             insert_sql = """
             INSERT INTO coverage_line_index
-                (project_name, file_path, file_path_hash, line_number, line_text,
+                (project_name, file_path, file_path_hash, source_file_name, line_number, line_text,
                  block_start_line, block_end_line, block_type,
                  function_name, function_hash, code_line_hash, code_occurrence)
             VALUES
-                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 file_path = VALUES(file_path),
+                source_file_name = VALUES(source_file_name),
                 line_text = VALUES(line_text),
                 block_start_line = VALUES(block_start_line),
                 block_end_line = VALUES(block_end_line),
@@ -505,6 +531,7 @@ class DatabaseManager:
                                 project_name,
                                 rec["file_path"],
                                 rec["file_path_hash"],
+                                rec.get("source_file_name", get_source_file_name(rec["file_path"])),
                                 rec["line_number"],
                                 rec["line_text"],
                                 rec["block_start_line"],
@@ -574,7 +601,7 @@ class DatabaseManager:
 
             cursor = self.conn.cursor()
             source_sql = """
-                SELECT si.file_path, si.function_hash, si.code_line_hash, si.code_occurrence,
+                SELECT si.file_path, si.source_file_name, si.function_hash, si.code_line_hash, si.code_occurrence,
                        a.reviewer, a.status, a.coverage_method, a.uncovered_reason
                 FROM coverage_analysis a
                 JOIN coverage_line_index si
@@ -591,17 +618,23 @@ class DatabaseManager:
             source_rows = cursor.fetchall()
 
             source_by_key = {}
+            ambiguous_keys = set()
             for row in source_rows:
+                source_file_name = row_value(row, "source_file_name", 1) or get_source_file_name(row_value(row, "file_path", 0))
                 key = (
-                    row_value(row, "file_path", 0),
-                    row_value(row, "function_hash", 1),
-                    row_value(row, "code_line_hash", 2),
-                    row_value(row, "code_occurrence", 3),
+                    source_file_name,
+                    row_value(row, "function_hash", 2),
+                    row_value(row, "code_line_hash", 3),
+                    row_value(row, "code_occurrence", 4),
                 )
-                source_by_key.setdefault(key, row)
+                if key in source_by_key:
+                    source_by_key.pop(key, None)
+                    ambiguous_keys.add(key)
+                elif key not in ambiguous_keys:
+                    source_by_key[key] = row
 
             target_sql = """
-                SELECT ti.file_path, ti.file_path_hash, ti.line_number,
+                SELECT ti.file_path, ti.file_path_hash, ti.source_file_name, ti.line_number,
                        ti.function_hash, ti.code_line_hash, ti.code_occurrence
                 FROM coverage_line_index ti
                 LEFT JOIN coverage_analysis existing
@@ -617,13 +650,18 @@ class DatabaseManager:
             target_rows = cursor.fetchall()
 
             payload = []
+            ambiguous_skipped = 0
             for row in target_rows:
+                target_file_name = row_value(row, "source_file_name", 2) or get_source_file_name(row_value(row, "file_path", 0))
                 key = (
-                    row_value(row, "file_path", 0),
-                    row_value(row, "function_hash", 3),
-                    row_value(row, "code_line_hash", 4),
-                    row_value(row, "code_occurrence", 5),
+                    target_file_name,
+                    row_value(row, "function_hash", 4),
+                    row_value(row, "code_line_hash", 5),
+                    row_value(row, "code_occurrence", 6),
                 )
+                if key in ambiguous_keys:
+                    ambiguous_skipped += 1
+                    continue
                 source = source_by_key.get(key)
                 if not source:
                     continue
@@ -631,11 +669,11 @@ class DatabaseManager:
                     target_project,
                     row_value(row, "file_path", 0),
                     row_value(row, "file_path_hash", 1),
-                    row_value(row, "line_number", 2),
-                    row_value(source, "reviewer", 4) or "",
-                    row_value(source, "status", 5) or unconfirmed_status,
-                    row_value(source, "coverage_method", 6) or "",
-                    row_value(source, "uncovered_reason", 7) or "",
+                    row_value(row, "line_number", 3),
+                    row_value(source, "reviewer", 5) or "",
+                    row_value(source, "status", 6) or unconfirmed_status,
+                    row_value(source, "coverage_method", 7) or "",
+                    row_value(source, "uncovered_reason", 8) or "",
                 ))
 
             insert_sql = """
@@ -662,6 +700,8 @@ class DatabaseManager:
                 "target_project": target_project,
                 "source_reviewed_records": len(source_rows),
                 "target_unfilled_records": len(target_rows),
+                "ambiguous_keys": len(ambiguous_keys),
+                "ambiguous_skipped_records": ambiguous_skipped,
                 "inherited_records": inherited
             }
         except Exception as e:
@@ -1207,6 +1247,8 @@ if __name__ == "__main__":
         print("[Inherit] Completed.")
         print(f"[Inherit] Source reviewed records: {result['source_reviewed_records']}")
         print(f"[Inherit] Target unfilled records: {result['target_unfilled_records']}")
+        print(f"[Inherit] Ambiguous source keys skipped: {result['ambiguous_keys']}")
+        print(f"[Inherit] Target records skipped by ambiguity: {result['ambiguous_skipped_records']}")
         print(f"[Inherit] Inherited records: {result['inherited_records']}")
     else:
         print_help()
