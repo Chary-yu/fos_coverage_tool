@@ -161,7 +161,9 @@ def extract_line_index_records(content, fallback_path, project_name):
 
         block = [item]
         block_type = "function_entry" if is_function_entry_text(item["code_text"]) else "control_flow" if is_control_flow_text(item["code_text"]) else "single"
-        if block_type == "function_entry":
+        if block_type != "control_flow":
+            if block_type == "single":
+                block_type = "straight_line"
             for next_item in lines[index + 1:]:
                 if is_control_flow_text(next_item["code_text"]) or is_function_entry_text(next_item["code_text"]):
                     break

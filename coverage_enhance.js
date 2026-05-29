@@ -4,7 +4,7 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'dop-legacy-align-refresh-20260528';
+    const ENHANCE_VERSION = 'dop-straight-block-20260529';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖', '冗余代码'];
@@ -204,12 +204,12 @@
                 continue;
             }
 
-            if (isFunctionEntryLine(item)) {
+            if (isControlFlowLine(item)) {
+                addBlock([item]);
+            } else {
                 const { block, consumedUntil } = buildSemanticBlock(i);
                 addBlock(block);
                 i = Math.max(i, consumedUntil);
-            } else {
-                addBlock([item]);
             }
         }
 
