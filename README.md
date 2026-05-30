@@ -22,6 +22,8 @@
 ```text
 /opt/coverage_tool/
   enhance_coverage.py        # 后台脚本：注入、启动服务、导出、继承
+  clear_coverage_data.py     # 调试脚本：清空单项目或全部数据库数据
+  coverage_progress.html     # 独立网页：查看项目/目录/文件分析进度
   coverage_enhance.js        # 前端增强脚本
   coverage_enhance.css       # 前端样式
   coverage_config.json       # 数据库、服务端口、项目名配置
@@ -78,6 +80,7 @@ pip3 install pymysql
     "host": "127.0.0.1",
     "port": 9528
   },
+  "worker_threads": 4,
   "project_name": "review_main_202605"
 }
 ```
@@ -85,8 +88,9 @@ pip3 install pymysql
 说明：
 
 * `mysql.database` 可以多个项目共用一个库；
-* `project_name` 是数据隔离的关键字段；
-* 每个版本、分支或项目建议使用不同的 `project_name`；
+* `project_name` 是兼容旧流程的默认项目名；
+* 推荐执行 `inject` 时用 `--project <项目名>` 显式指定项目名，避免忘记修改配置文件；
+* `worker_threads` 控制注入写库和按目录导出 Excel 的并发线程数，建议从 4 开始，数据库压力允许时再调大；
 * `server.host` 建议使用 `127.0.0.1`，由 Nginx 反向代理给浏览器访问。
 
 首次启动或注入时，脚本会自动建库、建表并升级表结构。
@@ -106,8 +110,10 @@ pip3 install pymysql
 ```bash
 cd /opt/coverage_tool
 python3 enhance_coverage.py inject \
+  --project review_main_202605 \
   --dir /opt/coverage_reports/raw_main_202605 \
-  --out /opt/coverage_tool/review_main_202605
+  --out /opt/coverage_tool/review_main_202605 \
+  --workers 4
 ```
 
 执行后会生成：
@@ -140,7 +146,7 @@ python3 enhance_coverage.py inject \
 * `total_indexed`：本次累计同步的未覆盖行索引数；
 * `eta`：按当前处理速度估算的剩余时间。
 
-注意：执行 `inject` 前，请确认 `coverage_config.json` 中的 `project_name` 已经改成当前版本对应的名字。
+注意：建议每次执行 `inject` 都显式传入 `--project <项目名>`。脚本会拒绝缺少项目名的注入命令，避免误用 `coverage_config.json` 中的旧项目名。
 
 ---
 
@@ -241,21 +247,16 @@ curl -I http://127.0.0.1/coverage/review_main_202605/html/coverage_enhance.css
 
 新版本操作：
 
-1. 修改 `coverage_config.json`
+1. 确认新版本项目名
 
-```json
-{
-  "project_name": "review_main_202606"
-}
-```
-
-保持 `mysql` 和 `server` 配置不变，只改 `project_name`。
+项目名直接通过命令行传入，不需要为了切换版本反复修改 `coverage_config.json`。
 
 2. 执行新版本注入
 
 ```bash
 cd /opt/coverage_tool
 python3 enhance_coverage.py inject \
+  --project review_main_202606 \
   --dir /opt/coverage_reports/raw_main_202606 \
   --out /opt/coverage_tool/review_main_202606
 ```
@@ -293,23 +294,44 @@ python3 enhance_coverage.py inherit \
 继承规则：
 
 * 只继承新版本仍然未覆盖的行；
-* 只继承新版本尚未填写的行，不覆盖人工已填写的新结论；
-* 不要求两个版本的完整编译路径一致，只要求源文件名一致，例如两个路径都以 `foo.c` 结尾即可进入匹配；
-* 在同名源文件内，只有函数内容 hash、代码文本 hash 和函数内出现顺序一致时才继承；
-* 如果旧版本中同名文件下出现多个无法唯一判断的匹配项，会跳过这些记录，避免误继承；
+* 只继承新版本尚未填写的行，或状态仍为“未确认”且填写内容为空的行；
+* 不覆盖新版本中人工已经填写过的有效结论；
+* 跨项目继承按源文件名匹配，例如两个路径都以 `foo.c` 结尾即可进入匹配；
+* 项目内要求 C 源文件名不重复，否则同名文件可能被判定为歧义并跳过；
+* 匹配项还必须满足函数内容 hash、代码文本 hash 和函数内出现顺序一致；
+* 如果旧版本中出现多个无法唯一判断的匹配项，会跳过这些记录，避免误继承；
 * 函数内容发生变化时不会自动继承；
 * 旧版本状态为“未确认”的记录不会继承。
+
+继承完成后会输出诊断信息，例如：
+
+```text
+[Inherit] Source analysis records: 320
+[Inherit] Source reviewed analysis records: 240
+[Inherit] Source index records: 1800
+[Inherit] Source hashable index records: 1700
+[Inherit] Source reviewed records joined with index: 220
+[Inherit] Target index records: 1900
+[Inherit] Target hashable index records: 1810
+[Inherit] Target unfilled records: 1810
+[Inherit] Filename matched records: 205
+[Inherit] Inherited records: 205
+```
+
+如果 `Source reviewed records joined with index` 为 0，通常说明旧版本没有用新版脚本重新执行过 `inject`，或者旧版本填写数据保存到了错误的 `project_name`。如果 `Target hashable index records` 为 0，通常说明新版本没有完成 `inject` 或函数识别失败。
 
 推荐流程：
 
 ```bash
-# 旧版本：project_name=review_main_202605
+# 旧版本
 python3 enhance_coverage.py inject \
+  --project review_main_202605 \
   --dir /opt/coverage_reports/raw_main_202605 \
   --out /opt/coverage_tool/review_main_202605
 
-# 新版本：先把 coverage_config.json 改为 project_name=review_main_202606
+# 新版本
 python3 enhance_coverage.py inject \
+  --project review_main_202606 \
   --dir /opt/coverage_reports/raw_main_202606 \
   --out /opt/coverage_tool/review_main_202606
 
@@ -323,7 +345,7 @@ python3 enhance_coverage.py inherit \
 
 ## 9. 导出数据
 
-启动后台服务后，可以通过 HTTP 导出 CSV。CSV 使用 UTF-8 BOM，Excel 可直接打开。
+启动后台服务后，可以通过 HTTP 导出 CSV 或 Excel。CSV 使用 UTF-8 BOM，Excel 可直接打开。
 
 导出已填写明细：
 
@@ -360,12 +382,71 @@ curl -o coverage_full_file_summary.csv \
   "http://127.0.0.1:9528/api/coverage/export?type=full_file_summary"
 ```
 
+导出全量目录汇总：
+
+```bash
+curl -o coverage_full_dir_summary.csv \
+  "http://127.0.0.1:9528/api/coverage/export?type=full_dir_summary"
+```
+
 导出全量项目汇总：
 
 ```bash
 curl -o coverage_full_project_summary.csv \
   "http://127.0.0.1:9528/api/coverage/export?type=full_project_summary"
 ```
+
+一次导出项目、目录、文件三个层级的分析进度：
+
+```bash
+curl -o coverage_full_progress_summary.csv \
+  "http://127.0.0.1:9528/api/coverage/export?type=full_progress_summary&project=review_main_202606"
+```
+
+`full_progress_summary` 包含：
+
+* `level=project`：整个项目分析进度；
+* `level=dir`：各目录分析进度；
+* `level=file`：各文件分析进度。
+
+主要进度字段：
+
+* `total_uncovered`：未覆盖行总数；
+* `filled_total` / `unfilled_total`：已填写 / 未填写数量；
+* `confirmed_total`：状态不是“未确认”的数量；
+* `coverable_total` / `uncoverable_total` / `redundant_total`：可覆盖 / 无法覆盖 / 冗余代码数量；
+* `fill_rate` / `confirmed_rate`：填写率 / 确认率。
+
+导出评审模板 Excel：
+
+```bash
+curl -o review_main_202606.xlsx \
+  "http://127.0.0.1:9528/api/coverage/export?type=review_excel&project=review_main_202606"
+```
+
+按单个代码目录导出评审模板 Excel：
+
+```bash
+curl -o review_main_202606_dir.xlsx \
+  "http://127.0.0.1:9528/api/coverage/export?type=review_excel&project=review_main_202606&dir=src/module_a"
+```
+
+按代码目录拆分导出评审模板压缩包：
+
+```bash
+curl -o review_main_202606_by_dir.zip \
+  "http://127.0.0.1:9528/api/coverage/export?type=review_excel_by_dir&project=review_main_202606"
+```
+
+`review_excel` 和 `review_excel_by_dir` 说明：
+
+* 每个源文件一个 sheet，sheet 名为源文件名；
+* 明细列为“行号、代码行、覆盖率标识、是否冗余代码，剔除计划、对测试覆盖的建议、无法覆盖原因、开发责任人”；
+* 单目录导出时，Excel 只包含该目录下的源文件 sheet，进度 sheet 也只保留该目录和该目录内文件；
+* `review_excel_by_dir` 返回 zip，每个代码目录一个 `.xlsx`，避免单个 Excel 过大；
+* `review_excel` 和 `review_excel_by_dir` 都必须指定 `project=<项目名>`。
+
+如果下载到的文件很小或不是 zip/xlsx，先检查 `type` 是否拼写为 `review_excel_by_dir`，以及项目是否已经重新执行过 `inject` 同步 `coverage_line_index`。当项目没有可导出的行索引时，zip 中会包含 `README.txt` 说明原因。
 
 只导出某个项目：
 
@@ -383,7 +464,95 @@ curl -o coverage_full_project_summary.csv \
 
 ---
 
-## 10. 常见问题排查
+## 10. 网页查看分析进度
+
+分析进度使用独立网页查看，不嵌入每个覆盖率源码页面。
+
+执行 `inject` 后，脚本会把 `coverage_progress.html` 复制到对应报表目录。例如：
+
+```text
+http://服务器IP/coverage/review_main_202606/coverage_progress.html?project=review_main_202606
+```
+
+同时也会在 `html/coverage_progress.html` 放一份，兼容只暴露 HTML 子目录的部署方式：
+
+```text
+http://服务器IP/coverage/review_main_202606/html/coverage_progress.html?project=review_main_202606
+```
+
+如果直接把 `/opt/coverage_tool/` 暴露到 `/coverage/`，也可以访问工具根目录下的页面：
+
+```text
+http://服务器IP/coverage/coverage_progress.html?project=review_main_202606
+```
+
+如果部署时漏拷了工具目录下的 `coverage_progress.html`，`inject` 会自动生成一个内置版进度页面，并在控制台打印 warning。
+
+页面默认展示：
+
+* 项目未覆盖行总数；
+* 已填写数量；
+* 填写率；
+* 确认率。
+
+同时提供：
+
+* 各目录进度；
+* 各文件进度；
+* 进度 CSV 导出入口；
+* 按目录拆分的 Excel ZIP 导出入口。
+
+该页面依赖后台服务提供的接口：
+
+```text
+/api/coverage/progress?project=<project_name>
+```
+
+如果已经生成过旧报表，需要重新执行一次 `inject`，把新的 `coverage_progress.html` 复制到报表目录，并更新覆盖率页面使用的 JS/CSS 版本。
+
+---
+
+## 11. 清空调试数据
+
+需要从零开始调试时，可以清空数据库中本工具维护的数据。脚本会读取同目录下的 `coverage_config.json`。
+
+建议优先清空单个项目，确认无误后再使用全量清空。
+
+只清空某个项目：
+
+```bash
+python3 clear_coverage_data.py --project review_main_202606 --yes
+```
+
+清空全部项目：
+
+```bash
+python3 clear_coverage_data.py --all --yes
+```
+
+为了避免误操作，脚本不带 `--yes` 会拒绝执行。
+
+典型调试流程：
+
+```bash
+# 1. 清空新版本项目数据
+python3 clear_coverage_data.py --project review_main_202606 --yes
+
+# 2. 重新注入新版本报告并重建行索引
+python3 enhance_coverage.py inject \
+  --project review_main_202606 \
+  --dir /opt/coverage_reports/raw_main_202606 \
+  --out /opt/coverage_tool/review_main_202606
+
+# 3. 如需复测继承，再执行继承命令
+python3 enhance_coverage.py inherit \
+  --from review_main_202605 \
+  --to review_main_202606
+```
+
+---
+
+## 12. 常见问题排查
 
 ### 网页能打开，但控件没有显示
 
@@ -440,7 +609,7 @@ Coverage controls: 800/3200 (25.0%)
 
 重点检查：
 
-* 执行 `inject` 前 `coverage_config.json` 的 `project_name` 是否正确；
+* 执行 `inject` 时 `--project` 是否是当前版本对应的项目名；
 * 旧版本和新版本是否使用了不同的 `project_name`；
 * 浏览器打开的是否是对应版本目录。
 
@@ -455,14 +624,14 @@ python3 enhance_coverage.py server
 或重新执行一次：
 
 ```bash
-python3 enhance_coverage.py inject --dir <raw_dir> --out <review_dir>
+python3 enhance_coverage.py inject --project <project_name> --dir <raw_dir> --out <review_dir>
 ```
 
 脚本会自动补齐表结构。
 
 ---
 
-## 11. 安全建议
+## 13. 安全建议
 
 * 不建议将服务直接暴露到公网；
 * Nginx 建议配置办公网段白名单；
@@ -472,25 +641,23 @@ python3 enhance_coverage.py inject --dir <raw_dir> --out <review_dir>
 
 ---
 
-## 12. 最小操作清单
+## 14. 最小操作清单
 
 新版本从零到可用：
 
 ```bash
 cd /opt/coverage_tool
 
-# 1. 修改 coverage_config.json 中 project_name
-vi coverage_config.json
-
-# 2. 注入新版本报告
+# 1. 注入新版本报告
 python3 enhance_coverage.py inject \
+  --project review_main_202606 \
   --dir /opt/coverage_reports/raw_main_202606 \
   --out /opt/coverage_tool/review_main_202606
 
-# 3. 启动后台服务
+# 2. 启动后台服务
 python3 enhance_coverage.py server
 
-# 4. 如果需要继承旧版本
+# 3. 如果需要继承旧版本
 python3 enhance_coverage.py inherit \
   --from review_main_202605 \
   --to review_main_202606

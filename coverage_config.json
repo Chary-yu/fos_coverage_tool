@@ -10,5 +10,6 @@
                    "host":  "127.0.0.1",
                    "port":  9528
                },
+    "worker_threads":  4,
     "project_name":  "Gemini-NOS"
 }

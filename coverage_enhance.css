@@ -257,7 +257,6 @@ textarea.coverage-analysis-input.multiline {
     pointer-events: none !important;
 }
 
-
 /* 动态表头统计行比例多级颜色高亮样式 */
 .coverage-ratio-low {
     color: #ff3b30 !important;   /* 默认 0% 为红色 */

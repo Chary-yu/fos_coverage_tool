@@ -17,7 +17,10 @@ import csv
 import io
 import html
 import time
+import zipfile
+from decimal import Decimal
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.parse
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -35,7 +38,63 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "coverage_config.json")
 JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
 CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
-ASSET_VERSION = "dop-redundant-status-20260528"
+PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
+ASSET_VERSION = "standalone-progress-20260530"
+DEFAULT_PROJECT_NAME = "Gemini-NOS"
+DEFAULT_PROGRESS_PAGE_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Coverage Analysis Progress</title>
+  <style>
+    body{margin:0;background:#f5f7fb;color:#172033;font:14px/1.5 Arial,"Microsoft YaHei",sans-serif}
+    header{padding:18px 24px 12px;background:#fff;border-bottom:1px solid #d8e0ea}
+    h1{margin:0 0 12px;font-size:22px}.controls{display:flex;gap:8px;flex-wrap:wrap}
+    input{width:min(420px,100%);height:34px;border:1px solid #bcc7d4;border-radius:4px;padding:0 10px}
+    button,a.button{height:34px;border:1px solid #c7d8ff;border-radius:4px;background:#eef4ff;color:#1f5fbf;padding:0 12px;font-weight:700;text-decoration:none;display:inline-flex;align-items:center;cursor:pointer}
+    main{padding:18px 24px 32px}.cards{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+    .card,.section{background:#fff;border:1px solid #d8e0ea;border-radius:6px}.card{padding:12px}.label{color:#64748b;font-size:12px}.value{font-size:24px;font-weight:800;margin-top:4px}
+    .section{margin-top:14px;overflow:hidden}.section h2{margin:0;padding:10px 12px;font-size:15px;background:#eef3f8;border-bottom:1px solid #d8e0ea}.table-wrap{overflow:auto}
+    table{width:100%;border-collapse:collapse;min-width:920px}th,td{border-bottom:1px solid #e7edf4;padding:7px 8px;text-align:left;vertical-align:top}th{background:#f8fafc;position:sticky;top:0}td.path{word-break:break-all}
+    .bar{display:inline-block;width:90px;height:8px;background:#e5e7eb;border-radius:4px;overflow:hidden;margin-left:8px}.bar span{display:block;height:100%;background:#1f9d55}.status{margin-top:10px;color:#64748b}.error{color:#b91c1c}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Coverage Analysis Progress</h1>
+    <div class="controls">
+      <input id="projectInput" placeholder="输入项目名，例如 review_v6r2_202605">
+      <button id="loadBtn" type="button">查看进度</button>
+      <a id="csvLink" class="button" href="#" target="_blank">导出进度 CSV</a>
+      <a id="excelLink" class="button" href="#" target="_blank">导出目录 Excel ZIP</a>
+    </div>
+    <div id="status" class="status"></div>
+  </header>
+  <main>
+    <div class="cards">
+      <div class="card"><div class="label">未覆盖行总数</div><div id="totalUncovered" class="value">-</div></div>
+      <div class="card"><div class="label">已填写</div><div id="filledTotal" class="value">-</div></div>
+      <div class="card"><div class="label">填写率</div><div id="fillRate" class="value">-</div></div>
+      <div class="card"><div class="label">确认率</div><div id="confirmedRate" class="value">-</div></div>
+    </div>
+    <section class="section"><h2>目录进度</h2><div class="table-wrap"><table id="dirTable"></table></div></section>
+    <section class="section"><h2>文件进度</h2><div class="table-wrap"><table id="fileTable"></table></div></section>
+  </main>
+  <script>
+    const params=new URLSearchParams(window.location.search),projectInput=document.getElementById('projectInput'),statusEl=document.getElementById('status'),csvLink=document.getElementById('csvLink'),excelLink=document.getElementById('excelLink');
+    projectInput.value=params.get('project')||'';
+    const asNumber=v=>Number.isFinite(Number(v))?Number(v):0,fmtRate=v=>Number.isFinite(Number(v))?`${Number(v).toFixed(1)}%`:'0.0%',bar=r=>`<span class="bar"><span style="width:${Math.max(0,Math.min(100,asNumber(r)))}%"></span></span>`;
+    function metric(id,value){document.getElementById(id).innerText=value}
+    function rows(items,pathKey){return !items||!items.length?'<tr><td>暂无数据</td></tr>':items.map(row=>`<tr><td class="path">${row[pathKey]||'(root)'}</td><td>${asNumber(row.total_uncovered)}</td><td>${asNumber(row.filled_total)}</td><td>${asNumber(row.unfilled_total)}</td><td>${asNumber(row.confirmed_total)}</td><td>${asNumber(row.coverable_total)}</td><td>${asNumber(row.uncoverable_total)}</td><td>${asNumber(row.redundant_total)}</td><td>${fmtRate(row.fill_rate)} ${bar(row.fill_rate)}</td><td>${fmtRate(row.confirmed_rate)} ${bar(row.confirmed_rate)}</td></tr>`).join('')}
+    function renderTable(id,items,pathKey){document.getElementById(id).innerHTML=`<thead><tr><th>路径</th><th>未覆盖</th><th>已填</th><th>未填</th><th>已确认</th><th>可覆盖</th><th>无法覆盖</th><th>冗余</th><th>填写率</th><th>确认率</th></tr></thead><tbody>${rows(items,pathKey)}</tbody>`}
+    function updateLinks(project){const encoded=encodeURIComponent(project);csvLink.href=`/api/coverage/export?type=full_progress_summary&project=${encoded}`;excelLink.href=`/api/coverage/export?type=review_excel_by_dir&project=${encoded}`}
+    function loadProgress(){const project=projectInput.value.trim();if(!project){statusEl.innerHTML='<span class="error">请输入项目名。</span>';return}updateLinks(project);statusEl.innerText='正在加载...';fetch(`/api/coverage/progress?project=${encodeURIComponent(project)}`).then(r=>{if(!r.ok)throw new Error(`HTTP ${r.status}`);return r.json()}).then(payload=>{if(!payload||payload.status!=='success')throw new Error(payload&&payload.message?payload.message:'加载失败');const data=payload.data||{},projectRow=data.project&&data.project[0]||{};metric('totalUncovered',asNumber(projectRow.total_uncovered));metric('filledTotal',asNumber(projectRow.filled_total));metric('fillRate',fmtRate(projectRow.fill_rate));metric('confirmedRate',fmtRate(projectRow.confirmed_rate));renderTable('dirTable',data.dirs||[],'dir_path');renderTable('fileTable',data.files||[],'file_path');statusEl.innerText=`已加载项目：${project}`;const url=new URL(window.location.href);url.searchParams.set('project',project);window.history.replaceState(null,'',url.toString())}).catch(e=>{statusEl.innerHTML=`<span class="error">加载失败：${e.message}</span>`})}
+    document.getElementById('loadBtn').addEventListener('click',loadProgress);projectInput.addEventListener('keydown',e=>{if(e.key==='Enter')loadProgress()});if(projectInput.value.trim())loadProgress();
+  </script>
+</body>
+</html>
+"""
 
 
 def calc_file_path_hash(file_path):
@@ -54,10 +113,66 @@ def get_source_file_name(file_path):
     return normalized.rsplit("/", 1)[-1]
 
 
+def get_source_dir_name(file_path):
+    """Return the normalized directory part of a report source path."""
+    normalized = str(file_path or "").replace("\\", "/").rstrip("/")
+    if "/" not in normalized:
+        return ""
+    return normalized.rsplit("/", 1)[0]
+
+
 def row_value(row, key, index):
     if isinstance(row, dict):
         return row.get(key)
     return row[index]
+
+
+def json_safe_default(value):
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value)
+
+
+def get_worker_count(config=None, override=None, default_max=8):
+    if override is not None:
+        try:
+            return max(1, int(override))
+        except (TypeError, ValueError):
+            return 1
+    configured = None
+    if config:
+        configured = config.get("worker_threads") or config.get("export_worker_threads")
+    if configured is not None:
+        try:
+            return max(1, int(configured))
+        except (TypeError, ValueError):
+            pass
+    cpu_count = os.cpu_count() or 4
+    return max(1, min(default_max, cpu_count))
+
+
+def source_file_join_condition(index_alias="i", analysis_alias="a"):
+    return (
+        f"{analysis_alias}.project_name = {index_alias}.project_name "
+        f"AND COALESCE(NULLIF({analysis_alias}.source_file_name, ''), "
+        f"SUBSTRING_INDEX(REPLACE({analysis_alias}.file_path, '\\\\', '/'), '/', -1)) = {index_alias}.source_file_name "
+        f"AND {analysis_alias}.line_number = {index_alias}.line_number"
+    )
+
+
+def sql_normalized_path(alias="i"):
+    return f"REPLACE({alias}.file_path, '\\\\', '/')"
+
+
+def sql_dir_path(alias="i"):
+    path = sql_normalized_path(alias)
+    return (
+        f"CASE WHEN LOCATE('/', {path}) > 0 "
+        f"THEN SUBSTRING({path}, 1, LENGTH({path}) - LENGTH(SUBSTRING_INDEX({path}, '/', -1)) - 1) "
+        f"ELSE '' END"
+    )
 
 
 CONTROL_FLOW_RE = re.compile(r'\b(if|else|for|while|do|switch|case|default)\b')
@@ -255,20 +370,67 @@ def load_config():
             "host": "0.0.0.0",
             "port": 9528
         },
-        "project_name": "Gemini-NOS"
+        "project_name": DEFAULT_PROJECT_NAME
     }
     if os.path.exists(CONFIG_PATH):
         try:
-            with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            with open(CONFIG_PATH, 'r', encoding='utf-8-sig') as f:
                 return json.load(f)
         except Exception as e:
             print(f"[Warning] Failed to load config file: {e}. Using defaults.")
     return default_config
 
 
+def write_configured_enhance_js(output_path, project_name):
+    """Copy the frontend script and inject the selected project name."""
+    with open(JS_SOURCE_PATH, 'r', encoding='utf-8') as f:
+        content = f.read()
+
+    project_literal = json.dumps(str(project_name), ensure_ascii=False)
+    new_content, replace_count = re.subn(
+        r"const\s+DEFAULT_PROJECT\s*=\s*(['\"]).*?\1\s*;",
+        f"const DEFAULT_PROJECT = {project_literal};",
+        content,
+        count=1
+    )
+    if replace_count != 1:
+        raise RuntimeError("Failed to inject project_name into coverage_enhance.js")
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(new_content)
+
+
+def write_progress_page_targets(output_dir, real_output_html):
+    target_paths = [
+        os.path.join(output_dir, "coverage_progress.html"),
+        os.path.join(real_output_html, "coverage_progress.html"),
+    ]
+    unique_targets = []
+    for target in target_paths:
+        if target not in unique_targets:
+            unique_targets.append(target)
+
+    source_exists = os.path.exists(PROGRESS_PAGE_SOURCE_PATH)
+    for target in unique_targets:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        if source_exists:
+            shutil.copy2(PROGRESS_PAGE_SOURCE_PATH, target)
+        else:
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(DEFAULT_PROGRESS_PAGE_HTML)
+
+    if source_exists:
+        print(f"[Injector] Copied progress page to: {', '.join(unique_targets)}")
+    else:
+        print(
+            "[Warning] coverage_progress.html not found beside enhance_coverage.py; "
+            f"generated fallback progress page at: {', '.join(unique_targets)}"
+        )
+
+
 class DatabaseManager:
     """MySQL 数据库管理层，处理连接、建库、建表以及存取操作"""
-    def __init__(self, config, exit_on_error=True):
+    def __init__(self, config, exit_on_error=True, init_schema=True):
         self.config = config["mysql"]
         self.exit_on_error = exit_on_error
         if not db_module:
@@ -278,7 +440,10 @@ class DatabaseManager:
                 sys.exit(1)
             raise RuntimeError("Missing MySQL driver")
         self.conn = None
-        self.init_database()
+        if init_schema:
+            self.init_database()
+        else:
+            self.conn = self.get_connection(select_db=True)
 
     def get_connection(self, select_db=True):
         """建立并返回 MySQL 连接"""
@@ -370,6 +535,13 @@ class DatabaseManager:
                 cursor.execute("UPDATE coverage_analysis SET file_path_hash = MD5(file_path) WHERE file_path_hash = ''")
                 self.conn.commit()
                 print("[DB] file_path_hash backfill complete.")
+
+            if "source_file_name" not in columns:
+                print("[DB] Upgrading schema: adding 'source_file_name' column...")
+                cursor.execute("ALTER TABLE coverage_analysis ADD COLUMN source_file_name VARCHAR(255) DEFAULT '' AFTER file_path_hash")
+                cursor.execute("UPDATE coverage_analysis SET source_file_name = SUBSTRING_INDEX(REPLACE(file_path, '\\\\', '/'), '/', -1) WHERE source_file_name = ''")
+                self.conn.commit()
+                print("[DB] source_file_name backfill complete.")
 
             cursor.execute("SHOW INDEX FROM coverage_analysis WHERE Key_name = 'ukey_proj_file_line'")
             index_rows = cursor.fetchall()
@@ -502,22 +674,24 @@ class DatabaseManager:
                 self.conn.ping(reconnect=True)
             except AttributeError:
                 pass
-                
+
             cursor = self.conn.cursor()
             file_path_hash = calc_file_path_hash(file_path)
+            source_file_name = get_source_file_name(file_path)
             sql = """
-            INSERT INTO coverage_analysis 
-                (project_name, file_path, file_path_hash, line_number, reviewer, status, coverage_method, uncovered_reason) 
-            VALUES 
-                (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE 
+            INSERT INTO coverage_analysis
+                (project_name, file_path, file_path_hash, source_file_name, line_number, reviewer, status, coverage_method, uncovered_reason)
+            VALUES
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
                 file_path = VALUES(file_path),
+                source_file_name = VALUES(source_file_name),
                 reviewer = VALUES(reviewer),
                 status = VALUES(status), 
                 coverage_method = VALUES(coverage_method), 
                 uncovered_reason = VALUES(uncovered_reason)
             """
-            cursor.execute(sql, (project_name, file_path, file_path_hash, int(line_number), reviewer, status, method, reason))
+            cursor.execute(sql, (project_name, file_path, file_path_hash, source_file_name, int(line_number), reviewer, status, method, reason))
             self.conn.commit()
             cursor.close()
             return True
@@ -591,6 +765,10 @@ class DatabaseManager:
             print(f"[DB] Synced {synced_total} uncovered line index record(s) across {len(records_by_file)} file(s) for project '{project_name}'.")
             return True
         except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
             print(f"[DB Error] Line index sync failed: {e}")
             return False
 
@@ -640,13 +818,55 @@ class DatabaseManager:
                 pass
 
             cursor = self.conn.cursor()
+
+            def fetch_count(sql, params):
+                cursor.execute(sql, params)
+                row = cursor.fetchone()
+                if isinstance(row, dict):
+                    return next(iter(row.values()))
+                return row[0] if row else 0
+
+            source_analysis_records = fetch_count(
+                "SELECT COUNT(*) FROM coverage_analysis WHERE project_name = %s",
+                (source_project,)
+            )
+            source_reviewed_records = fetch_count(
+                "SELECT COUNT(*) FROM coverage_analysis WHERE project_name = %s AND status <> %s",
+                (source_project, unconfirmed_status)
+            )
+            source_index_records = fetch_count(
+                "SELECT COUNT(*) FROM coverage_line_index WHERE project_name = %s",
+                (source_project,)
+            )
+            source_hashable_index_records = fetch_count(
+                """
+                SELECT COUNT(*) FROM coverage_line_index
+                WHERE project_name = %s
+                  AND function_hash <> ''
+                  AND code_line_hash <> ''
+                """,
+                (source_project,)
+            )
+            target_index_records = fetch_count(
+                "SELECT COUNT(*) FROM coverage_line_index WHERE project_name = %s",
+                (target_project,)
+            )
+            target_hashable_index_records = fetch_count(
+                """
+                SELECT COUNT(*) FROM coverage_line_index
+                WHERE project_name = %s
+                  AND function_hash <> ''
+                  AND code_line_hash <> ''
+                """,
+                (target_project,)
+            )
             source_sql = """
                 SELECT si.file_path, si.source_file_name, si.function_hash, si.code_line_hash, si.code_occurrence,
                        a.reviewer, a.status, a.coverage_method, a.uncovered_reason
                 FROM coverage_analysis a
                 JOIN coverage_line_index si
                   ON si.project_name = a.project_name
-                 AND si.file_path_hash = a.file_path_hash
+                 AND si.source_file_name = COALESCE(NULLIF(a.source_file_name, ''), SUBSTRING_INDEX(REPLACE(a.file_path, '\\\\', '/'), '/', -1))
                  AND si.line_number = a.line_number
                 WHERE a.project_name = %s
                   AND si.project_name = %s
@@ -657,25 +877,35 @@ class DatabaseManager:
             cursor.execute(source_sql, (source_project, source_project, unconfirmed_status))
             source_rows = cursor.fetchall()
 
-            source_by_key = {}
-            ambiguous_keys = set()
-            for row in source_rows:
+            def add_inherit_source(source_map, ambiguous_set, key, row):
                 source_file_name = row_value(row, "source_file_name", 1) or get_source_file_name(row_value(row, "file_path", 0))
-                key = (
-                    source_file_name,
+                if key in source_map:
+                    source_map.pop(key, None)
+                    ambiguous_set.add(key)
+                elif key not in ambiguous_set:
+                    source_map[key] = row
+                return source_file_name
+
+            source_by_name_key = {}
+            ambiguous_name_keys = set()
+            for row in source_rows:
+                common_key = (
                     row_value(row, "function_hash", 2),
                     row_value(row, "code_line_hash", 3),
                     row_value(row, "code_occurrence", 4),
                 )
-                if key in source_by_key:
-                    source_by_key.pop(key, None)
-                    ambiguous_keys.add(key)
-                elif key not in ambiguous_keys:
-                    source_by_key[key] = row
+                source_file_name = row_value(row, "source_file_name", 1) or get_source_file_name(row_value(row, "file_path", 0))
+                add_inherit_source(
+                    source_by_name_key,
+                    ambiguous_name_keys,
+                    (source_file_name,) + common_key,
+                    row
+                )
 
             target_sql = """
                 SELECT ti.file_path, ti.file_path_hash, ti.source_file_name, ti.line_number,
-                       ti.function_hash, ti.code_line_hash, ti.code_occurrence
+                       ti.function_hash, ti.code_line_hash, ti.code_occurrence,
+                       existing.status, existing.reviewer, existing.coverage_method, existing.uncovered_reason
                 FROM coverage_line_index ti
                 LEFT JOIN coverage_analysis existing
                   ON existing.project_name = ti.project_name
@@ -684,25 +914,38 @@ class DatabaseManager:
                 WHERE ti.project_name = %s
                   AND ti.function_hash <> ''
                   AND ti.code_line_hash <> ''
-                  AND existing.id IS NULL
+                  AND (
+                      existing.id IS NULL
+                      OR (
+                          existing.status = %s
+                          AND COALESCE(existing.reviewer, '') = ''
+                          AND COALESCE(existing.coverage_method, '') = ''
+                          AND COALESCE(existing.uncovered_reason, '') = ''
+                      )
+                  )
             """
-            cursor.execute(target_sql, (target_project,))
+            cursor.execute(target_sql, (target_project, unconfirmed_status))
             target_rows = cursor.fetchall()
 
             payload = []
-            ambiguous_skipped = 0
+            name_matches = 0
+            ambiguous_name_skipped = 0
             for row in target_rows:
                 target_file_name = row_value(row, "source_file_name", 2) or get_source_file_name(row_value(row, "file_path", 0))
-                key = (
-                    target_file_name,
+                common_key = (
                     row_value(row, "function_hash", 4),
                     row_value(row, "code_line_hash", 5),
                     row_value(row, "code_occurrence", 6),
                 )
-                if key in ambiguous_keys:
-                    ambiguous_skipped += 1
+                name_key = (target_file_name,) + common_key
+
+                if name_key in ambiguous_name_keys:
+                    ambiguous_name_skipped += 1
                     continue
-                source = source_by_key.get(key)
+                source = source_by_name_key.get(name_key)
+                if source:
+                    name_matches += 1
+
                 if not source:
                     continue
                 payload.append((
@@ -723,7 +966,11 @@ class DatabaseManager:
                 VALUES
                     (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
-                    file_path = VALUES(file_path)
+                    file_path = VALUES(file_path),
+                    reviewer = VALUES(reviewer),
+                    status = VALUES(status),
+                    coverage_method = VALUES(coverage_method),
+                    uncovered_reason = VALUES(uncovered_reason)
             """
             inherited = 0
             for start in range(0, len(payload), batch_size):
@@ -738,14 +985,80 @@ class DatabaseManager:
             return {
                 "source_project": source_project,
                 "target_project": target_project,
+                "source_analysis_records": source_analysis_records,
+                "source_index_records": source_index_records,
+                "source_hashable_index_records": source_hashable_index_records,
+                "target_index_records": target_index_records,
+                "target_hashable_index_records": target_hashable_index_records,
                 "source_reviewed_records": len(source_rows),
+                "source_reviewed_analysis_records": source_reviewed_records,
                 "target_unfilled_records": len(target_rows),
-                "ambiguous_keys": len(ambiguous_keys),
-                "ambiguous_skipped_records": ambiguous_skipped,
+                "ambiguous_name_keys": len(ambiguous_name_keys),
+                "ambiguous_name_skipped_records": ambiguous_name_skipped,
+                "name_matched_records": name_matches,
                 "inherited_records": inherited
             }
         except Exception as e:
             print(f"[DB Error] Inherit failed: {e}")
+            raise
+
+    def fetch_review_excel_rows(self, project_name, dir_path=None):
+        """Fetch full uncovered-line review details for the formatted Excel export."""
+        if not project_name:
+            raise ValueError("project_name is required for review Excel export")
+        try:
+            try:
+                self.conn.ping(reconnect=True)
+            except AttributeError:
+                pass
+
+            cursor = self.conn.cursor()
+            params = [project_name]
+            dir_filter_sql = ""
+            if dir_path is not None:
+                dir_filter_sql = f" AND {sql_dir_path('i')} = %s"
+                params.append(dir_path)
+
+            sql = f"""
+                SELECT i.project_name, i.source_file_name, i.file_path, i.line_number, i.line_text,
+                       COALESCE(a.status, '') AS status,
+                       COALESCE(a.coverage_method, '') AS coverage_method,
+                       COALESCE(a.uncovered_reason, '') AS uncovered_reason,
+                       COALESCE(a.reviewer, '') AS reviewer
+                FROM coverage_line_index i
+                LEFT JOIN coverage_analysis a
+                  ON {source_file_join_condition("i", "a")}
+                WHERE i.project_name = %s
+                  {dir_filter_sql}
+                ORDER BY i.source_file_name, i.line_number
+            """
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+            cursor.close()
+            return rows
+        except Exception as e:
+            print(f"[DB Error] Review Excel export query failed: {e}")
+            raise
+
+    def fetch_project_dirs(self, project_name):
+        if not project_name:
+            raise ValueError("project_name is required")
+        try:
+            cursor = self.conn.cursor()
+            dir_expr = sql_dir_path("i")
+            sql = f"""
+                SELECT {dir_expr} AS dir_path, COUNT(*) AS total_uncovered
+                FROM coverage_line_index i
+                WHERE i.project_name = %s
+                GROUP BY {dir_expr}
+                ORDER BY dir_path
+            """
+            cursor.execute(sql, (project_name,))
+            rows = cursor.fetchall()
+            cursor.close()
+            return [(row_value(row, "dir_path", 0) or "", row_value(row, "total_uncovered", 1)) for row in rows]
+        except Exception as e:
+            print(f"[DB Error] Fetch project dirs failed: {e}")
             raise
 
     def export_report(self, report_type="detail", project_name=None):
@@ -868,9 +1181,7 @@ class DatabaseManager:
                            a.updated_at
                     FROM coverage_line_index i
                     LEFT JOIN coverage_analysis a
-                      ON a.project_name = i.project_name
-                     AND a.file_path_hash = i.file_path_hash
-                     AND a.line_number = i.line_number
+                      ON {source_file_join_condition("i", "a")}
                     {full_where_sql}
                     ORDER BY i.project_name, i.file_path, i.line_number
                 """
@@ -903,12 +1214,47 @@ class DatabaseManager:
                            MAX(a.updated_at) AS last_updated
                     FROM coverage_line_index i
                     LEFT JOIN coverage_analysis a
-                      ON a.project_name = i.project_name
-                     AND a.file_path_hash = i.file_path_hash
-                     AND a.line_number = i.line_number
+                      ON {source_file_join_condition("i", "a")}
                     {full_where_sql}
                     GROUP BY i.project_name, i.file_path
                     ORDER BY i.project_name, i.file_path
+                """
+                summary_params = ["未确认", "可覆盖", "无法覆盖", "冗余代码", "未确认"] + full_params
+                cursor.execute(sql, summary_params)
+                rows = cursor.fetchall()
+                data = [[row_value(row, header, idx) for idx, header in enumerate(headers)] for row in rows]
+            elif report_type == "full_dir_summary":
+                full_where_sql = ""
+                full_params = []
+                dir_expr = sql_dir_path("i")
+                if project_name:
+                    full_where_sql = "WHERE i.project_name = %s"
+                    full_params.append(project_name)
+                headers = [
+                    "project_name", "dir_path", "file_total", "total_uncovered", "filled_total",
+                    "unfilled_total", "confirmed_total", "coverable_total",
+                    "uncoverable_total", "redundant_total", "fill_rate",
+                    "confirmed_rate", "last_updated"
+                ]
+                sql = f"""
+                    SELECT i.project_name, {dir_expr} AS dir_path,
+                           COUNT(DISTINCT i.source_file_name) AS file_total,
+                           COUNT(*) AS total_uncovered,
+                           SUM(CASE WHEN a.id IS NULL THEN 0 ELSE 1 END) AS filled_total,
+                           SUM(CASE WHEN a.id IS NULL THEN 1 ELSE 0 END) AS unfilled_total,
+                           SUM(CASE WHEN a.id IS NOT NULL AND a.status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
+                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS coverable_total,
+                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
+                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS redundant_total,
+                           ROUND(SUM(CASE WHEN a.id IS NULL THEN 0 ELSE 1 END) * 100.0 / COUNT(*), 2) AS fill_rate,
+                           ROUND(SUM(CASE WHEN a.id IS NOT NULL AND a.status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
+                           MAX(a.updated_at) AS last_updated
+                    FROM coverage_line_index i
+                    LEFT JOIN coverage_analysis a
+                      ON {source_file_join_condition("i", "a")}
+                    {full_where_sql}
+                    GROUP BY i.project_name, {dir_expr}
+                    ORDER BY i.project_name, dir_path
                 """
                 summary_params = ["未确认", "可覆盖", "无法覆盖", "冗余代码", "未确认"] + full_params
                 cursor.execute(sql, summary_params)
@@ -941,9 +1287,7 @@ class DatabaseManager:
                            MAX(a.updated_at) AS last_updated
                     FROM coverage_line_index i
                     LEFT JOIN coverage_analysis a
-                      ON a.project_name = i.project_name
-                     AND a.file_path_hash = i.file_path_hash
-                     AND a.line_number = i.line_number
+                      ON {source_file_join_condition("i", "a")}
                     {full_where_sql}
                     GROUP BY i.project_name
                     ORDER BY i.project_name
@@ -952,6 +1296,44 @@ class DatabaseManager:
                 cursor.execute(sql, summary_params)
                 rows = cursor.fetchall()
                 data = [[row_value(row, header, idx) for idx, header in enumerate(headers)] for row in rows]
+            elif report_type == "full_progress_summary":
+                headers = [
+                    "level", "project_name", "path", "file_total", "total_uncovered",
+                    "filled_total", "unfilled_total", "confirmed_total", "coverable_total",
+                    "uncoverable_total", "redundant_total", "fill_rate",
+                    "confirmed_rate", "last_updated"
+                ]
+                data = []
+                for level, child_type in (
+                    ("project", "full_project_summary"),
+                    ("dir", "full_dir_summary"),
+                    ("file", "full_file_summary"),
+                ):
+                    child_headers, child_rows = self.export_report(child_type, project_name)
+                    for child_row in child_rows:
+                        child_map = dict(zip(child_headers, child_row))
+                        if level == "project":
+                            path_value = ""
+                        elif level == "dir":
+                            path_value = child_map.get("dir_path", "")
+                        else:
+                            path_value = child_map.get("file_path", "")
+                        data.append([
+                            level,
+                            child_map.get("project_name", ""),
+                            path_value,
+                            child_map.get("file_total", 1 if level == "file" else ""),
+                            child_map.get("total_uncovered", ""),
+                            child_map.get("filled_total", ""),
+                            child_map.get("unfilled_total", ""),
+                            child_map.get("confirmed_total", ""),
+                            child_map.get("coverable_total", ""),
+                            child_map.get("uncoverable_total", ""),
+                            child_map.get("redundant_total", ""),
+                            child_map.get("fill_rate", ""),
+                            child_map.get("confirmed_rate", ""),
+                            child_map.get("last_updated", ""),
+                        ])
             else:
                 raise ValueError("Unsupported report type")
 
@@ -963,6 +1345,248 @@ class DatabaseManager:
 
 
 db_manager = None
+
+
+def excel_col_name(index):
+    name = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+
+def safe_sheet_name(name, used_names):
+    base = re.sub(r"[\[\]\:\*\?\/\\]+", "_", str(name or "Sheet")).strip() or "Sheet"
+    base = base[:31]
+    candidate = base
+    suffix = 1
+    while candidate in used_names:
+        suffix_text = f"_{suffix}"
+        candidate = f"{base[:31 - len(suffix_text)]}{suffix_text}"
+        suffix += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def xlsx_cell_xml(row_index, col_index, value, style_id=0):
+    ref = f"{excel_col_name(col_index)}{row_index}"
+    style_attr = f' s="{style_id}"' if style_id else ""
+    if value is None:
+        value = ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f'<c r="{ref}"{style_attr}><v>{value}</v></c>'
+    text = html.escape(str(value), quote=True)
+    return f'<c r="{ref}" t="inlineStr"{style_attr}><is><t>{text}</t></is></c>'
+
+
+def xlsx_sheet_xml(rows, column_widths=None, highlight_mark_column=False):
+    parts = ['<?xml version="1.0" encoding="UTF-8" standalone="yes"?>']
+    parts.append('<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">')
+    if column_widths:
+        parts.append("<cols>")
+        for index, width in enumerate(column_widths, start=1):
+            parts.append(f'<col min="{index}" max="{index}" width="{width}" customWidth="1"/>')
+        parts.append("</cols>")
+    parts.append("<sheetData>")
+    for row_index, row in enumerate(rows, start=1):
+        height_attr = ' ht="48" customHeight="1"' if row_index == 1 else ""
+        parts.append(f'<row r="{row_index}"{height_attr}>')
+        for col_index, value in enumerate(row, start=1):
+            style_id = 1 if row_index == 1 else 2
+            if highlight_mark_column and row_index > 1 and col_index == 3 and str(value) == "0":
+                style_id = 3
+            parts.append(xlsx_cell_xml(row_index, col_index, value, style_id))
+        parts.append("</row>")
+    parts.append("</sheetData>")
+    parts.append("</worksheet>")
+    return "".join(parts)
+
+
+def build_xlsx_workbook(sheet_defs):
+    workbook_xml_sheets = []
+    workbook_rels = []
+    content_overrides = [
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>',
+        '<Default Extension="xml" ContentType="application/xml"/>',
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>',
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>',
+    ]
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("_rels/.rels", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>""")
+        archive.writestr("xl/styles.xml", """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+<fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts>
+<fills count="4"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill><fill><patternFill patternType="solid"><fgColor rgb="FFFFFF00"/><bgColor indexed="64"/></patternFill></fill><fill><patternFill patternType="solid"><fgColor rgb="FFF4CCCC"/><bgColor indexed="64"/></patternFill></fill></fills>
+<borders count="2"><border/><border><left style="thin"/><right style="thin"/><top style="thin"/><bottom style="thin"/></border></borders>
+<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+<cellXfs count="4">
+<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>
+<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>
+<xf numFmtId="0" fontId="0" fillId="3" borderId="0" xfId="0" applyFill="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>
+</cellXfs>
+<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>""")
+        for sheet_index, sheet in enumerate(sheet_defs, start=1):
+            archive.writestr(f"xl/worksheets/sheet{sheet_index}.xml", sheet["xml"])
+            sheet_name = html.escape(sheet["name"], quote=True)
+            workbook_xml_sheets.append(f'<sheet name="{sheet_name}" sheetId="{sheet_index}" r:id="rId{sheet_index}"/>')
+            workbook_rels.append(f'<Relationship Id="rId{sheet_index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{sheet_index}.xml"/>')
+            content_overrides.append(f'<Override PartName="/xl/worksheets/sheet{sheet_index}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>')
+        archive.writestr("xl/workbook.xml", f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{''.join(workbook_xml_sheets)}</sheets></workbook>""")
+        workbook_rels.append(f'<Relationship Id="rId{len(sheet_defs) + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>')
+        archive.writestr("xl/_rels/workbook.xml.rels", f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{''.join(workbook_rels)}</Relationships>""")
+        archive.writestr("[Content_Types].xml", f"""<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">{''.join(content_overrides)}</Types>""")
+    return buffer.getvalue()
+
+
+def coverage_mark_from_status(status):
+    if status in ("无法覆盖", "冗余代码"):
+        return "NA"
+    return "0"
+
+
+def build_review_excel(project_name, detail_rows, progress_sections):
+    grouped = {}
+    for row in detail_rows:
+        source_file_name = row_value(row, "source_file_name", 1) or get_source_file_name(row_value(row, "file_path", 2))
+        grouped.setdefault(source_file_name, []).append(row)
+
+    sheet_defs = []
+    used_names = set()
+    for source_file_name in sorted(grouped.keys()):
+        rows = [[
+            "行号",
+            source_file_name,
+            "覆盖率标识\n(1代表覆盖，0代表未覆盖，NA代表无需覆盖)",
+            "是否冗余代码，剔除计划",
+            "对测试覆盖的建议\n(黑盒测试怎么才能覆盖)",
+            "无法覆盖原因",
+            "开发责任人",
+        ]]
+        for row in grouped[source_file_name]:
+            status = row_value(row, "status", 5) or ""
+            rows.append([
+                row_value(row, "line_number", 3),
+                row_value(row, "line_text", 4),
+                coverage_mark_from_status(status),
+                row_value(row, "coverage_method", 6) if status == "冗余代码" else "",
+                row_value(row, "coverage_method", 6),
+                row_value(row, "uncovered_reason", 7),
+                row_value(row, "reviewer", 8),
+            ])
+        sheet_defs.append({
+            "name": safe_sheet_name(source_file_name, used_names),
+            "xml": xlsx_sheet_xml(rows, [10, 48, 20, 22, 34, 24, 18], highlight_mark_column=True)
+        })
+
+    progress_headers = [
+        "层级", "项目名", "路径", "文件数", "未覆盖行总数", "已填写", "未填写",
+        "已确认", "可覆盖", "无法覆盖", "冗余代码", "填写率(%)", "确认率(%)", "最后更新时间"
+    ]
+    for sheet_name, headers, rows in progress_sections:
+        progress_rows = [progress_headers]
+        for row in rows:
+            row_map = dict(zip(headers, row))
+            level = sheet_name.replace("进度", "")
+            if sheet_name == "项目进度":
+                path_value = ""
+            elif sheet_name == "目录进度":
+                path_value = row_map.get("dir_path", "")
+            else:
+                path_value = row_map.get("file_path", "")
+            progress_rows.append([
+                level,
+                row_map.get("project_name", project_name),
+                path_value,
+                row_map.get("file_total", 1 if sheet_name == "文件进度" else ""),
+                row_map.get("total_uncovered", ""),
+                row_map.get("filled_total", ""),
+                row_map.get("unfilled_total", ""),
+                row_map.get("confirmed_total", ""),
+                row_map.get("coverable_total", ""),
+                row_map.get("uncoverable_total", ""),
+                row_map.get("redundant_total", ""),
+                row_map.get("fill_rate", ""),
+                row_map.get("confirmed_rate", ""),
+                row_map.get("last_updated", ""),
+            ])
+        sheet_defs.append({
+            "name": safe_sheet_name(sheet_name, used_names),
+            "xml": xlsx_sheet_xml(progress_rows, [10, 22, 56, 10, 14, 10, 10, 10, 10, 10, 10, 12, 12, 22])
+        })
+
+    if not sheet_defs:
+        sheet_defs.append({
+            "name": safe_sheet_name("empty", used_names),
+            "xml": xlsx_sheet_xml([["项目", project_name, "没有可导出的未覆盖行"]], [20, 28, 40])
+        })
+    return build_xlsx_workbook(sheet_defs)
+
+
+def safe_zip_member_name(value, default_name="root"):
+    name = str(value or default_name).replace("\\", "/").strip("/")
+    name = re.sub(r"[^A-Za-z0-9_.\-/]+", "_", name)
+    name = name.replace("/", "__")
+    return name or default_name
+
+
+def build_review_excel_zip(project_name, dir_entries):
+    buffer = io.BytesIO()
+    used_names = set()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        if not dir_entries:
+            archive.writestr(
+                "README.txt",
+                (
+                    f"No coverage review Excel files were generated for project: {project_name}\n"
+                    "Please check whether the project name is correct and whether inject has synced coverage_line_index data.\n"
+                )
+            )
+        for dir_path, excel_data in dir_entries:
+            base = safe_zip_member_name(dir_path, "root")
+            candidate = f"{base}.xlsx"
+            suffix = 1
+            while candidate in used_names:
+                candidate = f"{base}_{suffix}.xlsx"
+                suffix += 1
+            used_names.add(candidate)
+            archive.writestr(candidate, excel_data)
+    return buffer.getvalue()
+
+
+def build_review_excel_for_dir(config, project_name, current_dir, total_uncovered,
+                               project_headers, project_rows, dir_headers,
+                               current_dir_rows, file_headers, current_file_rows):
+    manager = None
+    try:
+        if db_module:
+            manager = DatabaseManager(config, exit_on_error=False, init_schema=False)
+            detail_rows = manager.fetch_review_excel_rows(project_name, current_dir)
+        else:
+            detail_rows = db_manager.fetch_review_excel_rows(project_name, current_dir)
+        progress_sections = [
+            ("项目进度", project_headers, project_rows),
+            ("目录进度", dir_headers, current_dir_rows),
+            ("文件进度", file_headers, current_file_rows),
+        ]
+        excel_data = build_review_excel(project_name, detail_rows, progress_sections)
+        return {
+            "dir_path": current_dir,
+            "total_uncovered": total_uncovered,
+            "row_count": len(detail_rows),
+            "excel_data": excel_data,
+        }
+    finally:
+        if manager and manager.conn:
+            manager.conn.close()
 
 
 class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
@@ -983,22 +1607,85 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         query_params = urllib.parse.parse_qs(parsed_url.query)
         if parsed_url.path == "/api/coverage/export":
             report_type = query_params.get("type", ["detail"])[0]
+            report_type_aliases = {
+                "review_execel": "review_excel",
+                "review_execel_by_dir": "review_excel_by_dir",
+            }
+            report_type = report_type_aliases.get(report_type, report_type)
             project_name = query_params.get("project", [""])[0] or None
+            dir_path = query_params.get("dir", [""])[0]
+            dir_path = dir_path if dir_path != "" else None
+            csv_report_types = (
+                "detail", "file_summary", "project_summary", "full_detail",
+                "full_file_summary", "full_dir_summary", "full_project_summary",
+                "full_progress_summary"
+            )
+            xlsx_report_types = ("review_excel", "review_excel_by_dir")
 
-            if report_type not in ("detail", "file_summary", "project_summary", "full_detail", "full_file_summary", "full_project_summary"):
-                self.send_error_response(400, "Unsupported export type. Use detail, file_summary, project_summary, full_detail, full_file_summary, or full_project_summary")
-                return
-
-            try:
-                headers, rows = db_manager.export_report(report_type, project_name)
-            except Exception:
-                self.send_error_response(500, "Failed to export report")
+            if report_type not in csv_report_types + xlsx_report_types:
+                self.send_error_response(400, "Unsupported export type. Use detail, file_summary, project_summary, full_detail, full_file_summary, full_dir_summary, full_project_summary, full_progress_summary, review_excel, or review_excel_by_dir")
                 return
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             project_part = project_name or "all"
-            filename = f"coverage_{report_type}_{project_part}_{timestamp}.csv"
-            self.send_csv_response(filename, headers, rows)
+            if report_type == "review_excel":
+                if not project_name:
+                    self.send_error_response(400, "review_excel requires project=<project_name>")
+                    return
+                try:
+                    detail_rows = db_manager.fetch_review_excel_rows(project_name, dir_path)
+                    dir_headers, dir_rows = db_manager.export_report("full_dir_summary", project_name)
+                    file_headers, file_rows = db_manager.export_report("full_file_summary", project_name)
+                    if dir_path is not None:
+                        dir_rows = [row for row in dir_rows if dict(zip(dir_headers, row)).get("dir_path", "") == dir_path]
+                        file_rows = [row for row in file_rows if get_source_dir_name(dict(zip(file_headers, row)).get("file_path", "")) == dir_path]
+                    progress_sections = [
+                        ("项目进度", *db_manager.export_report("full_project_summary", project_name)),
+                        ("目录进度", dir_headers, dir_rows),
+                        ("文件进度", file_headers, file_rows),
+                    ]
+                    data = build_review_excel(project_name, detail_rows, progress_sections)
+                except Exception:
+                    self.send_error_response(500, "Failed to export review Excel")
+                    return
+                dir_part = f"_{safe_zip_member_name(dir_path)}" if dir_path else ""
+                filename = f"coverage_review_{project_part}{dir_part}_{timestamp}.xlsx"
+                self.send_xlsx_response(filename, data)
+            elif report_type == "review_excel_by_dir":
+                if not project_name:
+                    self.send_error_response(400, "review_excel_by_dir requires project=<project_name>")
+                    return
+                filename = f"coverage_review_by_dir_{project_part}_{timestamp}.zip"
+                self.send_review_excel_by_dir_response(filename, project_name)
+            else:
+                try:
+                    headers, rows = db_manager.export_report(report_type, project_name)
+                except Exception:
+                    self.send_error_response(500, "Failed to export report")
+                    return
+
+                filename = f"coverage_{report_type}_{project_part}_{timestamp}.csv"
+                self.send_csv_response(filename, headers, rows)
+        elif parsed_url.path == "/api/coverage/progress":
+            project_name = query_params.get("project", [""])[0]
+            if not project_name:
+                self.send_error_response(400, "Missing 'project' parameter")
+                return
+
+            try:
+                project_headers, project_rows = db_manager.export_report("full_project_summary", project_name)
+                dir_headers, dir_rows = db_manager.export_report("full_dir_summary", project_name)
+                file_headers, file_rows = db_manager.export_report("full_file_summary", project_name)
+                data = {
+                    "project": [dict(zip(project_headers, row)) for row in project_rows],
+                    "dirs": [dict(zip(dir_headers, row)) for row in dir_rows],
+                    "files": [dict(zip(file_headers, row)) for row in file_rows],
+                }
+            except Exception:
+                self.send_error_response(500, "Failed to query progress")
+                return
+
+            self.send_json_response(200, {"status": "success", "data": data})
         elif parsed_url.path == "/api/coverage":
             project_name = query_params.get("project", [""])[0]
             file_path = query_params.get("file", [""])[0]
@@ -1049,7 +1736,7 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_cors_headers()
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.end_headers()
-        self.wfile.write(json.dumps(data).encode("utf-8"))
+        self.wfile.write(json.dumps(data, ensure_ascii=False, default=json_safe_default).encode("utf-8"))
 
     def send_csv_response(self, filename, headers, rows):
         output = io.StringIO()
@@ -1068,11 +1755,195 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_xlsx_response(self, filename, data):
+        safe_filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename)
+        self.send_response(200)
+        self.send_cors_headers()
+        self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_zip_response(self, filename, data):
+        safe_filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename)
+        self.send_response(200)
+        self.send_cors_headers()
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_review_excel_by_dir_response(self, filename, project_name):
+        safe_filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename)
+        self.send_response(200)
+        self.send_cors_headers()
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.flush()
+
+        written = 0
+        started_at = time.time()
+
+        with zipfile.ZipFile(self.wfile, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(
+                "EXPORT_STARTED.txt",
+                (
+                    f"Directory Excel export started for project: {project_name}\n"
+                    f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                )
+            )
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
+
+            try:
+                dir_infos = db_manager.fetch_project_dirs(project_name)
+                project_headers, project_rows = db_manager.export_report("full_project_summary", project_name)
+                dir_headers, all_dir_rows = db_manager.export_report("full_dir_summary", project_name)
+                file_headers, all_file_rows = db_manager.export_report("full_file_summary", project_name)
+            except Exception as e:
+                archive.writestr(
+                    "ERROR.txt",
+                    f"Failed to query export data for project: {project_name}\nError: {e}\n"
+                )
+                print(f"[Export] Failed to query data for project '{project_name}': {e}", flush=True)
+                return
+
+            all_file_maps = [dict(zip(file_headers, row)) for row in all_file_rows]
+            valid_dirs = [(dir_path, total) for dir_path, total in dir_infos if total]
+            config = load_config()
+            worker_count = get_worker_count(config, default_max=8)
+            print(f"[Export] Streaming directory Excel package for project '{project_name}', dirs={len(valid_dirs)}, workers={worker_count}", flush=True)
+            if not valid_dirs:
+                archive.writestr(
+                    "README.txt",
+                    (
+                        f"No coverage review Excel files were generated for project: {project_name}\n"
+                        "Please check whether the project name is correct and whether inject has synced coverage_line_index data.\n"
+                    )
+                )
+                print(f"[Export] No directory data for project '{project_name}'. README.txt written.", flush=True)
+                return
+
+            dir_row_maps = {dict(zip(dir_headers, row)).get("dir_path", ""): row for row in all_dir_rows}
+            file_rows_by_dir = {}
+            for file_map in all_file_maps:
+                file_dir = get_source_dir_name(file_map.get("file_path", ""))
+                file_rows_by_dir.setdefault(file_dir, []).append([
+                    file_map.get(header, "")
+                    for header in file_headers
+                ])
+
+            used_names = set()
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                futures = []
+                for current_dir, total_uncovered in valid_dirs:
+                    current_dir_rows = [dir_row_maps[current_dir]] if current_dir in dir_row_maps else []
+                    current_file_rows = file_rows_by_dir.get(current_dir, [])
+                    futures.append(executor.submit(
+                        build_review_excel_for_dir,
+                        config,
+                        project_name,
+                        current_dir,
+                        total_uncovered,
+                        project_headers,
+                        project_rows,
+                        dir_headers,
+                        current_dir_rows,
+                        file_headers,
+                        current_file_rows
+                    ))
+
+                for future in as_completed(futures):
+                    result = future.result()
+                    current_dir = result["dir_path"]
+                    total_uncovered = result["total_uncovered"]
+                    excel_data = result["excel_data"]
+                    base = safe_zip_member_name(current_dir, "root")
+                    candidate = f"{base}.xlsx"
+                    suffix = 1
+                    while candidate in used_names:
+                        candidate = f"{base}_{suffix}.xlsx"
+                        suffix += 1
+                    used_names.add(candidate)
+                    archive.writestr(candidate, excel_data)
+                    written += 1
+                    elapsed = time.time() - started_at
+                    print(
+                        f"[Export] Wrote {written}/{len(valid_dirs)} {candidate} "
+                        f"rows={result['row_count']} uncovered={total_uncovered} elapsed={elapsed:.1f}s",
+                        flush=True
+                    )
+
     def send_error_response(self, status_code, message):
         self.send_json_response(status_code, {"status": "error", "message": message})
 
 
-def inject_coverage_report(input_dir, output_dir):
+def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync_index=True):
+    depth = len(rel_path.split(os.sep)) - 1
+    prefix = "../" * depth
+
+    css_tag = f'<link rel="stylesheet" type="text/css" href="{prefix}coverage_enhance.css?v={ASSET_VERSION}">\n'
+    js_tag = f'<script type="text/javascript" src="{prefix}coverage_enhance.js?v={ASSET_VERSION}"></script>\n'
+    inject_code = f"{css_tag}{js_tag}</head>"
+
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        content = f.read()
+
+    report_file_path = extract_report_file_path(content, rel_path)
+    report_file_hash = calc_file_path_hash(report_file_path)
+    file_line_index_records = extract_line_index_records(content, rel_path, project_name)
+    file_index_synced = False
+
+    if sync_index:
+        max_attempts = 4
+        for attempt in range(1, max_attempts + 1):
+            manager = DatabaseManager(config, exit_on_error=False, init_schema=False)
+            try:
+                if file_line_index_records:
+                    file_index_synced = manager.sync_line_index(project_name, file_line_index_records)
+                else:
+                    file_index_synced = manager.delete_line_index_file(project_name, report_file_hash)
+                if file_index_synced:
+                    break
+            finally:
+                if manager.conn:
+                    manager.conn.close()
+            if attempt < max_attempts:
+                time.sleep(0.2 * attempt)
+                print(f"[DB] Retrying line-index sync for {rel_path} ({attempt + 1}/{max_attempts})", flush=True)
+
+    injected = 0
+    updated = 0
+    if "coverage_enhance.js" in content:
+        new_content = re.sub(r'(href="[^"]*coverage_enhance\.css)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', content)
+        new_content = re.sub(r'(src="[^"]*coverage_enhance\.js)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', new_content)
+        if new_content != content:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            updated = 1
+    elif "</head>" in content:
+        new_content = content.replace("</head>", inject_code, 1)
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        injected = 1
+
+    return {
+        "rel_path": rel_path,
+        "file_hash": report_file_hash,
+        "record_count": len(file_line_index_records),
+        "index_synced": file_index_synced,
+        "injected": injected,
+        "updated": updated,
+    }
+
+
+def inject_coverage_report(input_dir, output_dir, project_name=None, workers=None):
     """
     非破坏性注入覆盖率报告：
     1. 若 output_dir 与 input_dir 不同，则先自动将整个 input_dir 复制至 output_dir (清除已有的 output_dir)
@@ -1102,12 +1973,15 @@ def inject_coverage_report(input_dir, output_dir):
         print(f"[Error] Real output html directory '{real_output_html}' does not exist.")
         return
 
-    shutil.copy2(JS_SOURCE_PATH, os.path.join(real_output_html, "coverage_enhance.js"))
-    shutil.copy2(CSS_SOURCE_PATH, os.path.join(real_output_html, "coverage_enhance.css"))
-    print(f"[Injector] Copied static resources to: {real_output_html}")
-
     config = load_config()
-    project_name = config.get("project_name", "Gemini-NOS")
+    if project_name is None:
+        project_name = config.get("project_name", DEFAULT_PROJECT_NAME)
+
+    write_configured_enhance_js(os.path.join(real_output_html, "coverage_enhance.js"), project_name)
+    shutil.copy2(CSS_SOURCE_PATH, os.path.join(real_output_html, "coverage_enhance.css"))
+    write_progress_page_targets(output_dir, real_output_html)
+    print(f"[Injector] Copied static resources to: {real_output_html}")
+    print(f"[Injector] Frontend project name: {project_name}")
     index_manager = None
     indexed_records = 0
     indexed_files = 0
@@ -1139,58 +2013,42 @@ def inject_coverage_report(input_dir, output_dir):
     started_at = time.time()
     injected_count = 0
     updated_count = 0
-    for file_index, (file_path, rel_path) in enumerate(gcov_files, start=1):
-        depth = len(rel_path.split(os.sep)) - 1
-        prefix = "../" * depth
+    worker_count = get_worker_count(config, workers, default_max=8)
+    if index_manager and index_manager.conn:
+        index_manager.conn.close()
+    print(f"[Injector] Worker threads: {worker_count}")
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = [
+            executor.submit(process_gcov_file_for_inject, file_path, rel_path, project_name, config, index_manager is not None)
+            for file_path, rel_path in gcov_files
+        ]
+        for file_index, future in enumerate(as_completed(futures), start=1):
+            result = future.result()
+            active_file_hashes.add(result["file_hash"])
+            indexed_records += result["record_count"] if result["index_synced"] else 0
+            indexed_files += 1 if result["index_synced"] else 0
+            injected_count += result["injected"]
+            updated_count += result["updated"]
 
-        css_tag = f'<link rel="stylesheet" type="text/css" href="{prefix}coverage_enhance.css?v={ASSET_VERSION}">\n'
-        js_tag = f'<script type="text/javascript" src="{prefix}coverage_enhance.js?v={ASSET_VERSION}"></script>\n'
-        inject_code = f"{css_tag}{js_tag}</head>"
-
-        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-
-        report_file_path = extract_report_file_path(content, rel_path)
-        report_file_hash = calc_file_path_hash(report_file_path)
-        active_file_hashes.add(report_file_hash)
-        file_line_index_records = extract_line_index_records(content, rel_path, project_name)
-        file_index_synced = False
-        if index_manager:
-            if file_line_index_records and index_manager.sync_line_index(project_name, file_line_index_records):
-                indexed_records += len(file_line_index_records)
-                indexed_files += 1
-                file_index_synced = True
-            elif not file_line_index_records:
-                index_manager.delete_line_index_file(project_name, report_file_hash)
-
-        if "coverage_enhance.js" in content:
-            new_content = re.sub(r'(href="[^"]*coverage_enhance\.css)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', content)
-            new_content = re.sub(r'(src="[^"]*coverage_enhance\.js)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', new_content)
-            if new_content != content:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(new_content)
-                updated_count += 1
-        elif "</head>" in content:
-            new_content = content.replace("</head>", inject_code, 1)
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(new_content)
-            injected_count += 1
-
-        elapsed = time.time() - started_at
-        percent = file_index * 100.0 / total_files
-        rate = file_index / elapsed if elapsed > 0 else 0
-        remaining = (total_files - file_index) / rate if rate > 0 else 0
-        index_status = "synced" if file_index_synced else "empty" if not file_line_index_records else "skipped"
-        print(
-            f"[Injector] Progress {file_index}/{total_files} ({percent:.1f}%) "
-            f"elapsed={elapsed:.1f}s eta={remaining:.1f}s "
-            f"uncovered={len(file_line_index_records)} index={index_status} "
-            f"total_indexed={indexed_records} file={rel_path}",
-            flush=True
-        )
+            rel_path = result["rel_path"]
+            file_index_synced = result["index_synced"]
+            file_record_count = result["record_count"]
+            elapsed = time.time() - started_at
+            percent = file_index * 100.0 / total_files
+            rate = file_index / elapsed if elapsed > 0 else 0
+            remaining = (total_files - file_index) / rate if rate > 0 else 0
+            index_status = "synced" if file_index_synced else "empty" if not file_record_count else "skipped"
+            print(
+                f"[Injector] Progress {file_index}/{total_files} ({percent:.1f}%) "
+                f"elapsed={elapsed:.1f}s eta={remaining:.1f}s "
+                f"uncovered={file_record_count} index={index_status} "
+                f"total_indexed={indexed_records} file={rel_path}",
+                flush=True
+            )
 
     print(f"[Injector] Non-destructively enhanced {injected_count} new html report file(s), updated {updated_count} existing enhanced file(s) in: {output_dir}")
     if index_manager:
+        index_manager = DatabaseManager(config, exit_on_error=False, init_schema=False)
         index_manager.prune_line_index_project_files(project_name, active_file_hashes)
         if index_manager.conn:
             index_manager.conn.close()
@@ -1226,12 +2084,26 @@ def run_server():
 
 def print_help():
     print("Usage:")
-    print("  python scripts/enhance_coverage.py inject --dir <input_dir> --out <output_dir>")
+    print("  python scripts/enhance_coverage.py inject --project <project_name> --dir <input_dir> --out <output_dir>")
     print("    - Scan and inject custom interactive forms into HTML reports.")
+    print("    - --project is recommended and overrides coverage_config.json project_name.")
+    print("    - --workers <N> controls parallel HTML parsing and line-index DB sync.")
+    print("    - Use --use-config-project only if you intentionally want coverage_config.json project_name.")
     print("  python scripts/enhance_coverage.py server")
     print("    - Start local bridge server for MySQL persistence.")
     print("  python scripts/enhance_coverage.py inherit --from <old_project> --to <new_project>")
     print("    - Reuse reviewed analysis for unchanged functions in a later project/version.")
+
+
+def get_arg_value(args, name):
+    for i, arg in enumerate(args):
+        if arg == name and i + 1 < len(args):
+            return args[i + 1]
+    return None
+
+
+def has_arg(args, name):
+    return name in args
 
 
 if __name__ == "__main__":
@@ -1241,13 +2113,12 @@ if __name__ == "__main__":
 
     cmd = sys.argv[1]
     if cmd == "inject":
-        dir_path = None
-        out_path = None
-        for i in range(len(sys.argv)):
-            if sys.argv[i] == "--dir" and i + 1 < len(sys.argv):
-                dir_path = sys.argv[i + 1]
-            if sys.argv[i] == "--out" and i + 1 < len(sys.argv):
-                out_path = sys.argv[i + 1]
+        args = sys.argv[2:]
+        dir_path = get_arg_value(args, "--dir")
+        out_path = get_arg_value(args, "--out")
+        project_name = get_arg_value(args, "--project")
+        workers = get_arg_value(args, "--workers")
+        use_config_project = has_arg(args, "--use-config-project")
 
         if not dir_path:
             dir_path = os.path.join(SCRIPT_DIR, "../build/coverage")
@@ -1256,21 +2127,29 @@ if __name__ == "__main__":
                 out_path = os.path.join(os.path.dirname(dir_path), "coverage_review")
             else:
                 out_path = dir_path + "_review"
+
+        if not project_name:
+            if use_config_project:
+                config = load_config()
+                project_name = config.get("project_name", DEFAULT_PROJECT_NAME)
+                print("[Warning] Using project_name from coverage_config.json because --use-config-project was specified.")
+            else:
+                print("[Error] inject requires --project <project_name> to avoid writing data to the wrong project.")
+                print("        If you intentionally want coverage_config.json, add --use-config-project.")
+                print_help()
+                sys.exit(1)
             
         print(f"[Main] Non-destructive injection starts.")
+        print(f"[Main] Project : {project_name}")
         print(f"[Main] Input (ReadOnly) : {dir_path}")
         print(f"[Main] Output (Enhanced) : {out_path}")
-        inject_coverage_report(dir_path, out_path)
+        inject_coverage_report(dir_path, out_path, project_name, workers)
     elif cmd == "server":
         run_server()
     elif cmd == "inherit":
-        source_project = None
-        target_project = None
-        for i in range(len(sys.argv)):
-            if sys.argv[i] == "--from" and i + 1 < len(sys.argv):
-                source_project = sys.argv[i + 1]
-            if sys.argv[i] == "--to" and i + 1 < len(sys.argv):
-                target_project = sys.argv[i + 1]
+        args = sys.argv[2:]
+        source_project = get_arg_value(args, "--from")
+        target_project = get_arg_value(args, "--to")
 
         if not source_project or not target_project:
             print("[Error] inherit requires --from <old_project> and --to <new_project>.")
@@ -1285,10 +2164,17 @@ if __name__ == "__main__":
         if manager.conn:
             manager.conn.close()
         print("[Inherit] Completed.")
-        print(f"[Inherit] Source reviewed records: {result['source_reviewed_records']}")
+        print(f"[Inherit] Source analysis records: {result['source_analysis_records']}")
+        print(f"[Inherit] Source reviewed analysis records: {result['source_reviewed_analysis_records']}")
+        print(f"[Inherit] Source index records: {result['source_index_records']}")
+        print(f"[Inherit] Source hashable index records: {result['source_hashable_index_records']}")
+        print(f"[Inherit] Source reviewed records joined with index: {result['source_reviewed_records']}")
+        print(f"[Inherit] Target index records: {result['target_index_records']}")
+        print(f"[Inherit] Target hashable index records: {result['target_hashable_index_records']}")
         print(f"[Inherit] Target unfilled records: {result['target_unfilled_records']}")
-        print(f"[Inherit] Ambiguous source keys skipped: {result['ambiguous_keys']}")
-        print(f"[Inherit] Target records skipped by ambiguity: {result['ambiguous_skipped_records']}")
+        print(f"[Inherit] Filename matched records: {result['name_matched_records']}")
+        print(f"[Inherit] Ambiguous filename keys: {result['ambiguous_name_keys']}")
+        print(f"[Inherit] Target records skipped by filename ambiguity: {result['ambiguous_name_skipped_records']}")
         print(f"[Inherit] Inherited records: {result['inherited_records']}")
     else:
         print_help()

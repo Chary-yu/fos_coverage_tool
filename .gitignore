@@ -57,6 +57,11 @@ dkms.conf
 # Coverage tool local/runtime artifacts
 __pycache__/
 *.pyc
+.python_deps/
+.tmp_dop_export_test/
+.tmp_dop_inject/
+.tmp_dop_db_flow/
+.tmp_dop_http_flow/
 *.zip
 dop/
 dop_review_test/
