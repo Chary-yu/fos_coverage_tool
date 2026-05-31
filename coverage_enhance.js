@@ -4,7 +4,7 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'lazy-controls-20260531';
+    const ENHANCE_VERSION = 'low-memory-controls-20260531';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const RENDER_MODE = 'lazy'; // 'lazy' or 'immediate'
@@ -13,8 +13,8 @@
     const ACTIVE_MODE = (QUERY_MODE === 'lazy' || QUERY_MODE === 'immediate') ? QUERY_MODE : RENDER_MODE;
     const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖', '冗余代码'];
     const CONFIRMED_STATUS_SET = new Set(['可覆盖', '无法覆盖', '冗余代码']);
-    const RENDER_BATCH_SIZE = 200;
-    const RENDER_FRAME_BUDGET_MS = 24;
+    const RENDER_BATCH_SIZE = 1000;
+    const RENDER_FRAME_BUDGET_MS = 50;
     const RENDER_PROGRESS_MIN_BLOCKS = 300;
 
     // 控制流分支关键字侦测正则 (边界隔离)
@@ -26,6 +26,38 @@
     let legacyPanelSyncers = [];
     let legacyRefreshRequested = false;
     let requestLegacyPanelRefresh = function() {};
+
+    function getBlockStartItem(block) {
+        return block.startItem || block[0];
+    }
+
+    function getBlockLength(block) {
+        return block.length || (block.lineNums ? block.lineNums.length : 0);
+    }
+
+    function getBlockEndLineNum(block) {
+        if (block.endLineNum !== undefined) {
+            return block.endLineNum;
+        }
+        if (block.lineNums && block.lineNums.length > 0) {
+            return block.lineNums[block.lineNums.length - 1];
+        }
+        return block.length > 0 ? block[block.length - 1].lineNum : 0;
+    }
+
+    function getBlockLineNums(block) {
+        return block.lineNums || block.map(item => item.lineNum);
+    }
+
+    function forEachBlockItem(block, callback) {
+        if (Array.isArray(block)) {
+            block.forEach(callback);
+            return;
+        }
+        if (block.startItem) {
+            callback(block.startItem, 0);
+        }
+    }
 
     function getStoredPanelValue(panel, key) {
         if (!panel) {
@@ -75,8 +107,17 @@
 
     function decoratePlaceholder(placeholder, values, block) {
         const statusText = summarizeStatus(values || {});
-        placeholder.innerText = block.length > 1 ? `${statusText} L${block[0].lineNum}-${block[block.length - 1].lineNum}` : statusText;
+        const blockLength = getBlockLength(block);
+        const startLineNum = getBlockStartItem(block).lineNum;
+        const endLineNum = getBlockEndLineNum(block);
+        const label = blockLength > 1 ? `${statusText} L${startLineNum}-${endLineNum}` : statusText;
+        if (placeholder.dataset) {
+            placeholder.dataset.coverageLabel = label;
+        } else {
+            placeholder.innerText = label;
+        }
         placeholder.classList.toggle('saved', statusText !== '分析' && statusText !== '未确认');
+        placeholder.classList.toggle('coverage-analysis-placeholder-saved', statusText !== '分析' && statusText !== '未确认');
         placeholder.title = '点击展开覆盖率分析输入框';
     }
 
@@ -111,17 +152,43 @@
             console.log('[CoverageEnhance] No source container found.');
             return;
         }
-        function collectSourceLines(pre) {
-            const modernLines = Array.from(pre.querySelectorAll('span[id^="L"]')).map(span => ({
-                span,
-                lineNum: parseInt(span.id.replace('L', ''), 10),
-                legacyInline: false
-            })).filter(item => !Number.isNaN(item.lineNum));
+        preSource.addEventListener('click', function(e) {
+            const placeholder = e.target.closest('.coverage-analysis-placeholder, .coverage-analysis-placeholder-anchor');
+            if (!placeholder || !preSource.contains(placeholder)) {
+                return;
+            }
+            e.preventDefault();
+            e.stopPropagation();
+            const startLineNum = parseInt(placeholder.dataset.startLine || '', 10);
+            if (!Number.isNaN(startLineNum)) {
+                expandBlockPanel(startLineNum);
+            }
+        });
 
-            if (modernLines.length > 0) {
-                return modernLines;
+        function createSourceLineAccess(pre) {
+            const modernLineNodes = pre.querySelectorAll('span[id^="L"]');
+            if (modernLineNodes.length > 0) {
+                return {
+                    length: modernLineNodes.length,
+                    get(index) {
+                        const span = modernLineNodes[index];
+                        if (!span) {
+                            return null;
+                        }
+                        const lineNum = parseInt(span.id.replace('L', ''), 10);
+                        if (Number.isNaN(lineNum)) {
+                            return null;
+                        }
+                        return {
+                            span,
+                            lineNum,
+                            legacyInline: false
+                        };
+                    }
+                };
             }
 
+            const legacyLineNumNodes = pre.querySelectorAll('span.lineNum');
             function getSameLineInfo(lineNumSpan) {
                 let node = lineNumSpan.nextSibling;
                 let codeSpan = null;
@@ -138,7 +205,7 @@
                         if (node.matches('.lineCov, .lineNoCov, .tlaGNC, .tlaUNC, .tlaBgGNC, .tlaBgUNC')) {
                             codeSpan = node;
                         }
-                        lineText += node.innerText || '';
+                        lineText += node.textContent || '';
                     } else if (node.nodeType === Node.TEXT_NODE) {
                         lineText += node.nodeValue;
                     }
@@ -147,21 +214,28 @@
                 return { codeSpan, lineText };
             }
 
-            return Array.from(pre.querySelectorAll('span.lineNum')).map((lineNumSpan, index) => {
-                const lineNum = parseInt(lineNumSpan.innerText, 10);
-                const sameLineInfo = getSameLineInfo(lineNumSpan);
-                const codeSpan = sameLineInfo.codeSpan || lineNumSpan;
-                return {
-                    span: codeSpan,
-                    lineNumSpan,
-                    rawText: sameLineInfo.lineText || codeSpan.innerText || '',
-                    lineNum: Number.isNaN(lineNum) ? index + 1 : lineNum,
-                    legacyInline: true
-                };
-            });
+            return {
+                length: legacyLineNumNodes.length,
+                get(index) {
+                    const lineNumSpan = legacyLineNumNodes[index];
+                    if (!lineNumSpan) {
+                        return null;
+                    }
+                    const lineNum = parseInt(lineNumSpan.textContent, 10);
+                    const sameLineInfo = getSameLineInfo(lineNumSpan);
+                    const codeSpan = sameLineInfo.codeSpan || lineNumSpan;
+                    return {
+                        span: codeSpan,
+                        lineNumSpan,
+                        lineText: sameLineInfo.lineText || codeSpan.textContent || '',
+                        lineNum: Number.isNaN(lineNum) ? index + 1 : lineNum,
+                        legacyInline: true
+                    };
+                }
+            };
         }
 
-        const allLines = collectSourceLines(preSource);
+        const sourceLines = createSourceLineAccess(preSource);
         const countedUncoveredLines = new Set();
 
         function addBlock(block) {
@@ -181,15 +255,21 @@
         }
 
         function isUncoveredLine(item) {
+            if (!item || !item.span) {
+                return false;
+            }
             return item.span.matches('.tlaUNC, .tlaBgUNC, .lineNoCov') || item.span.querySelector('.tlaUNC, .tlaBgUNC, .lineNoCov') !== null;
         }
 
         function isCoveredLine(item) {
+            if (!item || !item.span) {
+                return false;
+            }
             return item.span.matches('.tlaGNC, .tlaBgGNC, .lineCov') || item.span.querySelector('.tlaGNC, .tlaBgGNC, .lineCov') !== null;
         }
 
         function getLineText(item) {
-            return item.rawText || item.span.innerText || '';
+            return item.lineText || item.span.textContent || '';
         }
 
         function getCodeText(item) {
@@ -249,13 +329,19 @@
         }
 
         function buildSemanticBlock(startIndex) {
-            const start = allLines[startIndex];
+            const start = sourceLines.get(startIndex);
+            if (!start) {
+                return { block: [], consumedUntil: startIndex };
+            }
             const block = [start];
             const startIsFunction = isFunctionEntryLine(start);
             let consumedUntil = startIndex;
 
-            for (let j = startIndex + 1; j < allLines.length; j++) {
-                const next = allLines[j];
+            for (let j = startIndex + 1; j < sourceLines.length; j++) {
+                const next = sourceLines.get(j);
+                if (!next) {
+                    continue;
+                }
                 if (isCoveredLine(next)) {
                     break;
                 }
@@ -292,8 +378,8 @@
             return { block, consumedUntil };
         }
 
-        for (let i = 0; i < allLines.length; i++) {
-            const item = allLines[i];
+        for (let i = 0; i < sourceLines.length; i++) {
+            const item = sourceLines.get(i);
             if (!isUncoveredLine(item) || countedUncoveredLines.has(item.lineNum)) {
                 continue;
             }
@@ -308,6 +394,7 @@
         }
 
         totalUncovered = countedUncoveredLines.size;
+        countedUncoveredLines.clear();
 
         if (totalUncovered === 0) {
             console.log('[CoverageEnhance] No uncovered lines found.');
@@ -411,7 +498,7 @@
                     } else {
                         renderBlockPlaceholder(blocks[index]);
                     }
-                    if (index + 1 < totalBlocks && performance.now() > deadline) {
+                    if (ACTIVE_MODE === 'immediate' && index + 1 < totalBlocks && performance.now() > deadline) {
                         index += 1;
                         break;
                     }
@@ -433,6 +520,7 @@
                     progress.innerText = `Coverage controls ready: ${totalBlocks} (${elapsed}s)`;
                     setTimeout(() => progress.remove(), 1500);
                 }
+                blocks = [];
                 requestLegacyPanelRefresh(4);
                 onComplete();
             }
@@ -441,7 +529,7 @@
         }
 
         function getLineCodeInfo(span) {
-            const lineText = span.innerText || '';
+            const lineText = span.textContent || '';
             const colonIndex = lineText.indexOf(':');
             if (colonIndex === -1) {
                 return { prefixLen: 0, codeLen: lineText.length };
@@ -452,9 +540,12 @@
         }
 
         function getBlockLayout(block) {
+            if (block.layout) {
+                return block.layout;
+            }
             let maxCodeLen = 0;
             let commonPrefixLen = 0;
-            block.forEach(item => {
+            forEachBlockItem(block, item => {
                 const info = getLineCodeInfo(item.span);
                 if (info.codeLen > maxCodeLen) {
                     maxCodeLen = info.codeLen;
@@ -473,7 +564,7 @@
         }
 
         function insertPanelLikeElement(block, element, isLegacyInline, layout) {
-            const startLineItem = block[0];
+            const startLineItem = getBlockStartItem(block);
             if (isLegacyInline) {
                 const legacyAlignSpacer = document.createElement('span');
                 legacyAlignSpacer.className = 'coverage-legacy-align-spacer';
@@ -489,25 +580,39 @@
         }
 
         function renderBlockPlaceholder(block) {
-            const startLineItem = block[0];
+            const startLineItem = getBlockStartItem(block);
             const startLineNum = startLineItem.lineNum;
             const isLegacyInline = startLineItem.legacyInline === true;
             const layout = getBlockLayout(block);
 
-            block.forEach(item => {
+            forEachBlockItem(block, item => {
                 if (!isLegacyInline) {
                     item.span.style.setProperty('padding-right', '180px', 'important');
                 }
             });
 
-            const placeholder = document.createElement('button');
-            placeholder.type = 'button';
-            placeholder.className = 'coverage-analysis-placeholder' + (isLegacyInline ? ' legacy-inline-fast' : '');
+            const placeholder = startLineItem.span;
+            placeholder.classList.add('coverage-analysis-placeholder-anchor');
+            placeholder.classList.toggle('legacy-inline-fast', isLegacyInline);
             placeholder.setAttribute('contenteditable', 'false');
+            placeholder.dataset.startLine = String(startLineNum);
+            placeholder.style.setProperty(
+                isLegacyInline ? '--coverage-placeholder-margin' : '--coverage-placeholder-left',
+                `${isLegacyInline ? Math.max(2, layout.targetCodeCol - layout.maxCodeLen) : layout.absoluteCol}ch`
+            );
 
+            const compactBlock = {
+                startItem: startLineItem,
+                lineNums: getBlockLineNums(block),
+                length: getBlockLength(block),
+                endLineNum: getBlockEndLineNum(block),
+                legacyInline: isLegacyInline,
+                layout
+            };
             const panelState = {
-                block,
+                block: compactBlock,
                 placeholder,
+                placeholderIsAnchor: true,
                 expanded: false,
                 values: {
                     status: '未确认',
@@ -517,20 +622,11 @@
                 }
             };
             panelsMap.set(startLineNum, panelState);
-            decoratePlaceholder(placeholder, panelState.values, block);
+            decoratePlaceholder(placeholder, panelState.values, compactBlock);
 
-            placeholder.addEventListener('click', function(e) {
-                e.preventDefault();
-                e.stopPropagation();
-                expandBlockPanel(startLineNum);
-            });
-
-            insertPanelLikeElement(block, placeholder, isLegacyInline, layout);
         }
 
         function renderBlockImmediate(block) {
-            const startLineItem = block[0];
-            const startLineNum = startLineItem.lineNum;
             const panel = renderBlockPanel(block);
             setStoredPanelValues(panel, {
                 status: '未确认',
@@ -555,24 +651,40 @@
                 panel.saveBtn.classList.add('saved');
             }
             if (placeholder) {
-                if (placeholder._coverageAlignSpacer) {
+                if (current.placeholderIsAnchor) {
+                    placeholder.classList.remove(
+                        'coverage-analysis-placeholder-anchor',
+                        'coverage-analysis-placeholder-saved',
+                        'saved',
+                        'error',
+                        'legacy-inline-fast'
+                    );
+                    placeholder.removeAttribute('data-start-line');
+                    placeholder.removeAttribute('data-coverage-label');
+                    placeholder.style.removeProperty('--coverage-placeholder-margin');
+                    placeholder.style.removeProperty('--coverage-placeholder-left');
+                    placeholder.removeAttribute('title');
+                } else if (placeholder._coverageAlignSpacer) {
                     placeholder._coverageAlignSpacer.remove();
+                    placeholder.remove();
+                } else {
+                    placeholder.remove();
                 }
-                placeholder.remove();
             }
             return panel;
         }
 
         // 3. 构建并注入表单 DOM，仅在 Block 的第一行注入
         function renderBlockPanel(block) {
-            const startLineItem = block[0];
+            const startLineItem = getBlockStartItem(block);
             const startLineNum = startLineItem.lineNum;
-            const endLineNum = block[block.length - 1].lineNum;
-            const isLegacyInline = startLineItem.legacyInline === true;
-            const isMultiLine = !isLegacyInline && block.length > 1;
+            const endLineNum = getBlockEndLineNum(block);
+            const isLegacyInline = block.legacyInline !== undefined ? block.legacyInline : startLineItem.legacyInline === true;
+            const blockLength = getBlockLength(block);
+            const isMultiLine = !isLegacyInline && blockLength > 1;
 
             // 动态为当前 Block 的所有物理行 span 设置 padding-right，以防止其内容与悬浮的表单面板重叠
-            block.forEach(item => {
+            forEachBlockItem(block, item => {
                 if (!isLegacyInline) {
                     item.span.style.setProperty('padding-right', '550px', 'important');
                 }
@@ -591,7 +703,7 @@
 
             if (isMultiLine && !isLegacyInline) {
                 // 完美契合 Block 的多行物理高度 (每行 24px)
-                panel.style.height = `${block.length * 24 - 4}px`;
+                panel.style.height = `${blockLength * 24 - 4}px`;
             }
 
             // 状态下拉框 (默认第一列为未确认/可覆盖/无法覆盖)
@@ -1052,6 +1164,7 @@
                 }
                 if (panel.placeholder) {
                     panel.placeholder.classList.add('error');
+                    panel.placeholder.classList.add('coverage-analysis-placeholder-error');
                     panel.placeholder.title = '无法连接到本地持久化服务，点击仍可填写，保存前请检查 enhance_coverage.py 服务。';
                 }
             });
@@ -1067,11 +1180,12 @@
         btn.innerText = 'Saving...';
         btn.className = 'coverage-analysis-btn saving';
 
-        const requests = block.map(item => {
+        const lineNums = getBlockLineNums(block);
+        const requests = lineNums.map(lineNum => {
             const payload = {
                 project_name: DEFAULT_PROJECT,
                 file_path: filePath,
-                line_number: item.lineNum,
+                line_number: lineNum,
                 reviewer: reviewer,
                 status: status,
                 coverage_method: method,
@@ -1087,7 +1201,7 @@
                 body: JSON.stringify(payload)
             }).then(response => {
                 if (!response.ok) {
-                    throw new Error(`Line ${item.lineNum} save failed with HTTP status: ${response.status}`);
+                    throw new Error(`Line ${lineNum} save failed with HTTP status: ${response.status}`);
                 }
                 return response.json();
             });
@@ -1097,7 +1211,7 @@
         .then(results => {
             const allSuccess = results.every(res => res.status === 'success');
             if (allSuccess) {
-                const startLineNum = block[0].lineNum;
+                const startLineNum = lineNums[0];
                 const panel = panelsMap.get(startLineNum);
                 if (panel) {
                     setStoredPanelValues(panel, {
@@ -1109,7 +1223,7 @@
                 }
                 btn.innerText = 'Saved';
                 btn.className = 'coverage-analysis-btn saved';
-                console.log(`[CoverageEnhance] Successfully saved block range L${block[0].lineNum}-${block[block.length - 1].lineNum}`);
+                console.log(`[CoverageEnhance] Successfully saved block range L${lineNums[0]}-${lineNums[lineNums.length - 1]}`);
                 
                 updateHeaderStatistics();
                 requestLegacyPanelRefresh(3);
