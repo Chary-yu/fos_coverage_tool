@@ -81,6 +81,7 @@ pip3 install pymysql
     "port": 9528
   },
   "worker_threads": 4,
+  "render_mode": "lazy",
   "project_name": "review_main_202605"
 }
 ```
@@ -91,6 +92,7 @@ pip3 install pymysql
 * `project_name` 是兼容旧流程的默认项目名；
 * 推荐执行 `inject` 时用 `--project <项目名>` 显式指定项目名，避免忘记修改配置文件；
 * `worker_threads` 控制注入写库和按目录导出 Excel 的并发线程数，建议从 4 开始，数据库压力允许时再调大；
+* `render_mode` 控制覆盖率页面右侧控件的默认显示方式，`lazy` 为轻量占位、点击展开，`immediate` 为打开页面后直接渲染完整控件；
 * `server.host` 建议使用 `127.0.0.1`，由 Nginx 反向代理给浏览器访问。
 
 首次启动或注入时，脚本会自动建库、建表并升级表结构。
@@ -113,6 +115,7 @@ python3 enhance_coverage.py inject \
   --project review_main_202605 \
   --dir /opt/coverage_reports/raw_main_202605 \
   --out /opt/coverage_tool/review_main_202605 \
+  --mode lazy \
   --workers 4
 ```
 
@@ -129,6 +132,7 @@ python3 enhance_coverage.py inject \
 
 * 将原始报告复制到 `--out` 指定目录；
 * 注入前端 JS/CSS 控件；
+* 按 `--mode` 或 `coverage_config.json` 中的 `render_mode` 写入前端控件显示模式；
 * 将未覆盖行索引同步到数据库，用于全量导出和跨版本继承。
 
 执行过程中会输出进度，例如：
@@ -148,6 +152,14 @@ python3 enhance_coverage.py inject \
 
 注意：建议每次执行 `inject` 都显式传入 `--project <项目名>`。脚本会拒绝缺少项目名的注入命令，避免误用 `coverage_config.json` 中的旧项目名。
 
+控件显示模式说明：
+
+* `--mode lazy`：默认推荐。页面先显示轻量 `分析` 占位按钮，点击后再展开完整输入框，适合未覆盖块很多的大文件；
+* `--mode immediate`：打开页面后直接渲染完整输入框，适合文件较小或希望保持旧交互习惯的项目；
+* 未传 `--mode` 时使用 `coverage_config.json` 中的 `render_mode`，配置不存在或非法时默认使用 `lazy`；
+* 临时查看时也可以在网页 URL 后追加 `?mode=lazy` 或 `?mode=immediate` 覆盖默认模式；如果 URL 已经带有其他参数，则使用 `&mode=lazy` 或 `&mode=immediate`；
+* 覆盖率源码页右下角也提供显示模式切换器，可以在当前页面快速切换 `lazy` / `immediate`。
+
 ---
 
 ## 5. 启动后台服务
@@ -166,6 +178,8 @@ python3 enhance_coverage.py server
 ```
 
 后台服务只需要启动一个。多个网页、多个版本都通过同一个 `/api/coverage` 接口访问后台，后台根据 `project_name` 区分数据。
+
+新版服务端使用多线程 HTTP 服务，并为每个工作线程维护独立数据库连接。这样进度页、保存请求和导出请求可以并发处理，避免一个较慢的导出请求阻塞其他网页操作。
 
 建议生产环境使用 `systemd` 管理该服务，避免终端关闭后服务退出。
 
@@ -258,7 +272,8 @@ cd /opt/coverage_tool
 python3 enhance_coverage.py inject \
   --project review_main_202606 \
   --dir /opt/coverage_reports/raw_main_202606 \
-  --out /opt/coverage_tool/review_main_202606
+  --out /opt/coverage_tool/review_main_202606 \
+  --mode lazy
 ```
 
 3. 打开新版本网页
@@ -444,6 +459,8 @@ curl -o review_main_202606_by_dir.zip \
 * 明细列为“行号、代码行、覆盖率标识、是否冗余代码，剔除计划、对测试覆盖的建议、无法覆盖原因、开发责任人”；
 * 单目录导出时，Excel 只包含该目录下的源文件 sheet，进度 sheet 也只保留该目录和该目录内文件；
 * `review_excel_by_dir` 返回 zip，每个代码目录一个 `.xlsx`，避免单个 Excel 过大；
+* 按目录导出会先批量查询项目、目录、文件和明细数据，再在内存中按目录分组并并发生成各目录 Excel，减少重复数据库查询；
+* 如果浏览器或 `curl` 中途取消下载，服务端会记录断连日志并停止继续写响应，后台服务不会因此退出；
 * `review_excel` 和 `review_excel_by_dir` 都必须指定 `project=<项目名>`。
 
 如果下载到的文件很小或不是 zip/xlsx，先检查 `type` 是否拼写为 `review_excel_by_dir`，以及项目是否已经重新执行过 `inject` 同步 `coverage_line_index`。当项目没有可导出的行索引时，zip 中会包含 `README.txt` 说明原因。
@@ -493,6 +510,16 @@ http://服务器IP/coverage/coverage_progress.html?project=review_main_202606
 ```text
 http://服务器IP/coverage/review_main_202606/coverage_progress.html?project=review_main_202606&api=http://服务器IP:9528/api/coverage
 ```
+
+进度页会按顺序尝试多个 API 地址：
+
+* URL 中 `api=` 指定的地址；
+* 当前域名下的 `/api/coverage`；
+* 当前主机的 `:9528/api/coverage`；
+* `http://127.0.0.1:9528/api/coverage`；
+* 相对路径 `/api/coverage`。
+
+页面顶部会显示正在尝试的接口地址；如果全部失败，会把已尝试地址展示出来，便于定位 Nginx 代理、端口或跨机器访问问题。
 
 页面默认展示：
 
@@ -603,7 +630,7 @@ Ctrl + F5
 * LCOV 原始 HTML 本身很大，浏览器解析和渲染代码需要时间；
 * 增强脚本需要扫描未覆盖行并创建分析入口。
 
-新版前端已经改为“轻量占位 + 点击展开”模式。大文件打开时，页面只会先在未覆盖代码块右侧生成一个很小的 `分析` 按钮；点击某一行的 `分析` 按钮后，才会展开状态、确认人、覆盖建议、无法覆盖原因和保存按钮。
+新版前端支持两种控件显示模式。默认推荐 `lazy`，大文件打开时页面只会先在未覆盖代码块右侧生成一个很小的 `分析` 按钮；点击某一行的 `分析` 按钮后，才会展开状态、确认人、覆盖建议、无法覆盖原因和保存按钮。若执行 `inject` 时使用 `--mode immediate`，则打开页面后直接显示完整输入框。
 
 当分析块较多时，右上角会显示类似进度：
 
@@ -612,6 +639,20 @@ Coverage controls: 800/3200 (25.0%)
 ```
 
 如果数据库中已有填写结果，占位按钮会直接显示 `可覆盖`、`无法覆盖`、`冗余代码` 等状态。点击后展开的完整输入框会自动带出已有内容。
+
+如果想临时切换当前网页的控件模式，可以使用页面右下角的显示模式切换器，或在 URL 后追加：
+
+```text
+?mode=lazy
+?mode=immediate
+```
+
+如果 URL 已经带有其他查询参数，则改用：
+
+```text
+&mode=lazy
+&mode=immediate
+```
 
 如果仍然明显卡顿，建议从源头拆分覆盖率报告，例如按模块、目录或子工程分别生成 LCOV HTML，再分别执行 `inject`。这样每个 `.gcov.html` 页面更小，浏览器体验会明显更稳。
 
