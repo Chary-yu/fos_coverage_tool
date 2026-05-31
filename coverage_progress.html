@@ -164,6 +164,7 @@
     const statusEl = document.getElementById('status');
     const csvLink = document.getElementById('csvLink');
     const excelLink = document.getElementById('excelLink');
+    let resolvedApiBase = '';
 
     projectInput.value = params.get('project') || '';
 
@@ -218,47 +219,102 @@
       `;
     }
 
-    function updateLinks(project) {
-      const encoded = encodeURIComponent(project);
-      csvLink.href = `/api/coverage/export?type=full_progress_summary&project=${encoded}`;
-      excelLink.href = `/api/coverage/export?type=review_excel_by_dir&project=${encoded}`;
+    function normalizeApiBase(value) {
+      return String(value || '').replace(/\/+$/, '');
     }
 
-    function loadProgress() {
-      const project = projectInput.value.trim();
-      if (!project) {
-        statusEl.innerHTML = '<span class="error">请输入项目名。</span>';
-        return;
+    function unique(values) {
+      return Array.from(new Set(values.filter(Boolean)));
+    }
+
+    function apiBaseCandidates() {
+      const explicit = params.get('api');
+      const origin = window.location.origin && window.location.origin !== 'null' ? window.location.origin : '';
+      const candidates = [];
+      if (explicit) {
+        candidates.push(normalizeApiBase(explicit));
       }
-      updateLinks(project);
-      statusEl.innerText = '正在加载...';
-      fetch(`/api/coverage/progress?project=${encodeURIComponent(project)}`)
+      if (origin) {
+        candidates.push(`${origin}/api/coverage`);
+        if (window.location.pathname.startsWith('/coverage/')) {
+          candidates.push(`${origin}/coverage/api/coverage`);
+        }
+        if (window.location.port !== '9528') {
+          candidates.push(`${window.location.protocol}//${window.location.hostname}:9528/api/coverage`);
+        }
+      }
+      candidates.push('http://127.0.0.1:9528/api/coverage');
+      candidates.push('/api/coverage');
+      return unique(candidates.map(normalizeApiBase));
+    }
+
+    function fetchJsonWithTimeout(url, timeoutMs) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      return fetch(url, { signal: controller.signal })
+        .finally(() => clearTimeout(timer))
         .then(response => {
           if (!response.ok) {
             throw new Error(`HTTP ${response.status}`);
           }
           return response.json();
-        })
-        .then(payload => {
-          if (!payload || payload.status !== 'success') {
-            throw new Error(payload && payload.message ? payload.message : '加载失败');
-          }
-          const data = payload.data || {};
-          const projectRow = (data.project && data.project[0]) || {};
-          metric('totalUncovered', asNumber(projectRow.total_uncovered));
-          metric('filledTotal', asNumber(projectRow.filled_total));
-          metric('fillRate', fmtRate(projectRow.fill_rate));
-          metric('confirmedRate', fmtRate(projectRow.confirmed_rate));
-          renderTable('dirTable', data.dirs || [], 'dir_path');
-          renderTable('fileTable', data.files || [], 'file_path');
-          statusEl.innerText = `已加载项目：${project}`;
-          const url = new URL(window.location.href);
-          url.searchParams.set('project', project);
-          window.history.replaceState(null, '', url.toString());
-        })
-        .catch(error => {
-          statusEl.innerHTML = `<span class="error">加载失败：${error.message}</span>`;
         });
+    }
+
+    function updateLinks(project, apiBase) {
+      const encoded = encodeURIComponent(project);
+      const base = normalizeApiBase(apiBase || resolvedApiBase || apiBaseCandidates()[0]);
+      csvLink.href = `${base}/export?type=full_progress_summary&project=${encoded}`;
+      excelLink.href = `${base}/export?type=review_excel_by_dir&project=${encoded}`;
+    }
+
+    async function loadProgress() {
+      const project = projectInput.value.trim();
+      if (!project) {
+        statusEl.innerHTML = '<span class="error">请输入项目名。</span>';
+        return;
+      }
+      const loadBtn = document.getElementById('loadBtn');
+      loadBtn.disabled = true;
+      loadBtn.innerText = '正在加载...';
+
+      const encodedProject = encodeURIComponent(project);
+      const candidates = apiBaseCandidates();
+      updateLinks(project, candidates[0]);
+      statusEl.innerText = `正在连接接口：${candidates[0]}`;
+      let lastError = null;
+
+      try {
+        for (const apiBase of candidates) {
+          try {
+            statusEl.innerText = `正在加载：${apiBase}`;
+            const payload = await fetchJsonWithTimeout(`${apiBase}/progress?project=${encodedProject}`, 15000);
+            if (!payload || payload.status !== 'success') {
+              throw new Error(payload && payload.message ? payload.message : '加载失败');
+            }
+            resolvedApiBase = apiBase;
+            updateLinks(project, apiBase);
+            const data = payload.data || {}, projectRow = (data.project && data.project[0]) || {};
+            metric('totalUncovered', asNumber(projectRow.total_uncovered)); metric('filledTotal', asNumber(projectRow.filled_total));
+            metric('fillRate', fmtRate(projectRow.fill_rate)); metric('confirmedRate', fmtRate(projectRow.confirmed_rate));
+            renderTable('dirTable', data.dirs || [], 'dir_path'); renderTable('fileTable', data.files || [], 'file_path');
+            statusEl.innerText = `已加载项目：${project}，接口：${apiBase}`;
+            const url = new URL(window.location.href);
+            url.searchParams.set('project', project);
+            if (params.get('api')) {
+              url.searchParams.set('api', apiBase);
+            }
+            window.history.replaceState(null, '', url.toString());
+            return;
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        statusEl.innerHTML = `<span class="error">加载失败：${lastError ? lastError.message : '无法连接接口'}。已尝试：${candidates.join(' , ')}</span>`;
+      } finally {
+        loadBtn.disabled = false;
+        loadBtn.innerText = '查看进度';
+      }
     }
 
     document.getElementById('loadBtn').addEventListener('click', loadProgress);

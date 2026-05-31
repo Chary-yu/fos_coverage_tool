@@ -22,7 +22,15 @@ from decimal import Decimal
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.parse
+import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+try:
+    from http.server import ThreadingHTTPServer
+except ImportError:
+    from socketserver import ThreadingMixIn
+    class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+        daemon_threads = True
 
 # 动态探测并优先使用 pymysql 或 mysql.connector
 db_module = None
@@ -39,9 +47,9 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "coverage_config.json")
 JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
 CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
 PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
-ASSET_VERSION = "standalone-progress-20260530"
+ASSET_VERSION = "lazy-controls-20260531"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
-DEFAULT_PROGRESS_PAGE_HTML = """<!doctype html>
+DEFAULT_PROGRESS_PAGE_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
@@ -82,14 +90,18 @@ DEFAULT_PROGRESS_PAGE_HTML = """<!doctype html>
     <section class="section"><h2>文件进度</h2><div class="table-wrap"><table id="fileTable"></table></div></section>
   </main>
   <script>
-    const params=new URLSearchParams(window.location.search),projectInput=document.getElementById('projectInput'),statusEl=document.getElementById('status'),csvLink=document.getElementById('csvLink'),excelLink=document.getElementById('excelLink');
+    const params=new URLSearchParams(window.location.search),projectInput=document.getElementById('projectInput'),statusEl=document.getElementById('status'),csvLink=document.getElementById('csvLink'),excelLink=document.getElementById('excelLink');let resolvedApiBase='';
     projectInput.value=params.get('project')||'';
     const asNumber=v=>Number.isFinite(Number(v))?Number(v):0,fmtRate=v=>Number.isFinite(Number(v))?`${Number(v).toFixed(1)}%`:'0.0%',bar=r=>`<span class="bar"><span style="width:${Math.max(0,Math.min(100,asNumber(r)))}%"></span></span>`;
     function metric(id,value){document.getElementById(id).innerText=value}
     function rows(items,pathKey){return !items||!items.length?'<tr><td>暂无数据</td></tr>':items.map(row=>`<tr><td class="path">${row[pathKey]||'(root)'}</td><td>${asNumber(row.total_uncovered)}</td><td>${asNumber(row.filled_total)}</td><td>${asNumber(row.unfilled_total)}</td><td>${asNumber(row.confirmed_total)}</td><td>${asNumber(row.coverable_total)}</td><td>${asNumber(row.uncoverable_total)}</td><td>${asNumber(row.redundant_total)}</td><td>${fmtRate(row.fill_rate)} ${bar(row.fill_rate)}</td><td>${fmtRate(row.confirmed_rate)} ${bar(row.confirmed_rate)}</td></tr>`).join('')}
     function renderTable(id,items,pathKey){document.getElementById(id).innerHTML=`<thead><tr><th>路径</th><th>未覆盖</th><th>已填</th><th>未填</th><th>已确认</th><th>可覆盖</th><th>无法覆盖</th><th>冗余</th><th>填写率</th><th>确认率</th></tr></thead><tbody>${rows(items,pathKey)}</tbody>`}
-    function updateLinks(project){const encoded=encodeURIComponent(project);csvLink.href=`/api/coverage/export?type=full_progress_summary&project=${encoded}`;excelLink.href=`/api/coverage/export?type=review_excel_by_dir&project=${encoded}`}
-    function loadProgress(){const project=projectInput.value.trim();if(!project){statusEl.innerHTML='<span class="error">请输入项目名。</span>';return}updateLinks(project);statusEl.innerText='正在加载...';fetch(`/api/coverage/progress?project=${encodeURIComponent(project)}`).then(r=>{if(!r.ok)throw new Error(`HTTP ${r.status}`);return r.json()}).then(payload=>{if(!payload||payload.status!=='success')throw new Error(payload&&payload.message?payload.message:'加载失败');const data=payload.data||{},projectRow=data.project&&data.project[0]||{};metric('totalUncovered',asNumber(projectRow.total_uncovered));metric('filledTotal',asNumber(projectRow.filled_total));metric('fillRate',fmtRate(projectRow.fill_rate));metric('confirmedRate',fmtRate(projectRow.confirmed_rate));renderTable('dirTable',data.dirs||[],'dir_path');renderTable('fileTable',data.files||[],'file_path');statusEl.innerText=`已加载项目：${project}`;const url=new URL(window.location.href);url.searchParams.set('project',project);window.history.replaceState(null,'',url.toString())}).catch(e=>{statusEl.innerHTML=`<span class="error">加载失败：${e.message}</span>`})}
+    function normalizeApiBase(value){return String(value||'').replace(/\/+$/,'')}
+    function unique(values){return Array.from(new Set(values.filter(Boolean)))}
+    function apiBaseCandidates(){const explicit=params.get('api'),origin=window.location.origin&&window.location.origin!=='null'?window.location.origin:'',c=[];if(explicit)c.push(normalizeApiBase(explicit));if(origin){c.push(`${origin}/api/coverage`);if(window.location.pathname.startsWith('/coverage/'))c.push(`${origin}/coverage/api/coverage`);if(window.location.port!=='9528')c.push(`${window.location.protocol}//${window.location.hostname}:9528/api/coverage`)}c.push('http://127.0.0.1:9528/api/coverage');c.push('/api/coverage');return unique(c.map(normalizeApiBase))}
+    function fetchJsonWithTimeout(url,timeoutMs){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeoutMs);return fetch(url,{signal:controller.signal}).finally(()=>clearTimeout(timer)).then(r=>{if(!r.ok)throw new Error(`HTTP ${r.status}`);return r.json()})}
+    function updateLinks(project,apiBase){const encoded=encodeURIComponent(project),base=normalizeApiBase(apiBase||resolvedApiBase||apiBaseCandidates()[0]);csvLink.href=`${base}/export?type=full_progress_summary&project=${encoded}`;excelLink.href=`${base}/export?type=review_excel_by_dir&project=${encoded}`}
+    async function loadProgress(){const project=projectInput.value.trim();if(!project){statusEl.innerHTML='<span class="error">请输入项目名。</span>';return}const loadBtn=document.getElementById('loadBtn');loadBtn.disabled=true;loadBtn.innerText='正在加载...';const encodedProject=encodeURIComponent(project),candidates=apiBaseCandidates();updateLinks(project,candidates[0]);statusEl.innerText=`正在连接接口：${candidates[0]}`;let lastError=null;try{for(const apiBase of candidates){try{statusEl.innerText=`正在加载：${apiBase}`;const payload=await fetchJsonWithTimeout(`${apiBase}/progress?project=${encodedProject}`,15000);if(!payload||payload.status!=='success')throw new Error(payload&&payload.message?payload.message:'加载失败');resolvedApiBase=apiBase;updateLinks(project,apiBase);const data=payload.data||{},projectRow=data.project&&data.project[0]||{};metric('totalUncovered',asNumber(projectRow.total_uncovered));metric('filledTotal',asNumber(projectRow.filled_total));metric('fillRate',fmtRate(projectRow.fill_rate));metric('confirmedRate',fmtRate(projectRow.confirmed_rate));renderTable('dirTable',data.dirs||[],'dir_path');renderTable('fileTable',data.files||[],'file_path');statusEl.innerText=`已加载项目：${project}，接口：${apiBase}`;const url=new URL(window.location.href);url.searchParams.set('project',project);if(params.get('api'))url.searchParams.set('api',apiBase);window.history.replaceState(null,'',url.toString());return}catch(e){lastError=e}}statusEl.innerHTML=`<span class="error">加载失败：${lastError?lastError.message:'无法连接接口'}。已尝试：${candidates.join(' , ')}</span>`}finally{loadBtn.disabled=false;loadBtn.innerText='查看进度'}}
     document.getElementById('loadBtn').addEventListener('click',loadProgress);projectInput.addEventListener('keydown',e=>{if(e.key==='Enter')loadProgress()});if(projectInput.value.trim())loadProgress();
   </script>
 </body>
@@ -135,7 +147,7 @@ def json_safe_default(value):
     return str(value)
 
 
-def get_worker_count(config=None, override=None, default_max=8):
+def get_worker_count(config=None, override=None, default_max=32):
     if override is not None:
         try:
             return max(1, int(override))
@@ -156,8 +168,7 @@ def get_worker_count(config=None, override=None, default_max=8):
 def source_file_join_condition(index_alias="i", analysis_alias="a"):
     return (
         f"{analysis_alias}.project_name = {index_alias}.project_name "
-        f"AND COALESCE(NULLIF({analysis_alias}.source_file_name, ''), "
-        f"SUBSTRING_INDEX(REPLACE({analysis_alias}.file_path, '\\\\', '/'), '/', -1)) = {index_alias}.source_file_name "
+        f"AND {analysis_alias}.file_path_hash = {index_alias}.file_path_hash "
         f"AND {analysis_alias}.line_number = {index_alias}.line_number"
     )
 
@@ -261,6 +272,7 @@ def extract_line_index_records(content, fallback_path, project_name):
         tail = match.group(2)
         line_text = strip_html_text(tail)
         code_text = get_code_text(line_text)
+        code_line_hash = calc_text_hash(normalize_code_for_hash(code_text))
         lines.append({
             "project_name": project_name,
             "file_path": file_path,
@@ -272,9 +284,15 @@ def extract_line_index_records(content, fallback_path, project_name):
             "code_text": code_text,
             "function_name": "",
             "function_hash": "",
-            "code_line_hash": calc_text_hash(normalize_code_for_hash(code_text)),
+            "code_line_hash": code_line_hash,
             "code_occurrence": 1
         })
+
+    file_occurrence_by_line_hash = {}
+    for line in lines:
+        code_line_hash = line["code_line_hash"]
+        file_occurrence_by_line_hash[code_line_hash] = file_occurrence_by_line_hash.get(code_line_hash, 0) + 1
+        line["code_occurrence"] = file_occurrence_by_line_hash[code_line_hash]
 
     function_ranges = []
     current_start = None
@@ -381,8 +399,8 @@ def load_config():
     return default_config
 
 
-def write_configured_enhance_js(output_path, project_name):
-    """Copy the frontend script and inject the selected project name."""
+def write_configured_enhance_js(output_path, project_name, render_mode):
+    """Copy the frontend script and inject the selected project name and render mode."""
     with open(JS_SOURCE_PATH, 'r', encoding='utf-8') as f:
         content = f.read()
 
@@ -395,6 +413,16 @@ def write_configured_enhance_js(output_path, project_name):
     )
     if replace_count != 1:
         raise RuntimeError("Failed to inject project_name into coverage_enhance.js")
+
+    render_mode_literal = json.dumps(str(render_mode), ensure_ascii=False)
+    new_content, replace_count = re.subn(
+        r"const\s+RENDER_MODE\s*=\s*(['\"]).*?\1\s*;",
+        f"const RENDER_MODE = {render_mode_literal};",
+        new_content,
+        count=1
+    )
+    if replace_count != 1:
+        raise RuntimeError("Failed to inject RENDER_MODE into coverage_enhance.js")
 
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(new_content)
@@ -842,7 +870,6 @@ class DatabaseManager:
                 """
                 SELECT COUNT(*) FROM coverage_line_index
                 WHERE project_name = %s
-                  AND function_hash <> ''
                   AND code_line_hash <> ''
                 """,
                 (source_project,)
@@ -855,7 +882,6 @@ class DatabaseManager:
                 """
                 SELECT COUNT(*) FROM coverage_line_index
                 WHERE project_name = %s
-                  AND function_hash <> ''
                   AND code_line_hash <> ''
                 """,
                 (target_project,)
@@ -870,7 +896,6 @@ class DatabaseManager:
                  AND si.line_number = a.line_number
                 WHERE a.project_name = %s
                   AND si.project_name = %s
-                  AND si.function_hash <> ''
                   AND si.code_line_hash <> ''
                   AND a.status <> %s
             """
@@ -912,7 +937,6 @@ class DatabaseManager:
                  AND existing.file_path_hash = ti.file_path_hash
                  AND existing.line_number = ti.line_number
                 WHERE ti.project_name = %s
-                  AND ti.function_hash <> ''
                   AND ti.code_line_hash <> ''
                   AND (
                       existing.id IS NULL
@@ -952,6 +976,7 @@ class DatabaseManager:
                     target_project,
                     row_value(row, "file_path", 0),
                     row_value(row, "file_path_hash", 1),
+                    target_file_name,
                     row_value(row, "line_number", 3),
                     row_value(source, "reviewer", 5) or "",
                     row_value(source, "status", 6) or unconfirmed_status,
@@ -961,12 +986,13 @@ class DatabaseManager:
 
             insert_sql = """
                 INSERT INTO coverage_analysis
-                    (project_name, file_path, file_path_hash, line_number,
+                    (project_name, file_path, file_path_hash, source_file_name, line_number,
                      reviewer, status, coverage_method, uncovered_reason)
                 VALUES
-                    (%s, %s, %s, %s, %s, %s, %s, %s)
+                    (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     file_path = VALUES(file_path),
+                    source_file_name = VALUES(source_file_name),
                     reviewer = VALUES(reviewer),
                     status = VALUES(status),
                     coverage_method = VALUES(coverage_method),
@@ -1068,7 +1094,7 @@ class DatabaseManager:
             except AttributeError:
                 pass
 
-            cursor = self.conn.cursor()
+            cursor = None
             where_sql = ""
             params = []
             if project_name:
@@ -1076,6 +1102,7 @@ class DatabaseManager:
                 params.append(project_name)
 
             if report_type == "detail":
+                cursor = self.conn.cursor()
                 headers = [
                     "project_name", "file_path", "line_number", "reviewer", "status",
                     "coverage_method", "uncovered_reason", "updated_at"
@@ -1102,6 +1129,7 @@ class DatabaseManager:
                         row_value(row, "updated_at", 7),
                     ])
             elif report_type == "file_summary":
+                cursor = self.conn.cursor()
                 headers = [
                     "project_name", "file_path", "review_total", "confirmed_total",
                     "coverable_total", "uncoverable_total", "redundant_total", "unconfirmed_total",
@@ -1130,6 +1158,7 @@ class DatabaseManager:
                 rows = cursor.fetchall()
                 data = [[row_value(row, header, idx) for idx, header in enumerate(headers)] for row in rows]
             elif report_type == "project_summary":
+                cursor = self.conn.cursor()
                 headers = [
                     "project_name", "review_total", "confirmed_total",
                     "coverable_total", "uncoverable_total", "redundant_total", "unconfirmed_total",
@@ -1159,6 +1188,7 @@ class DatabaseManager:
                 rows = cursor.fetchall()
                 data = [[row_value(row, header, idx) for idx, header in enumerate(headers)] for row in rows]
             elif report_type == "full_detail":
+                cursor = self.conn.cursor()
                 full_where_sql = ""
                 full_params = []
                 if project_name:
@@ -1189,6 +1219,7 @@ class DatabaseManager:
                 rows = cursor.fetchall()
                 data = [[row_value(row, header, idx) for idx, header in enumerate(headers)] for row in rows]
             elif report_type == "full_file_summary":
+                cursor = self.conn.cursor()
                 full_where_sql = ""
                 full_params = []
                 if project_name:
@@ -1224,6 +1255,7 @@ class DatabaseManager:
                 rows = cursor.fetchall()
                 data = [[row_value(row, header, idx) for idx, header in enumerate(headers)] for row in rows]
             elif report_type == "full_dir_summary":
+                cursor = self.conn.cursor()
                 full_where_sql = ""
                 full_params = []
                 dir_expr = sql_dir_path("i")
@@ -1261,6 +1293,7 @@ class DatabaseManager:
                 rows = cursor.fetchall()
                 data = [[row_value(row, header, idx) for idx, header in enumerate(headers)] for row in rows]
             elif report_type == "full_project_summary":
+                cursor = self.conn.cursor()
                 full_where_sql = ""
                 full_params = []
                 if project_name:
@@ -1337,7 +1370,8 @@ class DatabaseManager:
             else:
                 raise ValueError("Unsupported report type")
 
-            cursor.close()
+            if cursor is not None:
+                cursor.close()
             return headers, data
         except Exception as e:
             print(f"[DB Error] Export failed: {e}")
@@ -1562,31 +1596,22 @@ def build_review_excel_zip(project_name, dir_entries):
     return buffer.getvalue()
 
 
-def build_review_excel_for_dir(config, project_name, current_dir, total_uncovered,
+def build_review_excel_for_dir(project_name, current_dir, total_uncovered,
                                project_headers, project_rows, dir_headers,
-                               current_dir_rows, file_headers, current_file_rows):
-    manager = None
-    try:
-        if db_module:
-            manager = DatabaseManager(config, exit_on_error=False, init_schema=False)
-            detail_rows = manager.fetch_review_excel_rows(project_name, current_dir)
-        else:
-            detail_rows = db_manager.fetch_review_excel_rows(project_name, current_dir)
-        progress_sections = [
-            ("项目进度", project_headers, project_rows),
-            ("目录进度", dir_headers, current_dir_rows),
-            ("文件进度", file_headers, current_file_rows),
-        ]
-        excel_data = build_review_excel(project_name, detail_rows, progress_sections)
-        return {
-            "dir_path": current_dir,
-            "total_uncovered": total_uncovered,
-            "row_count": len(detail_rows),
-            "excel_data": excel_data,
-        }
-    finally:
-        if manager and manager.conn:
-            manager.conn.close()
+                               current_dir_rows, file_headers, current_file_rows,
+                               detail_rows):
+    progress_sections = [
+        ("项目进度", project_headers, project_rows),
+        ("目录进度", dir_headers, current_dir_rows),
+        ("文件进度", file_headers, current_file_rows),
+    ]
+    excel_data = build_review_excel(project_name, detail_rows, progress_sections)
+    return {
+        "dir_path": current_dir,
+        "total_uncovered": total_uncovered,
+        "row_count": len(detail_rows),
+        "excel_data": excel_data,
+    }
 
 
 class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
@@ -1596,6 +1621,13 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def safe_write(self, data):
+        """Write response data to the socket while safely handling client-side disconnects."""
+        try:
+            self.wfile.write(data)
+        except ConnectionError:
+            print("[Server] Client disconnected before response write completed.", flush=True)
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -1736,7 +1768,7 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_cors_headers()
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False, default=json_safe_default).encode("utf-8"))
+        self.safe_write(json.dumps(data, ensure_ascii=False, default=json_safe_default).encode("utf-8"))
 
     def send_csv_response(self, filename, headers, rows):
         output = io.StringIO()
@@ -1753,7 +1785,7 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        self.safe_write(data)
 
     def send_xlsx_response(self, filename, data):
         safe_filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename)
@@ -1763,7 +1795,7 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        self.safe_write(data)
 
     def send_zip_response(self, filename, data):
         safe_filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename)
@@ -1773,7 +1805,7 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        self.safe_write(data)
 
     def send_review_excel_by_dir_response(self, filename, project_name):
         safe_filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename)
@@ -1788,100 +1820,167 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         written = 0
         started_at = time.time()
 
-        with zipfile.ZipFile(self.wfile, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr(
-                "EXPORT_STARTED.txt",
-                (
-                    f"Directory Excel export started for project: {project_name}\n"
-                    f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                )
-            )
-            try:
-                self.wfile.flush()
-            except Exception:
-                pass
-
-            try:
-                dir_infos = db_manager.fetch_project_dirs(project_name)
-                project_headers, project_rows = db_manager.export_report("full_project_summary", project_name)
-                dir_headers, all_dir_rows = db_manager.export_report("full_dir_summary", project_name)
-                file_headers, all_file_rows = db_manager.export_report("full_file_summary", project_name)
-            except Exception as e:
+        try:
+            with zipfile.ZipFile(self.wfile, "w", zipfile.ZIP_DEFLATED) as archive:
                 archive.writestr(
-                    "ERROR.txt",
-                    f"Failed to query export data for project: {project_name}\nError: {e}\n"
-                )
-                print(f"[Export] Failed to query data for project '{project_name}': {e}", flush=True)
-                return
-
-            all_file_maps = [dict(zip(file_headers, row)) for row in all_file_rows]
-            valid_dirs = [(dir_path, total) for dir_path, total in dir_infos if total]
-            config = load_config()
-            worker_count = get_worker_count(config, default_max=8)
-            print(f"[Export] Streaming directory Excel package for project '{project_name}', dirs={len(valid_dirs)}, workers={worker_count}", flush=True)
-            if not valid_dirs:
-                archive.writestr(
-                    "README.txt",
+                    "EXPORT_STARTED.txt",
                     (
-                        f"No coverage review Excel files were generated for project: {project_name}\n"
-                        "Please check whether the project name is correct and whether inject has synced coverage_line_index data.\n"
+                        f"Directory Excel export started for project: {project_name}\n"
+                        f"Started at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                     )
                 )
-                print(f"[Export] No directory data for project '{project_name}'. README.txt written.", flush=True)
-                return
+                try:
+                    self.wfile.flush()
+                except Exception:
+                    pass
 
-            dir_row_maps = {dict(zip(dir_headers, row)).get("dir_path", ""): row for row in all_dir_rows}
-            file_rows_by_dir = {}
-            for file_map in all_file_maps:
-                file_dir = get_source_dir_name(file_map.get("file_path", ""))
-                file_rows_by_dir.setdefault(file_dir, []).append([
-                    file_map.get(header, "")
-                    for header in file_headers
-                ])
+                try:
+                    # 1. Fetch project-level summaries in indexed calls
+                    project_headers, project_rows = db_manager.export_report("full_project_summary", project_name)
+                    dir_headers, all_dir_rows = db_manager.export_report("full_dir_summary", project_name)
+                    file_headers, all_file_rows = db_manager.export_report("full_file_summary", project_name)
 
-            used_names = set()
-            with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                futures = []
-                for current_dir, total_uncovered in valid_dirs:
-                    current_dir_rows = [dir_row_maps[current_dir]] if current_dir in dir_row_maps else []
-                    current_file_rows = file_rows_by_dir.get(current_dir, [])
-                    futures.append(executor.submit(
-                        build_review_excel_for_dir,
-                        config,
-                        project_name,
-                        current_dir,
-                        total_uncovered,
-                        project_headers,
-                        project_rows,
-                        dir_headers,
-                        current_dir_rows,
-                        file_headers,
-                        current_file_rows
-                    ))
-
-                for future in as_completed(futures):
-                    result = future.result()
-                    current_dir = result["dir_path"]
-                    total_uncovered = result["total_uncovered"]
-                    excel_data = result["excel_data"]
-                    base = safe_zip_member_name(current_dir, "root")
-                    candidate = f"{base}.xlsx"
-                    suffix = 1
-                    while candidate in used_names:
-                        candidate = f"{base}_{suffix}.xlsx"
-                        suffix += 1
-                    used_names.add(candidate)
-                    archive.writestr(candidate, excel_data)
-                    written += 1
-                    elapsed = time.time() - started_at
-                    print(
-                        f"[Export] Wrote {written}/{len(valid_dirs)} {candidate} "
-                        f"rows={result['row_count']} uncovered={total_uncovered} elapsed={elapsed:.1f}s",
-                        flush=True
+                    # 2. Pre-fetch all detail rows for the entire project in a single indexed query!
+                    all_detail_rows = db_manager.fetch_review_excel_rows(project_name, dir_path=None)
+                except Exception as e:
+                    archive.writestr(
+                        "ERROR.txt",
+                        f"Failed to query export data for project: {project_name}\nError: {e}\n"
                     )
+                    print(f"[Export] Failed to query data for project '{project_name}': {e}", flush=True)
+                    return
+
+                # Extract valid_dirs in memory from all_dir_rows, bypassing the redundant fetch_project_dirs scan!
+                dir_infos = []
+                for row in all_dir_rows:
+                    row_map = dict(zip(dir_headers, row))
+                    dir_path = row_map.get("dir_path", "")
+                    total_uncovered = 0
+                    try:
+                        total_uncovered = int(row_map.get("total_uncovered", 0))
+                    except (ValueError, TypeError):
+                        pass
+                    dir_infos.append((dir_path, total_uncovered))
+
+                valid_dirs = [(dir_path, total) for dir_path, total in dir_infos if total]
+                all_file_maps = [dict(zip(file_headers, row)) for row in all_file_rows]
+                config = load_config()
+                worker_count = get_worker_count(config, default_max=8)
+                print(f"[Export] Streaming directory Excel package for project '{project_name}', dirs={len(valid_dirs)}, workers={worker_count}", flush=True)
+                if not valid_dirs:
+                    archive.writestr(
+                        "README.txt",
+                        (
+                            f"No coverage review Excel files were generated for project: {project_name}\n"
+                            "Please check whether the project name is correct and whether inject has synced coverage_line_index data.\n"
+                        )
+                    )
+                    print(f"[Export] No directory data for project '{project_name}'. README.txt written.", flush=True)
+                    return
+
+                # Group the pre-fetched detail rows by their directory in memory (extremely fast)
+                detail_rows_by_dir = {}
+                for row in all_detail_rows:
+                    file_path = row_value(row, "file_path", 2)
+                    dir_path = get_source_dir_name(file_path)
+                    detail_rows_by_dir.setdefault(dir_path, []).append(row)
+
+                dir_row_maps = {dict(zip(dir_headers, row)).get("dir_path", ""): row for row in all_dir_rows}
+                file_rows_by_dir = {}
+                for file_map in all_file_maps:
+                    file_dir = get_source_dir_name(file_map.get("file_path", ""))
+                    file_rows_by_dir.setdefault(file_dir, []).append([
+                        file_map.get(header, "")
+                        for header in file_headers
+                    ])
+
+                used_names = set()
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    futures = []
+                    for current_dir, total_uncovered in valid_dirs:
+                        current_dir_rows = [dir_row_maps[current_dir]] if current_dir in dir_row_maps else []
+                        current_file_rows = file_rows_by_dir.get(current_dir, [])
+                        current_detail_rows = detail_rows_by_dir.get(current_dir, [])
+                        futures.append(executor.submit(
+                            build_review_excel_for_dir,
+                            project_name,
+                            current_dir,
+                            total_uncovered,
+                            project_headers,
+                            project_rows,
+                            dir_headers,
+                            current_dir_rows,
+                            file_headers,
+                            current_file_rows,
+                            current_detail_rows
+                        ))
+
+                    for future in as_completed(futures):
+                        result = future.result()
+                        current_dir = result["dir_path"]
+                        total_uncovered = result["total_uncovered"]
+                        excel_data = result["excel_data"]
+                        base = safe_zip_member_name(current_dir, "root")
+                        candidate = f"{base}.xlsx"
+                        suffix = 1
+                        while candidate in used_names:
+                            candidate = f"{base}_{suffix}.xlsx"
+                            suffix += 1
+                        used_names.add(candidate)
+                        archive.writestr(candidate, excel_data)
+                        written += 1
+                        elapsed = time.time() - started_at
+                        print(
+                            f"[Export] Wrote {written}/{len(valid_dirs)} {candidate} "
+                            f"rows={result['row_count']} uncovered={total_uncovered} elapsed={elapsed:.1f}s",
+                            flush=True
+                        )
+        except ConnectionError:
+            print(f"[Export] Client disconnected before directory ZIP Excel download completed for project '{project_name}'.", flush=True)
 
     def send_error_response(self, status_code, message):
         self.send_json_response(status_code, {"status": "error", "message": message})
+
+
+_thread_local = threading.local()
+
+
+class ThreadLocalDatabaseManagerProxy:
+    """Proxy class to dynamically route global database calls to thread-local connection managers."""
+    def __init__(self, config):
+        self._config = config
+
+    def __getattr__(self, name):
+        manager = get_thread_db_manager(self._config)
+        return getattr(manager, name)
+
+
+def get_thread_db_manager(config):
+    manager = getattr(_thread_local, 'db_manager', None)
+    if manager is None:
+        manager = DatabaseManager(config, exit_on_error=False, init_schema=False)
+        _thread_local.db_manager = manager
+    else:
+        try:
+            manager.conn.ping(reconnect=True)
+        except Exception:
+            try:
+                manager.conn.close()
+            except Exception:
+                pass
+            manager = DatabaseManager(config, exit_on_error=False, init_schema=False)
+            _thread_local.db_manager = manager
+    return manager
+
+
+def close_thread_db_manager():
+    manager = getattr(_thread_local, 'db_manager', None)
+    if manager is not None:
+        try:
+            manager.conn.close()
+        except Exception:
+            pass
+        _thread_local.db_manager = None
 
 
 def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync_index=True):
@@ -1903,17 +2002,16 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
     if sync_index:
         max_attempts = 4
         for attempt in range(1, max_attempts + 1):
-            manager = DatabaseManager(config, exit_on_error=False, init_schema=False)
             try:
+                manager = get_thread_db_manager(config)
                 if file_line_index_records:
                     file_index_synced = manager.sync_line_index(project_name, file_line_index_records)
                 else:
                     file_index_synced = manager.delete_line_index_file(project_name, report_file_hash)
                 if file_index_synced:
                     break
-            finally:
-                if manager.conn:
-                    manager.conn.close()
+            except Exception:
+                close_thread_db_manager()
             if attempt < max_attempts:
                 time.sleep(0.2 * attempt)
                 print(f"[DB] Retrying line-index sync for {rel_path} ({attempt + 1}/{max_attempts})", flush=True)
@@ -1943,7 +2041,7 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
     }
 
 
-def inject_coverage_report(input_dir, output_dir, project_name=None, workers=None):
+def inject_coverage_report(input_dir, output_dir, project_name=None, workers=None, render_mode=None):
     """
     非破坏性注入覆盖率报告：
     1. 若 output_dir 与 input_dir 不同，则先自动将整个 input_dir 复制至 output_dir (清除已有的 output_dir)
@@ -1977,11 +2075,17 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
     if project_name is None:
         project_name = config.get("project_name", DEFAULT_PROJECT_NAME)
 
-    write_configured_enhance_js(os.path.join(real_output_html, "coverage_enhance.js"), project_name)
+    if render_mode is None:
+        render_mode = config.get("render_mode", "lazy")
+    if render_mode not in ("lazy", "immediate"):
+        render_mode = "lazy"
+
+    write_configured_enhance_js(os.path.join(real_output_html, "coverage_enhance.js"), project_name, render_mode)
     shutil.copy2(CSS_SOURCE_PATH, os.path.join(real_output_html, "coverage_enhance.css"))
     write_progress_page_targets(output_dir, real_output_html)
     print(f"[Injector] Copied static resources to: {real_output_html}")
     print(f"[Injector] Frontend project name: {project_name}")
+    print(f"[Injector] Frontend render mode: {render_mode}")
     index_manager = None
     indexed_records = 0
     indexed_files = 0
@@ -2062,13 +2166,19 @@ def run_server():
     config = load_config()
 
     print("[Server] Initializing MySQL Database...")
-    db_manager = DatabaseManager(config)
+    # First, run database schema checking/creation synchronously on startup
+    init_mgr = DatabaseManager(config)
+    if init_mgr.conn:
+        init_mgr.conn.close()
+
+    # Use thread-local database proxy for safe request handling
+    db_manager = ThreadLocalDatabaseManagerProxy(config)
 
     host = config["server"]["host"]
     port = int(config["server"]["port"])
     server_address = (host, port)
 
-    httpd = HTTPServer(server_address, CoverageHTTPRequestHandler)
+    httpd = ThreadingHTTPServer(server_address, CoverageHTTPRequestHandler)
     print(f"[Server] Microservice running on http://{host}:{port} ...")
     print("[Server] Press Ctrl+C to terminate.")
     
@@ -2076,18 +2186,18 @@ def run_server():
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\n[Server] Shutting down gracefully...")
-        if db_manager and db_manager.conn:
-            db_manager.conn.close()
+        close_thread_db_manager()
         httpd.server_close()
         print("[Server] Stopped.")
 
 
 def print_help():
     print("Usage:")
-    print("  python scripts/enhance_coverage.py inject --project <project_name> --dir <input_dir> --out <output_dir>")
+    print("  python scripts/enhance_coverage.py inject --project <project_name> --dir <input_dir> --out <output_dir> [--mode <lazy|immediate>]")
     print("    - Scan and inject custom interactive forms into HTML reports.")
     print("    - --project is recommended and overrides coverage_config.json project_name.")
     print("    - --workers <N> controls parallel HTML parsing and line-index DB sync.")
+    print("    - --mode <lazy|immediate> specifies the display mode (placeholder vs immediate controls).")
     print("    - Use --use-config-project only if you intentionally want coverage_config.json project_name.")
     print("  python scripts/enhance_coverage.py server")
     print("    - Start local bridge server for MySQL persistence.")
@@ -2118,6 +2228,7 @@ if __name__ == "__main__":
         out_path = get_arg_value(args, "--out")
         project_name = get_arg_value(args, "--project")
         workers = get_arg_value(args, "--workers")
+        render_mode = get_arg_value(args, "--mode")
         use_config_project = has_arg(args, "--use-config-project")
 
         if not dir_path:
@@ -2143,7 +2254,7 @@ if __name__ == "__main__":
         print(f"[Main] Project : {project_name}")
         print(f"[Main] Input (ReadOnly) : {dir_path}")
         print(f"[Main] Output (Enhanced) : {out_path}")
-        inject_coverage_report(dir_path, out_path, project_name, workers)
+        inject_coverage_report(dir_path, out_path, project_name, workers, render_mode)
     elif cmd == "server":
         run_server()
     elif cmd == "inherit":

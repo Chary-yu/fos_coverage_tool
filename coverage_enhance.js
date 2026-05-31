@@ -1,15 +1,20 @@
-﻿/**
+/**
  * 覆盖率 HTML 报告增强脚本 (ES6) - 基本块合并与控制流隔离终极版
  * 自动识别连续未覆盖代码段 (基本块)，只在首行渲染分析控件并显示范围徽章；
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'dop-safe-segment-20260529';
+    const ENHANCE_VERSION = 'lazy-controls-20260531';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
+    const RENDER_MODE = 'lazy'; // 'lazy' or 'immediate'
+    const URL_PARAMS = new URLSearchParams(window.location.search);
+    const QUERY_MODE = URL_PARAMS.get('mode');
+    const ACTIVE_MODE = (QUERY_MODE === 'lazy' || QUERY_MODE === 'immediate') ? QUERY_MODE : RENDER_MODE;
     const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖', '冗余代码'];
     const CONFIRMED_STATUS_SET = new Set(['可覆盖', '无法覆盖', '冗余代码']);
-    const RENDER_BATCH_SIZE = 80;
+    const RENDER_BATCH_SIZE = 200;
+    const RENDER_FRAME_BUDGET_MS = 24;
     const RENDER_PROGRESS_MIN_BLOCKS = 300;
 
     // 控制流分支关键字侦测正则 (边界隔离)
@@ -21,6 +26,59 @@
     let legacyPanelSyncers = [];
     let legacyRefreshRequested = false;
     let requestLegacyPanelRefresh = function() {};
+
+    function getStoredPanelValue(panel, key) {
+        if (!panel) {
+            return '';
+        }
+        if (key === 'status' && panel.select && typeof panel.select.value === 'string') {
+            return panel.select.value;
+        }
+        if (panel[key] && typeof panel[key].value === 'string') {
+            return panel[key].value;
+        }
+        return panel.values && typeof panel.values[key] === 'string' ? panel.values[key] : '';
+    }
+
+    function setStoredPanelValues(panel, values) {
+        panel.values = Object.assign({
+            status: '未确认',
+            reviewerInput: '',
+            methodInput: '',
+            reasonInput: ''
+        }, panel.values || {}, values || {});
+
+        if (panel.select) {
+            panel.select.value = panel.values.status || '未确认';
+        }
+        if (panel.reviewerInput) {
+            panel.reviewerInput.value = panel.values.reviewerInput || '';
+        }
+        if (panel.methodInput) {
+            panel.methodInput.value = panel.values.methodInput || '';
+        }
+        if (panel.reasonInput) {
+            panel.reasonInput.value = panel.values.reasonInput || '';
+        }
+    }
+
+    function summarizeStatus(values) {
+        const status = values.status || '未确认';
+        if (status !== '未确认') {
+            return status;
+        }
+        if (values.reviewerInput || values.methodInput || values.reasonInput) {
+            return '已填写';
+        }
+        return '分析';
+    }
+
+    function decoratePlaceholder(placeholder, values, block) {
+        const statusText = summarizeStatus(values || {});
+        placeholder.innerText = block.length > 1 ? `${statusText} L${block[0].lineNum}-${block[block.length - 1].lineNum}` : statusText;
+        placeholder.classList.toggle('saved', statusText !== '分析' && statusText !== '未确认');
+        placeholder.title = '点击展开覆盖率分析输入框';
+    }
 
     document.addEventListener('DOMContentLoaded', function() {
         // 1. 自动提取当前文件的相对路径
@@ -308,11 +366,7 @@
         }
 
         function scheduleNextRender(callback) {
-            if (window.requestIdleCallback) {
-                window.requestIdleCallback(callback, { timeout: 120 });
-            } else {
-                setTimeout(callback, 0);
-            }
+            setTimeout(callback, 0);
         }
 
         function runLegacyPanelRefresh() {
@@ -349,9 +403,18 @@
             const startedAt = performance.now();
 
             function renderBatch() {
+                const deadline = performance.now() + RENDER_FRAME_BUDGET_MS;
                 const end = Math.min(index + RENDER_BATCH_SIZE, totalBlocks);
                 for (; index < end; index++) {
-                    renderBlockPanel(blocks[index]);
+                    if (ACTIVE_MODE === 'immediate') {
+                        renderBlockImmediate(blocks[index]);
+                    } else {
+                        renderBlockPlaceholder(blocks[index]);
+                    }
+                    if (index + 1 < totalBlocks && performance.now() > deadline) {
+                        index += 1;
+                        break;
+                    }
                 }
                 requestLegacyPanelRefresh(2);
 
@@ -377,6 +440,129 @@
             scheduleNextRender(renderBatch);
         }
 
+        function getLineCodeInfo(span) {
+            const lineText = span.innerText || '';
+            const colonIndex = lineText.indexOf(':');
+            if (colonIndex === -1) {
+                return { prefixLen: 0, codeLen: lineText.length };
+            }
+            const prefixLen = colonIndex + 2;
+            const codeText = lineText.substring(prefixLen);
+            return { prefixLen, codeLen: codeText.length };
+        }
+
+        function getBlockLayout(block) {
+            let maxCodeLen = 0;
+            let commonPrefixLen = 0;
+            block.forEach(item => {
+                const info = getLineCodeInfo(item.span);
+                if (info.codeLen > maxCodeLen) {
+                    maxCodeLen = info.codeLen;
+                }
+                if (info.prefixLen > 0) {
+                    commonPrefixLen = info.prefixLen;
+                }
+            });
+            const targetCodeCol = maxCodeLen <= 120 ? 121 : (maxCodeLen + 2);
+            return {
+                maxCodeLen,
+                commonPrefixLen,
+                targetCodeCol,
+                absoluteCol: commonPrefixLen + targetCodeCol
+            };
+        }
+
+        function insertPanelLikeElement(block, element, isLegacyInline, layout) {
+            const startLineItem = block[0];
+            if (isLegacyInline) {
+                const legacyAlignSpacer = document.createElement('span');
+                legacyAlignSpacer.className = 'coverage-legacy-align-spacer';
+                legacyAlignSpacer.setAttribute('aria-hidden', 'true');
+                legacyAlignSpacer.style.width = `${Math.max(2, layout.targetCodeCol - layout.maxCodeLen)}ch`;
+                startLineItem.span.appendChild(legacyAlignSpacer);
+                startLineItem.span.appendChild(element);
+                element._coverageAlignSpacer = legacyAlignSpacer;
+                return;
+            }
+            element.style.left = `${layout.absoluteCol}ch`;
+            startLineItem.span.appendChild(element);
+        }
+
+        function renderBlockPlaceholder(block) {
+            const startLineItem = block[0];
+            const startLineNum = startLineItem.lineNum;
+            const isLegacyInline = startLineItem.legacyInline === true;
+            const layout = getBlockLayout(block);
+
+            block.forEach(item => {
+                if (!isLegacyInline) {
+                    item.span.style.setProperty('padding-right', '180px', 'important');
+                }
+            });
+
+            const placeholder = document.createElement('button');
+            placeholder.type = 'button';
+            placeholder.className = 'coverage-analysis-placeholder' + (isLegacyInline ? ' legacy-inline-fast' : '');
+            placeholder.setAttribute('contenteditable', 'false');
+
+            const panelState = {
+                block,
+                placeholder,
+                expanded: false,
+                values: {
+                    status: '未确认',
+                    reviewerInput: '',
+                    methodInput: '',
+                    reasonInput: ''
+                }
+            };
+            panelsMap.set(startLineNum, panelState);
+            decoratePlaceholder(placeholder, panelState.values, block);
+
+            placeholder.addEventListener('click', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                expandBlockPanel(startLineNum);
+            });
+
+            insertPanelLikeElement(block, placeholder, isLegacyInline, layout);
+        }
+
+        function renderBlockImmediate(block) {
+            const startLineItem = block[0];
+            const startLineNum = startLineItem.lineNum;
+            const panel = renderBlockPanel(block);
+            setStoredPanelValues(panel, {
+                status: '未确认',
+                reviewerInput: '',
+                methodInput: '',
+                reasonInput: ''
+            });
+        }
+
+        function expandBlockPanel(startLineNum) {
+            const current = panelsMap.get(startLineNum);
+            if (!current || current.expanded) {
+                return current;
+            }
+            const placeholder = current.placeholder;
+            const block = current.block;
+            const values = Object.assign({}, current.values || {});
+            const panel = renderBlockPanel(block);
+            setStoredPanelValues(panel, values);
+            if (values.status && values.status !== '未确认' && panel.saveBtn) {
+                panel.saveBtn.innerText = 'Saved';
+                panel.saveBtn.classList.add('saved');
+            }
+            if (placeholder) {
+                if (placeholder._coverageAlignSpacer) {
+                    placeholder._coverageAlignSpacer.remove();
+                }
+                placeholder.remove();
+            }
+            return panel;
+        }
+
         // 3. 构建并注入表单 DOM，仅在 Block 的第一行注入
         function renderBlockPanel(block) {
             const startLineItem = block[0];
@@ -396,38 +582,11 @@
             panel.className = 'coverage-analysis-panel' + (isMultiLine ? ' multiline' : '') + (isLegacyInline ? ' legacy-overlay' : '');
             panel.setAttribute('contenteditable', 'false');
 
-            // 提取前缀及实际 C 代码列数信息的辅助函数
-            function getLineCodeInfo(span) {
-                const lineText = span.innerText || '';
-                const colonIndex = lineText.indexOf(':');
-                if (colonIndex === -1) {
-                    return { prefixLen: 0, codeLen: lineText.length };
-                }
-                const prefixLen = colonIndex + 2; // 包含冒号以及冒号后面的一个空格
-                const codeText = lineText.substring(prefixLen);
-                return { prefixLen, codeLen: codeText.length };
-            }
-
-            // 扫描计算当前 Block 范围内的最大代码列数以及前缀列数
-            let maxCodeLen = 0;
-            let commonPrefixLen = 0;
-            block.forEach(item => {
-                const info = getLineCodeInfo(item.span);
-                if (info.codeLen > maxCodeLen) {
-                    maxCodeLen = info.codeLen;
-                }
-                if (info.prefixLen > 0) {
-                    commonPrefixLen = info.prefixLen;
-                }
-            });
-
-            // 核心对齐对位算法：默认从 121 列开始对齐；若最大代码列数超过了 120 列，则自动从最大代码行结束位置 +2 字符间距开始
-            const targetCodeCol = maxCodeLen <= 120 ? 121 : (maxCodeLen + 2);
-            const absoluteCol = commonPrefixLen + targetCodeCol;
+            const layout = getBlockLayout(block);
 
             // 完美等宽字体对位
             if (!isLegacyInline) {
-                panel.style.left = `${absoluteCol}ch`;
+                panel.style.left = `${layout.absoluteCol}ch`;
             }
 
             if (isMultiLine && !isLegacyInline) {
@@ -461,8 +620,8 @@
             reasonInput.className = 'coverage-analysis-input' + (isMultiLine ? ' multiline' : '');
             reasonInput.placeholder = '无条件覆盖原因';
             let onPanelResize = function() {};
-            const methodResizeGrip = createResizeGrip(methodInput, () => onPanelResize());
-            const reasonResizeGrip = createResizeGrip(reasonInput, () => onPanelResize());
+            const methodResizeGrip = isLegacyInline ? null : createResizeGrip(methodInput, () => onPanelResize());
+            const reasonResizeGrip = isLegacyInline ? null : createResizeGrip(reasonInput, () => onPanelResize());
 
             // 徽章渲染逻辑 (只在合并区间大于 1 行时才展示跨行徽章，避免视觉冗余)
             let badgeSpan = null;
@@ -488,9 +647,13 @@
             panel.appendChild(select);
             panel.appendChild(reviewerInput);
             panel.appendChild(methodInput);
-            panel.appendChild(methodResizeGrip);
+            if (methodResizeGrip) {
+                panel.appendChild(methodResizeGrip);
+            }
             panel.appendChild(reasonInput);
-            panel.appendChild(reasonResizeGrip);
+            if (reasonResizeGrip) {
+                panel.appendChild(reasonResizeGrip);
+            }
             if (badgeSpan) {
                 panel.appendChild(badgeSpan);
             }
@@ -561,25 +724,15 @@
 
             // 追加控件。旧 genhtml 的源码区是 <pre> 文本流，不能把控件插入其中，否则会破坏原始排版。
             if (isLegacyInline) {
-                panel.style.setProperty('visibility', 'hidden', 'important');
-                ensureLegacyRowSpacer();
-                document.body.appendChild(panel);
-                const syncAndPosition = () => {
-                    syncLegacyRowHeight();
-                    positionLegacyPanel();
-                };
-                legacyPanelSyncers.push(syncAndPosition);
-                onPanelResize = syncAndPosition;
-                requestAnimationFrame(syncAndPosition);
-                window.addEventListener('load', syncAndPosition);
-                window.addEventListener('resize', syncAndPosition);
-                if (window.ResizeObserver) {
-                    const resizeObserver = new ResizeObserver(syncAndPosition);
-                    resizeObserver.observe(panel);
-                } else {
-                    panel.addEventListener('mouseup', syncAndPosition);
-                    panel.addEventListener('input', syncAndPosition);
-                }
+                panel.classList.remove('legacy-overlay');
+                panel.classList.add('legacy-inline-fast');
+                const legacyAlignSpacer = document.createElement('span');
+                legacyAlignSpacer.className = 'coverage-legacy-align-spacer';
+                legacyAlignSpacer.setAttribute('aria-hidden', 'true');
+                legacyAlignSpacer.style.width = `${Math.max(2, layout.targetCodeCol - layout.maxCodeLen)}ch`;
+                startLineItem.span.appendChild(legacyAlignSpacer);
+                startLineItem.span.appendChild(panel);
+                onPanelResize = function() {};
             } else {
                 startLineItem.span.appendChild(panel);
                 onPanelResize = function() {};
@@ -592,7 +745,14 @@
                 methodInput,
                 reasonInput,
                 saveBtn,
-                block
+                block,
+                expanded: true,
+                values: {
+                    status: select.value,
+                    reviewerInput: reviewerInput.value,
+                    methodInput: methodInput.value,
+                    reasonInput: reasonInput.value
+                }
             });
 
             // 点击 Save 进行强规则校验和并发批量入库
@@ -640,10 +800,10 @@
                     return;
                 }
 
-                select.value = previous.select.value;
-                reviewerInput.value = previous.reviewerInput.value;
-                methodInput.value = previous.methodInput.value;
-                reasonInput.value = previous.reasonInput.value;
+                select.value = getStoredPanelValue(previous, 'status') || '未确认';
+                reviewerInput.value = getStoredPanelValue(previous, 'reviewerInput');
+                methodInput.value = getStoredPanelValue(previous, 'methodInput');
+                reasonInput.value = getStoredPanelValue(previous, 'reasonInput');
                 saveBtn.innerText = 'Save';
                 saveBtn.className = 'coverage-analysis-btn';
             });
@@ -653,24 +813,88 @@
                     saveBtn.innerText = 'Save';
                     saveBtn.className = 'coverage-analysis-btn';
                 }
+                const panel = panelsMap.get(startLineNum);
+                if (panel) {
+                    setStoredPanelValues(panel, { status: select.value });
+                }
             });
+
+            [reviewerInput, methodInput, reasonInput].forEach(input => {
+                input.addEventListener('input', function() {
+                    const panel = panelsMap.get(startLineNum);
+                    if (!panel) {
+                        return;
+                    }
+                    setStoredPanelValues(panel, {
+                        reviewerInput: reviewerInput.value,
+                        methodInput: methodInput.value,
+                        reasonInput: reasonInput.value
+                    });
+                });
+            });
+
+            return panelsMap.get(startLineNum);
+        }
+
+        function createModeToggler() {
+            const container = document.createElement('div');
+            container.className = 'coverage-mode-toggler-container';
+            container.setAttribute('contenteditable', 'false');
+
+            const label = document.createElement('span');
+            label.className = 'coverage-mode-toggler-label';
+            label.innerText = '显示模式: ';
+
+            const select = document.createElement('select');
+            select.className = 'coverage-mode-toggler-select';
+
+            const optLazy = document.createElement('option');
+            optLazy.value = 'lazy';
+            optLazy.innerText = '轻量占位 (懒加载)';
+            if (ACTIVE_MODE === 'lazy') optLazy.selected = true;
+
+            const optImmediate = document.createElement('option');
+            optImmediate.value = 'immediate';
+            optImmediate.innerText = '完整显示 (立即生成)';
+            if (ACTIVE_MODE === 'immediate') optImmediate.selected = true;
+
+            select.appendChild(optLazy);
+            select.appendChild(optImmediate);
+
+            select.addEventListener('change', function() {
+                const newMode = select.value;
+                const url = new URL(window.location.href);
+                url.searchParams.set('mode', newMode);
+                window.location.href = url.toString();
+            });
+
+            container.appendChild(label);
+            container.appendChild(select);
+            document.body.appendChild(container);
         }
 
         renderControlsInBatches(function() {
             // 4. 异步拉取并回显已有数据
             fetchLineAnalysis(filePath);
         });
+
+        // 5. 创建高级浮动显示模式切换器
+        createModeToggler();
     });
 
     function findPreviousFilledPanel(currentLineNum) {
         const candidates = Array.from(panelsMap.entries())
-            .filter(([lineNum, panel]) => lineNum < currentLineNum && panel.select.value !== '未确认')
+            .filter(([lineNum, panel]) => {
+                const status = panel.select ? panel.select.value : (panel.values && panel.values.status);
+                return lineNum < currentLineNum && status !== '未确认';
+            })
             .sort((a, b) => b[0] - a[0]);
 
         for (const [, panel] of candidates) {
-            const hasContent = panel.reviewerInput.value.trim() ||
-                panel.methodInput.value.trim() ||
-                panel.reasonInput.value.trim();
+            const reviewer = panel.reviewerInput ? panel.reviewerInput.value : (panel.values && panel.values.reviewerInput);
+            const method = panel.methodInput ? panel.methodInput.value : (panel.values && panel.values.methodInput);
+            const reason = panel.reasonInput ? panel.reasonInput.value : (panel.values && panel.values.reasonInput);
+            const hasContent = (reviewer || '').trim() || (method || '').trim() || (reason || '').trim();
             if (hasContent) {
                 return panel;
             }
@@ -686,7 +910,7 @@
 
         // 统计已分析确认的行数 (只要 Block 首行分析被保存，其所覆盖的所有物理行数均计入)
         panelsMap.forEach((panel, startLineNum) => {
-            const status = panel.select.value;
+            const status = panel.select ? panel.select.value : (panel.values && panel.values.status);
             if (CONFIRMED_STATUS_SET.has(status)) {
                 confirmedCount += panel.block.length;
             }
@@ -798,13 +1022,20 @@
                 panelsMap.forEach((panel, startLineNum) => {
                     const rec = dbRecordsMap.get(startLineNum);
                     if (rec) {
-                        panel.select.value = rec.status || '未确认';
-                        panel.reviewerInput.value = rec.reviewer || '';
-                        panel.methodInput.value = rec.coverage_method || '';
-                        panel.reasonInput.value = rec.uncovered_reason || '';
-                        
-                        panel.saveBtn.innerText = 'Saved';
-                        panel.saveBtn.classList.add('saved');
+                        setStoredPanelValues(panel, {
+                            status: rec.status || '未确认',
+                            reviewerInput: rec.reviewer || '',
+                            methodInput: rec.coverage_method || '',
+                            reasonInput: rec.uncovered_reason || ''
+                        });
+
+                        if (panel.saveBtn) {
+                            panel.saveBtn.innerText = 'Saved';
+                            panel.saveBtn.classList.add('saved');
+                        }
+                        if (panel.placeholder) {
+                            decoratePlaceholder(panel.placeholder, panel.values, panel.block);
+                        }
                     }
                 });
             }
@@ -814,9 +1045,15 @@
         .catch(err => {
             console.warn('[CoverageEnhance] Failed to fetch existing records:', err.message);
             panelsMap.forEach(panel => {
-                panel.saveBtn.innerText = 'Offline';
-                panel.saveBtn.classList.add('error');
-                panel.saveBtn.title = '无法连接到本地持久化服务，请检查 enhance_coverage.py 服务是否在运行。';
+                if (panel.saveBtn) {
+                    panel.saveBtn.innerText = 'Offline';
+                    panel.saveBtn.classList.add('error');
+                    panel.saveBtn.title = '无法连接到本地持久化服务，请检查 enhance_coverage.py 服务是否在运行。';
+                }
+                if (panel.placeholder) {
+                    panel.placeholder.classList.add('error');
+                    panel.placeholder.title = '无法连接到本地持久化服务，点击仍可填写，保存前请检查 enhance_coverage.py 服务。';
+                }
             });
             requestLegacyPanelRefresh(4);
             updateHeaderStatistics();
@@ -860,6 +1097,16 @@
         .then(results => {
             const allSuccess = results.every(res => res.status === 'success');
             if (allSuccess) {
+                const startLineNum = block[0].lineNum;
+                const panel = panelsMap.get(startLineNum);
+                if (panel) {
+                    setStoredPanelValues(panel, {
+                        status: status,
+                        reviewerInput: reviewer,
+                        methodInput: method,
+                        reasonInput: reason
+                    });
+                }
                 btn.innerText = 'Saved';
                 btn.className = 'coverage-analysis-btn saved';
                 console.log(`[CoverageEnhance] Successfully saved block range L${block[0].lineNum}-${block[block.length - 1].lineNum}`);
