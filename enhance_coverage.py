@@ -74,7 +74,7 @@ DEFAULT_PROGRESS_PAGE_HTML = r"""<!doctype html>
     <div class="controls">
       <input id="projectInput" placeholder="输入项目名，例如 review_v6r2_202605">
       <button id="loadBtn" type="button">查看进度</button>
-      <a id="csvLink" class="button" href="#" target="_blank">导出进度 CSV</a>
+      <a id="csvLink" class="button" href="#" target="_blank">导出进度 Excel</a>
       <a id="excelLink" class="button" href="#" target="_blank">导出目录 Excel ZIP</a>
     </div>
     <div id="status" class="status"></div>
@@ -1487,6 +1487,48 @@ def coverage_mark_from_status(status):
     return "0"
 
 
+def build_progress_excel(project_name, progress_sections):
+    sheet_defs = []
+    used_names = set()
+
+    progress_headers = [
+        "层级", "项目名", "路径", "文件数", "未覆盖行总数", "已填写", "未填写",
+        "已确认", "可覆盖", "无法覆盖", "冗余代码", "填写率(%)", "确认率(%)", "最后更新时间"
+    ]
+    for sheet_name, headers, rows in progress_sections:
+        progress_rows = [progress_headers]
+        for row in rows:
+            row_map = dict(zip(headers, row))
+            level = sheet_name.replace("进度", "")
+            if sheet_name == "项目进度":
+                path_value = ""
+            elif sheet_name == "目录进度":
+                path_value = row_map.get("dir_path", "")
+            else:
+                path_value = row_map.get("file_path", "")
+            progress_rows.append([
+                level,
+                row_map.get("project_name", project_name),
+                path_value,
+                row_map.get("file_total", 1 if sheet_name == "文件进度" else ""),
+                row_map.get("total_uncovered", ""),
+                row_map.get("filled_total", ""),
+                row_map.get("unfilled_total", ""),
+                row_map.get("confirmed_total", ""),
+                row_map.get("coverable_total", ""),
+                row_map.get("uncoverable_total", ""),
+                row_map.get("redundant_total", ""),
+                row_map.get("fill_rate", ""),
+                row_map.get("confirmed_rate", ""),
+                row_map.get("last_updated", ""),
+            ])
+        sheet_defs.append({
+            "name": safe_sheet_name(sheet_name, used_names),
+            "xml": xlsx_sheet_xml(progress_rows, [10, 22, 56, 10, 14, 10, 10, 10, 10, 10, 10, 12, 12, 22])
+        })
+    return build_xlsx_workbook(sheet_defs)
+
+
 def build_review_excel(project_name, detail_rows, progress_sections):
     grouped = {}
     for row in detail_rows:
@@ -1649,10 +1691,9 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
             dir_path = dir_path if dir_path != "" else None
             csv_report_types = (
                 "detail", "file_summary", "project_summary", "full_detail",
-                "full_file_summary", "full_dir_summary", "full_project_summary",
-                "full_progress_summary"
+                "full_file_summary", "full_dir_summary", "full_project_summary"
             )
-            xlsx_report_types = ("review_excel", "review_excel_by_dir")
+            xlsx_report_types = ("review_excel", "review_excel_by_dir", "full_progress_summary")
 
             if report_type not in csv_report_types + xlsx_report_types:
                 self.send_error_response(400, "Unsupported export type. Use detail, file_summary, project_summary, full_detail, full_file_summary, full_dir_summary, full_project_summary, full_progress_summary, review_excel, or review_excel_by_dir")
@@ -1689,6 +1730,25 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                     return
                 filename = f"coverage_review_by_dir_{project_part}_{timestamp}.zip"
                 self.send_review_excel_by_dir_response(filename, project_name)
+            elif report_type == "full_progress_summary":
+                if not project_name:
+                    self.send_error_response(400, "full_progress_summary requires project=<project_name>")
+                    return
+                try:
+                    project_headers, project_rows = db_manager.export_report("full_project_summary", project_name)
+                    dir_headers, dir_rows = db_manager.export_report("full_dir_summary", project_name)
+                    file_headers, file_rows = db_manager.export_report("full_file_summary", project_name)
+                    progress_sections = [
+                        ("项目进度", project_headers, project_rows),
+                        ("目录进度", dir_headers, dir_rows),
+                        ("文件进度", file_headers, file_rows),
+                    ]
+                    data = build_progress_excel(project_name, progress_sections)
+                except Exception:
+                    self.send_error_response(500, "Failed to export progress Excel")
+                    return
+                filename = f"coverage_progress_{project_part}_{timestamp}.xlsx"
+                self.send_xlsx_response(filename, data)
             else:
                 try:
                     headers, rows = db_manager.export_report(report_type, project_name)
