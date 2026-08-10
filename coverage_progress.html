@@ -133,7 +133,7 @@
 </head>
 <body>
   <header>
-    <h1>Coverage Analysis Progress</h1>
+    <h1 id="pageTitle">全量覆盖率分析进度</h1>
     <div class="controls">
       <input id="projectInput" placeholder="输入项目名，例如 review_v6r2_202605">
       <button id="loadBtn" type="button">查看进度</button>
@@ -144,7 +144,7 @@
   </header>
   <main>
     <div class="cards">
-      <div class="card"><div class="label">未覆盖行总数</div><div id="totalUncovered" class="value">-</div></div>
+      <div class="card"><div id="totalUncoveredLabel" class="label">未覆盖行总数</div><div id="totalUncovered" class="value">-</div></div>
       <div class="card"><div class="label">已填写</div><div id="filledTotal" class="value">-</div></div>
       <div class="card"><div class="label">填写率</div><div id="fillRate" class="value">-</div></div>
       <div class="card"><div class="label">确认率</div><div id="confirmedRate" class="value">-</div></div>
@@ -159,12 +159,20 @@
     </section>
   </main>
   <script>
+    const DEFAULT_REVIEW_SCOPE = 'full'; // 'full' or 'incremental'
     const params = new URLSearchParams(window.location.search);
+    const reviewScope = params.get('scope') === 'incremental' ? 'incremental' : DEFAULT_REVIEW_SCOPE;
     const projectInput = document.getElementById('projectInput');
     const statusEl = document.getElementById('status');
     const csvLink = document.getElementById('csvLink');
     const excelLink = document.getElementById('excelLink');
     let resolvedApiBase = '';
+
+    if (reviewScope === 'incremental') {
+      document.title = 'Incremental Coverage Analysis Progress';
+      document.getElementById('pageTitle').innerText = '增量覆盖率分析进度';
+      document.getElementById('totalUncoveredLabel').innerText = '增量未覆盖行';
+    }
 
     projectInput.value = params.get('project') || '';
 

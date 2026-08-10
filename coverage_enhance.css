@@ -1,5 +1,15 @@
 /* 覆盖率分析增强控件样式表 */
 
+.coverage-review-scope-notice {
+    margin: 8px 0;
+    padding: 7px 10px;
+    border: 1px solid #b9d7ff;
+    border-radius: 4px;
+    background: #eef6ff;
+    color: #1d5d9d;
+    font: 600 12px/18px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+}
+
 /* 强制使每一行代码容器成为独占整行的浮动块，确保控件完美在右侧本行对齐 */
 pre.source > span[id^="L"] {
     float: left !important;

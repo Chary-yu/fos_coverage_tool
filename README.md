@@ -22,6 +22,7 @@
 ```text
 /opt/coverage_tool/
   enhance_coverage.py        # 后台脚本：注入、启动服务、导出、继承
+  coverage_check.py          # Git + LCOV 增量覆盖率计算模块/独立命令
   clear_coverage_data.py     # 调试脚本：清空单项目或全部数据库数据
   coverage_progress.html     # 独立网页：查看项目/目录/文件分析进度
   coverage_enhance.js        # 前端增强脚本
@@ -159,6 +160,59 @@ python3 enhance_coverage.py inject \
 * 未传 `--mode` 时使用 `coverage_config.json` 中的 `render_mode`，配置不存在或非法时默认使用 `lazy`；
 * 临时查看时也可以在网页 URL 后追加 `?mode=lazy` 或 `?mode=immediate` 覆盖默认模式；如果 URL 已经带有其他参数，则使用 `&mode=lazy` 或 `&mode=immediate`；
 * 覆盖率源码页右下角也提供显示模式切换器，可以在当前页面快速切换 `lazy` / `immediate`。
+
+---
+
+## 4.1 生成增量覆盖率可填写网页
+
+当评审范围只需要关注两个 Git commit 之间新增、且尚未覆盖的代码时，使用 `incremental` 子命令。它会计算增量覆盖率，并复用当前的填写、保存、进度和导出能力。
+
+```bash
+cd /opt/coverage_tool
+python3 enhance_coverage.py incremental \
+  --project review_main_202606_incremental \
+  --repo /opt/src/main_repo \
+  --oldgit a1b2c3 \
+  --newgit d4e5f6 \
+  --info /opt/coverage_reports/main_202606/coverage.info \
+  --dir /opt/coverage_reports/raw_main_202606 \
+  --out /opt/coverage_tool/review_main_202606_incremental \
+  --mode lazy \
+  --workers 4
+```
+
+参数说明：
+
+* `--repo`：包含 `oldgit` 和 `newgit` 的 Git 仓库；脚本会执行 `git diff oldgit newgit`；
+* `--info`：单个 LCOV `.info` 文件，或仅包含多个 `.info` 文件的目录；多个文件会在 Python 内合并，不依赖系统 `lcov` 命令；
+* `--dir`：由 `genhtml` 生成的原始全量 HTML 报告，只读；
+* `--out`：增量审查网页输出目录。和全量 `inject` 一样，若目录已存在会被重新生成；
+* `--project`：增量审查数据在数据库中的隔离名称，建议不要与全量报告共用；
+* `--excel`：可选，指定增量结果 Excel 的输出位置；未指定时写入 `--out/incremental_coverage.xlsx`。
+
+输出目录的 `html/` 中会包含：
+
+* `incremental_coverage.html`：增量覆盖率汇总页，点击文件可打开源码页；
+* `incremental_coverage.json` / `incremental_coverage.xlsx`：每条新增行的计算结果；
+* `coverage_progress.html`：增量填写进度页；
+* 原始 LCOV 源码页：仍保留完整红绿覆盖率显示，但**只在 Git 新增且 LCOV 未覆盖的行旁显示填写控件**。
+
+统计口径为 `已覆盖 / (已覆盖 + 未覆盖)`。LCOV 中没有 `DA` 记录的新增行记为“无需覆盖”；整个文件未出现在 `.info` 中则记为“覆盖信息缺失”，不会被误算为无需覆盖，也不会生成填写控件。
+
+如只需独立计算而不生成网页，仍可直接执行原脚本：
+
+```bash
+python3 coverage_check.py \
+  --repo /opt/src/main_repo --oldgit a1b2c3 --newgit d4e5f6 \
+  --info /opt/coverage_reports/main_202606/coverage.info \
+  --excel incremental_coverage.xlsx --json incremental_coverage.json
+```
+
+访问增量汇总页：
+
+```text
+http://服务器IP/coverage/review_main_202606_incremental/html/incremental_coverage.html
+```
 
 ---
 

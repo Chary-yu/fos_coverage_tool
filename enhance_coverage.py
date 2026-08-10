@@ -25,6 +25,8 @@ import urllib.parse
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+import coverage_check
+
 try:
     from http.server import ThreadingHTTPServer
 except ImportError:
@@ -47,7 +49,7 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "coverage_config.json")
 JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
 CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
 PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
-ASSET_VERSION = "low-memory-controls-20260531"
+ASSET_VERSION = "incremental-review-20260810"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 DEFAULT_PROGRESS_PAGE_HTML = r"""<!doctype html>
 <html lang="zh-CN">
@@ -90,7 +92,7 @@ DEFAULT_PROGRESS_PAGE_HTML = r"""<!doctype html>
     <section class="section"><h2>文件进度</h2><div class="table-wrap"><table id="fileTable"></table></div></section>
   </main>
   <script>
-    const params=new URLSearchParams(window.location.search),projectInput=document.getElementById('projectInput'),statusEl=document.getElementById('status'),csvLink=document.getElementById('csvLink'),excelLink=document.getElementById('excelLink');let resolvedApiBase='';
+    const DEFAULT_REVIEW_SCOPE = 'full'; const params=new URLSearchParams(window.location.search),projectInput=document.getElementById('projectInput'),statusEl=document.getElementById('status'),csvLink=document.getElementById('csvLink'),excelLink=document.getElementById('excelLink');let resolvedApiBase='';
     projectInput.value=params.get('project')||'';
     const asNumber=v=>Number.isFinite(Number(v))?Number(v):0,fmtRate=v=>Number.isFinite(Number(v))?`${Number(v).toFixed(1)}%`:'0.0%',bar=r=>`<span class="bar"><span style="width:${Math.max(0,Math.min(100,asNumber(r)))}%"></span></span>`;
     function metric(id,value){document.getElementById(id).innerText=value}
@@ -117,6 +119,31 @@ def calc_file_path_hash(file_path):
 def calc_text_hash(value):
     """Return a stable hash for normalized source text."""
     return hashlib.md5(str(value).encode("utf-8")).hexdigest()
+
+
+def normalize_review_source_path(file_path):
+    """Normalize source/report paths before matching incremental review lines."""
+    normalized = os.path.normpath(str(file_path or "")).replace("\\", "/")
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized
+
+
+def get_incremental_lines_for_report(report_file_path, incremental_lines_by_file):
+    """Return selected Git-added lines for a report source path.
+
+    LCOV report titles can contain an absolute source path while Git diff paths are
+    repository-relative. A suffix match is useful in that case, but only when it is
+    unique so same-named files never receive another file's form controls.
+    """
+    report_file_path = normalize_review_source_path(report_file_path)
+    if report_file_path in incremental_lines_by_file:
+        return set(incremental_lines_by_file[report_file_path])
+    matches = [
+        lines for source_file, lines in incremental_lines_by_file.items()
+        if report_file_path.endswith("/" + source_file) or source_file.endswith("/" + report_file_path)
+    ]
+    return set(matches[0]) if len(matches) == 1 else set()
 
 
 def get_source_file_name(file_path):
@@ -262,7 +289,32 @@ def extract_report_file_path(content, fallback_path):
     return fallback_path.replace(os.sep, '/').replace('.gcov.html', '')
 
 
-def extract_line_index_records(content, fallback_path, project_name):
+def mark_incremental_review_lines(content, selected_line_numbers):
+    """Mark only selected source lines as editable in an LCOV HTML page.
+
+    Both genhtml layouts seen in the field are handled: modern ``id=L42`` rows and
+    legacy ``lineNum`` followed by a coverage span. Existing markers are first
+    removed, which makes re-running an in-place incremental injection deterministic.
+    """
+    content = re.sub(r'\sdata-coverage-review=(["\']).*?\1', '', content, flags=re.I)
+    selected_line_numbers = set(selected_line_numbers or [])
+    if not selected_line_numbers:
+        return content
+
+    def add_marker(match):
+        line_number = int(match.group(2))
+        return match.group(1) + (' data-coverage-review="incremental"' if line_number in selected_line_numbers else '') + match.group(3)
+
+    modern_line_pattern = re.compile(r'(<span\b[^>]*\bid=["\']L(\d+)["\'][^>]*)(>)', re.I)
+    legacy_line_pattern = re.compile(
+        r'(<span\b[^>]*\bclass=["\'][^"\']*\blineNum\b[^"\']*["\'][^>]*>\s*(\d+)\s*</span>\s*<span\b[^>]*)(>)',
+        re.I,
+    )
+    content = modern_line_pattern.sub(add_marker, content)
+    return legacy_line_pattern.sub(add_marker, content)
+
+
+def extract_line_index_records(content, fallback_path, project_name, review_line_numbers=None):
     file_path = extract_report_file_path(content, fallback_path)
     file_path_hash = calc_file_path_hash(file_path)
     source_file_name = get_source_file_name(file_path)
@@ -321,10 +373,12 @@ def extract_line_index_records(content, fallback_path, project_name):
             line["code_line_hash"] = code_line_hash
             line["code_occurrence"] = occurrence_by_line_hash[code_line_hash]
 
+    allowed_line_numbers = set(review_line_numbers) if review_line_numbers is not None else None
     records = []
     counted = set()
     for index, item in enumerate(lines):
-        if not item["is_uncovered"] or item["line_number"] in counted:
+        if (not item["is_uncovered"] or item["line_number"] in counted or
+                (allowed_line_numbers is not None and item["line_number"] not in allowed_line_numbers)):
             continue
 
         block = [item]
@@ -336,6 +390,9 @@ def extract_line_index_records(content, fallback_path, project_name):
                 if is_control_flow_text(next_item["code_text"]) or is_function_entry_text(next_item["code_text"]):
                     break
                 if next_item["is_uncovered"]:
+                    if (allowed_line_numbers is not None and
+                            next_item["line_number"] not in allowed_line_numbers):
+                        break
                     if block_type == "function_entry" and not is_simple_auto_group_text(next_item["code_text"]):
                         break
                     if block_type != "function_entry" and (
@@ -399,8 +456,8 @@ def load_config():
     return default_config
 
 
-def write_configured_enhance_js(output_path, project_name, render_mode):
-    """Copy the frontend script and inject the selected project name and render mode."""
+def write_configured_enhance_js(output_path, project_name, render_mode, review_scope="full"):
+    """Copy the frontend script and inject project, render mode and review scope."""
     with open(JS_SOURCE_PATH, 'r', encoding='utf-8') as f:
         content = f.read()
 
@@ -424,11 +481,21 @@ def write_configured_enhance_js(output_path, project_name, render_mode):
     if replace_count != 1:
         raise RuntimeError("Failed to inject RENDER_MODE into coverage_enhance.js")
 
+    scope_literal = json.dumps(str(review_scope), ensure_ascii=False)
+    new_content, replace_count = re.subn(
+        r"const\s+REVIEW_SCOPE\s*=\s*(['\"]).*?\1\s*;",
+        f"const REVIEW_SCOPE = {scope_literal};",
+        new_content,
+        count=1
+    )
+    if replace_count != 1:
+        raise RuntimeError("Failed to inject REVIEW_SCOPE into coverage_enhance.js")
+
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(new_content)
 
 
-def write_progress_page_targets(output_dir, real_output_html):
+def write_progress_page_targets(output_dir, real_output_html, review_scope="full"):
     target_paths = [
         os.path.join(output_dir, "coverage_progress.html"),
         os.path.join(real_output_html, "coverage_progress.html"),
@@ -442,7 +509,19 @@ def write_progress_page_targets(output_dir, real_output_html):
     for target in unique_targets:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         if source_exists:
-            shutil.copy2(PROGRESS_PAGE_SOURCE_PATH, target)
+            with open(PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as source:
+                progress_content = source.read()
+            scope_literal = json.dumps(str(review_scope), ensure_ascii=False)
+            progress_content, replacement_count = re.subn(
+                r"const\s+DEFAULT_REVIEW_SCOPE\s*=\s*(['\"]).*?\1\s*;",
+                f"const DEFAULT_REVIEW_SCOPE = {scope_literal};",
+                progress_content,
+                count=1,
+            )
+            if replacement_count != 1:
+                raise RuntimeError("Failed to inject DEFAULT_REVIEW_SCOPE into coverage_progress.html")
+            with open(target, "w", encoding="utf-8") as target_file:
+                target_file.write(progress_content)
         else:
             with open(target, "w", encoding="utf-8") as f:
                 f.write(DEFAULT_PROGRESS_PAGE_HTML)
@@ -461,13 +540,18 @@ class DatabaseManager:
     def __init__(self, config, exit_on_error=True, init_schema=True):
         self.config = config["mysql"]
         self.exit_on_error = exit_on_error
+        self.conn = None
         if not db_module:
             print("[CRITICAL] Missing MySQL driver. Please install PyMySQL to enable database support:")
             print("           pip install pymysql")
             if self.exit_on_error:
                 sys.exit(1)
-            raise RuntimeError("Missing MySQL driver")
-        self.conn = None
+            # Unit tests and offline export-format checks can provide a mock
+            # connection after construction. Production initialization still fails
+            # fast below when a real schema/connection is requested.
+            if init_schema:
+                raise RuntimeError("Missing MySQL driver")
+            return
         if init_schema:
             self.init_database()
         else:
@@ -2043,7 +2127,8 @@ def close_thread_db_manager():
         _thread_local.db_manager = None
 
 
-def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync_index=True):
+def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync_index=True,
+                                 review_scope="full", incremental_lines_by_file=None):
     depth = len(rel_path.split(os.sep)) - 1
     prefix = "../" * depth
 
@@ -2056,7 +2141,15 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
 
     report_file_path = extract_report_file_path(content, rel_path)
     report_file_hash = calc_file_path_hash(report_file_path)
-    file_line_index_records = extract_line_index_records(content, rel_path, project_name)
+    review_line_numbers = None
+    if review_scope == "incremental":
+        review_line_numbers = get_incremental_lines_for_report(
+            report_file_path, incremental_lines_by_file or {}
+        )
+        content = mark_incremental_review_lines(content, review_line_numbers)
+    file_line_index_records = extract_line_index_records(
+        content, rel_path, project_name, review_line_numbers
+    )
     file_index_synced = False
 
     if sync_index:
@@ -2101,11 +2194,14 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
     }
 
 
-def inject_coverage_report(input_dir, output_dir, project_name=None, workers=None, render_mode=None):
+def inject_coverage_report(input_dir, output_dir, project_name=None, workers=None, render_mode=None,
+                           review_scope="full", incremental_lines_by_file=None):
     """
     非破坏性注入覆盖率报告：
     1. 若 output_dir 与 input_dir 不同，则先自动将整个 input_dir 复制至 output_dir (清除已有的 output_dir)
     2. 在 output_dir 中注入样式表、增强脚本并复制静态资源。
+    3. ``review_scope=incremental`` 时，仅为 ``incremental_lines_by_file`` 中的
+       未覆盖行注入可填写控件和数据库索引。
     """
     if not os.path.exists(input_dir):
         print(f"[Error] Input directory '{input_dir}' does not exist.")
@@ -2139,13 +2235,18 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
         render_mode = config.get("render_mode", "lazy")
     if render_mode not in ("lazy", "immediate"):
         render_mode = "lazy"
+    if review_scope not in ("full", "incremental"):
+        raise ValueError("review_scope must be 'full' or 'incremental'")
 
-    write_configured_enhance_js(os.path.join(real_output_html, "coverage_enhance.js"), project_name, render_mode)
+    write_configured_enhance_js(
+        os.path.join(real_output_html, "coverage_enhance.js"), project_name, render_mode, review_scope
+    )
     shutil.copy2(CSS_SOURCE_PATH, os.path.join(real_output_html, "coverage_enhance.css"))
-    write_progress_page_targets(output_dir, real_output_html)
+    write_progress_page_targets(output_dir, real_output_html, review_scope)
     print(f"[Injector] Copied static resources to: {real_output_html}")
     print(f"[Injector] Frontend project name: {project_name}")
     print(f"[Injector] Frontend render mode: {render_mode}")
+    print(f"[Injector] Review scope: {review_scope}")
     index_manager = None
     indexed_records = 0
     indexed_files = 0
@@ -2183,7 +2284,16 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
     print(f"[Injector] Worker threads: {worker_count}")
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         futures = [
-            executor.submit(process_gcov_file_for_inject, file_path, rel_path, project_name, config, index_manager is not None)
+            executor.submit(
+                process_gcov_file_for_inject,
+                file_path,
+                rel_path,
+                project_name,
+                config,
+                index_manager is not None,
+                review_scope,
+                incremental_lines_by_file,
+            )
             for file_path, rel_path in gcov_files
         ]
         for file_index, future in enumerate(as_completed(futures), start=1):
@@ -2219,6 +2329,169 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
         print(f"[Injector] Synced full coverage line index: {indexed_records} record(s) across {indexed_files} file(s).")
     else:
         print("[Injector] Full coverage line index was not synced because database initialization failed.")
+
+
+def find_report_page_links(report_html_dir):
+    """Build a source-path -> report-page mapping from LCOV page titles."""
+    report_pages = {}
+    for root, dirs, files in os.walk(report_html_dir):
+        dirs.sort()
+        for filename in sorted(files):
+            if not filename.endswith(".gcov.html"):
+                continue
+            page_path = os.path.join(root, filename)
+            try:
+                with open(page_path, "r", encoding="utf-8", errors="ignore") as page:
+                    source_path = extract_report_file_path(page.read(), filename)
+            except OSError:
+                continue
+            source_path = normalize_review_source_path(source_path)
+            relative_page = os.path.relpath(page_path, report_html_dir).replace(os.sep, "/")
+            report_pages.setdefault(source_path, []).append(relative_page)
+    return report_pages
+
+
+def get_report_page_link(source_path, report_pages):
+    source_path = normalize_review_source_path(source_path)
+    direct_matches = report_pages.get(source_path, [])
+    if len(direct_matches) == 1:
+        return direct_matches[0]
+    suffix_matches = [
+        pages for report_source, pages in report_pages.items()
+        if report_source.endswith("/" + source_path) or source_path.endswith("/" + report_source)
+    ]
+    if len(suffix_matches) == 1 and len(suffix_matches[0]) == 1:
+        return suffix_matches[0][0]
+    return ""
+
+
+def write_incremental_summary_page(output_html_dir, project_name, result):
+    """Create an auditable landing page for the generated incremental review site."""
+    summary = result["summary"]
+    report_pages = find_report_page_links(output_html_dir)
+    details_by_file = {}
+    for item in result["details"]:
+        details_by_file.setdefault(item["file_path"], []).append(item)
+
+    def escaped(value):
+        return html.escape(str(value), quote=True)
+
+    rows = []
+    for source_path in sorted(details_by_file):
+        items = details_by_file[source_path]
+        counts = {status: 0 for status in (
+            coverage_check.STATUS_COVERED,
+            coverage_check.STATUS_UNCOVERED,
+            coverage_check.STATUS_IGNORED,
+            coverage_check.STATUS_MISSING,
+        )}
+        for item in items:
+            counts[item["status"]] += 1
+        page_link = get_report_page_link(source_path, report_pages)
+        source_cell = escaped(source_path)
+        if page_link:
+            source_cell = '<a href="{}">{}</a>'.format(
+                escaped(urllib.parse.quote(page_link, safe="/%#?=&-_.~")), source_cell
+            )
+        rows.append(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                source_cell,
+                len(items),
+                counts[coverage_check.STATUS_COVERED],
+                counts[coverage_check.STATUS_UNCOVERED],
+                counts[coverage_check.STATUS_IGNORED],
+                counts[coverage_check.STATUS_MISSING],
+            )
+        )
+
+    rate = summary["coverage_rate"]
+    rate_text = "N/A" if rate is None else "{:.2f}%".format(rate)
+    table_rows = "".join(rows) or '<tr><td colspan="6">本次 Git diff 没有新增代码行。</td></tr>'
+    page = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>增量覆盖率审查</title><style>
+body{{margin:0;background:#f5f7fb;color:#172033;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"Microsoft YaHei",sans-serif}}
+main{{max-width:1180px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}}.muted{{color:#64748b}}.links{{margin:16px 0}}a{{color:#1f5fbf}}.cards{{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:12px;margin:20px 0}}.card,section{{background:#fff;border:1px solid #d8e0ea;border-radius:6px}}.card{{padding:12px}}.label{{font-size:12px;color:#64748b}}.value{{font-size:24px;font-weight:800;margin-top:4px}}section{{overflow:auto}}h2{{margin:0;padding:12px 14px;font-size:16px;border-bottom:1px solid #d8e0ea}}table{{width:100%;border-collapse:collapse;min-width:720px}}th,td{{padding:9px 10px;border-bottom:1px solid #e7edf4;text-align:left}}th{{background:#f8fafc}}.warning{{color:#b45309}}@media(max-width:820px){{.cards{{grid-template-columns:repeat(2,minmax(120px,1fr))}}}}
+</style></head><body><main>
+<h1>增量覆盖率审查</h1>
+<div class="muted">项目：{project}；Git 范围：<code>{oldgit}</code> → <code>{newgit}</code>；生成时间：{generated_at}</div>
+<div class="links"><a href="coverage_progress.html?scope=incremental&amp;project={project_url}">查看填写进度</a>　<a href="incremental_coverage.json">下载计算结果 JSON</a>　<a href="incremental_coverage.xlsx">下载计算结果 Excel</a></div>
+<div class="cards"><div class="card"><div class="label">新增行</div><div class="value">{changed}</div></div><div class="card"><div class="label">已覆盖</div><div class="value">{covered}</div></div><div class="card"><div class="label">增量未覆盖（可填写）</div><div class="value">{uncovered}</div></div><div class="card"><div class="label">有效增量覆盖率</div><div class="value">{rate}</div></div><div class="card"><div class="label">覆盖信息缺失</div><div class="value warning">{missing}</div></div></div>
+<section><h2>文件明细（点击文件可打开可填写的源码页）</h2><table><thead><tr><th>文件</th><th>新增行</th><th>已覆盖</th><th>未覆盖</th><th>无需覆盖</th><th>覆盖信息缺失</th></tr></thead><tbody>{table_rows}</tbody></table></section>
+</main></body></html>""".format(
+        project=escaped(project_name),
+        project_url=escaped(urllib.parse.quote(str(project_name), safe="")),
+        oldgit=escaped(result["oldgit"]),
+        newgit=escaped(result["newgit"]),
+        generated_at=escaped(result["generated_at"]),
+        changed=summary["changed_lines"],
+        covered=summary["covered"],
+        uncovered=summary["uncovered"],
+        rate=rate_text,
+        missing=summary["missing"],
+        table_rows=table_rows,
+    )
+    with open(os.path.join(output_html_dir, "incremental_coverage.html"), "w", encoding="utf-8") as page_file:
+        page_file.write(page)
+
+
+def generate_incremental_review(repo_path, oldgit, newgit, info_path, input_dir, output_dir,
+                                project_name, workers=None, render_mode=None, excel_path=None):
+    """Calculate incremental coverage and build a fillable incremental review site."""
+    if not os.path.isdir(repo_path):
+        raise ValueError("Git 仓库目录不存在: {}".format(repo_path))
+    if not os.path.isdir(input_dir):
+        raise ValueError("LCOV HTML 报告目录不存在: {}".format(input_dir))
+
+    result = coverage_check.calculate_incremental_coverage(
+        repo_path, oldgit, newgit, info_path
+    )
+    summary = result["summary"]
+    print(
+        "[Incremental] Git-added lines={changed_lines}, covered={covered}, uncovered={uncovered}, "
+        "ignored={ignored}, missing={missing}".format(**summary)
+    )
+
+    inject_coverage_report(
+        input_dir,
+        output_dir,
+        project_name=project_name,
+        workers=workers,
+        render_mode=render_mode,
+        review_scope="incremental",
+        incremental_lines_by_file=result["uncovered_lines_by_file"],
+    )
+    real_output_html = (
+        os.path.join(output_dir, "html")
+        if os.path.isdir(os.path.join(input_dir, "html")) else output_dir
+    )
+    if not os.path.isdir(real_output_html):
+        raise RuntimeError("增量审查网页输出失败: {}".format(real_output_html))
+
+    result["project_name"] = project_name
+    result["review_scope"] = "incremental"
+    output_json = os.path.join(output_dir, "incremental_coverage.json")
+    coverage_check.write_result_json(result, output_json)
+    if os.path.abspath(real_output_html) != os.path.abspath(output_dir):
+        coverage_check.write_result_json(result, os.path.join(real_output_html, "incremental_coverage.json"))
+
+    if excel_path is None:
+        excel_path = os.path.join(output_dir, "incremental_coverage.xlsx")
+    excel_parent = os.path.dirname(os.path.abspath(excel_path))
+    if excel_parent:
+        os.makedirs(excel_parent, exist_ok=True)
+    coverage_check.write_result_excel(result, excel_path)
+    html_excel_path = os.path.join(real_output_html, "incremental_coverage.xlsx")
+    if os.path.abspath(excel_path) != os.path.abspath(html_excel_path):
+        shutil.copy2(excel_path, html_excel_path)
+
+    write_incremental_summary_page(real_output_html, project_name, result)
+    print("[Incremental] Review home page: {}".format(
+        os.path.join(real_output_html, "incremental_coverage.html")
+    ))
+    print("[Incremental] Result JSON: {}".format(output_json))
+    print("[Incremental] Result Excel: {}".format(excel_path))
+    return result
 
 
 def run_server():
@@ -2263,6 +2536,9 @@ def print_help():
     print("    - Start local bridge server for MySQL persistence.")
     print("  python scripts/enhance_coverage.py inherit --from <old_project> --to <new_project>")
     print("    - Reuse reviewed analysis for unchanged functions in a later project/version.")
+    print("  python scripts/enhance_coverage.py incremental --project <project_name> --repo <git_repo> --oldgit <old_commit> --newgit <new_commit> --info <coverage.info|dir> --dir <lcov_html_dir> --out <output_dir>")
+    print("    - Build an incremental review website; only Git-added, LCOV-uncovered lines are editable.")
+    print("    - Optional: --workers <N> --mode <lazy|immediate> --excel <result.xlsx>")
 
 
 def get_arg_value(args, name):
@@ -2347,6 +2623,59 @@ if __name__ == "__main__":
         print(f"[Inherit] Ambiguous filename keys: {result['ambiguous_name_keys']}")
         print(f"[Inherit] Target records skipped by filename ambiguity: {result['ambiguous_name_skipped_records']}")
         print(f"[Inherit] Inherited records: {result['inherited_records']}")
+    elif cmd == "incremental":
+        args = sys.argv[2:]
+        repo_path = get_arg_value(args, "--repo")
+        oldgit = get_arg_value(args, "--oldgit")
+        newgit = get_arg_value(args, "--newgit")
+        info_path = get_arg_value(args, "--info")
+        dir_path = get_arg_value(args, "--dir")
+        out_path = get_arg_value(args, "--out")
+        project_name = get_arg_value(args, "--project")
+        workers = get_arg_value(args, "--workers")
+        render_mode = get_arg_value(args, "--mode")
+        excel_path = get_arg_value(args, "--excel")
+        use_config_project = has_arg(args, "--use-config-project")
+
+        required_values = {
+            "--repo": repo_path,
+            "--oldgit": oldgit,
+            "--newgit": newgit,
+            "--info": info_path,
+            "--dir": dir_path,
+            "--out": out_path,
+        }
+        missing = [flag for flag, value in required_values.items() if not value]
+        if missing:
+            print("[Error] incremental requires {}.".format(", ".join(missing)))
+            print_help()
+            sys.exit(1)
+        if not project_name:
+            if use_config_project:
+                config = load_config()
+                project_name = config.get("project_name", DEFAULT_PROJECT_NAME)
+                print("[Warning] Using project_name from coverage_config.json because --use-config-project was specified.")
+            else:
+                print("[Error] incremental requires --project <project_name> to keep review data isolated.")
+                print("        If you intentionally want coverage_config.json, add --use-config-project.")
+                print_help()
+                sys.exit(1)
+
+        print("[Main] Incremental coverage review generation starts.")
+        print(f"[Main] Project : {project_name}")
+        print(f"[Main] Git repo : {repo_path}")
+        print(f"[Main] Git range : {oldgit} -> {newgit}")
+        print(f"[Main] LCOV info : {info_path}")
+        print(f"[Main] Report input (ReadOnly) : {dir_path}")
+        print(f"[Main] Report output (Enhanced) : {out_path}")
+        try:
+            generate_incremental_review(
+                repo_path, oldgit, newgit, info_path, dir_path, out_path,
+                project_name, workers, render_mode, excel_path,
+            )
+        except Exception as error:
+            print("[Error] Failed to generate incremental review: {}".format(error))
+            sys.exit(1)
     else:
         print_help()
         sys.exit(1)

@@ -8,6 +8,7 @@
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const RENDER_MODE = 'lazy'; // 'lazy' or 'immediate'
+    const REVIEW_SCOPE = 'full'; // 'full' or 'incremental'
     const URL_PARAMS = new URLSearchParams(window.location.search);
     const QUERY_MODE = URL_PARAMS.get('mode');
     const ACTIVE_MODE = (QUERY_MODE === 'lazy' || QUERY_MODE === 'immediate') ? QUERY_MODE : RENDER_MODE;
@@ -152,6 +153,12 @@
             console.log('[CoverageEnhance] No source container found.');
             return;
         }
+        if (REVIEW_SCOPE === 'incremental') {
+            const scopeNotice = document.createElement('div');
+            scopeNotice.className = 'coverage-review-scope-notice';
+            scopeNotice.innerText = '增量覆盖率审查：仅“Git 新增且未覆盖”的代码行显示填写控件。';
+            preSource.parentNode.insertBefore(scopeNotice, preSource);
+        }
         preSource.addEventListener('click', function(e) {
             const placeholder = e.target.closest('.coverage-analysis-placeholder, .coverage-analysis-placeholder-anchor');
             if (!placeholder || !preSource.contains(placeholder)) {
@@ -258,7 +265,13 @@
             if (!item || !item.span) {
                 return false;
             }
-            return item.span.matches('.tlaUNC, .tlaBgUNC, .lineNoCov') || item.span.querySelector('.tlaUNC, .tlaBgUNC, .lineNoCov') !== null;
+            const uncovered = item.span.matches('.tlaUNC, .tlaBgUNC, .lineNoCov') ||
+                item.span.querySelector('.tlaUNC, .tlaBgUNC, .lineNoCov') !== null;
+            if (!uncovered || REVIEW_SCOPE !== 'incremental') {
+                return uncovered;
+            }
+            return item.span.getAttribute('data-coverage-review') === 'incremental' ||
+                item.span.querySelector('[data-coverage-review="incremental"]') !== null;
         }
 
         function isCoveredLine(item) {
