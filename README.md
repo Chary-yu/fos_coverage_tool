@@ -49,7 +49,7 @@
 目标服务器需要：
 
 * Linux；
-* Python 3；
+* Python 3.6.8 或更高版本；
 * MySQL 或 MariaDB；
 * Nginx；
 * Python MySQL 驱动。
@@ -57,10 +57,23 @@
 安装 Python 驱动：
 
 ```bash
+# Python 3.7+：
 pip3 install pymysql
+
+# Python 3.6.8：使用项目提供的兼容依赖清单
+python3.6 -m pip install -r requirements-py36.txt
 ```
 
-如果内网有 PyPI 镜像，按公司镜像源安装即可。
+当前 PyMySQL 版本已不再支持 Python 3.6；Python 3.6 也已停止维护。因此旧环境应使用公司已审计的兼容包并限制在内网，长期建议升级 Python。脚本本身按 Python 3.6.8 兼容实现。
+
+Python 3.6.8 环境的统一运行方式：
+
+```bash
+python3.6 enhance_coverage.py inject ...
+python3.6 enhance_coverage.py incremental ...
+python3.6 enhance_coverage.py server
+python3.6 coverage_check.py ...
+```
 
 ---
 

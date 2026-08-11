@@ -34,21 +34,26 @@ def normalize_path(path):
 
 
 def run_git_diff(repo_path, oldgit, newgit):
-    """Return the textual diff between two revisions without invoking a shell."""
-    proc = subprocess.run(
+    """Return the textual diff between two revisions without invoking a shell.
+
+    ``text=`` on ``subprocess.run`` was introduced in Python 3.7.  Keep this
+    byte-oriented form so the incremental command works on Python 3.6.8 too.
+    """
+    proc = subprocess.Popen(
         ["git", "diff", "--no-ext-diff", "--no-color", oldgit, newgit],
         cwd=repo_path,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
     )
+    stdout, stderr = proc.communicate()
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", "replace")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
     if proc.returncode != 0:
-        message = proc.stderr.strip() or "git diff failed"
+        message = stderr.strip() or "git diff failed"
         raise RuntimeError("git diff {} {} failed: {}".format(oldgit, newgit, message))
-    return proc.stdout
+    return stdout
 
 
 def generate_diff_files(repo_path, oldgit, newgit, out_file):

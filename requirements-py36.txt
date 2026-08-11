@@ -1,0 +1,3 @@
+# Python 3.6.8-compatible MySQL driver for the coverage persistence service.
+# Install from the company's approved package mirror when possible.
+PyMySQL==0.10.1

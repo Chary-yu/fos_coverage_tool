@@ -5,10 +5,16 @@
 import json
 import os
 import shutil
+import sys
 import tempfile
 import unittest
 import unittest.mock
 import zipfile
+
+try:
+    import ast
+except ImportError:
+    ast = None
 
 import coverage_check
 import enhance_coverage
@@ -63,6 +69,70 @@ diff --git a/src/not_in_lcov.c b/src/not_in_lcov.c
         with zipfile.ZipFile(xlsx_path) as workbook:
             self.assertIn("xl/worksheets/sheet1.xml", workbook.namelist())
             self.assertIn("xl/worksheets/sheet2.xml", workbook.namelist())
+
+    @unittest.mock.patch("coverage_check.subprocess.Popen")
+    def test_git_diff_uses_python36_compatible_subprocess_api(self, mock_popen):
+        process = mock_popen.return_value
+        process.communicate.return_value = (b"diff output", b"")
+        process.returncode = 0
+
+        self.assertEqual(
+            coverage_check.run_git_diff(self.repo_dir, "old", "new"),
+            "diff output",
+        )
+        _, kwargs = mock_popen.call_args
+        self.assertNotIn("text", kwargs)
+        self.assertNotIn("encoding", kwargs)
+
+
+class TestPython36Compatibility(unittest.TestCase):
+    def test_project_scripts_use_python36_grammar(self):
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        script_paths = sorted(
+            os.path.join(project_dir, filename)
+            for filename in os.listdir(project_dir)
+            if filename.endswith(".py")
+        )
+        for script_path in script_paths:
+            with open(script_path, "r", encoding="utf-8") as script_file:
+                source = script_file.read()
+            if ast is not None and sys.version_info >= (3, 8):
+                ast.parse(source, filename=script_path, feature_version=6)
+            else:
+                compile(source, script_path, "exec")
+
+    def test_project_does_not_use_unconditional_python37_apis(self):
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        forbidden_fragments = (
+            "subprocess.run(",
+            "asyncio.run(",
+            "breakpoint(",
+            "import dataclasses",
+            "from dataclasses import",
+            "import contextvars",
+            "from contextvars import",
+            "time.time_ns(",
+            ".fromisoformat(",
+        )
+        for filename in os.listdir(project_dir):
+            if not filename.endswith(".py") or filename.startswith("test_"):
+                continue
+            script_path = os.path.join(project_dir, filename)
+            with open(script_path, "r", encoding="utf-8") as script_file:
+                source = script_file.read()
+            for fragment in forbidden_fragments:
+                self.assertNotIn(
+                    fragment,
+                    source,
+                    "{} requires Python 3.7+ API: {}".format(filename, fragment),
+                )
+
+    def test_threading_http_server_has_python36_fallback(self):
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(project_dir, "enhance_coverage.py"), "r", encoding="utf-8") as script_file:
+            source = script_file.read()
+        self.assertIn("from socketserver import ThreadingMixIn", source)
+        self.assertIn("class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):", source)
 
 
 class TestIncrementalReviewInjection(unittest.TestCase):
