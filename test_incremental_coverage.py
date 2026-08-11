@@ -222,7 +222,7 @@ class TestIncrementalReviewInjection(unittest.TestCase):
             page.write("""<!doctype html><html><head><title>LCOV - cov - src/main.c</title></head>
 <body><pre class="source">
 <span class="lineNum"> 10 </span><span class="lineCov"> covered();</span>
-<span class="lineNum"> 11 </span><span class="lineNoCov"> selected();</span>
+<span class="lineNum"> 11 </span><span class="branchNoCov"> - </span><span class="lineNoCov"> selected();</span>
 <span class="lineNum"> 12 </span><span class="lineNoCov"> existing_uncovered();</span>
 </pre></body></html>""")
 
@@ -261,6 +261,14 @@ class TestIncrementalReviewInjection(unittest.TestCase):
             enhanced = page.read()
         self.assertIn('data-coverage-review="incremental"', enhanced)
         self.assertEqual(enhanced.count('data-coverage-review="incremental"'), 1)
+        self.assertIn(
+            '<span class="lineNoCov" data-coverage-review="incremental"> selected();</span>',
+            enhanced,
+        )
+        self.assertNotIn(
+            'class="branchNoCov" data-coverage-review="incremental"',
+            enhanced,
+        )
         with open(os.path.join(self.output_dir, "coverage_enhance.js"), "r", encoding="utf-8") as js_file:
             self.assertIn('const REVIEW_SCOPE = "incremental";', js_file.read())
         with open(os.path.join(self.output_dir, "coverage_progress.html"), "r", encoding="utf-8") as progress_file:

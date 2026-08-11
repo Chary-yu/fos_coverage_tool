@@ -301,17 +301,28 @@ def mark_incremental_review_lines(content, selected_line_numbers):
     if not selected_line_numbers:
         return content
 
-    def add_marker(match):
+    def add_modern_marker(match):
         line_number = int(match.group(2))
         return match.group(1) + (' data-coverage-review="incremental"' if line_number in selected_line_numbers else '') + match.group(3)
 
+    def add_legacy_marker(match):
+        line_number = int(match.group("line_number"))
+        return match.group("prefix") + (
+            ' data-coverage-review="incremental"' if line_number in selected_line_numbers else ''
+        ) + match.group("closing")
+
     modern_line_pattern = re.compile(r'(<span\b[^>]*\bid=["\']L(\d+)["\'][^>]*)(>)', re.I)
     legacy_line_pattern = re.compile(
-        r'(<span\b[^>]*\bclass=["\'][^"\']*\blineNum\b[^"\']*["\'][^>]*>\s*(\d+)\s*</span>\s*<span\b[^>]*)(>)',
-        re.I,
+        r'(?P<prefix>'
+        r'<span\b[^>]*\bclass=["\'][^"\']*\blineNum\b[^"\']*["\'][^>]*>\s*'
+        r'(?P<line_number>\d+)\s*</span>'
+        r'(?:(?!<span\b[^>]*\bclass=["\'][^"\']*\blineNum\b[^"\']*["\']).)*?'
+        r'<span\b[^>]*\bclass=["\'][^"\']*\b(?:lineCov|lineNoCov|tlaGNC|tlaUNC|tlaBgGNC|tlaBgUNC)\b[^"\']*["\'][^>]*'
+        r')(?P<closing>>)',
+        re.I | re.S,
     )
-    content = modern_line_pattern.sub(add_marker, content)
-    return legacy_line_pattern.sub(add_marker, content)
+    content = modern_line_pattern.sub(add_modern_marker, content)
+    return legacy_line_pattern.sub(add_legacy_marker, content)
 
 
 def extract_line_index_records(content, fallback_path, project_name, review_line_numbers=None):
