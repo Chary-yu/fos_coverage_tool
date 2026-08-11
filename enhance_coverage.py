@@ -49,8 +49,13 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "coverage_config.json")
 JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
 CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
 PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
-ASSET_VERSION = "incremental-review-20260811"
+ASSET_VERSION = "batch-review-20260811"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
+REVIEW_STATUS_UNCONFIRMED = "未确认"
+REVIEW_CONFIRMED_STATUSES = ("可覆盖", "无法覆盖", "冗余代码")
+REVIEW_VALID_STATUSES = (REVIEW_STATUS_UNCONFIRMED,) + REVIEW_CONFIRMED_STATUSES
+MAX_BATCH_REVIEW_BLOCKS = 1000
+MAX_BATCH_REVIEW_LINES = 20000
 DEFAULT_PROGRESS_PAGE_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -626,6 +631,7 @@ class DatabaseManager:
                 line_number INT NOT NULL,
                 reviewer VARCHAR(128) DEFAULT '' COMMENT '确认人',
                 status VARCHAR(64) NOT NULL DEFAULT '未确认',
+                is_draft TINYINT(1) NOT NULL DEFAULT 0,
                 coverage_method VARCHAR(256) DEFAULT '',
                 uncovered_reason TEXT,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -665,6 +671,14 @@ class DatabaseManager:
                 cursor.execute("UPDATE coverage_analysis SET source_file_name = SUBSTRING_INDEX(REPLACE(file_path, '\\\\', '/'), '/', -1) WHERE source_file_name = ''")
                 self.conn.commit()
                 print("[DB] source_file_name backfill complete.")
+
+            self.ensure_column(
+                cursor,
+                "coverage_analysis",
+                "is_draft",
+                "ALTER TABLE coverage_analysis ADD COLUMN is_draft TINYINT(1) NOT NULL DEFAULT 0 AFTER status"
+            )
+            self.conn.commit()
 
             cursor.execute("SHOW INDEX FROM coverage_analysis WHERE Key_name = 'ukey_proj_file_line'")
             index_rows = cursor.fetchall()
@@ -759,7 +773,7 @@ class DatabaseManager:
             cursor = self.conn.cursor()
             file_path_hash = calc_file_path_hash(file_path)
             sql = """
-                SELECT line_number, reviewer, status, coverage_method, uncovered_reason
+                SELECT line_number, reviewer, status, is_draft, coverage_method, uncovered_reason
                 FROM coverage_analysis
                 WHERE project_name = %s AND file_path_hash = %s AND file_path = %s
             """
@@ -774,6 +788,7 @@ class DatabaseManager:
                         "line_number": row.get("line_number"),
                         "reviewer": row.get("reviewer", ""),
                         "status": row.get("status"),
+                        "is_draft": bool(row.get("is_draft")),
                         "coverage_method": row.get("coverage_method"),
                         "uncovered_reason": row.get("uncovered_reason")
                     })
@@ -782,8 +797,9 @@ class DatabaseManager:
                         "line_number": row[0],
                         "reviewer": row[1] if row[1] is not None else "",
                         "status": row[2],
-                        "coverage_method": row[3],
-                        "uncovered_reason": row[4]
+                        "is_draft": bool(row[3]),
+                        "coverage_method": row[4],
+                        "uncovered_reason": row[5]
                     })
             return records
         except Exception as e:
@@ -803,24 +819,86 @@ class DatabaseManager:
             source_file_name = get_source_file_name(file_path)
             sql = """
             INSERT INTO coverage_analysis
-                (project_name, file_path, file_path_hash, source_file_name, line_number, reviewer, status, coverage_method, uncovered_reason)
+                (project_name, file_path, file_path_hash, source_file_name, line_number, reviewer, status, is_draft, coverage_method, uncovered_reason)
             VALUES
-                (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON DUPLICATE KEY UPDATE
                 file_path = VALUES(file_path),
                 source_file_name = VALUES(source_file_name),
                 reviewer = VALUES(reviewer),
-                status = VALUES(status), 
+                status = VALUES(status),
+                is_draft = VALUES(is_draft),
                 coverage_method = VALUES(coverage_method), 
                 uncovered_reason = VALUES(uncovered_reason)
             """
-            cursor.execute(sql, (project_name, file_path, file_path_hash, source_file_name, int(line_number), reviewer, status, method, reason))
+            cursor.execute(sql, (project_name, file_path, file_path_hash, source_file_name, int(line_number), reviewer, status, 0, method, reason))
             self.conn.commit()
             cursor.close()
             return True
         except Exception as e:
             print(f"[DB Error] Save failed: {e}")
             return False
+
+    def save_records_batch(self, project_name, file_path, blocks, is_draft=False):
+        """Persist multiple review blocks for one source file in one transaction."""
+        cursor = None
+        try:
+            try:
+                self.conn.ping(reconnect=True)
+            except AttributeError:
+                pass
+
+            file_path_hash = calc_file_path_hash(file_path)
+            source_file_name = get_source_file_name(file_path)
+            payload = []
+            for block in blocks:
+                for line_number in block["line_numbers"]:
+                    payload.append((
+                        project_name,
+                        file_path,
+                        file_path_hash,
+                        source_file_name,
+                        int(line_number),
+                        block["reviewer"],
+                        block["status"],
+                        1 if is_draft else 0,
+                        block["coverage_method"],
+                        block["uncovered_reason"],
+                    ))
+            if not payload:
+                return None
+
+            cursor = self.conn.cursor()
+            sql = """
+            INSERT INTO coverage_analysis
+                (project_name, file_path, file_path_hash, source_file_name, line_number, reviewer, status, is_draft, coverage_method, uncovered_reason)
+            VALUES
+                (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                file_path = VALUES(file_path),
+                source_file_name = VALUES(source_file_name),
+                reviewer = VALUES(reviewer),
+                status = VALUES(status),
+                is_draft = VALUES(is_draft),
+                coverage_method = VALUES(coverage_method),
+                uncovered_reason = VALUES(uncovered_reason)
+            """
+            cursor.executemany(sql, payload)
+            self.conn.commit()
+            cursor.close()
+            return {"saved_blocks": len(blocks), "saved_lines": len(payload)}
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            print(f"[DB Error] Batch save failed: {e}")
+            return None
 
     def sync_line_index(self, project_name, records, batch_size=5000):
         try:
@@ -954,7 +1032,7 @@ class DatabaseManager:
                 (source_project,)
             )
             source_reviewed_records = fetch_count(
-                "SELECT COUNT(*) FROM coverage_analysis WHERE project_name = %s AND status <> %s",
+                "SELECT COUNT(*) FROM coverage_analysis WHERE project_name = %s AND status <> %s AND is_draft = 0",
                 (source_project, unconfirmed_status)
             )
             source_index_records = fetch_count(
@@ -993,6 +1071,7 @@ class DatabaseManager:
                   AND si.project_name = %s
                   AND si.code_line_hash <> ''
                   AND a.status <> %s
+                  AND a.is_draft = 0
             """
             cursor.execute(source_sql, (source_project, source_project, unconfirmed_status))
             source_rows = cursor.fetchall()
@@ -1233,15 +1312,15 @@ class DatabaseManager:
                 sql = f"""
                     SELECT project_name, file_path,
                            COUNT(*) AS review_total,
-                           SUM(CASE WHEN status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
-                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS coverable_total,
-                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
-                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS redundant_total,
-                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS unconfirmed_total,
-                           ROUND(SUM(CASE WHEN status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
-                           ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS coverable_rate,
-                           ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS uncoverable_rate,
-                           ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS redundant_rate,
+                           SUM(CASE WHEN is_draft = 0 AND status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
+                           SUM(CASE WHEN is_draft = 0 AND status = %s THEN 1 ELSE 0 END) AS coverable_total,
+                           SUM(CASE WHEN is_draft = 0 AND status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
+                           SUM(CASE WHEN is_draft = 0 AND status = %s THEN 1 ELSE 0 END) AS redundant_total,
+                           SUM(CASE WHEN is_draft = 1 OR status = %s THEN 1 ELSE 0 END) AS unconfirmed_total,
+                           ROUND(SUM(CASE WHEN is_draft = 0 AND status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
+                           ROUND(SUM(CASE WHEN is_draft = 0 AND status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS coverable_rate,
+                           ROUND(SUM(CASE WHEN is_draft = 0 AND status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS uncoverable_rate,
+                           ROUND(SUM(CASE WHEN is_draft = 0 AND status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS redundant_rate,
                            MAX(updated_at) AS last_updated
                     FROM coverage_analysis
                     {where_sql}
@@ -1262,15 +1341,15 @@ class DatabaseManager:
                 sql = f"""
                     SELECT project_name,
                            COUNT(*) AS review_total,
-                           SUM(CASE WHEN status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
-                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS coverable_total,
-                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
-                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS redundant_total,
-                           SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) AS unconfirmed_total,
-                           ROUND(SUM(CASE WHEN status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
-                           ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS coverable_rate,
-                           ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS uncoverable_rate,
-                           ROUND(SUM(CASE WHEN status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS redundant_rate,
+                           SUM(CASE WHEN is_draft = 0 AND status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
+                           SUM(CASE WHEN is_draft = 0 AND status = %s THEN 1 ELSE 0 END) AS coverable_total,
+                           SUM(CASE WHEN is_draft = 0 AND status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
+                           SUM(CASE WHEN is_draft = 0 AND status = %s THEN 1 ELSE 0 END) AS redundant_total,
+                           SUM(CASE WHEN is_draft = 1 OR status = %s THEN 1 ELSE 0 END) AS unconfirmed_total,
+                           ROUND(SUM(CASE WHEN is_draft = 0 AND status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
+                           ROUND(SUM(CASE WHEN is_draft = 0 AND status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS coverable_rate,
+                           ROUND(SUM(CASE WHEN is_draft = 0 AND status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS uncoverable_rate,
+                           ROUND(SUM(CASE WHEN is_draft = 0 AND status = %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS redundant_rate,
                            COUNT(DISTINCT file_path_hash) AS file_total,
                            MAX(updated_at) AS last_updated
                     FROM coverage_analysis
@@ -1331,12 +1410,12 @@ class DatabaseManager:
                            COUNT(*) AS total_uncovered,
                            SUM(CASE WHEN a.id IS NULL THEN 0 ELSE 1 END) AS filled_total,
                            SUM(CASE WHEN a.id IS NULL THEN 1 ELSE 0 END) AS unfilled_total,
-                           SUM(CASE WHEN a.id IS NOT NULL AND a.status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
-                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS coverable_total,
-                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
-                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS redundant_total,
+                           SUM(CASE WHEN a.id IS NOT NULL AND COALESCE(a.is_draft, 0) = 0 AND a.status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
+                           SUM(CASE WHEN COALESCE(a.is_draft, 0) = 0 AND a.status = %s THEN 1 ELSE 0 END) AS coverable_total,
+                           SUM(CASE WHEN COALESCE(a.is_draft, 0) = 0 AND a.status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
+                           SUM(CASE WHEN COALESCE(a.is_draft, 0) = 0 AND a.status = %s THEN 1 ELSE 0 END) AS redundant_total,
                            ROUND(SUM(CASE WHEN a.id IS NULL THEN 0 ELSE 1 END) * 100.0 / COUNT(*), 2) AS fill_rate,
-                           ROUND(SUM(CASE WHEN a.id IS NOT NULL AND a.status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
+                           ROUND(SUM(CASE WHEN a.id IS NOT NULL AND COALESCE(a.is_draft, 0) = 0 AND a.status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
                            MAX(a.updated_at) AS last_updated
                     FROM coverage_line_index i
                     LEFT JOIN coverage_analysis a
@@ -1369,12 +1448,12 @@ class DatabaseManager:
                            COUNT(*) AS total_uncovered,
                            SUM(CASE WHEN a.id IS NULL THEN 0 ELSE 1 END) AS filled_total,
                            SUM(CASE WHEN a.id IS NULL THEN 1 ELSE 0 END) AS unfilled_total,
-                           SUM(CASE WHEN a.id IS NOT NULL AND a.status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
-                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS coverable_total,
-                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
-                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS redundant_total,
+                           SUM(CASE WHEN a.id IS NOT NULL AND COALESCE(a.is_draft, 0) = 0 AND a.status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
+                           SUM(CASE WHEN COALESCE(a.is_draft, 0) = 0 AND a.status = %s THEN 1 ELSE 0 END) AS coverable_total,
+                           SUM(CASE WHEN COALESCE(a.is_draft, 0) = 0 AND a.status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
+                           SUM(CASE WHEN COALESCE(a.is_draft, 0) = 0 AND a.status = %s THEN 1 ELSE 0 END) AS redundant_total,
                            ROUND(SUM(CASE WHEN a.id IS NULL THEN 0 ELSE 1 END) * 100.0 / COUNT(*), 2) AS fill_rate,
-                           ROUND(SUM(CASE WHEN a.id IS NOT NULL AND a.status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
+                           ROUND(SUM(CASE WHEN a.id IS NOT NULL AND COALESCE(a.is_draft, 0) = 0 AND a.status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
                            MAX(a.updated_at) AS last_updated
                     FROM coverage_line_index i
                     LEFT JOIN coverage_analysis a
@@ -1406,12 +1485,12 @@ class DatabaseManager:
                            COUNT(*) AS total_uncovered,
                            SUM(CASE WHEN a.id IS NULL THEN 0 ELSE 1 END) AS filled_total,
                            SUM(CASE WHEN a.id IS NULL THEN 1 ELSE 0 END) AS unfilled_total,
-                           SUM(CASE WHEN a.id IS NOT NULL AND a.status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
-                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS coverable_total,
-                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
-                           SUM(CASE WHEN a.status = %s THEN 1 ELSE 0 END) AS redundant_total,
+                           SUM(CASE WHEN a.id IS NOT NULL AND COALESCE(a.is_draft, 0) = 0 AND a.status <> %s THEN 1 ELSE 0 END) AS confirmed_total,
+                           SUM(CASE WHEN COALESCE(a.is_draft, 0) = 0 AND a.status = %s THEN 1 ELSE 0 END) AS coverable_total,
+                           SUM(CASE WHEN COALESCE(a.is_draft, 0) = 0 AND a.status = %s THEN 1 ELSE 0 END) AS uncoverable_total,
+                           SUM(CASE WHEN COALESCE(a.is_draft, 0) = 0 AND a.status = %s THEN 1 ELSE 0 END) AS redundant_total,
                            ROUND(SUM(CASE WHEN a.id IS NULL THEN 0 ELSE 1 END) * 100.0 / COUNT(*), 2) AS fill_rate,
-                           ROUND(SUM(CASE WHEN a.id IS NOT NULL AND a.status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
+                           ROUND(SUM(CASE WHEN a.id IS NOT NULL AND COALESCE(a.is_draft, 0) = 0 AND a.status <> %s THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) AS confirmed_rate,
                            MAX(a.updated_at) AS last_updated
                     FROM coverage_line_index i
                     LEFT JOIN coverage_analysis a
@@ -1915,6 +1994,97 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.send_json_response(200, {"status": "success", "message": "Record saved successfully"})
             else:
                 self.send_error_response(500, "Failed to save record to database")
+        elif parsed_url.path == "/api/coverage/batch":
+            content_length = int(self.headers.get("Content-Length", 0))
+            post_data = self.rfile.read(content_length)
+            try:
+                payload = json.loads(post_data.decode("utf-8"))
+            except ValueError:
+                self.send_error_response(400, "Invalid JSON data")
+                return
+
+            if not isinstance(payload, dict):
+                self.send_error_response(400, "JSON payload must be an object")
+                return
+
+            project_name = str(payload.get("project_name") or "").strip()
+            file_path = str(payload.get("file_path") or "").strip()
+            mode = str(payload.get("mode") or "draft").strip().lower()
+            blocks = payload.get("blocks")
+            if not project_name or not file_path:
+                self.send_error_response(400, "Missing required parameters (project_name, file_path)")
+                return
+            if mode not in ("draft", "confirm"):
+                self.send_error_response(400, "mode must be draft or confirm")
+                return
+            if not isinstance(blocks, list) or not blocks:
+                self.send_error_response(400, "blocks must be a non-empty array")
+                return
+            if len(blocks) > MAX_BATCH_REVIEW_BLOCKS:
+                self.send_error_response(400, "Too many review blocks in one batch")
+                return
+
+            normalized_blocks = []
+            used_line_numbers = set()
+            total_line_count = 0
+            for block_index, block in enumerate(blocks, start=1):
+                if not isinstance(block, dict):
+                    self.send_error_response(400, "blocks[{}] must be an object".format(block_index))
+                    return
+                line_numbers = block.get("line_numbers")
+                if not isinstance(line_numbers, list) or not line_numbers:
+                    self.send_error_response(400, "blocks[{}].line_numbers must be a non-empty array".format(block_index))
+                    return
+
+                normalized_line_numbers = []
+                for raw_line_number in line_numbers:
+                    try:
+                        line_number = int(raw_line_number)
+                    except (TypeError, ValueError):
+                        self.send_error_response(400, "Invalid line number in blocks[{}]".format(block_index))
+                        return
+                    if line_number <= 0 or line_number in used_line_numbers:
+                        self.send_error_response(400, "Duplicate or invalid line number in batch")
+                        return
+                    used_line_numbers.add(line_number)
+                    normalized_line_numbers.append(line_number)
+
+                total_line_count += len(normalized_line_numbers)
+                if total_line_count > MAX_BATCH_REVIEW_LINES:
+                    self.send_error_response(400, "Too many review lines in one batch")
+                    return
+
+                status = str(block.get("status") or REVIEW_STATUS_UNCONFIRMED).strip()
+                reviewer = str(block.get("reviewer") or "").strip()
+                method = str(block.get("coverage_method") or "").strip()
+                reason = str(block.get("uncovered_reason") or "").strip()
+                if status not in REVIEW_VALID_STATUSES:
+                    self.send_error_response(400, "Invalid review status in blocks[{}]".format(block_index))
+                    return
+                if mode == "confirm":
+                    if status not in REVIEW_CONFIRMED_STATUSES:
+                        self.send_error_response(400, "Confirmed blocks must use a confirmed status")
+                        return
+                    if not reviewer or (not method and not reason):
+                        self.send_error_response(400, "Confirmed blocks require reviewer and method or reason")
+                        return
+                normalized_blocks.append({
+                    "line_numbers": normalized_line_numbers,
+                    "reviewer": reviewer,
+                    "status": status,
+                    "coverage_method": method,
+                    "uncovered_reason": reason,
+                })
+
+            result = db_manager.save_records_batch(
+                project_name, file_path, normalized_blocks, is_draft=(mode == "draft")
+            )
+            if result:
+                response = {"status": "success", "mode": mode}
+                response.update(result)
+                self.send_json_response(200, response)
+            else:
+                self.send_error_response(500, "Failed to save batch records to database")
         else:
             self.send_error_response(404, "Not Found")
 

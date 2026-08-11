@@ -4,7 +4,7 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'review-navigation-20260811';
+    const ENHANCE_VERSION = 'batch-review-20260811';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const RENDER_MODE = 'lazy'; // 'lazy' or 'immediate'
@@ -27,6 +27,8 @@
     let legacyPanelSyncers = [];
     let legacyRefreshRequested = false;
     let requestLegacyPanelRefresh = function() {};
+    let dirtyPanelStartLines = new Set();
+    let batchToolbarState = null;
 
     function getBlockStartItem(block) {
         return block.startItem || block[0];
@@ -76,6 +78,7 @@
     function setStoredPanelValues(panel, values) {
         panel.values = Object.assign({
             status: '未确认',
+            isDraft: false,
             reviewerInput: '',
             methodInput: '',
             reasonInput: ''
@@ -93,6 +96,85 @@
         if (panel.reasonInput) {
             panel.reasonInput.value = panel.values.reasonInput || '';
         }
+    }
+
+    function setPanelPersistedState(panel) {
+        if (!panel || !panel.saveBtn) {
+            return;
+        }
+        const status = getStoredPanelValue(panel, 'status');
+        panel.saveBtn.className = 'coverage-analysis-btn saved';
+        panel.saveBtn.innerText = panel.values && panel.values.isDraft ? '已暂存' : (status === '未确认' ? '已保存' : '已确认');
+    }
+
+    function updateBatchToolbar() {
+        if (!batchToolbarState) {
+            return;
+        }
+        const count = dirtyPanelStartLines.size;
+        const submitting = batchToolbarState.submitting === true;
+        batchToolbarState.count.innerText = `待暂存 ${count} 项`;
+        batchToolbarState.draftBtn.innerText = submitting ? '保存中...' : `暂存草稿 (${count})`;
+        batchToolbarState.confirmBtn.innerText = submitting ? '保存中...' : `确认提交 (${count})`;
+        batchToolbarState.draftBtn.disabled = count === 0 || submitting;
+        batchToolbarState.confirmBtn.disabled = count === 0 || submitting;
+        batchToolbarState.container.classList.toggle('has-pending', count > 0);
+    }
+
+    function markPanelDirty(startLineNum) {
+        const panel = panelsMap.get(startLineNum);
+        if (!panel) {
+            return;
+        }
+        dirtyPanelStartLines.add(startLineNum);
+        if (panel.saveBtn) {
+            panel.saveBtn.className = 'coverage-analysis-btn pending';
+            panel.saveBtn.innerText = '待暂存';
+        }
+        updateBatchToolbar();
+    }
+
+    function clearPanelDirty(startLineNum, isDraft) {
+        const panel = panelsMap.get(startLineNum);
+        dirtyPanelStartLines.delete(startLineNum);
+        if (panel) {
+            setStoredPanelValues(panel, { isDraft: isDraft === true });
+        }
+        setPanelPersistedState(panel);
+        updateBatchToolbar();
+    }
+
+    function getPanelBatchPayload(panel) {
+        return {
+            line_numbers: getBlockLineNums(panel.block),
+            reviewer: getStoredPanelValue(panel, 'reviewerInput').trim(),
+            status: getStoredPanelValue(panel, 'status') || '未确认',
+            coverage_method: getStoredPanelValue(panel, 'methodInput').trim(),
+            uncovered_reason: getStoredPanelValue(panel, 'reasonInput').trim()
+        };
+    }
+
+    function saveReviewBlocksBatch(filePath, blocks, mode) {
+        return fetch(`${SERVER_URL}/batch`, {
+            method: 'POST',
+            mode: 'cors',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                project_name: DEFAULT_PROJECT,
+                file_path: filePath,
+                mode: mode,
+                blocks: blocks
+            })
+        }).then(response => {
+            return response.json().then(data => {
+                if (!response.ok || !data || data.status !== 'success') {
+                    throw new Error(data && data.message ? data.message : `HTTP ${response.status}`);
+                }
+                return data;
+            });
+        });
     }
 
     function summarizeStatus(values) {
@@ -660,9 +742,8 @@
             const values = Object.assign({}, current.values || {});
             const panel = renderBlockPanel(block);
             setStoredPanelValues(panel, values);
-            if (values.status && values.status !== '未确认' && panel.saveBtn) {
-                panel.saveBtn.innerText = 'Saved';
-                panel.saveBtn.classList.add('saved');
+            if ((values.isDraft || (values.status && values.status !== '未确认')) && panel.saveBtn) {
+                setPanelPersistedState(panel);
             }
             if (placeholder) {
                 if (current.placeholderIsAnchor) {
@@ -1005,6 +1086,7 @@
                 reasonInput.value = getStoredPanelValue(previous, 'reasonInput');
                 saveBtn.innerText = 'Save';
                 saveBtn.className = 'coverage-analysis-btn';
+                markPanelDirty(startLineNum);
             });
 
             previousBtn.addEventListener('click', function(e) {
@@ -1028,6 +1110,7 @@
                 if (panel) {
                     setStoredPanelValues(panel, { status: select.value });
                 }
+                markPanelDirty(startLineNum);
             });
 
             [reviewerInput, methodInput, reasonInput].forEach(input => {
@@ -1041,10 +1124,112 @@
                         methodInput: methodInput.value,
                         reasonInput: reasonInput.value
                     });
+                    markPanelDirty(startLineNum);
                 });
             });
 
             return panelsMap.get(startLineNum);
+        }
+
+        function validatePanelForConfirm(startLineNum, panel) {
+            const values = getPanelBatchPayload(panel);
+            if (!CONFIRMED_STATUS_SET.has(values.status)) {
+                return `第 ${startLineNum} 行：请选择“可覆盖”、“无法覆盖”或“冗余代码”。`;
+            }
+            if (!values.reviewer) {
+                return `第 ${startLineNum} 行：请输入确认人。`;
+            }
+            if (!values.coverage_method && !values.uncovered_reason) {
+                return `第 ${startLineNum} 行：请填写条件覆盖方法或无条件覆盖原因。`;
+            }
+            return '';
+        }
+
+        function submitDirtyPanels(mode) {
+            const startLineNumbers = Array.from(dirtyPanelStartLines)
+                .filter(startLineNum => panelsMap.has(startLineNum))
+                .sort((left, right) => left - right);
+            if (!startLineNumbers.length || !batchToolbarState || batchToolbarState.submitting) {
+                return;
+            }
+
+            const panels = startLineNumbers.map(startLineNum => ({
+                startLineNum,
+                panel: panelsMap.get(startLineNum)
+            }));
+            if (mode === 'confirm') {
+                for (const item of panels) {
+                    const message = validatePanelForConfirm(item.startLineNum, item.panel);
+                    if (message) {
+                        alert(`[校验失败] ${message}`);
+                        focusReviewPanel(item.panel);
+                        return;
+                    }
+                }
+            }
+
+            batchToolbarState.submitting = true;
+            updateBatchToolbar();
+            saveReviewBlocksBatch(
+                filePath,
+                panels.map(item => getPanelBatchPayload(item.panel)),
+                mode
+            ).then(result => {
+                panels.forEach(item => clearPanelDirty(item.startLineNum, mode === 'draft'));
+                updateHeaderStatistics();
+                requestLegacyPanelRefresh(3);
+                console.log(`[CoverageEnhance] ${mode} batch saved: ${result.saved_blocks} block(s), ${result.saved_lines} line(s).`);
+            }).catch(error => {
+                console.error('[CoverageEnhance] Batch save failed:', error);
+                alert(`批量${mode === 'confirm' ? '确认提交' : '暂存'}失败：${error.message}`);
+            }).then(() => {
+                batchToolbarState.submitting = false;
+                updateBatchToolbar();
+            });
+        }
+
+        function createBatchToolbar() {
+            const container = document.createElement('div');
+            container.className = 'coverage-batch-toolbar';
+            container.setAttribute('contenteditable', 'false');
+            container.setAttribute('aria-label', '批量暂存和确认提交');
+
+            const count = document.createElement('span');
+            count.className = 'coverage-batch-count';
+
+            const draftBtn = document.createElement('button');
+            draftBtn.className = 'coverage-batch-btn draft';
+            draftBtn.type = 'button';
+            draftBtn.title = '将当前文件内已修改的控件作为草稿批量保存，可暂不填写完整信息';
+
+            const confirmBtn = document.createElement('button');
+            confirmBtn.className = 'coverage-batch-btn confirm';
+            confirmBtn.type = 'button';
+            confirmBtn.title = '校验当前文件内已修改的控件后批量确认提交';
+
+            draftBtn.addEventListener('click', function() {
+                submitDirtyPanels('draft');
+            });
+            confirmBtn.addEventListener('click', function() {
+                submitDirtyPanels('confirm');
+            });
+
+            container.appendChild(count);
+            container.appendChild(draftBtn);
+            container.appendChild(confirmBtn);
+            document.body.appendChild(container);
+            batchToolbarState = { container, count, draftBtn, confirmBtn, submitting: false };
+            updateBatchToolbar();
+
+            window.addEventListener('beforeunload', function(event) {
+                if (!dirtyPanelStartLines.size) {
+                    return undefined;
+                }
+                const message = '当前页面有未暂存的填写内容。';
+                event.preventDefault();
+                event.returnValue = message;
+                return message;
+            });
         }
 
         function createModeToggler() {
@@ -1091,6 +1276,7 @@
 
         // 5. 创建高级浮动显示模式切换器
         createModeToggler();
+        createBatchToolbar();
     });
 
     function findPreviousFilledPanel(currentLineNum) {
@@ -1122,7 +1308,8 @@
         // 统计已分析确认的行数 (只要 Block 首行分析被保存，其所覆盖的所有物理行数均计入)
         panelsMap.forEach((panel, startLineNum) => {
             const status = panel.select ? panel.select.value : (panel.values && panel.values.status);
-            if (CONFIRMED_STATUS_SET.has(status)) {
+            const isDraft = panel.values && panel.values.isDraft === true;
+            if (!isDraft && CONFIRMED_STATUS_SET.has(status)) {
                 confirmedCount += panel.block.length;
             }
         });
@@ -1232,18 +1419,15 @@
                 // 对每一个被我们隔离出来的 Block，检查其首行数据库是否已被填报过
                 panelsMap.forEach((panel, startLineNum) => {
                     const rec = dbRecordsMap.get(startLineNum);
-                    if (rec) {
+                    if (rec && !dirtyPanelStartLines.has(startLineNum)) {
                         setStoredPanelValues(panel, {
                             status: rec.status || '未确认',
+                            isDraft: rec.is_draft === true || rec.is_draft === 1 || rec.is_draft === '1',
                             reviewerInput: rec.reviewer || '',
                             methodInput: rec.coverage_method || '',
                             reasonInput: rec.uncovered_reason || ''
                         });
-
-                        if (panel.saveBtn) {
-                            panel.saveBtn.innerText = 'Saved';
-                            panel.saveBtn.classList.add('saved');
-                        }
+                        setPanelPersistedState(panel);
                         if (panel.placeholder) {
                             decoratePlaceholder(panel.placeholder, panel.values, panel.block);
                         }
@@ -1273,79 +1457,42 @@
     }
 
     /**
-     * 批量并发持久化该 Block 包含的所有代码行
+     * Confirm and persist one analysis block through the same transactional
+     * batch endpoint used by the page-level draft/confirm toolbar.
      */
     function saveBlockLineAnalysis(filePath, block, reviewer, status, method, reason, btn) {
         btn.innerText = 'Saving...';
         btn.className = 'coverage-analysis-btn saving';
 
         const lineNums = getBlockLineNums(block);
-        const requests = lineNums.map(lineNum => {
-            const payload = {
-                project_name: DEFAULT_PROJECT,
-                file_path: filePath,
-                line_number: lineNum,
-                reviewer: reviewer,
-                status: status,
-                coverage_method: method,
-                uncovered_reason: reason
-            };
-
-            return fetch(SERVER_URL, {
-                method: 'POST',
-                mode: 'cors',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(payload)
-            }).then(response => {
-                if (!response.ok) {
-                    throw new Error(`Line ${lineNum} save failed with HTTP status: ${response.status}`);
-                }
-                return response.json();
-            });
-        });
-
-        Promise.all(requests)
-        .then(results => {
-            const allSuccess = results.every(res => res.status === 'success');
-            if (allSuccess) {
-                const startLineNum = lineNums[0];
-                const panel = panelsMap.get(startLineNum);
-                if (panel) {
-                    setStoredPanelValues(panel, {
-                        status: status,
-                        reviewerInput: reviewer,
-                        methodInput: method,
-                        reasonInput: reason
-                    });
-                }
-                btn.innerText = 'Saved';
-                btn.className = 'coverage-analysis-btn saved';
-                console.log(`[CoverageEnhance] Successfully saved block range L${lineNums[0]}-${lineNums[lineNums.length - 1]}`);
-                
-                updateHeaderStatistics();
-                requestLegacyPanelRefresh(3);
-                
-                setTimeout(() => {
-                    if (btn.className.includes('saved')) {
-                        btn.innerText = 'Save';
-                    }
-                }, 2000);
-            } else {
-                const failMsg = results.find(res => res.status !== 'success')?.message || 'Unknown server error';
-                throw new Error(failMsg);
+        const startLineNum = lineNums[0];
+        saveReviewBlocksBatch(filePath, [{
+            line_numbers: lineNums,
+            reviewer: reviewer,
+            status: status,
+            coverage_method: method,
+            uncovered_reason: reason
+        }], 'confirm').then(result => {
+            const panel = panelsMap.get(startLineNum);
+            if (panel) {
+                setStoredPanelValues(panel, {
+                    status: status,
+                    reviewerInput: reviewer,
+                    methodInput: method,
+                    reasonInput: reason
+                });
             }
-        })
-        .catch(err => {
-            console.error('[CoverageEnhance] Batch save failed:', err);
+            clearPanelDirty(startLineNum, false);
+            console.log(`[CoverageEnhance] Confirmed block range L${lineNums[0]}-${lineNums[lineNums.length - 1]} (${result.saved_lines} line(s)).`);
+            updateHeaderStatistics();
+            requestLegacyPanelRefresh(3);
+        }).catch(err => {
+            console.error('[CoverageEnhance] Block save failed:', err);
             btn.innerText = 'Error';
             btn.className = 'coverage-analysis-btn error';
             btn.title = `保存失败: ${err.message}. 请重试。`;
-            
-            setTimeout(() => {
-                btn.innerText = 'Save';
-                btn.className = 'coverage-analysis-btn';
+            window.setTimeout(() => {
+                markPanelDirty(startLineNum);
             }, 3000);
         });
     }

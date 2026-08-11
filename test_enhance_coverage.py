@@ -12,6 +12,7 @@ import shutil
 import tempfile
 import re
 import json
+import io
 
 # Import functions from enhance_coverage.py
 import enhance_coverage
@@ -87,6 +88,157 @@ class TestCParserHelpers(unittest.TestCase):
         self.assertEqual(len(h), 32)
 
 
+class TestBatchReviewSave(unittest.TestCase):
+    class BatchCursor(object):
+        def __init__(self):
+            self.executemany_calls = []
+            self.closed = False
+
+        def executemany(self, sql, payload):
+            self.executemany_calls.append((sql, list(payload)))
+
+        def close(self):
+            self.closed = True
+
+    class BatchConnection(object):
+        def __init__(self, cursor):
+            self.batch_cursor = cursor
+            self.commits = 0
+            self.rollbacks = 0
+
+        def ping(self, reconnect=True):
+            return None
+
+        def cursor(self):
+            return self.batch_cursor
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    def test_database_batch_save_uses_one_transaction(self):
+        cursor = self.BatchCursor()
+        manager = object.__new__(enhance_coverage.DatabaseManager)
+        manager.conn = self.BatchConnection(cursor)
+        blocks = [
+            {
+                "line_numbers": [10, 11], "reviewer": "Alice", "status": "可覆盖",
+                "coverage_method": "UT", "uncovered_reason": "",
+            },
+            {
+                "line_numbers": [20], "reviewer": "", "status": "未确认",
+                "coverage_method": "", "uncovered_reason": "待补充",
+            },
+        ]
+
+        result = manager.save_records_batch("batch_project", "src/main.c", blocks, is_draft=True)
+
+        self.assertEqual(result, {"saved_blocks": 2, "saved_lines": 3})
+        self.assertEqual(manager.conn.commits, 1)
+        self.assertEqual(manager.conn.rollbacks, 0)
+        self.assertEqual(len(cursor.executemany_calls), 1)
+        payload = cursor.executemany_calls[0][1]
+        self.assertEqual([row[4] for row in payload], [10, 11, 20])
+        self.assertEqual([row[7] for row in payload], [1, 1, 1])
+        self.assertTrue(cursor.closed)
+
+    def make_post_handler(self, path, payload, responses):
+        handler = object.__new__(enhance_coverage.CoverageHTTPRequestHandler)
+        payload_bytes = json.dumps(payload).encode("utf-8")
+        handler.path = path
+        handler.headers = {"Content-Length": str(len(payload_bytes))}
+        handler.rfile = io.BytesIO(payload_bytes)
+        handler.send_json_response = lambda status, data: responses.append(("json", status, data))
+        handler.send_error_response = lambda status, message: responses.append(("error", status, message))
+        return handler
+
+    def test_batch_endpoint_accepts_draft_and_normalizes_lines(self):
+        calls = []
+
+        class BatchManager(object):
+            def save_records_batch(self, project_name, file_path, blocks, is_draft=False):
+                calls.append((project_name, file_path, blocks, is_draft))
+                return {"saved_blocks": len(blocks), "saved_lines": 3}
+
+        previous_manager = enhance_coverage.db_manager
+        enhance_coverage.db_manager = BatchManager()
+        try:
+            responses = []
+            handler = self.make_post_handler("/api/coverage/batch", {
+                "project_name": "batch_project",
+                "file_path": "src/main.c",
+                "mode": "draft",
+                "blocks": [
+                    {"line_numbers": ["10", 11], "status": "未确认"},
+                    {"line_numbers": [20], "status": "可覆盖", "reviewer": "Alice", "coverage_method": "UT"},
+                ],
+            }, responses)
+
+            handler.do_POST()
+
+            self.assertEqual(responses[0][0:2], ("json", 200))
+            self.assertEqual(responses[0][2]["saved_lines"], 3)
+            self.assertEqual(calls[0][0:2], ("batch_project", "src/main.c"))
+            self.assertEqual(calls[0][2][0]["line_numbers"], [10, 11])
+            self.assertTrue(calls[0][3])
+        finally:
+            enhance_coverage.db_manager = previous_manager
+
+    def test_batch_endpoint_rejects_incomplete_confirm(self):
+        class BatchManager(object):
+            def save_records_batch(self, project_name, file_path, blocks, is_draft=False):
+                raise AssertionError("invalid confirm payload must not reach database")
+
+        previous_manager = enhance_coverage.db_manager
+        enhance_coverage.db_manager = BatchManager()
+        try:
+            responses = []
+            handler = self.make_post_handler("/api/coverage/batch", {
+                "project_name": "batch_project",
+                "file_path": "src/main.c",
+                "mode": "confirm",
+                "blocks": [{"line_numbers": [10], "status": "可覆盖"}],
+            }, responses)
+
+            handler.do_POST()
+
+            self.assertEqual(responses[0][0:2], ("error", 400))
+            self.assertIn("reviewer", responses[0][2])
+        finally:
+            enhance_coverage.db_manager = previous_manager
+
+    def test_batch_endpoint_marks_confirmed_blocks_as_non_draft(self):
+        calls = []
+
+        class BatchManager(object):
+            def save_records_batch(self, project_name, file_path, blocks, is_draft=False):
+                calls.append(is_draft)
+                return {"saved_blocks": len(blocks), "saved_lines": 1}
+
+        previous_manager = enhance_coverage.db_manager
+        enhance_coverage.db_manager = BatchManager()
+        try:
+            responses = []
+            handler = self.make_post_handler("/api/coverage/batch", {
+                "project_name": "batch_project",
+                "file_path": "src/main.c",
+                "mode": "confirm",
+                "blocks": [{
+                    "line_numbers": [10], "status": "可覆盖", "reviewer": "Alice",
+                    "coverage_method": "UT",
+                }],
+            }, responses)
+
+            handler.do_POST()
+
+            self.assertEqual(responses[0][0:2], ("json", 200))
+            self.assertEqual(calls, [False])
+        finally:
+            enhance_coverage.db_manager = previous_manager
+
+
 class TestIntegration(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
@@ -143,6 +295,10 @@ class TestIntegration(unittest.TestCase):
         self.assertIn('function navigateReviewPanel', content)
         self.assertIn("previousBtn.innerText = '上一个';", content)
         self.assertIn("nextBtn.innerText = '下一个';", content)
+        self.assertIn('function saveReviewBlocksBatch', content)
+        self.assertIn('暂存草稿', content)
+        self.assertIn('确认提交', content)
+        self.assertIn("${SERVER_URL}/batch", content)
 
     @unittest.mock.patch('enhance_coverage.DatabaseManager')
     def test_inject_coverage_report_lazy(self, mock_db_manager):
