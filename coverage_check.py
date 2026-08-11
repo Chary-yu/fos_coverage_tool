@@ -192,21 +192,82 @@ def resolve_coverage_file(filename, coverage_data, repo_path):
     return suffix_matches[0] if len(suffix_matches) == 1 else None
 
 
-def calculate_incremental_coverage(repo_path, oldgit, newgit, info_path, diff_text=None):
-    """Calculate coverage of Git-added lines.
+def load_repositories_config(config_path):
+    """Load and validate the independent Git repositories used by multi-repo mode."""
+    config_path = os.path.abspath(config_path)
+    with open(config_path, "r", encoding="utf-8") as config_file:
+        raw_config = json.load(config_file)
 
-    The returned object is JSON-safe and deliberately includes the individual lines,
-    so the web-report generator can limit its editable controls to ``未覆盖`` lines.
-    """
+    repositories = raw_config.get("repositories") if isinstance(raw_config, dict) else raw_config
+    if not isinstance(repositories, list) or not repositories:
+        raise ValueError("仓库配置必须包含非空 repositories 数组: {}".format(config_path))
+
+    config_dir = os.path.dirname(config_path)
+    result = []
+    names = set()
+    paths = set()
+    for index, item in enumerate(repositories, start=1):
+        if not isinstance(item, dict):
+            raise ValueError("repositories 第 {} 项必须是对象".format(index))
+        name = str(item.get("name") or "").strip()
+        repo_path = str(item.get("path") or item.get("repo") or "").strip()
+        oldgit = str(item.get("oldgit") or "").strip()
+        newgit = str(item.get("newgit") or "").strip()
+        if not name or not repo_path or not oldgit or not newgit:
+            raise ValueError(
+                "repositories 第 {} 项需要 name、path、oldgit、newgit".format(index)
+            )
+        if not os.path.isabs(repo_path):
+            repo_path = os.path.join(config_dir, repo_path)
+        repo_path = os.path.abspath(repo_path)
+        if name in names:
+            raise ValueError("仓库配置中 name 重复: {}".format(name))
+        if repo_path in paths:
+            raise ValueError("仓库配置中 path 重复: {}".format(repo_path))
+        if not os.path.isdir(repo_path):
+            raise ValueError("Git 仓库目录不存在: {}".format(repo_path))
+        names.add(name)
+        paths.add(repo_path)
+        result.append({
+            "name": name,
+            "path": repo_path,
+            "oldgit": oldgit,
+            "newgit": newgit,
+        })
+    return result
+
+
+def build_summary(counters):
+    """Build the common summary fields from line-status counters."""
+    covered = counters[STATUS_COVERED]
+    uncovered = counters[STATUS_UNCOVERED]
+    ignored = counters[STATUS_IGNORED]
+    missing = counters[STATUS_MISSING]
+    coverable_total = covered + uncovered
+    changed_total = covered + uncovered + ignored + missing
+    return {
+        "changed_lines": changed_total,
+        "covered": covered,
+        "uncovered": uncovered,
+        "ignored": ignored,
+        "missing": missing,
+        "coverable_total": coverable_total,
+        "coverage_rate": covered * 100.0 / coverable_total if coverable_total else None,
+    }
+
+
+def calculate_repository_coverage(repo_path, oldgit, newgit, coverage_data, info_files,
+                                  diff_text=None, repository_name=""):
+    """Calculate one repository against already-loaded LCOV data."""
     repo_path = os.path.abspath(repo_path)
     if diff_text is None:
         diff_text = run_git_diff(repo_path, oldgit, newgit)
     changes = parse_diff_text(diff_text)
-    coverage_data, info_files = load_lcov_info(info_path)
 
     details = []
     counters = defaultdict(int)
     uncovered_lines_by_file = defaultdict(list)
+    review_lines_by_file = defaultdict(list)
     for filename in sorted(changes):
         coverage_file = resolve_coverage_file(filename, coverage_data, repo_path)
         line_data = coverage_data.get(coverage_file, {}) if coverage_file else None
@@ -222,21 +283,18 @@ def calculate_incremental_coverage(repo_path, oldgit, newgit, info_path, diff_te
             counters[status] += 1
             if status == STATUS_UNCOVERED:
                 uncovered_lines_by_file[filename].append(line_number)
+                review_file_path = coverage_file or normalize_path(os.path.join(repo_path, filename))
+                review_lines_by_file[review_file_path].append(line_number)
             details.append({
+                "repository": repository_name,
                 "file_path": filename,
                 "coverage_file": coverage_file or "",
+                "review_file_path": coverage_file or normalize_path(os.path.join(repo_path, filename)),
                 "line_number": line_number,
                 "execution_count": execution_count,
                 "status": status,
             })
 
-    covered = counters[STATUS_COVERED]
-    uncovered = counters[STATUS_UNCOVERED]
-    ignored = counters[STATUS_IGNORED]
-    missing = counters[STATUS_MISSING]
-    coverable_total = covered + uncovered
-    changed_total = len(details)
-    coverage_rate = covered * 100.0 / coverable_total if coverable_total else None
     return {
         "schema_version": 1,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -244,20 +302,95 @@ def calculate_incremental_coverage(repo_path, oldgit, newgit, info_path, diff_te
         "oldgit": oldgit,
         "newgit": newgit,
         "info_files": [os.path.abspath(path) for path in info_files],
-        "summary": {
-            "changed_lines": changed_total,
-            "covered": covered,
-            "uncovered": uncovered,
-            "ignored": ignored,
-            "missing": missing,
-            "coverable_total": coverable_total,
-            "coverage_rate": coverage_rate,
-        },
+        "summary": build_summary(counters),
         "details": details,
         "uncovered_lines_by_file": {
             filename: sorted(lines) for filename, lines in sorted(uncovered_lines_by_file.items())
         },
+        "review_lines_by_file": {
+            filename: sorted(lines) for filename, lines in sorted(review_lines_by_file.items())
+        },
     }
+
+
+def calculate_incremental_coverage(repo_path, oldgit, newgit, info_path, diff_text=None):
+    """Calculate coverage of Git-added lines in one repository."""
+    coverage_data, info_files = load_lcov_info(info_path)
+    return calculate_repository_coverage(
+        repo_path, oldgit, newgit, coverage_data, info_files, diff_text
+    )
+
+
+def calculate_multi_repo_incremental_coverage(repositories, info_path):
+    """Calculate one combined incremental report for several independent Git repos.
+
+    A multi-repo LCOV file must use absolute ``SF:`` paths. Without that identity,
+    identical relative source paths from different repositories cannot be matched
+    safely to their respective Git diff.
+    """
+    if not repositories:
+        raise ValueError("至少需要一个 Git 仓库")
+    coverage_data, info_files = load_lcov_info(info_path)
+    details = []
+    counters = defaultdict(int)
+    raw_uncovered_lines = {}
+    review_lines_by_file = defaultdict(list)
+    repository_summaries = []
+
+    for repository in repositories:
+        name = repository["name"]
+        repo_path = repository["path"]
+        result = calculate_repository_coverage(
+            repo_path,
+            repository["oldgit"],
+            repository["newgit"],
+            coverage_data,
+            info_files,
+            repository_name=name,
+        )
+        for item in result["details"]:
+            coverage_file = item.get("coverage_file")
+            if coverage_file and not os.path.isabs(coverage_file):
+                raise ValueError(
+                    "多仓库模式要求 .info 的 SF 路径为绝对路径；发现: {}。"
+                    "请重新生成 LCOV .info 后重试。".format(coverage_file)
+                )
+            counters[item["status"]] += 1
+        details.extend(result["details"])
+        for file_path, lines in result["uncovered_lines_by_file"].items():
+            raw_uncovered_lines["{}:{}".format(name, file_path)] = lines
+        for file_path, lines in result["review_lines_by_file"].items():
+            review_lines_by_file[file_path].extend(lines)
+        repository_summaries.append({
+            "name": name,
+            "path": repo_path,
+            "oldgit": repository["oldgit"],
+            "newgit": repository["newgit"],
+            "summary": result["summary"],
+        })
+
+    return {
+        "schema_version": 1,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "repo_path": "",
+        "oldgit": "multiple",
+        "newgit": "multiple",
+        "repositories": repository_summaries,
+        "info_files": [os.path.abspath(path) for path in info_files],
+        "summary": build_summary(counters),
+        "details": details,
+        "uncovered_lines_by_file": raw_uncovered_lines,
+        "review_lines_by_file": {
+            filename: sorted(set(lines)) for filename, lines in sorted(review_lines_by_file.items())
+        },
+    }
+
+
+def calculate_multi_repo_incremental_coverage_from_config(config_path, info_path):
+    """Load a repository config file and calculate its combined report."""
+    return calculate_multi_repo_incremental_coverage(
+        load_repositories_config(config_path), info_path
+    )
 
 
 def check_coverage(info_file, changes, out_excel, repo_path):
@@ -357,11 +490,11 @@ def _build_simple_xlsx(sheet_defs):
 
 def write_result_excel(result, output_path):
     """Write the familiar Details/Summary workbook without external dependencies."""
-    details_rows = [["File", "Coverage File", "Line", "Execution Count", "Coverage"]]
+    details_rows = [["Repository", "File", "Coverage File", "Line", "Execution Count", "Coverage"]]
     for item in result["details"]:
         details_rows.append([
-            item["file_path"], item.get("coverage_file", ""), item["line_number"],
-            item.get("execution_count"), item["status"],
+            item.get("repository", ""), item["file_path"], item.get("coverage_file", ""),
+            item["line_number"], item.get("execution_count"), item["status"],
         ])
 
     summary = result["summary"]
@@ -379,8 +512,24 @@ def write_result_excel(result, output_path):
     summary_rows.append(["覆盖率(有效增量行)", "{}/{}".format(summary["covered"], total),
                          "{:.2f}%".format(rate) if rate is not None else "N/A"])
     summary_rows.append(["总增量行", changed_total, "100%" if changed_total else "N/A"])
+    sheet_defs = [("Details", details_rows), ("Summary", summary_rows)]
+    repositories = result.get("repositories") or []
+    if repositories:
+        repository_rows = [[
+            "Repository", "Path", "Old Commit", "New Commit", "Changed Lines",
+            "Covered", "Uncovered", "Coverage Rate",
+        ]]
+        for repository in repositories:
+            repository_summary = repository["summary"]
+            rate = repository_summary["coverage_rate"]
+            repository_rows.append([
+                repository["name"], repository["path"], repository["oldgit"], repository["newgit"],
+                repository_summary["changed_lines"], repository_summary["covered"],
+                repository_summary["uncovered"], "{:.2f}%".format(rate) if rate is not None else "N/A",
+            ])
+        sheet_defs.append(("Repositories", repository_rows))
     with open(output_path, "wb") as handle:
-        handle.write(_build_simple_xlsx([("Details", details_rows), ("Summary", summary_rows)]))
+        handle.write(_build_simple_xlsx(sheet_defs))
 
 
 def print_result(result):
@@ -396,31 +545,57 @@ def print_result(result):
         print("  覆盖率(有效增量行) = {}/{} = {:.2f}%".format(
             summary["covered"], summary["coverable_total"], summary["coverage_rate"]
         ))
+    for repository in result.get("repositories") or []:
+        repository_summary = repository["summary"]
+        rate = repository_summary["coverage_rate"]
+        rate_text = "N/A" if rate is None else "{:.2f}%".format(rate)
+        print("  [{}] 新增={}，已覆盖={}，未覆盖={}，覆盖率={}".format(
+            repository["name"], repository_summary["changed_lines"],
+            repository_summary["covered"], repository_summary["uncovered"], rate_text,
+        ))
 
 
 def main():
     parser = argparse.ArgumentParser(description="Git 增量代码覆盖率检测（基于 LCOV .info 文件）")
-    parser.add_argument("--repo", required=True, help="Git 仓库路径")
-    parser.add_argument("--oldgit", required=True, help="旧 commit")
-    parser.add_argument("--newgit", required=True, help="新 commit")
+    parser.add_argument("--repo", help="单仓库模式：Git 仓库路径")
+    parser.add_argument("--oldgit", help="单仓库模式：旧 commit")
+    parser.add_argument("--newgit", help="单仓库模式：新 commit")
+    parser.add_argument("--repos-config", help="多仓库模式：仓库 JSON 配置文件")
     parser.add_argument("--info", required=True, help=".info 文件或目录")
     parser.add_argument("--excel", default="coverage_result.xlsx", help="结果 Excel 文件")
     parser.add_argument("--json", dest="json_path", help="可选：结果 JSON 文件")
     parser.add_argument("--steps", nargs="+", choices=["diff", "check"], default=["diff", "check"],
-                        help="兼容旧参数：diff=生成 diff.patch，check=计算覆盖率")
+                        help="仅单仓库模式：diff=生成 diff.patch，check=计算覆盖率")
     args = parser.parse_args()
 
-    diff_file = os.path.join(os.path.abspath(args.repo), "diff.patch")
-    diff_text = None
-    if "diff" in args.steps:
-        diff_text = generate_diff_files(args.repo, args.oldgit, args.newgit, diff_file)
-    if "check" in args.steps:
+    if args.repos_config:
+        if args.repo or args.oldgit or args.newgit:
+            parser.error("--repos-config 不能与 --repo、--oldgit、--newgit 一起使用")
+        if args.steps != ["diff", "check"]:
+            parser.error("多仓库模式始终执行 diff + check，不支持 --steps")
+        result = calculate_multi_repo_incremental_coverage_from_config(
+            args.repos_config, args.info
+        )
+    else:
+        missing = [name for name, value in (
+            ("--repo", args.repo), ("--oldgit", args.oldgit), ("--newgit", args.newgit)
+        ) if not value]
+        if missing:
+            parser.error("单仓库模式需要 {}，或改用 --repos-config".format("、".join(missing)))
+        diff_file = os.path.join(os.path.abspath(args.repo), "diff.patch")
+        diff_text = None
+        if "diff" in args.steps:
+            diff_text = generate_diff_files(args.repo, args.oldgit, args.newgit, diff_file)
+        if "check" not in args.steps:
+            return
         if diff_text is None:
             if not os.path.exists(diff_file):
                 parser.error("--steps check 需要已有 {}，或同时执行 diff".format(diff_file))
             with open(diff_file, "r", encoding="utf-8", errors="replace") as handle:
                 diff_text = handle.read()
         result = calculate_incremental_coverage(args.repo, args.oldgit, args.newgit, args.info, diff_text)
+
+    if result:
         write_result_excel(result, args.excel)
         if args.json_path:
             write_result_json(result, args.json_path)

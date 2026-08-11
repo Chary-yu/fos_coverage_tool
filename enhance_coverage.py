@@ -2371,14 +2371,15 @@ def write_incremental_summary_page(output_html_dir, project_name, result):
     report_pages = find_report_page_links(output_html_dir)
     details_by_file = {}
     for item in result["details"]:
-        details_by_file.setdefault(item["file_path"], []).append(item)
+        key = (item.get("repository", ""), item.get("review_file_path") or item["file_path"])
+        details_by_file.setdefault(key, []).append(item)
 
     def escaped(value):
         return html.escape(str(value), quote=True)
 
     rows = []
-    for source_path in sorted(details_by_file):
-        items = details_by_file[source_path]
+    for repository_name, review_file_path in sorted(details_by_file):
+        items = details_by_file[(repository_name, review_file_path)]
         counts = {status: 0 for status in (
             coverage_check.STATUS_COVERED,
             coverage_check.STATUS_UNCOVERED,
@@ -2387,14 +2388,15 @@ def write_incremental_summary_page(output_html_dir, project_name, result):
         )}
         for item in items:
             counts[item["status"]] += 1
-        page_link = get_report_page_link(source_path, report_pages)
-        source_cell = escaped(source_path)
+        page_link = get_report_page_link(review_file_path, report_pages)
+        source_cell = escaped(items[0]["file_path"])
         if page_link:
             source_cell = '<a href="{}">{}</a>'.format(
                 escaped(urllib.parse.quote(page_link, safe="/%#?=&-_.~")), source_cell
             )
         rows.append(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                escaped(repository_name or "-"),
                 source_cell,
                 len(items),
                 counts[coverage_check.STATUS_COVERED],
@@ -2406,23 +2408,36 @@ def write_incremental_summary_page(output_html_dir, project_name, result):
 
     rate = summary["coverage_rate"]
     rate_text = "N/A" if rate is None else "{:.2f}%".format(rate)
-    table_rows = "".join(rows) or '<tr><td colspan="6">本次 Git diff 没有新增代码行。</td></tr>'
+    table_rows = "".join(rows) or '<tr><td colspan="7">本次 Git diff 没有新增代码行。</td></tr>'
+    repositories = result.get("repositories") or []
+    if repositories:
+        git_range_text = "{} 个仓库的 Git 范围".format(len(repositories))
+        repository_ranges = "<ul class=\"repo-ranges\">{}</ul>".format("".join(
+            "<li><strong>{}</strong>：<code>{}</code> → <code>{}</code></li>".format(
+                escaped(repository["name"]), escaped(repository["oldgit"]), escaped(repository["newgit"])
+            ) for repository in repositories
+        ))
+    else:
+        git_range_text = "<code>{}</code> → <code>{}</code>".format(
+            escaped(result["oldgit"]), escaped(result["newgit"])
+        )
+        repository_ranges = ""
     page = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>增量覆盖率审查</title><style>
 body{{margin:0;background:#f5f7fb;color:#172033;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"Microsoft YaHei",sans-serif}}
-main{{max-width:1180px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}}.muted{{color:#64748b}}.links{{margin:16px 0}}a{{color:#1f5fbf}}.cards{{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:12px;margin:20px 0}}.card,section{{background:#fff;border:1px solid #d8e0ea;border-radius:6px}}.card{{padding:12px}}.label{{font-size:12px;color:#64748b}}.value{{font-size:24px;font-weight:800;margin-top:4px}}section{{overflow:auto}}h2{{margin:0;padding:12px 14px;font-size:16px;border-bottom:1px solid #d8e0ea}}table{{width:100%;border-collapse:collapse;min-width:720px}}th,td{{padding:9px 10px;border-bottom:1px solid #e7edf4;text-align:left}}th{{background:#f8fafc}}.warning{{color:#b45309}}@media(max-width:820px){{.cards{{grid-template-columns:repeat(2,minmax(120px,1fr))}}}}
+main{{max-width:1180px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}}.muted{{color:#64748b}}.links{{margin:16px 0}}a{{color:#1f5fbf}}.repo-ranges{{margin:8px 0 0;padding-left:20px;color:#475569}}.cards{{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:12px;margin:20px 0}}.card,section{{background:#fff;border:1px solid #d8e0ea;border-radius:6px}}.card{{padding:12px}}.label{{font-size:12px;color:#64748b}}.value{{font-size:24px;font-weight:800;margin-top:4px}}section{{overflow:auto}}h2{{margin:0;padding:12px 14px;font-size:16px;border-bottom:1px solid #d8e0ea}}table{{width:100%;border-collapse:collapse;min-width:720px}}th,td{{padding:9px 10px;border-bottom:1px solid #e7edf4;text-align:left}}th{{background:#f8fafc}}.warning{{color:#b45309}}@media(max-width:820px){{.cards{{grid-template-columns:repeat(2,minmax(120px,1fr))}}}}
 </style></head><body><main>
 <h1>增量覆盖率审查</h1>
-<div class="muted">项目：{project}；Git 范围：<code>{oldgit}</code> → <code>{newgit}</code>；生成时间：{generated_at}</div>
+<div class="muted">项目：{project}；Git 范围：{git_range_text}；生成时间：{generated_at}</div>{repository_ranges}
 <div class="links"><a href="coverage_progress.html?scope=incremental&amp;project={project_url}">查看填写进度</a>　<a href="incremental_coverage.json">下载计算结果 JSON</a>　<a href="incremental_coverage.xlsx">下载计算结果 Excel</a></div>
 <div class="cards"><div class="card"><div class="label">新增行</div><div class="value">{changed}</div></div><div class="card"><div class="label">已覆盖</div><div class="value">{covered}</div></div><div class="card"><div class="label">增量未覆盖（可填写）</div><div class="value">{uncovered}</div></div><div class="card"><div class="label">有效增量覆盖率</div><div class="value">{rate}</div></div><div class="card"><div class="label">覆盖信息缺失</div><div class="value warning">{missing}</div></div></div>
-<section><h2>文件明细（点击文件可打开可填写的源码页）</h2><table><thead><tr><th>文件</th><th>新增行</th><th>已覆盖</th><th>未覆盖</th><th>无需覆盖</th><th>覆盖信息缺失</th></tr></thead><tbody>{table_rows}</tbody></table></section>
+<section><h2>文件明细（点击文件可打开可填写的源码页）</h2><table><thead><tr><th>仓库</th><th>文件</th><th>新增行</th><th>已覆盖</th><th>未覆盖</th><th>无需覆盖</th><th>覆盖信息缺失</th></tr></thead><tbody>{table_rows}</tbody></table></section>
 </main></body></html>""".format(
         project=escaped(project_name),
         project_url=escaped(urllib.parse.quote(str(project_name), safe="")),
-        oldgit=escaped(result["oldgit"]),
-        newgit=escaped(result["newgit"]),
+        git_range_text=git_range_text,
+        repository_ranges=repository_ranges,
         generated_at=escaped(result["generated_at"]),
         changed=summary["changed_lines"],
         covered=summary["covered"],
@@ -2435,17 +2450,12 @@ main{{max-width:1180px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}
         page_file.write(page)
 
 
-def generate_incremental_review(repo_path, oldgit, newgit, info_path, input_dir, output_dir,
-                                project_name, workers=None, render_mode=None, excel_path=None):
-    """Calculate incremental coverage and build a fillable incremental review site."""
-    if not os.path.isdir(repo_path):
-        raise ValueError("Git 仓库目录不存在: {}".format(repo_path))
+def build_incremental_review_site(result, input_dir, output_dir, project_name,
+                                  workers=None, render_mode=None, excel_path=None):
+    """Build a fillable incremental review site from a calculated result."""
     if not os.path.isdir(input_dir):
         raise ValueError("LCOV HTML 报告目录不存在: {}".format(input_dir))
 
-    result = coverage_check.calculate_incremental_coverage(
-        repo_path, oldgit, newgit, info_path
-    )
     summary = result["summary"]
     print(
         "[Incremental] Git-added lines={changed_lines}, covered={covered}, uncovered={uncovered}, "
@@ -2459,7 +2469,7 @@ def generate_incremental_review(repo_path, oldgit, newgit, info_path, input_dir,
         workers=workers,
         render_mode=render_mode,
         review_scope="incremental",
-        incremental_lines_by_file=result["uncovered_lines_by_file"],
+        incremental_lines_by_file=result.get("review_lines_by_file") or result["uncovered_lines_by_file"],
     )
     real_output_html = (
         os.path.join(output_dir, "html")
@@ -2492,6 +2502,30 @@ def generate_incremental_review(repo_path, oldgit, newgit, info_path, input_dir,
     print("[Incremental] Result JSON: {}".format(output_json))
     print("[Incremental] Result Excel: {}".format(excel_path))
     return result
+
+
+def generate_incremental_review(repo_path, oldgit, newgit, info_path, input_dir, output_dir,
+                                project_name, workers=None, render_mode=None, excel_path=None):
+    """Calculate one repository and build a fillable incremental review site."""
+    if not os.path.isdir(repo_path):
+        raise ValueError("Git 仓库目录不存在: {}".format(repo_path))
+    result = coverage_check.calculate_incremental_coverage(
+        repo_path, oldgit, newgit, info_path
+    )
+    return build_incremental_review_site(
+        result, input_dir, output_dir, project_name, workers, render_mode, excel_path
+    )
+
+
+def generate_multi_repo_incremental_review(repos_config_path, info_path, input_dir, output_dir,
+                                           project_name, workers=None, render_mode=None, excel_path=None):
+    """Calculate configured repositories together and build one review site."""
+    result = coverage_check.calculate_multi_repo_incremental_coverage_from_config(
+        repos_config_path, info_path
+    )
+    return build_incremental_review_site(
+        result, input_dir, output_dir, project_name, workers, render_mode, excel_path
+    )
 
 
 def run_server():
@@ -2539,6 +2573,8 @@ def print_help():
     print("  python scripts/enhance_coverage.py incremental --project <project_name> --repo <git_repo> --oldgit <old_commit> --newgit <new_commit> --info <coverage.info|dir> --dir <lcov_html_dir> --out <output_dir>")
     print("    - Build an incremental review website; only Git-added, LCOV-uncovered lines are editable.")
     print("    - Optional: --workers <N> --mode <lazy|immediate> --excel <result.xlsx>")
+    print("  python scripts/enhance_coverage.py incremental --project <project_name> --repos-config <repos.json> --info <coverage.info|dir> --dir <lcov_html_dir> --out <output_dir>")
+    print("    - Build one incremental review website from several independent Git repositories.")
 
 
 def get_arg_value(args, name):
@@ -2628,6 +2664,7 @@ if __name__ == "__main__":
         repo_path = get_arg_value(args, "--repo")
         oldgit = get_arg_value(args, "--oldgit")
         newgit = get_arg_value(args, "--newgit")
+        repos_config_path = get_arg_value(args, "--repos-config")
         info_path = get_arg_value(args, "--info")
         dir_path = get_arg_value(args, "--dir")
         out_path = get_arg_value(args, "--out")
@@ -2638,13 +2675,21 @@ if __name__ == "__main__":
         use_config_project = has_arg(args, "--use-config-project")
 
         required_values = {
-            "--repo": repo_path,
-            "--oldgit": oldgit,
-            "--newgit": newgit,
             "--info": info_path,
             "--dir": dir_path,
             "--out": out_path,
         }
+        if repos_config_path:
+            if repo_path or oldgit or newgit:
+                print("[Error] --repos-config 不能与 --repo、--oldgit、--newgit 一起使用.")
+                print_help()
+                sys.exit(1)
+        else:
+            required_values.update({
+                "--repo": repo_path,
+                "--oldgit": oldgit,
+                "--newgit": newgit,
+            })
         missing = [flag for flag, value in required_values.items() if not value]
         if missing:
             print("[Error] incremental requires {}.".format(", ".join(missing)))
@@ -2663,16 +2708,25 @@ if __name__ == "__main__":
 
         print("[Main] Incremental coverage review generation starts.")
         print(f"[Main] Project : {project_name}")
-        print(f"[Main] Git repo : {repo_path}")
-        print(f"[Main] Git range : {oldgit} -> {newgit}")
+        if repos_config_path:
+            print(f"[Main] Repositories config : {repos_config_path}")
+        else:
+            print(f"[Main] Git repo : {repo_path}")
+            print(f"[Main] Git range : {oldgit} -> {newgit}")
         print(f"[Main] LCOV info : {info_path}")
         print(f"[Main] Report input (ReadOnly) : {dir_path}")
         print(f"[Main] Report output (Enhanced) : {out_path}")
         try:
-            generate_incremental_review(
-                repo_path, oldgit, newgit, info_path, dir_path, out_path,
-                project_name, workers, render_mode, excel_path,
-            )
+            if repos_config_path:
+                generate_multi_repo_incremental_review(
+                    repos_config_path, info_path, dir_path, out_path,
+                    project_name, workers, render_mode, excel_path,
+                )
+            else:
+                generate_incremental_review(
+                    repo_path, oldgit, newgit, info_path, dir_path, out_path,
+                    project_name, workers, render_mode, excel_path,
+                )
         except Exception as error:
             print("[Error] Failed to generate incremental review: {}".format(error))
             sys.exit(1)

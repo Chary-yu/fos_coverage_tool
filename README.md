@@ -23,6 +23,7 @@
 /opt/coverage_tool/
   enhance_coverage.py        # 后台脚本：注入、启动服务、导出、继承
   coverage_check.py          # Git + LCOV 增量覆盖率计算模块/独立命令
+  repositories.example.json  # 多仓库增量覆盖率配置示例
   clear_coverage_data.py     # 调试脚本：清空单项目或全部数据库数据
   coverage_progress.html     # 独立网页：查看项目/目录/文件分析进度
   coverage_enhance.js        # 前端增强脚本
@@ -220,6 +221,45 @@ python3 coverage_check.py \
   --info /opt/coverage_reports/main_202606/coverage.info \
   --excel incremental_coverage.xlsx --json incremental_coverage.json
 ```
+
+### 多仓库增量评审
+
+一个 `.info` 同时包含多个独立 Git 仓库时，复制 `repositories.example.json` 为实际配置文件，并为每个仓库填写独立的路径和 commit 范围：
+
+```json
+{
+  "repositories": [
+    {"name": "platform", "path": "/opt/src/platform", "oldgit": "a1b2c3", "newgit": "d4e5f6"},
+    {"name": "driver", "path": "/opt/src/driver", "oldgit": "112233", "newgit": "445566"},
+    {"name": "app", "path": "/opt/src/app", "oldgit": "abc111", "newgit": "def222"}
+  ]
+}
+```
+
+在配置文件所在目录执行时，`path` 可以写相对路径；仓库名称必须唯一。然后一次生成统一的可填写网页：
+
+```bash
+python3.6 enhance_coverage.py incremental \
+  --project review_multi_incremental \
+  --repos-config /opt/coverage_tool/repositories.json \
+  --info /opt/coverage_reports/all_repositories.info \
+  --dir /opt/coverage_reports/all_repositories_html \
+  --out /opt/coverage_tool/review_multi_incremental \
+  --mode lazy \
+  --workers 4
+```
+
+如果只需统计/导出而无需网页：
+
+```bash
+python3.6 coverage_check.py \
+  --repos-config /opt/coverage_tool/repositories.json \
+  --info /opt/coverage_reports/all_repositories.info \
+  --excel multi_incremental.xlsx \
+  --json multi_incremental.json
+```
+
+多仓库模式会分别执行每个仓库的 `git diff`，最后汇总总覆盖率；汇总网页与 Excel 会显示仓库列，Excel 额外提供 `Repositories` 工作表。为避免同名文件混淆，`.info` 的 `SF:` 必须是**绝对路径**，且应与 LCOV HTML 源码页标题中的路径一致。若检测到相对 `SF:` 路径，脚本会中止而不是生成可能串数据的结果。
 
 访问增量汇总页：
 

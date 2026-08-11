@@ -84,6 +84,80 @@ diff --git a/src/not_in_lcov.c b/src/not_in_lcov.c
         self.assertNotIn("text", kwargs)
         self.assertNotIn("encoding", kwargs)
 
+    @unittest.mock.patch("coverage_check.run_git_diff")
+    def test_calculate_multiple_repositories_uses_absolute_lcov_paths(self, mock_git_diff):
+        repo_b = os.path.join(self.temp_dir, "repo_b")
+        repo_c = os.path.join(self.temp_dir, "repo_c")
+        os.makedirs(repo_b)
+        os.makedirs(repo_c)
+        with open(self.info_path, "w", encoding="utf-8") as info_file:
+            for repo_path in (self.repo_dir, repo_b, repo_c):
+                info_file.write("SF:{}/src/shared.c\nDA:10,1\nDA:11,0\nend_of_record\n".format(repo_path))
+
+        repositories = [
+            {"name": "repo_a", "path": self.repo_dir, "oldgit": "a1", "newgit": "a2"},
+            {"name": "repo_b", "path": repo_b, "oldgit": "b1", "newgit": "b2"},
+            {"name": "repo_c", "path": repo_c, "oldgit": "c1", "newgit": "c2"},
+        ]
+        mock_git_diff.return_value = """--- a/src/shared.c
++++ b/src/shared.c
+@@ -9,0 +10,2 @@
++covered();
++uncovered();
+"""
+
+        result = coverage_check.calculate_multi_repo_incremental_coverage(repositories, self.info_path)
+
+        self.assertEqual(result["summary"]["changed_lines"], 6)
+        self.assertEqual(result["summary"]["covered"], 3)
+        self.assertEqual(result["summary"]["uncovered"], 3)
+        self.assertEqual(result["summary"]["coverage_rate"], 50.0)
+        self.assertEqual(set(item["repository"] for item in result["details"]), {"repo_a", "repo_b", "repo_c"})
+        self.assertEqual(
+            result["review_lines_by_file"],
+            {
+                os.path.join(self.repo_dir, "src", "shared.c"): [11],
+                os.path.join(repo_b, "src", "shared.c"): [11],
+                os.path.join(repo_c, "src", "shared.c"): [11],
+            },
+        )
+
+        xlsx_path = os.path.join(self.temp_dir, "multi.xlsx")
+        coverage_check.write_result_excel(result, xlsx_path)
+        with zipfile.ZipFile(xlsx_path) as workbook:
+            self.assertIn("xl/worksheets/sheet3.xml", workbook.namelist())
+
+    @unittest.mock.patch("coverage_check.run_git_diff")
+    def test_repositories_config_resolves_relative_repository_paths(self, mock_git_diff):
+        config_path = os.path.join(self.temp_dir, "repositories.json")
+        with open(config_path, "w", encoding="utf-8") as config_file:
+            json.dump({"repositories": [{
+                "name": "repo_a", "path": "repo", "oldgit": "a1", "newgit": "a2",
+            }]}, config_file)
+        mock_git_diff.return_value = ""
+
+        result = coverage_check.calculate_multi_repo_incremental_coverage_from_config(config_path, self.info_path)
+
+        self.assertEqual(result["repositories"][0]["path"], self.repo_dir)
+
+    @unittest.mock.patch("coverage_check.run_git_diff")
+    def test_multi_repository_rejects_relative_lcov_source_paths(self, mock_git_diff):
+        repo_b = os.path.join(self.temp_dir, "repo_b")
+        os.makedirs(repo_b)
+        with open(self.info_path, "w", encoding="utf-8") as info_file:
+            info_file.write("SF:src/shared.c\nDA:10,0\nend_of_record\n")
+        mock_git_diff.return_value = """--- a/src/shared.c
++++ b/src/shared.c
+@@ -9,0 +10 @@
++uncovered();
+"""
+
+        with self.assertRaises(ValueError):
+            coverage_check.calculate_multi_repo_incremental_coverage([
+                {"name": "repo_a", "path": self.repo_dir, "oldgit": "a1", "newgit": "a2"},
+                {"name": "repo_b", "path": repo_b, "oldgit": "b1", "newgit": "b2"},
+            ], self.info_path)
+
 
 class TestPython36Compatibility(unittest.TestCase):
     def test_project_scripts_use_python36_grammar(self):
@@ -195,6 +269,67 @@ class TestIncrementalReviewInjection(unittest.TestCase):
         self.assertTrue(os.path.exists(os.path.join(self.output_dir, "incremental_coverage.xlsx")))
         with open(os.path.join(self.output_dir, "incremental_coverage.json"), "r", encoding="utf-8") as result_file:
             self.assertEqual(json.load(result_file)["review_scope"], "incremental")
+
+
+class TestMultiRepositoryReviewInjection(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.input_dir = os.path.join(self.temp_dir, "coverage")
+        self.output_dir = os.path.join(self.temp_dir, "review")
+        self.repo_a_source = os.path.join(self.temp_dir, "repo_a", "src", "shared.c")
+        self.repo_b_source = os.path.join(self.temp_dir, "repo_b", "src", "shared.c")
+        os.makedirs(self.input_dir)
+        for filename, source_path in (("repo_a.gcov.html", self.repo_a_source), ("repo_b.gcov.html", self.repo_b_source)):
+            with open(os.path.join(self.input_dir, filename), "w", encoding="utf-8") as page:
+                page.write("""<!doctype html><html><head><title>LCOV - cov - {}</title></head>
+<body><pre class="source"><span class="lineNum"> 11 </span><span class="lineNoCov"> target();</span></pre></body></html>""".format(source_path))
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir)
+
+    @unittest.mock.patch("enhance_coverage.DatabaseManager")
+    def test_multi_repo_result_marks_each_absolute_source_page(self, mock_db_manager):
+        mock_db_manager.return_value = unittest.mock.MagicMock()
+        result = {
+            "generated_at": "2026-08-11 10:00:00",
+            "oldgit": "multiple",
+            "newgit": "multiple",
+            "summary": {
+                "changed_lines": 2, "covered": 0, "uncovered": 2, "ignored": 0,
+                "missing": 0, "coverable_total": 2, "coverage_rate": 0.0,
+            },
+            "repositories": [
+                {"name": "repo_a", "path": os.path.dirname(os.path.dirname(self.repo_a_source)),
+                 "oldgit": "a1", "newgit": "a2", "summary": {"changed_lines": 1, "covered": 0, "uncovered": 1, "ignored": 0, "missing": 0, "coverable_total": 1, "coverage_rate": 0.0}},
+                {"name": "repo_b", "path": os.path.dirname(os.path.dirname(self.repo_b_source)),
+                 "oldgit": "b1", "newgit": "b2", "summary": {"changed_lines": 1, "covered": 0, "uncovered": 1, "ignored": 0, "missing": 0, "coverable_total": 1, "coverage_rate": 0.0}},
+            ],
+            "details": [
+                {"repository": "repo_a", "file_path": "src/shared.c", "coverage_file": self.repo_a_source,
+                 "review_file_path": self.repo_a_source, "line_number": 11, "execution_count": 0,
+                 "status": coverage_check.STATUS_UNCOVERED},
+                {"repository": "repo_b", "file_path": "src/shared.c", "coverage_file": self.repo_b_source,
+                 "review_file_path": self.repo_b_source, "line_number": 11, "execution_count": 0,
+                 "status": coverage_check.STATUS_UNCOVERED},
+            ],
+            "uncovered_lines_by_file": {"repo_a:src/shared.c": [11], "repo_b:src/shared.c": [11]},
+            "review_lines_by_file": {self.repo_a_source: [11], self.repo_b_source: [11]},
+        }
+
+        enhance_coverage.build_incremental_review_site(
+            result, self.input_dir, self.output_dir, "multi_review", workers=1, render_mode="lazy"
+        )
+
+        for filename in ("repo_a.gcov.html", "repo_b.gcov.html"):
+            with open(os.path.join(self.output_dir, filename), "r", encoding="utf-8") as page:
+                self.assertIn('data-coverage-review="incremental"', page.read())
+        with open(os.path.join(self.output_dir, "incremental_coverage.html"), "r", encoding="utf-8") as summary_page:
+            summary_html = summary_page.read()
+        self.assertIn("2 个仓库的 Git 范围", summary_html)
+        self.assertIn("repo_a", summary_html)
+        self.assertIn("repo_b", summary_html)
+        with zipfile.ZipFile(os.path.join(self.output_dir, "incremental_coverage.xlsx")) as workbook:
+            self.assertIn("xl/worksheets/sheet3.xml", workbook.namelist())
 
 
 if __name__ == "__main__":
