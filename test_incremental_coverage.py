@@ -336,8 +336,40 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         self.assertIn("2 个仓库的 Git 范围", summary_html)
         self.assertIn("repo_a", summary_html)
         self.assertIn("repo_b", summary_html)
+        self.assertIn('data-sort-key="uncovered"', summary_html)
+        self.assertIn('sortRows("uncovered", -1)', summary_html)
+        self.assertIn('data-sort-value="1"', summary_html)
         with zipfile.ZipFile(os.path.join(self.output_dir, "incremental_coverage.xlsx")) as workbook:
             self.assertIn("xl/worksheets/sheet3.xml", workbook.namelist())
+
+    def test_summary_defaults_to_most_uncovered_file_first(self):
+        os.makedirs(self.output_dir)
+        result = {
+            "generated_at": "2026-08-11 12:00:00",
+            "oldgit": "old123",
+            "newgit": "new456",
+            "summary": {
+                "changed_lines": 3, "covered": 0, "uncovered": 3, "ignored": 0,
+                "missing": 0, "coverable_total": 3, "coverage_rate": 0.0,
+            },
+            "details": [
+                {"file_path": "src/low.c", "line_number": 10,
+                 "execution_count": 0, "status": coverage_check.STATUS_UNCOVERED},
+                {"file_path": "src/high.c", "line_number": 10,
+                 "execution_count": 0, "status": coverage_check.STATUS_UNCOVERED},
+                {"file_path": "src/high.c", "line_number": 11,
+                 "execution_count": 0, "status": coverage_check.STATUS_UNCOVERED},
+            ],
+        }
+
+        enhance_coverage.write_incremental_summary_page(self.output_dir, "sort_test", result)
+
+        with open(os.path.join(self.output_dir, "incremental_coverage.html"), "r", encoding="utf-8") as summary_page:
+            summary_html = summary_page.read()
+        self.assertLess(summary_html.index("src/high.c"), summary_html.index("src/low.c"))
+        self.assertIn('data-sort-key="changed"', summary_html)
+        self.assertIn('data-sort-key="covered"', summary_html)
+        self.assertIn('data-sort-key="uncovered"', summary_html)
 
 
 if __name__ == "__main__":

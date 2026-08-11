@@ -140,6 +140,9 @@ class TestIntegration(unittest.TestCase):
 
         self.assertIn('const DEFAULT_PROJECT = "TestProjInject";', content)
         self.assertIn('const RENDER_MODE = "immediate";', content)
+        self.assertIn('function navigateReviewPanel', content)
+        self.assertIn("previousBtn.innerText = '上一个';", content)
+        self.assertIn("nextBtn.innerText = '下一个';", content)
 
     @unittest.mock.patch('enhance_coverage.DatabaseManager')
     def test_inject_coverage_report_lazy(self, mock_db_manager):

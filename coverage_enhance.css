@@ -360,6 +360,33 @@ textarea.coverage-analysis-input.multiline {
     border-color: #9fbcff;
 }
 
+.coverage-navigation-btn {
+    height: 18px;
+    padding: 0 6px;
+    border: 1px solid #d1d9e6;
+    border-radius: 3px;
+    background-color: #fff;
+    color: #475569;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 42px;
+}
+
+.coverage-navigation-btn:hover:not(:disabled) {
+    background-color: #eef4ff;
+    border-color: #9fbcff;
+    color: #1f5fbf;
+}
+
+.coverage-navigation-btn:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+}
+
 .coverage-render-progress {
     position: fixed !important;
     top: 10px !important;

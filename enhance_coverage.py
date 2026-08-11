@@ -49,7 +49,7 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "coverage_config.json")
 JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
 CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
 PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
-ASSET_VERSION = "incremental-review-20260810"
+ASSET_VERSION = "incremental-review-20260811"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 DEFAULT_PROGRESS_PAGE_HTML = r"""<!doctype html>
 <html lang="zh-CN">
@@ -2388,7 +2388,7 @@ def write_incremental_summary_page(output_html_dir, project_name, result):
     def escaped(value):
         return html.escape(str(value), quote=True)
 
-    rows = []
+    file_rows = []
     for repository_name, review_file_path in sorted(details_by_file):
         items = details_by_file[(repository_name, review_file_path)]
         counts = {status: 0 for status in (
@@ -2399,21 +2399,47 @@ def write_incremental_summary_page(output_html_dir, project_name, result):
         )}
         for item in items:
             counts[item["status"]] += 1
+        file_rows.append({
+            "repository": repository_name or "",
+            "file_path": items[0]["file_path"],
+            "review_file_path": review_file_path,
+            "changed": len(items),
+            "covered": counts[coverage_check.STATUS_COVERED],
+            "uncovered": counts[coverage_check.STATUS_UNCOVERED],
+            "ignored": counts[coverage_check.STATUS_IGNORED],
+            "missing": counts[coverage_check.STATUS_MISSING],
+        })
+
+    # The first render already prioritizes files that need the most review; the
+    # browser-side table controls below let reviewers switch to any other metric.
+    file_rows.sort(key=lambda item: (
+        -item["uncovered"], -item["changed"], item["repository"], item["file_path"]
+    ))
+
+    rows = []
+    for item in file_rows:
+        repository_name = item["repository"]
+        review_file_path = item["review_file_path"]
         page_link = get_report_page_link(review_file_path, report_pages)
-        source_cell = escaped(items[0]["file_path"])
+        source_cell = escaped(item["file_path"])
         if page_link:
             source_cell = '<a href="{}">{}</a>'.format(
                 escaped(urllib.parse.quote(page_link, safe="/%#?=&-_.~")), source_cell
             )
         rows.append(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+            "<tr><td data-sort-value=\"{}\">{}</td><td data-sort-value=\"{}\">{}</td>"
+            "<td data-sort-value=\"{}\">{}</td><td data-sort-value=\"{}\">{}</td>"
+            "<td data-sort-value=\"{}\">{}</td><td data-sort-value=\"{}\">{}</td>"
+            "<td data-sort-value=\"{}\">{}</td></tr>".format(
+                escaped(repository_name),
                 escaped(repository_name or "-"),
+                escaped(item["file_path"]),
                 source_cell,
-                len(items),
-                counts[coverage_check.STATUS_COVERED],
-                counts[coverage_check.STATUS_UNCOVERED],
-                counts[coverage_check.STATUS_IGNORED],
-                counts[coverage_check.STATUS_MISSING],
+                item["changed"], item["changed"],
+                item["covered"], item["covered"],
+                item["uncovered"], item["uncovered"],
+                item["ignored"], item["ignored"],
+                item["missing"], item["missing"],
             )
         )
 
@@ -2437,14 +2463,67 @@ def write_incremental_summary_page(output_html_dir, project_name, result):
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>增量覆盖率审查</title><style>
 body{{margin:0;background:#f5f7fb;color:#172033;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"Microsoft YaHei",sans-serif}}
-main{{max-width:1180px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}}.muted{{color:#64748b}}.links{{margin:16px 0}}a{{color:#1f5fbf}}.repo-ranges{{margin:8px 0 0;padding-left:20px;color:#475569}}.cards{{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:12px;margin:20px 0}}.card,section{{background:#fff;border:1px solid #d8e0ea;border-radius:6px}}.card{{padding:12px}}.label{{font-size:12px;color:#64748b}}.value{{font-size:24px;font-weight:800;margin-top:4px}}section{{overflow:auto}}h2{{margin:0;padding:12px 14px;font-size:16px;border-bottom:1px solid #d8e0ea}}table{{width:100%;border-collapse:collapse;min-width:720px}}th,td{{padding:9px 10px;border-bottom:1px solid #e7edf4;text-align:left}}th{{background:#f8fafc}}.warning{{color:#b45309}}@media(max-width:820px){{.cards{{grid-template-columns:repeat(2,minmax(120px,1fr))}}}}
+main{{max-width:1180px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}}.muted{{color:#64748b}}.links{{margin:16px 0}}a{{color:#1f5fbf}}.repo-ranges{{margin:8px 0 0;padding-left:20px;color:#475569}}.cards{{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:12px;margin:20px 0}}.card,section{{background:#fff;border:1px solid #d8e0ea;border-radius:6px}}.card{{padding:12px}}.label{{font-size:12px;color:#64748b}}.value{{font-size:24px;font-weight:800;margin-top:4px}}section{{overflow:auto}}h2{{margin:0;padding:12px 14px;font-size:16px;border-bottom:1px solid #d8e0ea}}table{{width:100%;border-collapse:collapse;min-width:720px}}th,td{{padding:9px 10px;border-bottom:1px solid #e7edf4;text-align:left}}th{{background:#f8fafc}}.sort-button{{appearance:none;border:0;background:transparent;color:inherit;cursor:pointer;font:inherit;font-weight:700;padding:0;white-space:nowrap}}.sort-button:hover{{color:#1f5fbf}}.sort-button:focus{{outline:2px solid #93c5fd;outline-offset:2px}}.sort-indicator{{display:inline-block;min-width:1em;color:#64748b}}.warning{{color:#b45309}}@media(max-width:820px){{.cards{{grid-template-columns:repeat(2,minmax(120px,1fr))}}}}
 </style></head><body><main>
 <h1>增量覆盖率审查</h1>
 <div class="muted">项目：{project}；Git 范围：{git_range_text}；生成时间：{generated_at}</div>{repository_ranges}
 <div class="links"><a href="coverage_progress.html?scope=incremental&amp;project={project_url}">查看填写进度</a>　<a href="incremental_coverage.json">下载计算结果 JSON</a>　<a href="incremental_coverage.xlsx">下载计算结果 Excel</a></div>
 <div class="cards"><div class="card"><div class="label">新增行</div><div class="value">{changed}</div></div><div class="card"><div class="label">已覆盖</div><div class="value">{covered}</div></div><div class="card"><div class="label">增量未覆盖（可填写）</div><div class="value">{uncovered}</div></div><div class="card"><div class="label">有效增量覆盖率</div><div class="value">{rate}</div></div><div class="card"><div class="label">覆盖信息缺失</div><div class="value warning">{missing}</div></div></div>
-<section><h2>文件明细（点击文件可打开可填写的源码页）</h2><table><thead><tr><th>仓库</th><th>文件</th><th>新增行</th><th>已覆盖</th><th>未覆盖</th><th>无需覆盖</th><th>覆盖信息缺失</th></tr></thead><tbody>{table_rows}</tbody></table></section>
-</main></body></html>""".format(
+<section><h2>文件明细（点击表头可排序；默认未覆盖新增行从多到少）</h2><table id="incremental-file-table"><thead><tr><th data-sort-key="repository" aria-sort="none"><button type="button" class="sort-button" data-sort-key="repository" data-sort-type="text">仓库 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="file" aria-sort="none"><button type="button" class="sort-button" data-sort-key="file" data-sort-type="text">文件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="changed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="changed" data-sort-type="number">新增行 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="covered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="covered" data-sort-type="number">已覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="uncovered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="uncovered" data-sort-type="number">未覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ignored" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ignored" data-sort-type="number">无需覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="missing" aria-sort="none"><button type="button" class="sort-button" data-sort-key="missing" data-sort-type="number">覆盖信息缺失 <span class="sort-indicator" aria-hidden="true">↕</span></button></th></tr></thead><tbody>{table_rows}</tbody></table></section>
+</main><script>
+(function() {{
+    var table = document.getElementById("incremental-file-table");
+    if (!table || !table.tBodies.length) {{ return; }}
+    var body = table.tBodies[0];
+    var keyToColumn = {{repository: 0, file: 1, changed: 2, covered: 3, uncovered: 4, ignored: 5, missing: 6}};
+    var currentKey = "";
+    var currentDirection = 1;
+
+    function updateIndicators() {{
+        var buttons = table.querySelectorAll(".sort-button");
+        for (var index = 0; index < buttons.length; index += 1) {{
+            var button = buttons[index];
+            var key = button.getAttribute("data-sort-key");
+            var active = key === currentKey;
+            var indicator = button.querySelector(".sort-indicator");
+            if (indicator) {{ indicator.textContent = active ? (currentDirection < 0 ? "↓" : "↑") : "↕"; }}
+            button.parentNode.setAttribute("aria-sort", active ? (currentDirection < 0 ? "descending" : "ascending") : "none");
+        }}
+    }}
+
+    function sortRows(key, direction) {{
+        var column = keyToColumn[key];
+        if (column === undefined) {{ return; }}
+        var rows = Array.prototype.slice.call(body.rows);
+        if (!rows.length || rows[0].cells.length !== 7) {{ return; }}
+        rows = rows.map(function(row, index) {{ return {{row: row, index: index}}; }});
+        rows.sort(function(left, right) {{
+            var leftValue = left.row.cells[column].getAttribute("data-sort-value") || "";
+            var rightValue = right.row.cells[column].getAttribute("data-sort-value") || "";
+            var numeric = table.querySelector('.sort-button[data-sort-key="' + key + '"]').getAttribute("data-sort-type") === "number";
+            var comparison;
+            if (numeric) {{ comparison = Number(leftValue) - Number(rightValue); }}
+            else {{ comparison = leftValue.localeCompare(rightValue); }}
+            return comparison ? comparison * direction : left.index - right.index;
+        }});
+        for (var index = 0; index < rows.length; index += 1) {{ body.appendChild(rows[index].row); }}
+        currentKey = key;
+        currentDirection = direction;
+        updateIndicators();
+    }}
+
+    var buttons = table.querySelectorAll(".sort-button");
+    for (var index = 0; index < buttons.length; index += 1) {{
+        buttons[index].addEventListener("click", function() {{
+            var key = this.getAttribute("data-sort-key");
+            var type = this.getAttribute("data-sort-type");
+            var direction = key === currentKey ? -currentDirection : (type === "number" ? -1 : 1);
+            sortRows(key, direction);
+        }});
+    }}
+    sortRows("uncovered", -1);
+}})();
+</script></body></html>""".format(
         project=escaped(project_name),
         project_url=escaped(urllib.parse.quote(str(project_name), safe="")),
         git_range_text=git_range_text,

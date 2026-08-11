@@ -4,7 +4,7 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'low-memory-controls-20260531';
+    const ENHANCE_VERSION = 'review-navigation-20260811';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const RENDER_MODE = 'lazy'; // 'lazy' or 'immediate'
@@ -535,6 +535,7 @@
                 }
                 blocks = [];
                 requestLegacyPanelRefresh(4);
+                updateReviewNavigation();
                 onComplete();
             }
 
@@ -687,6 +688,61 @@
             return panel;
         }
 
+        function getReviewPanelLineNumbers() {
+            return Array.from(panelsMap.keys()).sort((left, right) => left - right);
+        }
+
+        function updateReviewNavigation() {
+            const lineNumbers = getReviewPanelLineNumbers();
+            panelsMap.forEach((panel, lineNumber) => {
+                if (!panel.previousBtn || !panel.nextBtn) {
+                    return;
+                }
+                const index = lineNumbers.indexOf(lineNumber);
+                const previousLine = index > 0 ? lineNumbers[index - 1] : null;
+                const nextLine = index >= 0 && index < lineNumbers.length - 1 ? lineNumbers[index + 1] : null;
+                panel.previousBtn.disabled = previousLine === null;
+                panel.nextBtn.disabled = nextLine === null;
+                panel.previousBtn.title = previousLine === null ? '已是当前文件第一处可填写控件' : `跳转到第 ${previousLine} 行的可填写控件`;
+                panel.nextBtn.title = nextLine === null ? '已是当前文件最后一处可填写控件' : `跳转到第 ${nextLine} 行的可填写控件`;
+            });
+        }
+
+        function focusReviewPanel(panel) {
+            const focusTarget = panel && (panel.select || panel.placeholder);
+            if (!focusTarget) {
+                return;
+            }
+            if (typeof focusTarget.scrollIntoView === 'function') {
+                try {
+                    focusTarget.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+                } catch (e) {
+                    focusTarget.scrollIntoView(true);
+                }
+            }
+            window.setTimeout(function() {
+                if (typeof focusTarget.focus === 'function') {
+                    focusTarget.focus();
+                }
+            }, 350);
+        }
+
+        function navigateReviewPanel(currentLineNum, direction) {
+            const lineNumbers = getReviewPanelLineNumbers();
+            const currentIndex = lineNumbers.indexOf(currentLineNum);
+            const targetIndex = currentIndex + direction;
+            if (currentIndex === -1 || targetIndex < 0 || targetIndex >= lineNumbers.length) {
+                return;
+            }
+            const targetLineNum = lineNumbers[targetIndex];
+            let targetPanel = panelsMap.get(targetLineNum);
+            if (targetPanel && !targetPanel.expanded) {
+                targetPanel = expandBlockPanel(targetLineNum);
+            }
+            updateReviewNavigation();
+            focusReviewPanel(targetPanel);
+        }
+
         // 3. 构建并注入表单 DOM，仅在 Block 的第一行注入
         function renderBlockPanel(block) {
             const startLineItem = getBlockStartItem(block);
@@ -768,6 +824,18 @@
             inheritBtn.innerText = '继承';
             inheritBtn.title = '继承上一条已填写的分析结果';
 
+            const previousBtn = document.createElement('button');
+            previousBtn.className = 'coverage-navigation-btn';
+            previousBtn.type = 'button';
+            previousBtn.innerText = '上一个';
+            previousBtn.setAttribute('aria-label', '跳转到上一个可填写控件');
+
+            const nextBtn = document.createElement('button');
+            nextBtn.className = 'coverage-navigation-btn';
+            nextBtn.type = 'button';
+            nextBtn.innerText = '下一个';
+            nextBtn.setAttribute('aria-label', '跳转到下一个可填写控件');
+
             // 组合面板
             panel.appendChild(select);
             panel.appendChild(reviewerInput);
@@ -783,6 +851,8 @@
                 panel.appendChild(badgeSpan);
             }
             panel.appendChild(inheritBtn);
+            panel.appendChild(previousBtn);
+            panel.appendChild(nextBtn);
             panel.appendChild(saveBtn);
 
             function positionLegacyPanel() {
@@ -870,6 +940,8 @@
                 methodInput,
                 reasonInput,
                 saveBtn,
+                previousBtn,
+                nextBtn,
                 block,
                 expanded: true,
                 values: {
@@ -879,6 +951,8 @@
                     reasonInput: reasonInput.value
                 }
             });
+
+            updateReviewNavigation();
 
             // 点击 Save 进行强规则校验和并发批量入库
             saveBtn.addEventListener('click', function(e) {
@@ -931,6 +1005,18 @@
                 reasonInput.value = getStoredPanelValue(previous, 'reasonInput');
                 saveBtn.innerText = 'Save';
                 saveBtn.className = 'coverage-analysis-btn';
+            });
+
+            previousBtn.addEventListener('click', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                navigateReviewPanel(startLineNum, -1);
+            });
+
+            nextBtn.addEventListener('click', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                navigateReviewPanel(startLineNum, 1);
             });
 
             select.addEventListener('change', function() {
