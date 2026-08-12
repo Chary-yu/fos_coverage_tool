@@ -25,7 +25,8 @@
   coverage_check.py          # Git + LCOV 增量覆盖率计算模块/独立命令
   repositories.example.json  # 多仓库增量覆盖率配置示例
   clear_coverage_data.py     # 调试脚本：清空单项目或全部数据库数据
-  coverage_progress.html     # 独立网页：查看项目/目录/文件分析进度
+  coverage_progress.html     # 独立网页：查看项目/小组/组长/目录/文件分析进度
+  代码目录归属模块统计.xlsx   # 本地提供，不入 Git；目录 -> 模块 -> 小组/组长归属表
   coverage_enhance.js        # 前端增强脚本
   coverage_enhance.css       # 前端样式
   coverage_config.json       # 数据库、服务端口、项目名配置
@@ -96,6 +97,10 @@ python3.6 coverage_check.py ...
     "port": 9528
   },
   "worker_threads": 4,
+  "ownership": {
+    "enabled": true,
+    "xlsx_path": "代码目录归属模块统计.xlsx"
+  },
   "render_mode": "lazy",
   "project_name": "review_main_202605"
 }
@@ -107,6 +112,8 @@ python3.6 coverage_check.py ...
 * `project_name` 是兼容旧流程的默认项目名；
 * 推荐执行 `inject` 时用 `--project <项目名>` 显式指定项目名，避免忘记修改配置文件；
 * `worker_threads` 控制注入写库和按目录导出 Excel 的并发线程数，建议从 4 开始，数据库压力允许时再调大；
+* `ownership.xlsx_path` 指向代码目录归属表，支持绝对路径；相对路径按 `enhance_coverage.py` 所在目录解析；
+* `ownership.enabled=false` 可以临时停用小组/组长归类，但不会影响原有项目、目录、文件进度；
 * `render_mode` 控制覆盖率页面右侧控件的默认显示方式，`lazy` 为轻量占位、点击展开，`immediate` 为打开页面后直接渲染完整控件；
 * `server.host` 建议使用 `127.0.0.1`，由 Nginx 反向代理给浏览器访问。
 
@@ -522,18 +529,19 @@ curl -o coverage_full_project_summary.csv \
   "http://127.0.0.1:9528/api/coverage/export?type=full_project_summary"
 ```
 
-一次导出项目、目录、文件三个层级的分析进度：
+一次导出项目、目录、小组/组长、文件四个层级的分析进度：
 
 ```bash
-curl -o coverage_full_progress_summary.csv \
+curl -o coverage_full_progress_summary.xlsx \
   "http://127.0.0.1:9528/api/coverage/export?type=full_progress_summary&project=review_main_202606"
 ```
 
 `full_progress_summary` 包含：
 
-* `level=project`：整个项目分析进度；
-* `level=dir`：各目录分析进度；
-* `level=file`：各文件分析进度。
+* `项目进度` sheet：整个项目分析进度；
+* `目录进度` sheet：各目录分析进度；
+* `小组进度` sheet：按开发小组和开发主管归类的分析进度；
+* `文件进度` sheet：各文件分析进度，并附带模块、小组、组长和归属匹配状态。
 
 主要进度字段：
 
@@ -641,10 +649,50 @@ http://服务器IP/coverage/review_main_202606/coverage_progress.html?project=re
 
 同时提供：
 
+* 按小组和组长汇总的填写、确认进度；
 * 各目录进度；
-* 各文件进度；
-* 进度 CSV 导出入口；
+* 各文件进度及其模块、小组、组长、匹配状态；
+* 归属表已匹配/未匹配文件计数，目录无法识别的文件会集中归入“未匹配小组”；
+* 进度 Excel 导出入口；
 * 按目录拆分的 Excel ZIP 导出入口。
+
+### 小组和组长归属表
+
+进度接口每次查询都会检查 `ownership.xlsx_path` 指向文件的修改时间、大小和文件标识。表格未变化时使用内存缓存；替换或修改表格后会在下一次查询时自动重新读取，不需要重启服务。建议先生成完整新文件，再用同名文件替换旧文件，避免服务恰好读取到保存中的半成品。
+
+匹配链路为：文件路径 -> 最长匹配代码目录 -> 模块 -> 开发小组/开发主管。工作簿和 sheet 名可以变化，程序按表头识别数据：
+
+* 目录表需要“Directory（或目录/代码目录/代码路径/路径）”和“模块（或组件）”；
+* 负责人表需要“组件（或模块）”、“开发小组（或小组/开发组）”和“开发主管（或组长/小组组长/主管）”；
+* 构建机根目录变化不会影响匹配，例如表中的 `/home/coverage/repo/src/a` 可以匹配报告中的 `/build/work/repo/src/a/file.c`；
+* 重复目录或组件如果配置成互相冲突的归属，会被视为歧义并进入未匹配统计，避免把进度错误分给某个小组。
+
+推荐使用一个标准 `.xlsx` 工作簿，放置下面两个 sheet。sheet 名不限制，其他无关列也可以保留。
+
+目录与模块 sheet 示例：
+
+| Directory | 模块 |
+| --- | --- |
+| `/home/coverage/repo_a/src/network/core` | `NET_CORE` |
+| `/home/coverage/repo_b/src/storage` | `STORAGE` |
+
+负责人 sheet 示例：
+
+| 组件 | 开发小组 | 开发主管 |
+| --- | --- | --- |
+| `NET_CORE` | `网络平台组` | `张三` |
+| `STORAGE` | `存储平台组` | `李四` |
+
+填写要求：
+
+* `模块` 和 `组件` 是两张表的关联键，建议保持完全一致；匹配时会忽略大小写和首尾空格；
+* `Directory` 填源码目录，不填具体源文件，也不需要通配符；程序使用路径分段和最长目录规则匹配；
+* 表头之前可以有标题行，程序会自动寻找包含必需表头的行；
+* 合并单元格可以读取，但为了避免归属不清，建议每条目录和组件各占一行；
+* 文件必须是 `.xlsx`，不支持旧版二进制 `.xls`；
+* 该文件已加入 `.gitignore`，部署时需要单独放到配置路径，不能依赖 Git 拉取获得。
+
+读取 xlsx 只使用 Python 标准库，不依赖 `openpyxl`，可在 Python 3.6.8 环境运行。
 
 该页面依赖后台服务提供的接口：
 

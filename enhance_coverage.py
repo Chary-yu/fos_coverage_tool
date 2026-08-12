@@ -18,11 +18,13 @@ import io
 import html
 import time
 import zipfile
+import posixpath
 from decimal import Decimal
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.parse
 import threading
+from xml.etree import ElementTree
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import coverage_check
@@ -49,13 +51,18 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "coverage_config.json")
 JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
 CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
 PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
-ASSET_VERSION = "progress-refresh-20260812"
+DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
+ASSET_VERSION = "ownership-progress-20260812"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 REVIEW_STATUS_UNCONFIRMED = "未确认"
 REVIEW_CONFIRMED_STATUSES = ("可覆盖", "无法覆盖", "冗余代码")
 REVIEW_VALID_STATUSES = (REVIEW_STATUS_UNCONFIRMED,) + REVIEW_CONFIRMED_STATUSES
 MAX_BATCH_REVIEW_BLOCKS = 1000
 MAX_BATCH_REVIEW_LINES = 20000
+OWNERSHIP_UNMATCHED_TEAM = "未匹配小组"
+OWNERSHIP_UNMATCHED_LEADER = "未匹配组长"
+_ownership_cache = {}
+_ownership_cache_lock = threading.Lock()
 DEFAULT_PROGRESS_PAGE_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -68,11 +75,11 @@ DEFAULT_PROGRESS_PAGE_HTML = r"""<!doctype html>
     h1{margin:0 0 12px;font-size:22px}.controls{display:flex;gap:8px;flex-wrap:wrap}
     input{width:min(420px,100%);height:34px;border:1px solid #bcc7d4;border-radius:4px;padding:0 10px}
     button,a.button{height:34px;border:1px solid #c7d8ff;border-radius:4px;background:#eef4ff;color:#1f5fbf;padding:0 12px;font-weight:700;text-decoration:none;display:inline-flex;align-items:center;cursor:pointer}
-    main{padding:18px 24px 32px}.cards{display:grid;grid-template-columns:repeat(4,minmax(150px,1fr));gap:12px;margin-bottom:16px}
+    main{padding:18px 24px 32px}.cards{display:grid;grid-template-columns:repeat(6,minmax(140px,1fr));gap:12px;margin-bottom:16px}
     .card,.section{background:#fff;border:1px solid #d8e0ea;border-radius:6px}.card{padding:12px}.label{color:#64748b;font-size:12px}.value{font-size:24px;font-weight:800;margin-top:4px}
     .section{margin-top:14px;overflow:hidden}.section h2{margin:0;padding:10px 12px;font-size:15px;background:#eef3f8;border-bottom:1px solid #d8e0ea}.table-wrap{overflow:auto}
     table{width:100%;border-collapse:collapse;min-width:920px}th,td{border-bottom:1px solid #e7edf4;padding:7px 8px;text-align:left;vertical-align:top}th{background:#f8fafc;position:sticky;top:0}td.path{word-break:break-all}
-    .bar{display:inline-block;width:90px;height:8px;background:#e5e7eb;border-radius:4px;overflow:hidden;margin-left:8px}.bar span{display:block;height:100%;background:#1f9d55}.status{margin-top:10px;color:#64748b}.error{color:#b91c1c}
+    .bar{display:inline-block;width:90px;height:8px;background:#e5e7eb;border-radius:4px;overflow:hidden;margin-left:8px}.bar span{display:block;height:100%;background:#1f9d55}.status{margin-top:10px;color:#64748b}.error{color:#b91c1c}.warning{color:#a16207}.unmatched{color:#b91c1c;font-weight:700}
   </style>
 </head>
 <body>
@@ -92,7 +99,11 @@ DEFAULT_PROGRESS_PAGE_HTML = r"""<!doctype html>
       <div class="card"><div class="label">已填写</div><div id="filledTotal" class="value">-</div></div>
       <div class="card"><div class="label">填写率</div><div id="fillRate" class="value">-</div></div>
       <div class="card"><div class="label">确认率</div><div id="confirmedRate" class="value">-</div></div>
+      <div class="card"><div class="label">归属已匹配文件</div><div id="matchedFiles" class="value">-</div></div>
+      <div class="card"><div class="label">归属未匹配文件</div><div id="unmatchedFiles" class="value">-</div></div>
     </div>
+    <div id="ownershipStatus" class="status"></div>
+    <section class="section"><h2>小组 / 组长填写进度</h2><div class="table-wrap"><table id="teamTable"></table></div></section>
     <section class="section"><h2>目录进度</h2><div class="table-wrap"><table id="dirTable"></table></div></section>
     <section class="section"><h2>文件进度</h2><div class="table-wrap"><table id="fileTable"></table></div></section>
   </main>
@@ -101,14 +112,17 @@ DEFAULT_PROGRESS_PAGE_HTML = r"""<!doctype html>
     projectInput.value=params.get('project')||'';
     const asNumber=v=>Number.isFinite(Number(v))?Number(v):0,fmtRate=v=>Number.isFinite(Number(v))?`${Number(v).toFixed(1)}%`:'0.0%',bar=r=>`<span class="bar"><span style="width:${Math.max(0,Math.min(100,asNumber(r)))}%"></span></span>`;
     function metric(id,value){document.getElementById(id).innerText=value}
+    function esc(value){return String(value==null?'':value).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
     function rows(items,pathKey){return !items||!items.length?'<tr><td>暂无数据</td></tr>':items.map(row=>`<tr><td class="path">${row[pathKey]||'(root)'}</td><td>${asNumber(row.total_uncovered)}</td><td>${asNumber(row.filled_total)}</td><td>${asNumber(row.unfilled_total)}</td><td>${asNumber(row.confirmed_total)}</td><td>${asNumber(row.coverable_total)}</td><td>${asNumber(row.uncoverable_total)}</td><td>${asNumber(row.redundant_total)}</td><td>${fmtRate(row.fill_rate)} ${bar(row.fill_rate)}</td><td>${fmtRate(row.confirmed_rate)} ${bar(row.confirmed_rate)}</td></tr>`).join('')}
     function renderTable(id,items,pathKey){document.getElementById(id).innerHTML=`<thead><tr><th>路径</th><th>未覆盖</th><th>已填</th><th>未填</th><th>已确认</th><th>可覆盖</th><th>无法覆盖</th><th>冗余</th><th>填写率</th><th>确认率</th></tr></thead><tbody>${rows(items,pathKey)}</tbody>`}
+    function renderTeam(items){const body=!items||!items.length?'<tr><td>暂无数据</td></tr>':items.map(row=>`<tr><td>${esc(row.team)}</td><td>${esc(row.leader)}</td><td>${esc(row.module_names)}</td><td>${asNumber(row.file_total)}</td><td>${asNumber(row.total_uncovered)}</td><td>${asNumber(row.filled_total)}</td><td>${asNumber(row.unfilled_total)}</td><td>${asNumber(row.confirmed_total)}</td><td>${fmtRate(row.fill_rate)} ${bar(row.fill_rate)}</td><td>${fmtRate(row.confirmed_rate)} ${bar(row.confirmed_rate)}</td></tr>`).join('');document.getElementById('teamTable').innerHTML=`<thead><tr><th>小组</th><th>组长</th><th>模块</th><th>文件数</th><th>未覆盖</th><th>已填</th><th>未填</th><th>已确认</th><th>填写率</th><th>确认率</th></tr></thead><tbody>${body}</tbody>`}
+    function renderOwnership(item){item=item||{};metric('matchedFiles',asNumber(item.matched_files));metric('unmatchedFiles',asNumber(item.unmatched_files));document.getElementById('ownershipStatus').innerHTML=item.available?`归属表规则 ${asNumber(item.directory_rule_total)} 条，已匹配 ${asNumber(item.matched_files)} 个文件，<span class="unmatched">未匹配 ${asNumber(item.unmatched_files)} 个文件</span>。`:`<span class="warning">${esc(item.warning||'代码目录归属表不可用')}</span>`}
     function normalizeApiBase(value){return String(value||'').replace(/\/+$/,'')}
     function unique(values){return Array.from(new Set(values.filter(Boolean)))}
     function apiBaseCandidates(){const explicit=params.get('api'),origin=window.location.origin&&window.location.origin!=='null'?window.location.origin:'',c=[];if(explicit)c.push(normalizeApiBase(explicit));if(origin){c.push(`${origin}/api/coverage`);if(window.location.pathname.startsWith('/coverage/'))c.push(`${origin}/coverage/api/coverage`);if(window.location.port!=='9528')c.push(`${window.location.protocol}//${window.location.hostname}:9528/api/coverage`)}c.push('http://127.0.0.1:9528/api/coverage');c.push('/api/coverage');return unique(c.map(normalizeApiBase))}
     function fetchJsonWithTimeout(url,timeoutMs){const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),timeoutMs);return fetch(url,{signal:controller.signal}).finally(()=>clearTimeout(timer)).then(r=>{if(!r.ok)throw new Error(`HTTP ${r.status}`);return r.json()})}
     function updateLinks(project,apiBase){const encoded=encodeURIComponent(project),base=normalizeApiBase(apiBase||resolvedApiBase||apiBaseCandidates()[0]);csvLink.href=`${base}/export?type=full_progress_summary&project=${encoded}`;excelLink.href=`${base}/export?type=review_excel_by_dir&project=${encoded}`}
-    async function loadProgress(){const project=projectInput.value.trim();if(!project){statusEl.innerHTML='<span class="error">请输入项目名。</span>';return}const loadBtn=document.getElementById('loadBtn');loadBtn.disabled=true;loadBtn.innerText='正在加载...';const encodedProject=encodeURIComponent(project),candidates=apiBaseCandidates();updateLinks(project,candidates[0]);statusEl.innerText=`正在连接接口：${candidates[0]}`;let lastError=null;try{for(const apiBase of candidates){try{statusEl.innerText=`正在加载：${apiBase}`;const payload=await fetchJsonWithTimeout(`${apiBase}/progress?project=${encodedProject}`,15000);if(!payload||payload.status!=='success')throw new Error(payload&&payload.message?payload.message:'加载失败');resolvedApiBase=apiBase;updateLinks(project,apiBase);const data=payload.data||{},projectRow=data.project&&data.project[0]||{};metric('totalUncovered',asNumber(projectRow.total_uncovered));metric('filledTotal',asNumber(projectRow.filled_total));metric('fillRate',fmtRate(projectRow.fill_rate));metric('confirmedRate',fmtRate(projectRow.confirmed_rate));renderTable('dirTable',data.dirs||[],'dir_path');renderTable('fileTable',data.files||[],'file_path');statusEl.innerText=`已加载项目：${project}，接口：${apiBase}`;const url=new URL(window.location.href);url.searchParams.set('project',project);if(params.get('api'))url.searchParams.set('api',apiBase);window.history.replaceState(null,'',url.toString());return}catch(e){lastError=e}}statusEl.innerHTML=`<span class="error">加载失败：${lastError?lastError.message:'无法连接接口'}。已尝试：${candidates.join(' , ')}</span>`}finally{loadBtn.disabled=false;loadBtn.innerText='查看进度'}}
+    async function loadProgress(){const project=projectInput.value.trim();if(!project){statusEl.innerHTML='<span class="error">请输入项目名。</span>';return}const loadBtn=document.getElementById('loadBtn');loadBtn.disabled=true;loadBtn.innerText='正在加载...';const encodedProject=encodeURIComponent(project),candidates=apiBaseCandidates();updateLinks(project,candidates[0]);statusEl.innerText=`正在连接接口：${candidates[0]}`;let lastError=null;try{for(const apiBase of candidates){try{statusEl.innerText=`正在加载：${apiBase}`;const payload=await fetchJsonWithTimeout(`${apiBase}/progress?project=${encodedProject}`,15000);if(!payload||payload.status!=='success')throw new Error(payload&&payload.message?payload.message:'加载失败');resolvedApiBase=apiBase;updateLinks(project,apiBase);const data=payload.data||{},projectRow=data.project&&data.project[0]||{};metric('totalUncovered',asNumber(projectRow.total_uncovered));metric('filledTotal',asNumber(projectRow.filled_total));metric('fillRate',fmtRate(projectRow.fill_rate));metric('confirmedRate',fmtRate(projectRow.confirmed_rate));renderOwnership(data.ownership);renderTeam(data.teams||[]);renderTable('dirTable',data.dirs||[],'dir_path');renderTable('fileTable',data.files||[],'file_path');statusEl.innerText=`已加载项目：${project}，接口：${apiBase}`;const url=new URL(window.location.href);url.searchParams.set('project',project);if(params.get('api'))url.searchParams.set('api',apiBase);window.history.replaceState(null,'',url.toString());return}catch(e){lastError=e}}statusEl.innerHTML=`<span class="error">加载失败：${lastError?lastError.message:'无法连接接口'}。已尝试：${candidates.join(' , ')}</span>`}finally{loadBtn.disabled=false;loadBtn.innerText='查看进度'}}
     document.getElementById('loadBtn').addEventListener('click',loadProgress);projectInput.addEventListener('keydown',e=>{if(e.key==='Enter')loadProgress()});if(projectInput.value.trim())loadProgress();
   </script>
 </body>
@@ -169,6 +183,414 @@ def row_value(row, key, index):
     if isinstance(row, dict):
         return row.get(key)
     return row[index]
+
+
+def _xlsx_column_index(cell_reference):
+    match = re.match(r"([A-Za-z]+)", str(cell_reference or ""))
+    if not match:
+        return 0
+    index = 0
+    for character in match.group(1).upper():
+        index = index * 26 + ord(character) - 64
+    return max(0, index - 1)
+
+
+def _xlsx_sheet_rows(archive, member_name, shared_strings):
+    spreadsheet_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    root = ElementTree.fromstring(archive.read(member_name))
+    cells = {}
+    max_row = 0
+    max_column = 0
+    for row_element in root.findall(".//{%s}sheetData/{%s}row" % (spreadsheet_ns, spreadsheet_ns)):
+        row_index = int(row_element.get("r") or 0)
+        max_row = max(max_row, row_index)
+        for cell in row_element.findall("{%s}c" % spreadsheet_ns):
+            column_index = _xlsx_column_index(cell.get("r"))
+            max_column = max(max_column, column_index + 1)
+            cell_type = cell.get("t")
+            if cell_type == "inlineStr":
+                value = "".join(
+                    text.text or "" for text in cell.findall(".//{%s}t" % spreadsheet_ns)
+                )
+            else:
+                value_element = cell.find("{%s}v" % spreadsheet_ns)
+                raw_value = value_element.text if value_element is not None else ""
+                if cell_type == "s" and raw_value != "":
+                    try:
+                        value = shared_strings[int(raw_value)]
+                    except (IndexError, TypeError, ValueError):
+                        value = raw_value
+                else:
+                    value = raw_value
+            cells[(row_index, column_index)] = value
+
+    merge_cells = root.find("{%s}mergeCells" % spreadsheet_ns)
+    if merge_cells is not None:
+        for merge_cell in merge_cells.findall("{%s}mergeCell" % spreadsheet_ns):
+            cell_range = str(merge_cell.get("ref") or "")
+            if ":" not in cell_range:
+                continue
+            start_ref, end_ref = cell_range.split(":", 1)
+            start_row_match = re.search(r"(\d+)$", start_ref)
+            end_row_match = re.search(r"(\d+)$", end_ref)
+            if not start_row_match or not end_row_match:
+                continue
+            start_row = int(start_row_match.group(1))
+            end_row = int(end_row_match.group(1))
+            start_column = _xlsx_column_index(start_ref)
+            end_column = _xlsx_column_index(end_ref)
+            merged_value = cells.get((start_row, start_column), "")
+            for row_index in range(start_row, end_row + 1):
+                for column_index in range(start_column, end_column + 1):
+                    if cells.get((row_index, column_index), "") == "":
+                        cells[(row_index, column_index)] = merged_value
+            max_row = max(max_row, end_row)
+            max_column = max(max_column, end_column + 1)
+
+    return [
+        [cells.get((row_index, column_index), "") for column_index in range(max_column)]
+        for row_index in range(1, max_row + 1)
+    ]
+
+
+def read_xlsx_tables(xlsx_path):
+    """Read XLSX worksheets using only the Python 3.6 standard library."""
+    spreadsheet_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    relationship_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    package_relationship_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+    with zipfile.ZipFile(xlsx_path, "r") as archive:
+        shared_strings = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            shared_root = ElementTree.fromstring(archive.read("xl/sharedStrings.xml"))
+            for string_item in shared_root.findall("{%s}si" % spreadsheet_ns):
+                shared_strings.append("".join(
+                    text.text or "" for text in string_item.findall(".//{%s}t" % spreadsheet_ns)
+                ))
+
+        relation_root = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        relation_targets = {}
+        for relation in relation_root.findall("{%s}Relationship" % package_relationship_ns):
+            relation_targets[relation.get("Id")] = relation.get("Target")
+
+        workbook_root = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+        tables = []
+        for sheet in workbook_root.findall(".//{%s}sheet" % spreadsheet_ns):
+            relation_id = sheet.get("{%s}id" % relationship_ns)
+            target = relation_targets.get(relation_id)
+            if not target:
+                continue
+            if target.startswith("/"):
+                member_name = target.lstrip("/")
+            else:
+                member_name = posixpath.normpath(posixpath.join("xl", target))
+            tables.append({
+                "name": sheet.get("name") or member_name,
+                "rows": _xlsx_sheet_rows(archive, member_name, shared_strings),
+            })
+        return tables
+
+
+def _normalize_excel_header(value):
+    return re.sub(r"\s+", "", str(value or "")).strip().lower()
+
+
+def _find_xlsx_table(tables, required_columns):
+    normalized_aliases = {
+        key: set(_normalize_excel_header(alias) for alias in aliases)
+        for key, aliases in required_columns.items()
+    }
+    for table in tables:
+        for row_index, row in enumerate(table.get("rows") or []):
+            header_indexes = {}
+            for column_index, value in enumerate(row):
+                normalized_value = _normalize_excel_header(value)
+                for key, aliases in normalized_aliases.items():
+                    if key not in header_indexes and normalized_value in aliases:
+                        header_indexes[key] = column_index
+            if len(header_indexes) == len(required_columns):
+                return table, row_index, header_indexes
+    raise ValueError("Required ownership columns were not found: {}".format(
+        ", ".join(sorted(required_columns.keys()))
+    ))
+
+
+def _normalize_ownership_path(value):
+    normalized = str(value or "").strip().replace("\\", "/")
+    normalized = re.sub(r"/+", "/", normalized)
+    while normalized.startswith("./"):
+        normalized = normalized[2:]
+    return normalized.rstrip("/")
+
+
+def parse_ownership_workbook(xlsx_path):
+    tables = read_xlsx_tables(xlsx_path)
+    directory_table, directory_header_row, directory_columns = _find_xlsx_table(tables, {
+        "directory": ("Directory", "目录", "代码目录", "代码路径", "路径"),
+        "module": ("模块", "组件"),
+    })
+    owner_table, owner_header_row, owner_columns = _find_xlsx_table(tables, {
+        "module": ("组件", "模块"),
+        "team": ("开发小组", "小组", "开发组"),
+        "leader": ("开发主管", "组长", "小组组长", "主管"),
+    })
+
+    directory_map = {}
+    ambiguous_directories = set()
+    for row in directory_table["rows"][directory_header_row + 1:]:
+        directory = _normalize_ownership_path(
+            row[directory_columns["directory"]] if len(row) > directory_columns["directory"] else ""
+        )
+        module = str(
+            row[directory_columns["module"]] if len(row) > directory_columns["module"] else ""
+        ).strip()
+        if not directory or not module:
+            continue
+        directory_key = directory.lower()
+        previous_module = directory_map.get(directory_key)
+        if previous_module and previous_module["module_key"] != module.upper():
+            ambiguous_directories.add(directory_key)
+            continue
+        directory_map[directory_key] = {
+            "directory": directory,
+            "segments": tuple(segment.lower() for segment in directory.strip("/").split("/") if segment),
+            "module": module,
+            "module_key": module.upper(),
+        }
+    for directory_key in ambiguous_directories:
+        directory_map.pop(directory_key, None)
+
+    owner_map = {}
+    ambiguous_modules = set()
+    for row in owner_table["rows"][owner_header_row + 1:]:
+        module = str(row[owner_columns["module"]] if len(row) > owner_columns["module"] else "").strip()
+        team = str(row[owner_columns["team"]] if len(row) > owner_columns["team"] else "").strip()
+        leader = str(row[owner_columns["leader"]] if len(row) > owner_columns["leader"] else "").strip()
+        if not module:
+            continue
+        module_key = module.upper()
+        ownership = {"team": team, "leader": leader}
+        previous_ownership = owner_map.get(module_key)
+        if previous_ownership and previous_ownership != ownership:
+            ambiguous_modules.add(module_key)
+            continue
+        owner_map[module_key] = ownership
+    for module_key in ambiguous_modules:
+        owner_map.pop(module_key, None)
+
+    suffix_rules = {}
+    ambiguous_suffixes = set()
+    for rule in directory_map.values():
+        segments = rule["segments"]
+        # Keep at least two path segments. This supports concise rules such as
+        # "inc/nem" while avoiding an overly broad single "src" match.
+        for start_index in range(0, max(0, len(segments) - 1)):
+            suffix = segments[start_index:]
+            previous_rule = suffix_rules.get(suffix)
+            if previous_rule and previous_rule["module_key"] != rule["module_key"]:
+                ambiguous_suffixes.add(suffix)
+                continue
+            suffix_rules[suffix] = rule
+    for suffix in ambiguous_suffixes:
+        suffix_rules.pop(suffix, None)
+
+    return {
+        "xlsx_path": os.path.abspath(xlsx_path),
+        "directory_sheet": directory_table["name"],
+        "owner_sheet": owner_table["name"],
+        "directory_rules": list(directory_map.values()),
+        "owner_rules": owner_map,
+        "suffix_rules": suffix_rules,
+        "ambiguous_directories": len(ambiguous_directories),
+        "ambiguous_modules": sorted(ambiguous_modules),
+        "ambiguous_suffixes": len(ambiguous_suffixes),
+    }
+
+
+def resolve_ownership_xlsx_path(config=None):
+    ownership_config = (config or {}).get("ownership") or {}
+    configured_path = ownership_config.get("xlsx_path") or DEFAULT_OWNERSHIP_XLSX_PATH
+    configured_path = os.path.expanduser(str(configured_path))
+    if not os.path.isabs(configured_path):
+        configured_path = os.path.join(SCRIPT_DIR, configured_path)
+    return os.path.abspath(configured_path)
+
+
+def load_ownership_workbook(config=None):
+    ownership_config = (config or {}).get("ownership") or {}
+    if ownership_config.get("enabled", True) is False:
+        return {"available": False, "warning": "代码目录归属统计已在配置中禁用。"}
+    xlsx_path = resolve_ownership_xlsx_path(config)
+    if not os.path.isfile(xlsx_path):
+        return {
+            "available": False,
+            "xlsx_path": xlsx_path,
+            "warning": "未找到代码目录归属表：{}".format(xlsx_path),
+        }
+    stat_result = os.stat(xlsx_path)
+    signature = (
+        getattr(stat_result, "st_mtime_ns", stat_result.st_mtime),
+        stat_result.st_size,
+        getattr(stat_result, "st_ino", 0),
+    )
+    with _ownership_cache_lock:
+        cached = _ownership_cache.get(xlsx_path)
+        if cached and cached.get("signature") == signature:
+            return cached["value"]
+        try:
+            value = parse_ownership_workbook(xlsx_path)
+            value.update({
+                "available": True,
+                "modified_at": datetime.fromtimestamp(stat_result.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+            })
+        except Exception as error:
+            value = {
+                "available": False,
+                "xlsx_path": xlsx_path,
+                "warning": "读取代码目录归属表失败：{}".format(error),
+            }
+        _ownership_cache[xlsx_path] = {"signature": signature, "value": value}
+        return value
+
+
+def match_file_ownership(file_path, ownership_workbook):
+    normalized_path = _normalize_ownership_path(file_path)
+    file_segments = tuple(segment.lower() for segment in normalized_path.strip("/").split("/") if segment)
+    best_rule = None
+    best_length = -1
+    suffix_rules = ownership_workbook.get("suffix_rules") or {}
+    # The last segment is normally the source filename. Try all segment-aligned
+    # directory slices so build-machine root changes do not break ownership matching.
+    for start_index in range(0, len(file_segments)):
+        for end_index in range(start_index + 2, len(file_segments) + 1):
+            rule = suffix_rules.get(file_segments[start_index:end_index])
+            if rule and end_index - start_index > best_length:
+                best_rule = rule
+                best_length = end_index - start_index
+    if not best_rule:
+        return {
+            "module": "",
+            "team": OWNERSHIP_UNMATCHED_TEAM,
+            "leader": OWNERSHIP_UNMATCHED_LEADER,
+            "ownership_status": "目录未匹配",
+        }
+    ownership = (ownership_workbook.get("owner_rules") or {}).get(best_rule["module_key"])
+    if not ownership:
+        return {
+            "module": best_rule["module"],
+            "team": OWNERSHIP_UNMATCHED_TEAM,
+            "leader": OWNERSHIP_UNMATCHED_LEADER,
+            "ownership_status": "模块未配置负责人",
+        }
+    team = ownership.get("team") or OWNERSHIP_UNMATCHED_TEAM
+    leader = ownership.get("leader") or OWNERSHIP_UNMATCHED_LEADER
+    return {
+        "module": best_rule["module"],
+        "team": team,
+        "leader": leader,
+        "ownership_status": "已匹配" if team != OWNERSHIP_UNMATCHED_TEAM and leader != OWNERSHIP_UNMATCHED_LEADER else "负责人信息不完整",
+    }
+
+
+def _progress_number(value):
+    if value in (None, ""):
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 0
+
+
+def build_ownership_progress(file_rows, config=None):
+    workbook = load_ownership_workbook(config)
+    enriched_files = []
+    grouped = {}
+    matched_files = 0
+    status_counts = {}
+    for file_row in file_rows:
+        row = dict(file_row)
+        ownership = match_file_ownership(row.get("file_path"), workbook) if workbook.get("available") else {
+            "module": "",
+            "team": OWNERSHIP_UNMATCHED_TEAM,
+            "leader": OWNERSHIP_UNMATCHED_LEADER,
+            "ownership_status": "归属表不可用",
+        }
+        row.update(ownership)
+        enriched_files.append(row)
+        status = ownership["ownership_status"]
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if status == "已匹配":
+            matched_files += 1
+        group_key = (ownership["team"], ownership["leader"])
+        group = grouped.setdefault(group_key, {
+            "team": ownership["team"],
+            "leader": ownership["leader"],
+            "modules": set(),
+            "file_total": 0,
+            "total_uncovered": 0,
+            "filled_total": 0,
+            "unfilled_total": 0,
+            "confirmed_total": 0,
+            "coverable_total": 0,
+            "uncoverable_total": 0,
+            "redundant_total": 0,
+            "last_updated": "",
+        })
+        if ownership["module"]:
+            group["modules"].add(ownership["module"])
+        group["file_total"] += 1
+        for field in (
+            "total_uncovered", "filled_total", "unfilled_total", "confirmed_total",
+            "coverable_total", "uncoverable_total", "redundant_total",
+        ):
+            group[field] += _progress_number(row.get(field))
+        last_updated = row.get("last_updated")
+        if last_updated is not None:
+            last_updated_text = json_safe_default(last_updated)
+            if last_updated_text > group["last_updated"]:
+                group["last_updated"] = last_updated_text
+
+    team_rows = []
+    for group in grouped.values():
+        total = group["total_uncovered"]
+        group["module_total"] = len(group["modules"])
+        group["module_names"] = "、".join(sorted(group["modules"]))
+        group["fill_rate"] = round(group["filled_total"] * 100.0 / total, 2) if total else 0.0
+        group["confirmed_rate"] = round(group["confirmed_total"] * 100.0 / total, 2) if total else 0.0
+        group.pop("modules", None)
+        team_rows.append(group)
+    team_rows.sort(key=lambda row: (
+        row["team"] == OWNERSHIP_UNMATCHED_TEAM,
+        -row["total_uncovered"],
+        row["team"],
+        row["leader"],
+    ))
+
+    public_workbook = {
+        key: value for key, value in workbook.items()
+        if key not in ("directory_rules", "owner_rules", "suffix_rules")
+    }
+    public_workbook.update({
+        "directory_rule_total": len(workbook.get("directory_rules") or []),
+        "owner_rule_total": len(workbook.get("owner_rules") or {}),
+        "matched_files": matched_files,
+        "unmatched_files": len(enriched_files) - matched_files,
+        "status_counts": status_counts,
+    })
+    return {
+        "ownership": public_workbook,
+        "teams": team_rows,
+        "files": enriched_files,
+    }
+
+
+def dict_rows_to_table(rows, fields):
+    return list(fields), [
+        [row.get(field, "") for field in fields]
+        for row in rows
+    ]
 
 
 def json_safe_default(value):
@@ -460,6 +882,10 @@ def load_config():
         "server": {
             "host": "0.0.0.0",
             "port": 9528
+        },
+        "ownership": {
+            "enabled": True,
+            "xlsx_path": DEFAULT_OWNERSHIP_XLSX_PATH
         },
         "project_name": DEFAULT_PROJECT_NAME
     }
@@ -1666,7 +2092,7 @@ def build_progress_excel(project_name, progress_sections):
     used_names = set()
 
     progress_headers = [
-        "层级", "项目名", "路径", "文件数", "未覆盖行总数", "已填写", "未填写",
+        "层级", "项目名", "小组", "组长", "模块", "归属匹配状态", "路径", "文件数", "未覆盖行总数", "已填写", "未填写",
         "已确认", "可覆盖", "无法覆盖", "冗余代码", "填写率(%)", "确认率(%)", "最后更新时间"
     ]
     for sheet_name, headers, rows in progress_sections:
@@ -1678,11 +2104,17 @@ def build_progress_excel(project_name, progress_sections):
                 path_value = ""
             elif sheet_name == "目录进度":
                 path_value = row_map.get("dir_path", "")
-            else:
+            elif sheet_name == "文件进度":
                 path_value = row_map.get("file_path", "")
+            else:
+                path_value = ""
             progress_rows.append([
                 level,
                 row_map.get("project_name", project_name),
+                row_map.get("team", ""),
+                row_map.get("leader", ""),
+                row_map.get("module_names", row_map.get("module", "")),
+                row_map.get("ownership_status", ""),
                 path_value,
                 row_map.get("file_total", 1 if sheet_name == "文件进度" else ""),
                 row_map.get("total_uncovered", ""),
@@ -1698,7 +2130,7 @@ def build_progress_excel(project_name, progress_sections):
             ])
         sheet_defs.append({
             "name": safe_sheet_name(sheet_name, used_names),
-            "xml": xlsx_sheet_xml(progress_rows, [10, 22, 56, 10, 14, 10, 10, 10, 10, 10, 10, 12, 12, 22])
+            "xml": xlsx_sheet_xml(progress_rows, [10, 22, 18, 18, 32, 18, 56, 10, 14, 10, 10, 10, 10, 10, 10, 12, 12, 22])
         })
     return build_xlsx_workbook(sheet_defs)
 
@@ -1912,10 +2344,27 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                     project_headers, project_rows = db_manager.export_report("full_project_summary", project_name)
                     dir_headers, dir_rows = db_manager.export_report("full_dir_summary", project_name)
                     file_headers, file_rows = db_manager.export_report("full_file_summary", project_name)
+                    ownership_progress = build_ownership_progress(
+                        [dict(zip(file_headers, row)) for row in file_rows],
+                        load_config(),
+                    )
+                    team_headers, team_rows = dict_rows_to_table(ownership_progress["teams"], (
+                        "team", "leader", "module_names", "file_total", "total_uncovered",
+                        "filled_total", "unfilled_total", "confirmed_total", "coverable_total",
+                        "uncoverable_total", "redundant_total", "fill_rate", "confirmed_rate",
+                        "last_updated",
+                    ))
+                    enriched_file_headers = list(file_headers) + [
+                        "module", "team", "leader", "ownership_status"
+                    ]
+                    enriched_file_headers, enriched_file_rows = dict_rows_to_table(
+                        ownership_progress["files"], enriched_file_headers
+                    )
                     progress_sections = [
                         ("项目进度", project_headers, project_rows),
                         ("目录进度", dir_headers, dir_rows),
-                        ("文件进度", file_headers, file_rows),
+                        ("小组进度", team_headers, team_rows),
+                        ("文件进度", enriched_file_headers, enriched_file_rows),
                     ]
                     data = build_progress_excel(project_name, progress_sections)
                 except Exception:
@@ -1942,10 +2391,14 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 project_headers, project_rows = db_manager.export_report("full_project_summary", project_name)
                 dir_headers, dir_rows = db_manager.export_report("full_dir_summary", project_name)
                 file_headers, file_rows = db_manager.export_report("full_file_summary", project_name)
+                file_data = [dict(zip(file_headers, row)) for row in file_rows]
+                ownership_progress = build_ownership_progress(file_data, load_config())
                 data = {
                     "project": [dict(zip(project_headers, row)) for row in project_rows],
                     "dirs": [dict(zip(dir_headers, row)) for row in dir_rows],
-                    "files": [dict(zip(file_headers, row)) for row in file_rows],
+                    "files": ownership_progress["files"],
+                    "teams": ownership_progress["teams"],
+                    "ownership": ownership_progress["ownership"],
                 }
             except Exception:
                 self.send_error_response(500, "Failed to query progress")

@@ -191,7 +191,7 @@ class TestExportSystem(unittest.TestCase):
             print(f"[ZIP Package] verified successfully! ZIP has 'src.xlsx' ({len(excel_bytes)} bytes)")
 
     def test_full_progress_summary_xlsx(self):
-        """Verify full_progress_summary (XLSX Spreadsheet) compiles successfully with 3 separate sheets."""
+        """Verify full_progress_summary includes the team/leader progress sheet."""
         print("\n=== Verifying full_progress_summary (XLSX Spreadsheet) Format ===")
         
         project_headers, project_rows = self.mock_db.export_report("full_project_summary", "test_proj")
@@ -201,6 +201,11 @@ class TestExportSystem(unittest.TestCase):
         progress_sections = [
             ("项目进度", project_headers, project_rows),
             ("目录进度", dir_headers, dir_rows),
+            ("小组进度", [
+                "team", "leader", "module_names", "file_total", "total_uncovered",
+                "filled_total", "unfilled_total", "confirmed_total", "fill_rate",
+                "confirmed_rate",
+            ], [["平台一组", "张三", "NET_CORE", 1, 10, 5, 5, 2, 50.0, 20.0]]),
             ("文件进度", file_headers, file_rows),
         ]
         
@@ -208,6 +213,12 @@ class TestExportSystem(unittest.TestCase):
         xlsx_data = enhance_coverage.build_progress_excel("test_proj", progress_sections)
         self.assertIsNotNone(xlsx_data)
         self.assertTrue(len(xlsx_data) > 100)
+        with zipfile.ZipFile(io.BytesIO(xlsx_data), "r") as archive:
+            workbook_xml = archive.read("xl/workbook.xml").decode("utf-8")
+            team_sheet_xml = archive.read("xl/worksheets/sheet3.xml").decode("utf-8")
+        self.assertIn('name="小组进度"', workbook_xml)
+        self.assertIn("平台一组", team_sheet_xml)
+        self.assertIn("张三", team_sheet_xml)
         print(f"[Progress XLSX Format] compiled successfully! Binary size={len(xlsx_data)} bytes")
 
 

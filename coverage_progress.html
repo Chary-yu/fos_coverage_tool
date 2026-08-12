@@ -65,7 +65,7 @@
     main { padding: 18px 24px 32px; }
     .cards {
       display: grid;
-      grid-template-columns: repeat(4, minmax(150px, 1fr));
+      grid-template-columns: repeat(6, minmax(140px, 1fr));
       gap: 12px;
       margin-bottom: 16px;
     }
@@ -127,6 +127,12 @@
     }
     .error { color: var(--red); }
     .warning { color: #a16207; }
+    .matched { color: var(--green); }
+    .unmatched { color: var(--red); font-weight: 700; }
+    .ownership-status {
+      margin-top: 7px;
+      color: var(--muted);
+    }
     @media (max-width: 900px) {
       .cards { grid-template-columns: repeat(2, minmax(150px, 1fr)); }
     }
@@ -149,7 +155,14 @@
       <div class="card"><div class="label">已填写</div><div id="filledTotal" class="value">-</div></div>
       <div class="card"><div class="label">填写率</div><div id="fillRate" class="value">-</div></div>
       <div class="card"><div class="label">确认率</div><div id="confirmedRate" class="value">-</div></div>
+      <div class="card"><div class="label">归属已匹配文件</div><div id="matchedFiles" class="value">-</div></div>
+      <div class="card"><div class="label">归属未匹配文件</div><div id="unmatchedFiles" class="value">-</div></div>
     </div>
+    <div id="ownershipStatus" class="ownership-status"></div>
+    <section class="section">
+      <h2>小组 / 组长填写进度</h2>
+      <div class="table-wrap"><table id="teamTable"></table></div>
+    </section>
     <section class="section">
       <h2>目录进度</h2>
       <div class="table-wrap"><table id="dirTable"></table></div>
@@ -197,13 +210,22 @@
       document.getElementById(id).innerText = value;
     }
 
+    function escapeHtml(value) {
+      return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
     function tableRows(rows, pathKey) {
       if (!rows || rows.length === 0) {
         return '<tr><td>暂无数据</td></tr>';
       }
       return rows.map(row => `
         <tr>
-          <td class="path">${row[pathKey] || '(root)'}</td>
+          <td class="path">${escapeHtml(row[pathKey] || '(root)')}</td>
           <td>${asNumber(row.total_uncovered)}</td>
           <td>${asNumber(row.filled_total)}</td>
           <td>${asNumber(row.unfilled_total)}</td>
@@ -227,6 +249,80 @@
         </thead>
         <tbody>${tableRows(rows, pathKey)}</tbody>
       `;
+    }
+
+    function renderTeamTable(rows) {
+      const body = !rows || rows.length === 0 ? '<tr><td colspan="14">暂无数据</td></tr>' : rows.map(row => `
+        <tr>
+          <td>${escapeHtml(row.team || '')}</td>
+          <td>${escapeHtml(row.leader || '')}</td>
+          <td class="path">${escapeHtml(row.module_names || '')}</td>
+          <td>${asNumber(row.file_total)}</td>
+          <td>${asNumber(row.total_uncovered)}</td>
+          <td>${asNumber(row.filled_total)}</td>
+          <td>${asNumber(row.unfilled_total)}</td>
+          <td>${asNumber(row.confirmed_total)}</td>
+          <td>${asNumber(row.coverable_total)}</td>
+          <td>${asNumber(row.uncoverable_total)}</td>
+          <td>${asNumber(row.redundant_total)}</td>
+          <td>${fmtRate(row.fill_rate)} ${bar(row.fill_rate)}</td>
+          <td>${fmtRate(row.confirmed_rate)} ${bar(row.confirmed_rate)}</td>
+          <td>${escapeHtml(row.last_updated || '')}</td>
+        </tr>
+      `).join('');
+      document.getElementById('teamTable').innerHTML = `
+        <thead><tr>
+          <th>小组</th><th>组长</th><th>模块</th><th>文件数</th><th>未覆盖</th>
+          <th>已填</th><th>未填</th><th>已确认</th><th>可覆盖</th><th>无法覆盖</th>
+          <th>冗余</th><th>填写率</th><th>确认率</th><th>最后更新</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      `;
+    }
+
+    function renderFileTable(rows) {
+      const body = !rows || rows.length === 0 ? '<tr><td colspan="14">暂无数据</td></tr>' : rows.map(row => `
+        <tr>
+          <td class="path">${escapeHtml(row.file_path || '')}</td>
+          <td>${escapeHtml(row.module || '')}</td>
+          <td>${escapeHtml(row.team || '')}</td>
+          <td>${escapeHtml(row.leader || '')}</td>
+          <td class="${row.ownership_status === '已匹配' ? 'matched' : 'unmatched'}">${escapeHtml(row.ownership_status || '')}</td>
+          <td>${asNumber(row.total_uncovered)}</td>
+          <td>${asNumber(row.filled_total)}</td>
+          <td>${asNumber(row.unfilled_total)}</td>
+          <td>${asNumber(row.confirmed_total)}</td>
+          <td>${asNumber(row.coverable_total)}</td>
+          <td>${asNumber(row.uncoverable_total)}</td>
+          <td>${asNumber(row.redundant_total)}</td>
+          <td>${fmtRate(row.fill_rate)} ${bar(row.fill_rate)}</td>
+          <td>${fmtRate(row.confirmed_rate)} ${bar(row.confirmed_rate)}</td>
+        </tr>
+      `).join('');
+      document.getElementById('fileTable').innerHTML = `
+        <thead><tr>
+          <th>文件路径</th><th>模块</th><th>小组</th><th>组长</th><th>匹配状态</th>
+          <th>未覆盖</th><th>已填</th><th>未填</th><th>已确认</th><th>可覆盖</th>
+          <th>无法覆盖</th><th>冗余</th><th>填写率</th><th>确认率</th>
+        </tr></thead>
+        <tbody>${body}</tbody>
+      `;
+    }
+
+    function renderOwnershipStatus(ownership) {
+      ownership = ownership || {};
+      metric('matchedFiles', asNumber(ownership.matched_files));
+      metric('unmatchedFiles', asNumber(ownership.unmatched_files));
+      const status = document.getElementById('ownershipStatus');
+      if (!ownership.available) {
+        status.innerHTML = `<span class="warning">${escapeHtml(ownership.warning || '代码目录归属表不可用，文件已归入未匹配小组。')}</span>`;
+        return;
+      }
+      const sourceName = String(ownership.xlsx_path || '').replace(/\\/g, '/').split('/').pop();
+      status.innerHTML = `归属表：${escapeHtml(sourceName)}（更新时间 ${escapeHtml(ownership.modified_at || '-')}），`
+        + `目录规则 ${asNumber(ownership.directory_rule_total)} 条，负责人规则 ${asNumber(ownership.owner_rule_total)} 条，`
+        + `<span class="matched">已匹配 ${asNumber(ownership.matched_files)} 个文件</span>，`
+        + `<span class="${asNumber(ownership.unmatched_files) ? 'unmatched' : 'matched'}">未匹配 ${asNumber(ownership.unmatched_files)} 个文件</span>。`;
     }
 
     function normalizeApiBase(value) {
@@ -311,9 +407,12 @@
             const projectRow = projectRows[0] || {};
             metric('totalUncovered', asNumber(projectRow.total_uncovered)); metric('filledTotal', asNumber(projectRow.filled_total));
             metric('fillRate', fmtRate(projectRow.fill_rate)); metric('confirmedRate', fmtRate(projectRow.confirmed_rate));
-            renderTable('dirTable', data.dirs || [], 'dir_path'); renderTable('fileTable', data.files || [], 'file_path');
+            renderOwnershipStatus(data.ownership || {});
+            renderTeamTable(data.teams || []);
+            renderTable('dirTable', data.dirs || [], 'dir_path');
+            renderFileTable(data.files || []);
             if (projectRows.length === 0) {
-              statusEl.innerHTML = `<span class="warning">未找到项目“${project}”的审查行索引。填写记录可能已保存，但生成报告时未同步索引；请在数据库可连接时重新执行 incremental 或 inject。</span>`;
+              statusEl.innerHTML = `<span class="warning">未找到项目“${escapeHtml(project)}”的审查行索引。填写记录可能已保存，但生成报告时未同步索引；请在数据库可连接时重新执行 incremental 或 inject。</span>`;
             } else {
               statusEl.innerText = `已加载项目：${project}，接口：${apiBase}`;
             }
@@ -328,7 +427,7 @@
             lastError = error;
           }
         }
-        statusEl.innerHTML = `<span class="error">加载失败：${lastError ? lastError.message : '无法连接接口'}。已尝试：${candidates.join(' , ')}</span>`;
+        statusEl.innerHTML = `<span class="error">加载失败：${escapeHtml(lastError ? lastError.message : '无法连接接口')}。已尝试：${escapeHtml(candidates.join(' , '))}</span>`;
       } finally {
         loadBtn.disabled = false;
         loadBtn.innerText = '查看进度';

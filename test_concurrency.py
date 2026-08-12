@@ -157,6 +157,12 @@ class TestServerConcurrency(unittest.TestCase):
         self.assertEqual(payload["data"]["project"][0]["confirmed_total"], 5)
         self.assertEqual(payload["data"]["dirs"][0]["dir_path"], "src")
         self.assertEqual(payload["data"]["files"][0]["file_path"], "src/main.c")
+        self.assertIn("teams", payload["data"])
+        self.assertIn("ownership", payload["data"])
+        self.assertEqual(payload["data"]["teams"][0]["total_uncovered"], 10)
+        self.assertIn("team", payload["data"]["files"][0])
+        self.assertIn("leader", payload["data"]["files"][0])
+        self.assertIn("ownership_status", payload["data"]["files"][0])
 
 
 if __name__ == "__main__":

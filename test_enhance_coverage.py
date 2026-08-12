@@ -88,6 +88,134 @@ class TestCParserHelpers(unittest.TestCase):
         self.assertEqual(len(h), 32)
 
 
+class TestOwnershipProgress(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp(prefix="coverage-ownership-test-")
+        self.xlsx_path = os.path.join(self.temp_dir, "ownership.xlsx")
+        with enhance_coverage._ownership_cache_lock:
+            enhance_coverage._ownership_cache.clear()
+
+    def tearDown(self):
+        with enhance_coverage._ownership_cache_lock:
+            enhance_coverage._ownership_cache.clear()
+        shutil.rmtree(self.temp_dir)
+
+    def write_workbook(self, team="平台一组", leader="张三"):
+        workbook_data = enhance_coverage.build_xlsx_workbook([
+            {
+                "name": "可变目录清单",
+                "xml": enhance_coverage.xlsx_sheet_xml([
+                    ["代码目录", "模块"],
+                    ["/old/build/repository/src/network/core", "NET_CORE"],
+                    ["/old/build/repository/src/storage", "STORAGE"],
+                    ["short/inc", "SHORT_INC"],
+                ]),
+            },
+            {
+                "name": "可变负责人清单",
+                "xml": enhance_coverage.xlsx_sheet_xml([
+                    ["组件", "开发小组", "开发主管"],
+                    ["NET_CORE", team, leader],
+                    ["STORAGE", team, leader],
+                    ["SHORT_INC", team, leader],
+                ]),
+            },
+        ])
+        with open(self.xlsx_path, "wb") as workbook_file:
+            workbook_file.write(workbook_data)
+
+    def config(self):
+        return {
+            "ownership": {
+                "enabled": True,
+                "xlsx_path": self.xlsx_path,
+            }
+        }
+
+    def test_reads_changed_sheet_names_and_matches_shifted_root(self):
+        self.write_workbook()
+        workbook = enhance_coverage.parse_ownership_workbook(self.xlsx_path)
+
+        ownership = enhance_coverage.match_file_ownership(
+            "/new/agent/repository/src/network/core/main.c",
+            workbook,
+        )
+
+        self.assertEqual(workbook["directory_sheet"], "可变目录清单")
+        self.assertEqual(workbook["owner_sheet"], "可变负责人清单")
+        self.assertEqual(ownership["module"], "NET_CORE")
+        self.assertEqual(ownership["team"], "平台一组")
+        self.assertEqual(ownership["leader"], "张三")
+        self.assertEqual(ownership["ownership_status"], "已匹配")
+        short_ownership = enhance_coverage.match_file_ownership(
+            "/new/agent/short/inc/header.h",
+            workbook,
+        )
+        self.assertEqual(short_ownership["module"], "SHORT_INC")
+
+    def test_groups_progress_by_team_and_leader(self):
+        self.write_workbook()
+        progress = enhance_coverage.build_ownership_progress([
+            {
+                "file_path": "/new/repository/src/network/core/main.c",
+                "total_uncovered": 10,
+                "filled_total": 6,
+                "unfilled_total": 4,
+                "confirmed_total": 5,
+                "coverable_total": 3,
+                "uncoverable_total": 1,
+                "redundant_total": 1,
+            },
+            {
+                "file_path": "/new/repository/src/storage/disk.c",
+                "total_uncovered": 5,
+                "filled_total": 2,
+                "unfilled_total": 3,
+                "confirmed_total": 2,
+                "coverable_total": 2,
+                "uncoverable_total": 0,
+                "redundant_total": 0,
+            },
+            {
+                "file_path": "/new/repository/src/unknown.c",
+                "total_uncovered": 4,
+                "filled_total": 0,
+                "unfilled_total": 4,
+                "confirmed_total": 0,
+            },
+        ], self.config())
+
+        matched_group = progress["teams"][0]
+        self.assertEqual(matched_group["team"], "平台一组")
+        self.assertEqual(matched_group["leader"], "张三")
+        self.assertEqual(matched_group["module_names"], "NET_CORE、STORAGE")
+        self.assertEqual(matched_group["file_total"], 2)
+        self.assertEqual(matched_group["total_uncovered"], 15)
+        self.assertEqual(matched_group["filled_total"], 8)
+        self.assertEqual(progress["teams"][-1]["team"], "未匹配小组")
+        self.assertEqual(progress["ownership"]["matched_files"], 2)
+        self.assertEqual(progress["ownership"]["unmatched_files"], 1)
+
+    def test_reloads_workbook_after_file_changes(self):
+        self.write_workbook(team="旧小组", leader="旧组长")
+        first = enhance_coverage.load_ownership_workbook(self.config())
+        first_match = enhance_coverage.match_file_ownership(
+            "/new/repository/src/storage/disk.c", first
+        )
+
+        old_mtime = os.stat(self.xlsx_path).st_mtime
+        self.write_workbook(team="更新后的开发小组", leader="更新后的组长")
+        os.utime(self.xlsx_path, (old_mtime + 2, old_mtime + 2))
+        second = enhance_coverage.load_ownership_workbook(self.config())
+        second_match = enhance_coverage.match_file_ownership(
+            "/new/repository/src/storage/disk.c", second
+        )
+
+        self.assertEqual(first_match["team"], "旧小组")
+        self.assertEqual(second_match["team"], "更新后的开发小组")
+        self.assertEqual(second_match["leader"], "更新后的组长")
+
+
 class TestBatchReviewSave(unittest.TestCase):
     class BatchCursor(object):
         def __init__(self):
@@ -346,7 +474,11 @@ class TestIntegration(unittest.TestCase):
         with open(progress_html, "r", encoding="utf-8") as f:
             progress_content = f.read()
         self.assertIn('coverage-review-progress-updated', progress_content)
-        self.assertIn('未找到项目“${project}”的审查行索引', progress_content)
+        self.assertIn('未找到项目“${escapeHtml(project)}”的审查行索引', progress_content)
+        self.assertIn('id="teamTable"', progress_content)
+        self.assertIn('小组 / 组长填写进度', progress_content)
+        self.assertIn('function renderOwnershipStatus', progress_content)
+        self.assertIn('ownership_status', progress_content)
 
 
 class TestInheritAnalysis(unittest.TestCase):
