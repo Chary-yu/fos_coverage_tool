@@ -365,6 +365,9 @@ textarea.coverage-analysis-input.multiline {
 }
 
 .coverage-navigation-btn {
+    display: inline-flex !important;
+    visibility: visible !important;
+    flex: 0 0 auto !important;
     height: 18px;
     padding: 0 6px;
     border: 1px solid #d1d9e6;

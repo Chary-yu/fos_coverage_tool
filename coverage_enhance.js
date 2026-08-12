@@ -4,7 +4,7 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'batch-review-20260811';
+    const ENHANCE_VERSION = 'batch-review-navigation-20260811';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const RENDER_MODE = 'lazy'; // 'lazy' or 'immediate'
@@ -919,6 +919,11 @@
 
             // 组合面板
             panel.appendChild(select);
+            // 导航按钮必须紧邻状态选择框：后面的两个说明输入框较宽，
+            // 放在末尾时容易落到报告页面的横向可视区域之外。
+            panel.appendChild(previousBtn);
+            panel.appendChild(nextBtn);
+            panel.appendChild(inheritBtn);
             panel.appendChild(reviewerInput);
             panel.appendChild(methodInput);
             if (methodResizeGrip) {
@@ -931,9 +936,6 @@
             if (badgeSpan) {
                 panel.appendChild(badgeSpan);
             }
-            panel.appendChild(inheritBtn);
-            panel.appendChild(previousBtn);
-            panel.appendChild(nextBtn);
             panel.appendChild(saveBtn);
 
             function positionLegacyPanel() {

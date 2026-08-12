@@ -295,6 +295,10 @@ class TestIntegration(unittest.TestCase):
         self.assertIn('function navigateReviewPanel', content)
         self.assertIn("previousBtn.innerText = '上一个';", content)
         self.assertIn("nextBtn.innerText = '下一个';", content)
+        self.assertLess(
+            content.index('panel.appendChild(previousBtn);'),
+            content.index('panel.appendChild(reviewerInput);')
+        )
         self.assertIn('function saveReviewBlocksBatch', content)
         self.assertIn('暂存草稿', content)
         self.assertIn('确认提交', content)
