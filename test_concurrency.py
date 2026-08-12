@@ -28,6 +28,36 @@ class MockDatabaseManager:
         print(f"[MockDB] Thread {thread_name} starting sleep...")
         time.sleep(0.1)
         print(f"[MockDB] Thread {thread_name} waking up.")
+        if report_type == "full_project_summary":
+            return (
+                [
+                    "project_name", "file_total", "total_uncovered", "filled_total",
+                    "unfilled_total", "confirmed_total", "coverable_total",
+                    "uncoverable_total", "redundant_total", "fill_rate",
+                    "confirmed_rate", "last_updated",
+                ],
+                [[project_name, 2, 10, 6, 4, 5, 3, 1, 1, 60.0, 50.0, "2026-08-12"]],
+            )
+        if report_type == "full_dir_summary":
+            return (
+                [
+                    "project_name", "dir_path", "file_total", "total_uncovered", "filled_total",
+                    "unfilled_total", "confirmed_total", "coverable_total",
+                    "uncoverable_total", "redundant_total", "fill_rate",
+                    "confirmed_rate", "last_updated",
+                ],
+                [[project_name, "src", 2, 10, 6, 4, 5, 3, 1, 1, 60.0, 50.0, "2026-08-12"]],
+            )
+        if report_type == "full_file_summary":
+            return (
+                [
+                    "project_name", "file_path", "total_uncovered", "filled_total",
+                    "unfilled_total", "confirmed_total", "coverable_total",
+                    "uncoverable_total", "redundant_total", "fill_rate",
+                    "confirmed_rate", "last_updated",
+                ],
+                [[project_name, "src/main.c", 10, 6, 4, 5, 3, 1, 1, 60.0, 50.0, "2026-08-12"]],
+            )
         return ["header1"], [["row1"]]
 
 
@@ -106,6 +136,27 @@ class TestServerConcurrency(unittest.TestCase):
         # - ThreadingHTTPServer runs in parallel and should take < 0.5 seconds (usually ~0.3s)
         print(f"[Concurrency Verification] Concurrent elapsed: {elapsed:.3f} seconds (Expected: < 0.5s)")
         self.assertLess(elapsed, 0.5, "Server is not handling requests in parallel (blocked synchronously)")
+
+    def test_progress_endpoint_returns_review_counts(self):
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), CoverageHTTPRequestHandler)
+        server_thread = threading.Thread(target=httpd.serve_forever)
+        server_thread.daemon = True
+        server_thread.start()
+        port = httpd.server_address[1]
+        try:
+            url = "http://127.0.0.1:{}/api/coverage/progress?project=progress_project".format(port)
+            with urllib.request.urlopen(url, timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+        self.assertEqual(payload["status"], "success")
+        self.assertEqual(payload["data"]["project"][0]["total_uncovered"], 10)
+        self.assertEqual(payload["data"]["project"][0]["filled_total"], 6)
+        self.assertEqual(payload["data"]["project"][0]["confirmed_total"], 5)
+        self.assertEqual(payload["data"]["dirs"][0]["dir_path"], "src")
+        self.assertEqual(payload["data"]["files"][0]["file_path"], "src/main.c")
 
 
 if __name__ == "__main__":

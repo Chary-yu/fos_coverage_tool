@@ -415,6 +415,9 @@ textarea.coverage-analysis-input.multiline {
     bottom: 66px !important;
     z-index: 99999 !important;
     display: flex !important;
+    flex-wrap: wrap !important;
+    justify-content: flex-end !important;
+    max-width: calc(100vw - 20px) !important;
     align-items: center !important;
     gap: 7px !important;
     padding: 7px 9px !important;
@@ -448,6 +451,10 @@ textarea.coverage-analysis-input.multiline {
 
 .coverage-batch-btn.draft {
     background: #64748b !important;
+}
+
+.coverage-batch-btn.locate {
+    background: #0f766e !important;
 }
 
 .coverage-batch-btn.confirm {

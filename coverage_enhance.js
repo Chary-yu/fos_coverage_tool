@@ -4,7 +4,7 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'batch-review-navigation-20260811';
+    const ENHANCE_VERSION = 'progress-refresh-20260812';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const RENDER_MODE = 'lazy'; // 'lazy' or 'immediate'
@@ -29,6 +29,8 @@
     let requestLegacyPanelRefresh = function() {};
     let dirtyPanelStartLines = new Set();
     let batchToolbarState = null;
+    let reviewControlsReady = false;
+    const PROGRESS_UPDATE_STORAGE_KEY = 'coverage-review-progress-updated';
 
     function getBlockStartItem(block) {
         return block.startItem || block[0];
@@ -114,6 +116,7 @@
         const count = dirtyPanelStartLines.size;
         const submitting = batchToolbarState.submitting === true;
         batchToolbarState.count.innerText = `待暂存 ${count} 项`;
+        batchToolbarState.locateBtn.disabled = !reviewControlsReady || submitting;
         batchToolbarState.draftBtn.innerText = submitting ? '保存中...' : `暂存草稿 (${count})`;
         batchToolbarState.confirmBtn.innerText = submitting ? '保存中...' : `确认提交 (${count})`;
         batchToolbarState.draftBtn.disabled = count === 0 || submitting;
@@ -134,6 +137,14 @@
         updateBatchToolbar();
     }
 
+    function isPanelAwaitingReview(panel) {
+        if (!panel) {
+            return false;
+        }
+        const isDraft = panel.values && panel.values.isDraft === true;
+        return isDraft || getStoredPanelValue(panel, 'status') === '未确认';
+    }
+
     function clearPanelDirty(startLineNum, isDraft) {
         const panel = panelsMap.get(startLineNum);
         dirtyPanelStartLines.delete(startLineNum);
@@ -152,6 +163,18 @@
             coverage_method: getStoredPanelValue(panel, 'methodInput').trim(),
             uncovered_reason: getStoredPanelValue(panel, 'reasonInput').trim()
         };
+    }
+
+    function notifyProgressChanged() {
+        try {
+            window.localStorage.setItem(PROGRESS_UPDATE_STORAGE_KEY, JSON.stringify({
+                project_name: DEFAULT_PROJECT,
+                updated_at: Date.now()
+            }));
+        } catch (error) {
+            // Storage can be disabled for file:// reports. Saving review data must not fail because of it.
+            console.debug('[CoverageEnhance] Progress refresh notification skipped:', error);
+        }
     }
 
     function saveReviewBlocksBatch(filePath, blocks, mode) {
@@ -1178,6 +1201,7 @@
                 mode
             ).then(result => {
                 panels.forEach(item => clearPanelDirty(item.startLineNum, mode === 'draft'));
+                notifyProgressChanged();
                 updateHeaderStatistics();
                 requestLegacyPanelRefresh(3);
                 console.log(`[CoverageEnhance] ${mode} batch saved: ${result.saved_blocks} block(s), ${result.saved_lines} line(s).`);
@@ -1199,6 +1223,12 @@
             const count = document.createElement('span');
             count.className = 'coverage-batch-count';
 
+            const locateBtn = document.createElement('button');
+            locateBtn.className = 'coverage-batch-btn locate';
+            locateBtn.type = 'button';
+            locateBtn.innerText = '定位首个待填写';
+            locateBtn.title = '展开并跳转到当前文件首个未确认或暂存的填写控件';
+
             const draftBtn = document.createElement('button');
             draftBtn.className = 'coverage-batch-btn draft';
             draftBtn.type = 'button';
@@ -1209,6 +1239,21 @@
             confirmBtn.type = 'button';
             confirmBtn.title = '校验当前文件内已修改的控件后批量确认提交';
 
+            locateBtn.addEventListener('click', function() {
+                const pendingEntry = Array.from(panelsMap.entries())
+                    .sort((left, right) => left[0] - right[0])
+                    .find(entry => isPanelAwaitingReview(entry[1]));
+                if (!pendingEntry) {
+                    alert('当前文件没有待填写的控件。');
+                    return;
+                }
+                let targetPanel = pendingEntry[1];
+                if (!targetPanel.expanded) {
+                    targetPanel = expandBlockPanel(pendingEntry[0]);
+                }
+                updateReviewNavigation();
+                focusReviewPanel(targetPanel);
+            });
             draftBtn.addEventListener('click', function() {
                 submitDirtyPanels('draft');
             });
@@ -1217,10 +1262,11 @@
             });
 
             container.appendChild(count);
+            container.appendChild(locateBtn);
             container.appendChild(draftBtn);
             container.appendChild(confirmBtn);
             document.body.appendChild(container);
-            batchToolbarState = { container, count, draftBtn, confirmBtn, submitting: false };
+            batchToolbarState = { container, count, locateBtn, draftBtn, confirmBtn, submitting: false };
             updateBatchToolbar();
 
             window.addEventListener('beforeunload', function(event) {
@@ -1273,7 +1319,10 @@
 
         renderControlsInBatches(function() {
             // 4. 异步拉取并回显已有数据
-            fetchLineAnalysis(filePath);
+            fetchLineAnalysis(filePath, function() {
+                reviewControlsReady = true;
+                updateBatchToolbar();
+            });
         });
 
         // 5. 创建高级浮动显示模式切换器
@@ -1396,7 +1445,7 @@
     /**
      * 向后端获取已有分析记录并回显到表单中
      */
-    function fetchLineAnalysis(filePath) {
+    function fetchLineAnalysis(filePath, onComplete) {
         const url = `${SERVER_URL}?project=${encodeURIComponent(DEFAULT_PROJECT)}&file=${encodeURIComponent(filePath)}`;
         
         fetch(url, {
@@ -1438,6 +1487,9 @@
             }
             requestLegacyPanelRefresh(4);
             updateHeaderStatistics();
+            if (typeof onComplete === 'function') {
+                onComplete();
+            }
         })
         .catch(err => {
             console.warn('[CoverageEnhance] Failed to fetch existing records:', err.message);
@@ -1455,6 +1507,9 @@
             });
             requestLegacyPanelRefresh(4);
             updateHeaderStatistics();
+            if (typeof onComplete === 'function') {
+                onComplete();
+            }
         });
     }
 
@@ -1485,6 +1540,7 @@
                 });
             }
             clearPanelDirty(startLineNum, false);
+            notifyProgressChanged();
             console.log(`[CoverageEnhance] Confirmed block range L${lineNums[0]}-${lineNums[lineNums.length - 1]} (${result.saved_lines} line(s)).`);
             updateHeaderStatistics();
             requestLegacyPanelRefresh(3);

@@ -299,6 +299,9 @@ class TestIntegration(unittest.TestCase):
             content.index('panel.appendChild(previousBtn);'),
             content.index('panel.appendChild(reviewerInput);')
         )
+        self.assertIn("locateBtn.innerText = '定位首个待填写';", content)
+        self.assertIn('function isPanelAwaitingReview', content)
+        self.assertIn('function notifyProgressChanged', content)
         self.assertIn('function saveReviewBlocksBatch', content)
         self.assertIn('暂存草稿', content)
         self.assertIn('确认提交', content)
@@ -337,6 +340,13 @@ class TestIntegration(unittest.TestCase):
         # Verify CSS file
         copied_css = os.path.join(self.output_dir, "coverage_enhance.css")
         self.assertTrue(os.path.exists(copied_css))
+
+        progress_html = os.path.join(self.output_dir, "coverage_progress.html")
+        self.assertTrue(os.path.exists(progress_html))
+        with open(progress_html, "r", encoding="utf-8") as f:
+            progress_content = f.read()
+        self.assertIn('coverage-review-progress-updated', progress_content)
+        self.assertIn('未找到项目“${project}”的审查行索引', progress_content)
 
 
 class TestInheritAnalysis(unittest.TestCase):

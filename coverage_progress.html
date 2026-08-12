@@ -126,6 +126,7 @@
       color: var(--muted);
     }
     .error { color: var(--red); }
+    .warning { color: #a16207; }
     @media (max-width: 900px) {
       .cards { grid-template-columns: repeat(2, minmax(150px, 1fr)); }
     }
@@ -166,6 +167,7 @@
     const statusEl = document.getElementById('status');
     const csvLink = document.getElementById('csvLink');
     const excelLink = document.getElementById('excelLink');
+    const PROGRESS_UPDATE_STORAGE_KEY = 'coverage-review-progress-updated';
     let resolvedApiBase = '';
 
     if (reviewScope === 'incremental') {
@@ -262,10 +264,12 @@
       return fetch(url, { signal: controller.signal })
         .finally(() => clearTimeout(timer))
         .then(response => {
-          if (!response.ok) {
-            throw new Error(`HTTP ${response.status}`);
-          }
-          return response.json();
+          return response.json().catch(() => ({})).then(payload => {
+            if (!response.ok) {
+              throw new Error(payload.message || `HTTP ${response.status}`);
+            }
+            return payload;
+          });
         });
     }
 
@@ -302,11 +306,17 @@
             }
             resolvedApiBase = apiBase;
             updateLinks(project, apiBase);
-            const data = payload.data || {}, projectRow = (data.project && data.project[0]) || {};
+            const data = payload.data || {};
+            const projectRows = Array.isArray(data.project) ? data.project : [];
+            const projectRow = projectRows[0] || {};
             metric('totalUncovered', asNumber(projectRow.total_uncovered)); metric('filledTotal', asNumber(projectRow.filled_total));
             metric('fillRate', fmtRate(projectRow.fill_rate)); metric('confirmedRate', fmtRate(projectRow.confirmed_rate));
             renderTable('dirTable', data.dirs || [], 'dir_path'); renderTable('fileTable', data.files || [], 'file_path');
-            statusEl.innerText = `已加载项目：${project}，接口：${apiBase}`;
+            if (projectRows.length === 0) {
+              statusEl.innerHTML = `<span class="warning">未找到项目“${project}”的审查行索引。填写记录可能已保存，但生成报告时未同步索引；请在数据库可连接时重新执行 incremental 或 inject。</span>`;
+            } else {
+              statusEl.innerText = `已加载项目：${project}，接口：${apiBase}`;
+            }
             const url = new URL(window.location.href);
             url.searchParams.set('project', project);
             if (params.get('api')) {
@@ -329,6 +339,19 @@
     projectInput.addEventListener('keydown', event => {
       if (event.key === 'Enter') {
         loadProgress();
+      }
+    });
+    window.addEventListener('storage', event => {
+      if (event.key !== PROGRESS_UPDATE_STORAGE_KEY || !event.newValue) {
+        return;
+      }
+      try {
+        const update = JSON.parse(event.newValue);
+        if (update.project_name === projectInput.value.trim()) {
+          loadProgress();
+        }
+      } catch (error) {
+        // Ignore malformed cross-tab notifications.
       }
     });
     if (projectInput.value.trim()) {
