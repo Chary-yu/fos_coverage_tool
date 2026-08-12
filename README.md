@@ -26,7 +26,7 @@
   repositories.example.json  # 多仓库增量覆盖率配置示例
   clear_coverage_data.py     # 调试脚本：清空单项目或全部数据库数据
   coverage_progress.html     # 独立网页：查看项目/小组/组长/目录/文件分析进度
-  代码目录归属模块统计.xlsx   # 本地提供，不入 Git；目录 -> 模块 -> 小组/组长归属表
+  代码目录归属模块统计.xlsx   # 目录 -> 模块 -> 小组/组长归属表
   coverage_enhance.js        # 前端增强脚本
   coverage_enhance.css       # 前端样式
   coverage_config.json       # 数据库、服务端口、项目名配置
@@ -690,7 +690,7 @@ http://服务器IP/coverage/review_main_202606/coverage_progress.html?project=re
 * 表头之前可以有标题行，程序会自动寻找包含必需表头的行；
 * 合并单元格可以读取，但为了避免归属不清，建议每条目录和组件各占一行；
 * 文件必须是 `.xlsx`，不支持旧版二进制 `.xls`；
-* 该文件已加入 `.gitignore`，部署时需要单独放到配置路径，不能依赖 Git 拉取获得。
+* 项目已提供一份同名表格；归属发生变化时可以直接更新该文件，或通过 `ownership.xlsx_path` 指向外部维护的表格。
 
 读取 xlsx 只使用 Python 标准库，不依赖 `openpyxl`，可在 Python 3.6.8 环境运行。
 
