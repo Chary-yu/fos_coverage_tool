@@ -4,12 +4,16 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'progress-refresh-20260812';
+    const ENHANCE_VERSION = 'batch-inherit-20260812';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const RENDER_MODE = 'lazy'; // 'lazy' or 'immediate'
     const REVIEW_SCOPE = 'full'; // 'full' or 'incremental'
+    const ENHANCE_SCRIPT_URL = document.currentScript && document.currentScript.src
+        ? document.currentScript.src
+        : '';
     const URL_PARAMS = new URLSearchParams(window.location.search);
+    const EXPLICIT_API_URL = URL_PARAMS.get('api');
     const QUERY_MODE = URL_PARAMS.get('mode');
     const ACTIVE_MODE = (QUERY_MODE === 'lazy' || QUERY_MODE === 'immediate') ? QUERY_MODE : RENDER_MODE;
     const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖', '冗余代码'];
@@ -30,7 +34,75 @@
     let dirtyPanelStartLines = new Set();
     let batchToolbarState = null;
     let reviewControlsReady = false;
+    let resolvedServerUrl = '';
     const PROGRESS_UPDATE_STORAGE_KEY = 'coverage-review-progress-updated';
+
+    function normalizeApiBase(value) {
+        return String(value || '').replace(/\/+$/, '');
+    }
+
+    function uniqueApiBases(values) {
+        return Array.from(new Set(values.filter(Boolean).map(normalizeApiBase)));
+    }
+
+    function apiBaseCandidates() {
+        const candidates = [];
+        const origin = window.location.origin && window.location.origin !== 'null'
+            ? window.location.origin
+            : '';
+        if (resolvedServerUrl) {
+            candidates.push(resolvedServerUrl);
+        }
+        if (EXPLICIT_API_URL) {
+            candidates.push(EXPLICIT_API_URL);
+        }
+        candidates.push(SERVER_URL);
+        if (origin && window.location.hostname && window.location.port !== '9528') {
+            candidates.push(`${window.location.protocol}//${window.location.hostname}:9528/api/coverage`);
+        }
+        if (!origin) {
+            candidates.push('http://127.0.0.1:9528/api/coverage');
+        }
+        return uniqueApiBases(candidates);
+    }
+
+    async function requestCoverageApi(pathSuffix, options) {
+        const attempted = [];
+        let lastError = null;
+        for (const apiBase of apiBaseCandidates()) {
+            const url = `${apiBase}${pathSuffix || ''}`;
+            attempted.push(url);
+            try {
+                const response = await fetch(url, options || {});
+                const contentType = response.headers.get('Content-Type') || '';
+                const data = contentType.includes('application/json')
+                    ? await response.json()
+                    : null;
+                if (response.ok && data && data.status === 'success') {
+                    resolvedServerUrl = apiBase;
+                    return data;
+                }
+                const message = data && data.message
+                    ? data.message
+                    : `HTTP ${response.status}${data ? '' : '（接口未返回 JSON）'}`;
+                lastError = new Error(message);
+                // 静态站点可能对未知路径返回 404，或返回 200 + 首页 HTML；两种情况都继续尝试后台端口。
+                if (!data || response.status === 404 || response.status === 405 || response.status === 501) {
+                    continue;
+                }
+                lastError.coverageApiResponse = true;
+                throw lastError;
+            } catch (error) {
+                lastError = error;
+                // 服务端明确返回的业务/数据库错误不再向其他地址重复提交。
+                if (error && error.coverageApiResponse) {
+                    throw error;
+                }
+            }
+        }
+        const detail = lastError && lastError.message ? lastError.message : '无法连接后台服务';
+        throw new Error(`${detail}；已尝试：${attempted.join('，')}`);
+    }
 
     function getBlockStartItem(block) {
         return block.startItem || block[0];
@@ -178,7 +250,7 @@
     }
 
     function saveReviewBlocksBatch(filePath, blocks, mode) {
-        return fetch(`${SERVER_URL}/batch`, {
+        return requestCoverageApi('/batch', {
             method: 'POST',
             mode: 'cors',
             headers: {
@@ -190,13 +262,6 @@
                 mode: mode,
                 blocks: blocks
             })
-        }).then(response => {
-            return response.json().then(data => {
-                if (!response.ok || !data || data.status !== 'success') {
-                    throw new Error(data && data.message ? data.message : `HTTP ${response.status}`);
-                }
-                return data;
-            });
         });
     }
 
@@ -928,6 +993,12 @@
             inheritBtn.innerText = '继承';
             inheritBtn.title = '继承上一条已填写的分析结果';
 
+            const batchInheritBtn = document.createElement('button');
+            batchInheritBtn.className = 'coverage-inherit-btn batch';
+            batchInheritBtn.type = 'button';
+            batchInheritBtn.innerText = '批量继承';
+            batchInheritBtn.title = '从上方最近已填写控件继承到它之后至当前控件的整段内容';
+
             const previousBtn = document.createElement('button');
             previousBtn.className = 'coverage-navigation-btn';
             previousBtn.type = 'button';
@@ -947,6 +1018,7 @@
             panel.appendChild(previousBtn);
             panel.appendChild(nextBtn);
             panel.appendChild(inheritBtn);
+            panel.appendChild(batchInheritBtn);
             panel.appendChild(reviewerInput);
             panel.appendChild(methodInput);
             if (methodResizeGrip) {
@@ -1105,13 +1177,52 @@
                     return;
                 }
 
-                select.value = getStoredPanelValue(previous, 'status') || '未确认';
-                reviewerInput.value = getStoredPanelValue(previous, 'reviewerInput');
-                methodInput.value = getStoredPanelValue(previous, 'methodInput');
-                reasonInput.value = getStoredPanelValue(previous, 'reasonInput');
+                const currentPanel = panelsMap.get(startLineNum);
+                setStoredPanelValues(currentPanel, {
+                    status: getStoredPanelValue(previous, 'status') || '未确认',
+                    reviewerInput: getStoredPanelValue(previous, 'reviewerInput'),
+                    methodInput: getStoredPanelValue(previous, 'methodInput'),
+                    reasonInput: getStoredPanelValue(previous, 'reasonInput')
+                });
                 saveBtn.innerText = 'Save';
                 saveBtn.className = 'coverage-analysis-btn';
                 markPanelDirty(startLineNum);
+            });
+
+            batchInheritBtn.addEventListener('click', function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+
+                const sourceEntry = findPreviousFilledPanelEntry(startLineNum);
+                if (!sourceEntry) {
+                    alert('没有找到可作为批量继承来源的上一条已填写结果。');
+                    return;
+                }
+
+                const sourceLineNum = sourceEntry[0];
+                const sourcePanel = sourceEntry[1];
+                const inheritedValues = {
+                    status: getStoredPanelValue(sourcePanel, 'status') || '未确认',
+                    reviewerInput: getStoredPanelValue(sourcePanel, 'reviewerInput'),
+                    methodInput: getStoredPanelValue(sourcePanel, 'methodInput'),
+                    reasonInput: getStoredPanelValue(sourcePanel, 'reasonInput')
+                };
+                const targetEntries = Array.from(panelsMap.entries())
+                    .filter(([lineNum]) => lineNum > sourceLineNum && lineNum <= startLineNum)
+                    .sort((left, right) => left[0] - right[0]);
+
+                targetEntries.forEach(([lineNum, targetPanel]) => {
+                    setStoredPanelValues(targetPanel, inheritedValues);
+                    if (targetPanel.placeholder) {
+                        decoratePlaceholder(targetPanel.placeholder, targetPanel.values, targetPanel.block);
+                    }
+                    if (targetPanel.saveBtn) {
+                        targetPanel.saveBtn.innerText = 'Save';
+                        targetPanel.saveBtn.className = 'coverage-analysis-btn';
+                    }
+                    markPanelDirty(lineNum);
+                });
+                alert(`已从第 ${sourceLineNum} 行批量继承到 ${targetEntries.length} 个控件，请点击“暂存草稿”或“确认提交”写入数据库。`);
             });
 
             previousBtn.addEventListener('click', function(e) {
@@ -1229,6 +1340,29 @@
             locateBtn.innerText = '定位首个待填写';
             locateBtn.title = '展开并跳转到当前文件首个未确认或暂存的填写控件';
 
+            const progressLink = document.createElement('a');
+            progressLink.className = 'coverage-batch-btn progress';
+            progressLink.innerText = '查看进展 / 导出';
+            progressLink.title = '打开当前项目的数据库进展和报表导出页面';
+            progressLink.target = '_blank';
+            progressLink.rel = 'noopener';
+
+            function updateProgressLink() {
+                const progressUrl = new URL(
+                    'coverage_progress.html',
+                    ENHANCE_SCRIPT_URL || window.location.href
+                );
+                progressUrl.searchParams.set('project', DEFAULT_PROJECT);
+                progressUrl.searchParams.set('scope', REVIEW_SCOPE);
+                const apiUrl = resolvedServerUrl || EXPLICIT_API_URL;
+                if (apiUrl) {
+                    progressUrl.searchParams.set('api', apiUrl);
+                }
+                progressLink.href = progressUrl.toString();
+            }
+            updateProgressLink();
+            progressLink.addEventListener('click', updateProgressLink);
+
             const draftBtn = document.createElement('button');
             draftBtn.className = 'coverage-batch-btn draft';
             draftBtn.type = 'button';
@@ -1262,6 +1396,7 @@
             });
 
             container.appendChild(count);
+            container.appendChild(progressLink);
             container.appendChild(locateBtn);
             container.appendChild(draftBtn);
             container.appendChild(confirmBtn);
@@ -1330,7 +1465,7 @@
         createBatchToolbar();
     });
 
-    function findPreviousFilledPanel(currentLineNum) {
+    function findPreviousFilledPanelEntry(currentLineNum) {
         const candidates = Array.from(panelsMap.entries())
             .filter(([lineNum, panel]) => {
                 const status = panel.select ? panel.select.value : (panel.values && panel.values.status);
@@ -1338,16 +1473,22 @@
             })
             .sort((a, b) => b[0] - a[0]);
 
-        for (const [, panel] of candidates) {
+        for (const entry of candidates) {
+            const panel = entry[1];
             const reviewer = panel.reviewerInput ? panel.reviewerInput.value : (panel.values && panel.values.reviewerInput);
             const method = panel.methodInput ? panel.methodInput.value : (panel.values && panel.values.methodInput);
             const reason = panel.reasonInput ? panel.reasonInput.value : (panel.values && panel.values.reasonInput);
             const hasContent = (reviewer || '').trim() || (method || '').trim() || (reason || '').trim();
             if (hasContent) {
-                return panel;
+                return entry;
             }
         }
         return null;
+    }
+
+    function findPreviousFilledPanel(currentLineNum) {
+        const entry = findPreviousFilledPanelEntry(currentLineNum);
+        return entry ? entry[1] : null;
     }
 
     /**
@@ -1446,17 +1587,11 @@
      * 向后端获取已有分析记录并回显到表单中
      */
     function fetchLineAnalysis(filePath, onComplete) {
-        const url = `${SERVER_URL}?project=${encodeURIComponent(DEFAULT_PROJECT)}&file=${encodeURIComponent(filePath)}`;
-        
-        fetch(url, {
+        const query = `?project=${encodeURIComponent(DEFAULT_PROJECT)}&file=${encodeURIComponent(filePath)}`;
+
+        requestCoverageApi(query, {
             method: 'GET',
             mode: 'cors'
-        })
-        .then(response => {
-            if (!response.ok) {
-                throw new Error(`HTTP error! status: ${response.status}`);
-            }
-            return response.json();
         })
         .then(data => {
             if (data && data.records) {

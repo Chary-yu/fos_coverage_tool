@@ -142,7 +142,8 @@
   <header>
     <h1 id="pageTitle">全量覆盖率分析进度</h1>
     <div class="controls">
-      <input id="projectInput" placeholder="输入项目名，例如 review_v6r2_202605">
+      <input id="projectInput" list="projectOptions" placeholder="输入或选择数据库中的项目">
+      <datalist id="projectOptions"></datalist>
       <button id="loadBtn" type="button">查看进度</button>
       <a id="csvLink" class="button" href="#" target="_blank">导出进度 Excel</a>
       <a id="excelLink" class="button" href="#" target="_blank">导出目录 Excel ZIP</a>
@@ -177,6 +178,7 @@
     const params = new URLSearchParams(window.location.search);
     const reviewScope = params.get('scope') === 'incremental' ? 'incremental' : DEFAULT_REVIEW_SCOPE;
     const projectInput = document.getElementById('projectInput');
+    const projectOptions = document.getElementById('projectOptions');
     const statusEl = document.getElementById('status');
     const csvLink = document.getElementById('csvLink');
     const excelLink = document.getElementById('excelLink');
@@ -405,6 +407,7 @@
             const data = payload.data || {};
             const projectRows = Array.isArray(data.project) ? data.project : [];
             const projectRow = projectRows[0] || {};
+            const meta = data.meta || {};
             metric('totalUncovered', asNumber(projectRow.total_uncovered)); metric('filledTotal', asNumber(projectRow.filled_total));
             metric('fillRate', fmtRate(projectRow.fill_rate)); metric('confirmedRate', fmtRate(projectRow.confirmed_rate));
             renderOwnershipStatus(data.ownership || {});
@@ -413,6 +416,8 @@
             renderFileTable(data.files || []);
             if (projectRows.length === 0) {
               statusEl.innerHTML = `<span class="warning">未找到项目“${escapeHtml(project)}”的审查行索引。填写记录可能已保存，但生成报告时未同步索引；请在数据库可连接时重新执行 incremental 或 inject。</span>`;
+            } else if (meta.scope_complete === false && asNumber(meta.saved_total) > 0) {
+              statusEl.innerHTML = `<span class="warning">项目“${escapeHtml(project)}”当前仅有 ${asNumber(meta.saved_total)} 条已保存记录、没有覆盖率行索引；页面和导出可查看这些数据库记录，但未填写总量暂时无法计算。重新执行 incremental 或 inject 后可恢复完整进度。</span>`;
             } else {
               statusEl.innerText = `已加载项目：${project}，接口：${apiBase}`;
             }
@@ -431,6 +436,39 @@
       } finally {
         loadBtn.disabled = false;
         loadBtn.innerText = '查看进度';
+      }
+    }
+
+    async function loadProjectOptions() {
+      let lastError = null;
+      for (const apiBase of apiBaseCandidates()) {
+        try {
+          const payload = await fetchJsonWithTimeout(`${apiBase}/projects`, 10000);
+          if (!payload || payload.status !== 'success') {
+            throw new Error(payload && payload.message ? payload.message : '项目列表加载失败');
+          }
+          resolvedApiBase = apiBase;
+          const projects = Array.isArray(payload.projects) ? payload.projects : [];
+          projectOptions.innerHTML = projects.map(item => {
+            const name = escapeHtml(item.project_name || '');
+            const label = `已存 ${asNumber(item.saved_total)} / 索引 ${asNumber(item.indexed_total)}`;
+            return `<option value="${name}" label="${escapeHtml(label)}"></option>`;
+          }).join('');
+          if (!projectInput.value.trim() && projects.length === 1) {
+            projectInput.value = projects[0].project_name || '';
+            loadProgress();
+          } else if (!projectInput.value.trim()) {
+            statusEl.innerText = projects.length
+              ? `已发现 ${projects.length} 个数据库项目，请输入或选择项目。`
+              : '数据库中暂无覆盖率项目。';
+          }
+          return;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      if (!projectInput.value.trim()) {
+        statusEl.innerHTML = `<span class="warning">项目列表加载失败：${escapeHtml(lastError ? lastError.message : '无法连接接口')}；仍可手工输入项目名。</span>`;
       }
     }
 
@@ -453,6 +491,7 @@
         // Ignore malformed cross-tab notifications.
       }
     });
+    loadProjectOptions();
     if (projectInput.value.trim()) {
       loadProgress();
     }

@@ -433,7 +433,15 @@ class TestIntegration(unittest.TestCase):
         self.assertIn('function saveReviewBlocksBatch', content)
         self.assertIn('暂存草稿', content)
         self.assertIn('确认提交', content)
-        self.assertIn("${SERVER_URL}/batch", content)
+        self.assertIn("requestCoverageApi('/batch'", content)
+        self.assertIn('function apiBaseCandidates', content)
+        self.assertIn("progressLink.innerText = '查看进展 / 导出';", content)
+        self.assertIn('setStoredPanelValues(currentPanel, {', content)
+        self.assertIn("status: getStoredPanelValue(previous, 'status')", content)
+        self.assertIn("batchInheritBtn.innerText = '批量继承';", content)
+        self.assertIn('function findPreviousFilledPanelEntry', content)
+        self.assertIn('lineNum > sourceLineNum && lineNum <= startLineNum', content)
+        self.assertIn('setStoredPanelValues(targetPanel, inheritedValues);', content)
 
     @unittest.mock.patch('enhance_coverage.DatabaseManager')
     def test_inject_coverage_report_lazy(self, mock_db_manager):

@@ -67,3 +67,4 @@ dop/
 dop_review_test/
 review/
 *.log
+.coverage_demo/

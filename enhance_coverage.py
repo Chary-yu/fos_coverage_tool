@@ -24,6 +24,7 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.parse
 import threading
+import importlib
 from xml.etree import ElementTree
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -40,7 +41,7 @@ except ImportError:
 db_module = None
 for module_name in ['pymysql', 'mysql.connector']:
     try:
-        db_module = __import__(module_name)
+        db_module = importlib.import_module(module_name)
         break
     except ImportError:
         continue
@@ -52,7 +53,7 @@ JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
 CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
 PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "ownership-progress-20260812"
+ASSET_VERSION = "batch-inherit-20260812"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 REVIEW_STATUS_UNCONFIRMED = "未确认"
 REVIEW_CONFIRMED_STATUSES = ("可覆盖", "无法覆盖", "冗余代码")
@@ -1013,8 +1014,11 @@ class DatabaseManager:
         if db_module.__name__ == 'pymysql':
             params["cursorclass"] = db_module.cursors.DictCursor
             
+        if select_db and db_module.__name__ == 'mysql.connector':
+            params["database"] = self.config["database"]
+
         conn = db_module.connect(**params)
-        if select_db:
+        if select_db and db_module.__name__ == 'pymysql':
             conn.select_db(self.config["database"])
         return conn
 
@@ -1660,6 +1664,22 @@ class DatabaseManager:
             """
             cursor.execute(sql, params)
             rows = cursor.fetchall()
+            if not rows:
+                fallback_params = [project_name]
+                fallback_dir_sql = ""
+                if dir_path is not None:
+                    fallback_dir_sql = f" AND {sql_dir_path('a')} = %s"
+                    fallback_params.append(dir_path)
+                cursor.execute(f"""
+                    SELECT a.project_name, a.source_file_name, a.file_path, a.line_number,
+                           '' AS line_text, a.status, a.coverage_method,
+                           a.uncovered_reason, a.reviewer
+                    FROM coverage_analysis a
+                    WHERE a.project_name = %s
+                      {fallback_dir_sql}
+                    ORDER BY a.source_file_name, a.line_number
+                """, fallback_params)
+                rows = cursor.fetchall()
             cursor.close()
             return rows
         except Exception as e:
@@ -1686,6 +1706,158 @@ class DatabaseManager:
         except Exception as e:
             print(f"[DB Error] Fetch project dirs failed: {e}")
             raise
+
+    def fetch_projects(self):
+        """List projects visible in either the review index or saved analysis table."""
+        cursor = None
+        try:
+            try:
+                self.conn.ping(reconnect=True)
+            except AttributeError:
+                pass
+            cursor = self.conn.cursor()
+            projects = {}
+
+            cursor.execute("""
+                SELECT project_name, COUNT(*) AS saved_total,
+                       COUNT(DISTINCT file_path_hash) AS saved_file_total,
+                       MAX(updated_at) AS last_updated
+                FROM coverage_analysis
+                GROUP BY project_name
+            """)
+            for row in cursor.fetchall():
+                name = row_value(row, "project_name", 0)
+                projects[name] = {
+                    "project_name": name,
+                    "saved_total": int(row_value(row, "saved_total", 1) or 0),
+                    "saved_file_total": int(row_value(row, "saved_file_total", 2) or 0),
+                    "indexed_total": 0,
+                    "indexed_file_total": 0,
+                    "last_updated": row_value(row, "last_updated", 3),
+                }
+
+            cursor.execute("""
+                SELECT project_name, COUNT(*) AS indexed_total,
+                       COUNT(DISTINCT file_path_hash) AS indexed_file_total
+                FROM coverage_line_index
+                GROUP BY project_name
+            """)
+            for row in cursor.fetchall():
+                name = row_value(row, "project_name", 0)
+                item = projects.setdefault(name, {
+                    "project_name": name,
+                    "saved_total": 0,
+                    "saved_file_total": 0,
+                    "indexed_total": 0,
+                    "indexed_file_total": 0,
+                    "last_updated": None,
+                })
+                item["indexed_total"] = int(row_value(row, "indexed_total", 1) or 0)
+                item["indexed_file_total"] = int(row_value(row, "indexed_file_total", 2) or 0)
+
+            return sorted(projects.values(), key=lambda item: str(item["project_name"]))
+        except Exception as e:
+            print(f"[DB Error] Fetch projects failed: {e}")
+            raise
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+
+    def _analysis_only_full_report(self, report_type, project_name):
+        """Expose saved legacy rows when a project has no coverage_line_index data.
+
+        The total scope cannot be reconstructed without the index, so these reports
+        deliberately treat the saved rows as the known scope. The progress endpoint
+        also returns project metadata so the page can show a clear warning.
+        """
+        if report_type == "full_detail":
+            source_headers, source_rows = self.export_report("detail", project_name)
+            headers = [
+                "project_name", "file_path", "line_number", "line_text",
+                "block_start_line", "block_end_line", "block_type",
+                "fill_status", "status", "reviewer", "coverage_method",
+                "uncovered_reason", "updated_at"
+            ]
+            data = []
+            for row in source_rows:
+                item = dict(zip(source_headers, row))
+                line_number = item.get("line_number")
+                data.append([
+                    item.get("project_name", ""), item.get("file_path", ""), line_number, "",
+                    line_number, line_number, "analysis_only", "已填写",
+                    item.get("status", ""), item.get("reviewer", ""),
+                    item.get("coverage_method", ""), item.get("uncovered_reason", ""),
+                    item.get("updated_at"),
+                ])
+            return headers, data
+
+        if report_type in ("full_file_summary", "full_project_summary"):
+            source_type = "file_summary" if report_type == "full_file_summary" else "project_summary"
+            source_headers, source_rows = self.export_report(source_type, project_name)
+            headers = [
+                "project_name",
+                "file_path" if report_type == "full_file_summary" else "file_total",
+                "total_uncovered", "filled_total", "unfilled_total", "confirmed_total",
+                "coverable_total", "uncoverable_total", "redundant_total", "fill_rate",
+                "confirmed_rate", "last_updated"
+            ]
+            data = []
+            for row in source_rows:
+                item = dict(zip(source_headers, row))
+                known_total = int(item.get("review_total") or 0)
+                second_value = item.get("file_path", "") if report_type == "full_file_summary" else item.get("file_total", 0)
+                data.append([
+                    item.get("project_name", ""), second_value, known_total, known_total, 0,
+                    item.get("confirmed_total", 0), item.get("coverable_total", 0),
+                    item.get("uncoverable_total", 0), item.get("redundant_total", 0),
+                    100.0 if known_total else 0.0, item.get("confirmed_rate", 0),
+                    item.get("last_updated"),
+                ])
+            return headers, data
+
+        if report_type == "full_dir_summary":
+            file_headers, file_rows = self.export_report("full_file_summary", project_name)
+            headers = [
+                "project_name", "dir_path", "file_total", "total_uncovered", "filled_total",
+                "unfilled_total", "confirmed_total", "coverable_total",
+                "uncoverable_total", "redundant_total", "fill_rate",
+                "confirmed_rate", "last_updated"
+            ]
+            grouped = {}
+            for row in file_rows:
+                item = dict(zip(file_headers, row))
+                key = (item.get("project_name", ""), get_source_dir_name(item.get("file_path", "")))
+                target = grouped.setdefault(key, {
+                    "file_total": 0, "total_uncovered": 0, "filled_total": 0,
+                    "unfilled_total": 0, "confirmed_total": 0, "coverable_total": 0,
+                    "uncoverable_total": 0, "redundant_total": 0, "last_updated": None,
+                })
+                target["file_total"] += 1
+                for field in (
+                    "total_uncovered", "filled_total", "unfilled_total", "confirmed_total",
+                    "coverable_total", "uncoverable_total", "redundant_total",
+                ):
+                    target[field] += int(item.get(field) or 0)
+                updated = item.get("last_updated")
+                if updated is not None and (target["last_updated"] is None or str(updated) > str(target["last_updated"])):
+                    target["last_updated"] = updated
+            data = []
+            for (name, dir_path), item in sorted(grouped.items()):
+                total = item["total_uncovered"]
+                data.append([
+                    name, dir_path, item["file_total"], total, item["filled_total"],
+                    item["unfilled_total"], item["confirmed_total"], item["coverable_total"],
+                    item["uncoverable_total"], item["redundant_total"],
+                    round(item["filled_total"] * 100.0 / total, 2) if total else 0.0,
+                    round(item["confirmed_total"] * 100.0 / total, 2) if total else 0.0,
+                    item["last_updated"],
+                ])
+            return headers, data
+
+        raise ValueError("Unsupported analysis-only report type")
 
     def export_report(self, report_type="detail", project_name=None):
         try:
@@ -1972,6 +2144,12 @@ class DatabaseManager:
 
             if cursor is not None:
                 cursor.close()
+            if (
+                project_name and not data and report_type in (
+                    "full_detail", "full_file_summary", "full_dir_summary", "full_project_summary"
+                )
+            ):
+                return self._analysis_only_full_report(report_type, project_name)
             return headers, data
         except Exception as e:
             print(f"[DB Error] Export failed: {e}")
@@ -2381,6 +2559,13 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
 
                 filename = f"coverage_{report_type}_{project_part}_{timestamp}.csv"
                 self.send_csv_response(filename, headers, rows)
+        elif parsed_url.path == "/api/coverage/projects":
+            try:
+                projects = db_manager.fetch_projects()
+            except Exception:
+                self.send_error_response(500, "Failed to list coverage projects")
+                return
+            self.send_json_response(200, {"status": "success", "projects": projects})
         elif parsed_url.path == "/api/coverage/progress":
             project_name = query_params.get("project", [""])[0]
             if not project_name:
@@ -2393,12 +2578,33 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 file_headers, file_rows = db_manager.export_report("full_file_summary", project_name)
                 file_data = [dict(zip(file_headers, row)) for row in file_rows]
                 ownership_progress = build_ownership_progress(file_data, load_config())
+                project_meta = {
+                    "project_name": project_name,
+                    "indexed_total": 0,
+                    "saved_total": 0,
+                    "index_available": bool(project_rows),
+                    "scope_complete": bool(project_rows),
+                }
+                try:
+                    project_catalog = db_manager.fetch_projects()
+                    catalog_item = next(
+                        (item for item in project_catalog if item.get("project_name") == project_name),
+                        None,
+                    )
+                    if catalog_item:
+                        project_meta.update(catalog_item)
+                        project_meta["index_available"] = int(catalog_item.get("indexed_total") or 0) > 0
+                        project_meta["scope_complete"] = project_meta["index_available"]
+                except AttributeError:
+                    # Lightweight/mock managers used by embedded deployments may not expose discovery.
+                    pass
                 data = {
                     "project": [dict(zip(project_headers, row)) for row in project_rows],
                     "dirs": [dict(zip(dir_headers, row)) for row in dir_rows],
                     "files": ownership_progress["files"],
                     "teams": ownership_progress["teams"],
                     "ownership": ownership_progress["ownership"],
+                    "meta": project_meta,
                 }
             except Exception:
                 self.send_error_response(500, "Failed to query progress")

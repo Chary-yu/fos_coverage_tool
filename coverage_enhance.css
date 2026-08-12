@@ -364,6 +364,19 @@ textarea.coverage-analysis-input.multiline {
     border-color: #9fbcff;
 }
 
+.coverage-inherit-btn.batch {
+    color: #6d28d9;
+    background-color: #f3e8ff;
+    border-color: #d8b4fe;
+    min-width: 62px;
+}
+
+.coverage-inherit-btn.batch:hover {
+    color: #5b21b6;
+    background-color: #e9d5ff;
+    border-color: #c084fc;
+}
+
 .coverage-navigation-btn {
     display: inline-flex !important;
     visibility: visible !important;
@@ -459,6 +472,13 @@ textarea.coverage-analysis-input.multiline {
 
 .coverage-batch-btn.confirm {
     background: #0076ff !important;
+}
+
+.coverage-batch-btn.progress {
+    display: inline-flex !important;
+    align-items: center !important;
+    background: #7c3aed !important;
+    text-decoration: none !important;
 }
 
 .coverage-batch-btn:not(:disabled):hover {
