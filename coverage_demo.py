@@ -190,6 +190,13 @@ class DemoDatabaseManager:
             })
         return result
 
+    def has_line_index(self, project_name):
+        rows = self._fetchall(
+            "SELECT 1 AS found FROM coverage_line_index WHERE project_name = ? LIMIT 1",
+            (project_name,),
+        )
+        return bool(rows)
+
     def _joined_rows(self, project_name=None):
         params = () if project_name is None else (project_name,)
         where_sql = "" if project_name is None else "WHERE i.project_name = ?"
@@ -362,6 +369,44 @@ class DemoDatabaseManager:
             row["coverage_method"] or "", row["uncovered_reason"] or "",
             row["reviewer"] or "",
         ] for row in rows]
+
+    def count_full_detail_rows(self, project_name):
+        rows = self._fetchall(
+            "SELECT COUNT(*) AS total FROM coverage_line_index WHERE project_name = ?",
+            (project_name,),
+        )
+        return int(rows[0]["total"] if rows else 0)
+
+    def iter_full_detail_batches(self, project_name, batch_size=5000):
+        headers, rows = self.export_report("full_detail", project_name)
+        del headers
+        for index in range(0, len(rows), batch_size):
+            yield rows[index:index + batch_size]
+
+    def fetch_full_detail_page(self, project_name, file_path, page=1, page_size=200):
+        page = max(1, int(page))
+        page_size = max(1, min(enhance_coverage.DETAIL_PAGE_SIZE_MAX, int(page_size)))
+        rows = [
+            row for row in self._joined_rows(project_name)
+            if row["file_path"] == file_path
+        ]
+        total = len(rows)
+        selected = rows[(page - 1) * page_size:page * page_size]
+        detail_rows = [[
+            row["project_name"], row["file_path"], row["line_number"], row["line_text"],
+            row["block_start_line"], row["block_end_line"], row["block_type"],
+            "已填写" if row["is_filled"] else "未填写", row["status"] or "",
+            row["reviewer"] or "", row["coverage_method"] or "",
+            row["uncovered_reason"] or "", row["updated_at"],
+        ] for row in selected]
+        return {
+            "headers": list(enhance_coverage.FULL_DETAIL_HEADERS),
+            "rows": detail_rows,
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": (total + page_size - 1) // page_size,
+        }
 
 
 class DemoHTTPRequestHandler(CoverageHTTPRequestHandler):

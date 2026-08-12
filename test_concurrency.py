@@ -164,6 +164,32 @@ class TestServerConcurrency(unittest.TestCase):
         self.assertIn("leader", payload["data"]["files"][0])
         self.assertIn("ownership_status", payload["data"]["files"][0])
 
+    def test_background_progress_endpoint_reports_completion(self):
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), CoverageHTTPRequestHandler)
+        server_thread = threading.Thread(target=httpd.serve_forever)
+        server_thread.daemon = True
+        server_thread.start()
+        port = httpd.server_address[1]
+        try:
+            start_url = "http://127.0.0.1:{}/api/coverage/progress/start?project=background_project".format(port)
+            with urllib.request.urlopen(start_url, timeout=5) as response:
+                start_payload = json.loads(response.read().decode("utf-8"))
+            job = start_payload["job"]
+            deadline = time.time() + 5
+            while job["state"] == "running" and time.time() < deadline:
+                time.sleep(0.03)
+                status_url = "http://127.0.0.1:{}/api/coverage/jobs/status?id={}".format(port, job["id"])
+                with urllib.request.urlopen(status_url, timeout=5) as response:
+                    job = json.loads(response.read().decode("utf-8"))["job"]
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+        self.assertEqual(job["state"], "completed")
+        self.assertEqual(job["percent"], 100)
+        self.assertEqual(job["data"]["meta"]["aggregation_level"], "file")
+        self.assertEqual(job["data"]["meta"]["detail_rows_returned"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

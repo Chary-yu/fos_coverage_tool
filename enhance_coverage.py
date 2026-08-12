@@ -25,6 +25,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.parse
 import threading
 import importlib
+import uuid
+import tempfile
 from xml.etree import ElementTree
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -53,17 +55,27 @@ JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
 CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
 PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "batch-inherit-20260812"
+ASSET_VERSION = "scalable-progress-20260812"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 REVIEW_STATUS_UNCONFIRMED = "未确认"
 REVIEW_CONFIRMED_STATUSES = ("可覆盖", "无法覆盖", "冗余代码")
 REVIEW_VALID_STATUSES = (REVIEW_STATUS_UNCONFIRMED,) + REVIEW_CONFIRMED_STATUSES
 MAX_BATCH_REVIEW_BLOCKS = 1000
 MAX_BATCH_REVIEW_LINES = 20000
+DETAIL_PAGE_SIZE_DEFAULT = 200
+DETAIL_PAGE_SIZE_MAX = 1000
+DETAIL_EXPORT_BATCH_SIZE = 5000
+BACKGROUND_JOB_RETENTION_SECONDS = 1800
+PROGRESS_CACHE_SECONDS = 30
+PROGRESS_JOB_RETENTION_SECONDS = 120
 OWNERSHIP_UNMATCHED_TEAM = "未匹配小组"
 OWNERSHIP_UNMATCHED_LEADER = "未匹配组长"
 _ownership_cache = {}
 _ownership_cache_lock = threading.Lock()
+_background_jobs = {}
+_background_job_keys = {}
+_background_jobs_lock = threading.RLock()
+_project_data_versions = {}
 DEFAULT_PROGRESS_PAGE_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -504,14 +516,18 @@ def _progress_number(value):
             return 0
 
 
-def build_ownership_progress(file_rows, config=None):
+def build_ownership_progress(file_rows, config=None, progress_callback=None):
     workbook = load_ownership_workbook(config)
     enriched_files = []
     grouped = {}
     matched_files = 0
     status_counts = {}
-    for file_row in file_rows:
-        row = dict(file_row)
+    file_total = len(file_rows)
+    callback_interval = max(1, file_total // 100) if file_total else 1
+    for file_index, file_row in enumerate(file_rows, start=1):
+        # Progress rows are freshly created for this request. Enrich them in place
+        # so large projects do not hold a second copy of every file dictionary.
+        row = file_row if isinstance(file_row, dict) else dict(file_row)
         ownership = match_file_ownership(row.get("file_path"), workbook) if workbook.get("available") else {
             "module": "",
             "team": OWNERSHIP_UNMATCHED_TEAM,
@@ -552,6 +568,8 @@ def build_ownership_progress(file_rows, config=None):
             last_updated_text = json_safe_default(last_updated)
             if last_updated_text > group["last_updated"]:
                 group["last_updated"] = last_updated_text
+        if progress_callback and (file_index == file_total or file_index % callback_interval == 0):
+            progress_callback(file_index, file_total)
 
     team_rows = []
     for group in grouped.values():
@@ -585,6 +603,419 @@ def build_ownership_progress(file_rows, config=None):
         "teams": team_rows,
         "files": enriched_files,
     }
+
+
+PROGRESS_VALUE_FIELDS = (
+    "total_uncovered", "filled_total", "unfilled_total", "confirmed_total",
+    "coverable_total", "uncoverable_total", "redundant_total",
+)
+PROGRESS_FILE_HEADERS = [
+    "project_name", "file_path", "total_uncovered", "filled_total",
+    "unfilled_total", "confirmed_total", "coverable_total",
+    "uncoverable_total", "redundant_total", "fill_rate",
+    "confirmed_rate", "last_updated",
+]
+PROGRESS_DIR_HEADERS = [
+    "project_name", "dir_path", "file_total", "total_uncovered", "filled_total",
+    "unfilled_total", "confirmed_total", "coverable_total",
+    "uncoverable_total", "redundant_total", "fill_rate",
+    "confirmed_rate", "last_updated",
+]
+PROGRESS_PROJECT_HEADERS = [
+    "project_name", "file_total", "total_uncovered", "filled_total",
+    "unfilled_total", "confirmed_total", "coverable_total",
+    "uncoverable_total", "redundant_total", "fill_rate",
+    "confirmed_rate", "last_updated",
+]
+
+
+def _new_progress_bucket():
+    bucket = {field: 0 for field in PROGRESS_VALUE_FIELDS}
+    bucket.update({"file_total": 0, "last_updated": ""})
+    return bucket
+
+
+def _add_file_to_progress_bucket(bucket, file_row):
+    bucket["file_total"] += 1
+    for field in PROGRESS_VALUE_FIELDS:
+        bucket[field] += _progress_number(file_row.get(field))
+    last_updated = file_row.get("last_updated")
+    if last_updated is not None:
+        last_updated_text = json_safe_default(last_updated)
+        if last_updated_text > bucket["last_updated"]:
+            bucket["last_updated"] = last_updated_text
+
+
+def _finalize_progress_bucket(bucket):
+    total = bucket["total_uncovered"]
+    result = dict(bucket)
+    result["fill_rate"] = round(bucket["filled_total"] * 100.0 / total, 2) if total else 0.0
+    result["confirmed_rate"] = round(bucket["confirmed_total"] * 100.0 / total, 2) if total else 0.0
+    return result
+
+
+def build_progress_data_from_file_rows(project_name, file_headers, file_rows, config=None,
+                                       index_available=True, progress_callback=None):
+    """Build project/directory/team summaries from one compact row per file."""
+    file_data = [dict(zip(file_headers, row)) for row in file_rows]
+    project_bucket = _new_progress_bucket()
+    dir_buckets = {}
+    file_total = len(file_data)
+    callback_interval = max(1, file_total // 100) if file_total else 1
+
+    for file_index, file_row in enumerate(file_data, start=1):
+        _add_file_to_progress_bucket(project_bucket, file_row)
+        dir_path = get_source_dir_name(file_row.get("file_path", ""))
+        _add_file_to_progress_bucket(dir_buckets.setdefault(dir_path, _new_progress_bucket()), file_row)
+        if progress_callback and (file_index == file_total or file_index % callback_interval == 0):
+            fraction = file_index / float(file_total or 1)
+            progress_callback(62 + int(fraction * 10), "summary", "正在汇总项目和目录：{}/{} 个文件".format(file_index, file_total))
+
+    ownership_progress = build_ownership_progress(
+        file_data,
+        config,
+        progress_callback=(
+            lambda current, total: progress_callback(
+                72 + int(current * 20.0 / float(total or 1)),
+                "ownership",
+                "正在匹配文件归属：{}/{} 个文件".format(current, total),
+            )
+        ) if progress_callback else None,
+    )
+
+    project_row = _finalize_progress_bucket(project_bucket)
+    project_row["project_name"] = project_name
+    dir_rows = []
+    for dir_path, bucket in sorted(dir_buckets.items()):
+        row = _finalize_progress_bucket(bucket)
+        row.update({"project_name": project_name, "dir_path": dir_path})
+        dir_rows.append(row)
+
+    indexed_total = project_row["total_uncovered"] if index_available else 0
+    return {
+        "project": [project_row] if file_data else [],
+        "dirs": dir_rows,
+        "files": ownership_progress["files"],
+        "teams": ownership_progress["teams"],
+        "ownership": ownership_progress["ownership"],
+        "meta": {
+            "project_name": project_name,
+            "indexed_total": indexed_total,
+            "indexed_file_total": project_row["file_total"] if index_available else 0,
+            "saved_total": project_row["filled_total"],
+            "saved_file_total": sum(1 for row in file_data if _progress_number(row.get("filled_total")) > 0),
+            "last_updated": project_row["last_updated"] or None,
+            "index_available": bool(index_available),
+            "scope_complete": bool(index_available),
+            "aggregation_level": "file",
+            "detail_rows_returned": 0,
+        },
+    }
+
+
+def compute_progress_data(manager, project_name, config=None, progress_callback=None):
+    """Run exactly one file-level aggregation query, then summarize in memory."""
+    if progress_callback:
+        progress_callback(5, "preparing", "正在检查项目索引")
+    try:
+        index_available = manager.has_line_index(project_name)
+    except AttributeError:
+        index_available = None
+
+    if progress_callback:
+        progress_callback(15, "database", "数据库正在按文件聚合，数据量大时此阶段耗时较长")
+    file_headers, file_rows = manager.export_report("full_file_summary", project_name)
+    if index_available is None:
+        index_available = bool(file_rows)
+    if progress_callback:
+        progress_callback(60, "database", "数据库聚合完成，共 {} 个文件".format(len(file_rows)))
+    data = build_progress_data_from_file_rows(
+        project_name,
+        file_headers,
+        file_rows,
+        config=config,
+        index_available=index_available,
+        progress_callback=progress_callback,
+    )
+    if progress_callback:
+        progress_callback(98, "finalizing", "正在整理文件级进展结果")
+    return data
+
+
+FULL_DETAIL_HEADERS = [
+    "project_name", "file_path", "line_number", "line_text",
+    "block_start_line", "block_end_line", "block_type", "fill_status",
+    "status", "reviewer", "coverage_method", "uncovered_reason", "updated_at",
+]
+
+
+def invalidate_project_background_jobs(project_name):
+    """Make cached progress/export results stale after review data changes."""
+    project_name = str(project_name or "")
+    if not project_name:
+        return
+    with _background_jobs_lock:
+        _project_data_versions[project_name] = _project_data_versions.get(project_name, 0) + 1
+        for key in list(_background_job_keys):
+            if len(key) > 1 and key[1] == project_name:
+                _background_job_keys.pop(key, None)
+
+
+def _cleanup_background_jobs_locked(now):
+    expired_ids = []
+    for job_id, job in _background_jobs.items():
+        finished_at = job.get("finished_at_epoch")
+        retention = (PROGRESS_JOB_RETENTION_SECONDS if job.get("kind") == "progress"
+                     else BACKGROUND_JOB_RETENTION_SECONDS)
+        if finished_at and now - finished_at > retention:
+            expired_ids.append(job_id)
+    for job_id in expired_ids:
+        job = _background_jobs.pop(job_id, None) or {}
+        key = job.get("key")
+        if key and _background_job_keys.get(key) == job_id:
+            _background_job_keys.pop(key, None)
+        output_path = job.get("output_path")
+        if output_path:
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
+
+def _expire_background_job(job_id, expected_finished_at):
+    with _background_jobs_lock:
+        job = _background_jobs.get(job_id)
+        if not job or job.get("finished_at_epoch") != expected_finished_at:
+            return
+        key = job.get("key")
+        if key and _background_job_keys.get(key) == job_id:
+            _background_job_keys.pop(key, None)
+        _background_jobs.pop(job_id, None)
+        output_path = job.get("output_path")
+    if output_path:
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+
+
+def _update_background_job(job_id, percent, stage, message):
+    with _background_jobs_lock:
+        job = _background_jobs.get(job_id)
+        if not job or job.get("state") != "running":
+            return
+        job["percent"] = max(job.get("percent", 0), min(99, int(percent)))
+        job["stage"] = stage
+        job["message"] = message
+        job["updated_at_epoch"] = time.time()
+
+
+def _finish_background_job(job_id, **values):
+    retention = BACKGROUND_JOB_RETENTION_SECONDS
+    finished_at = None
+    with _background_jobs_lock:
+        job = _background_jobs.get(job_id)
+        if not job:
+            return
+        job.update(values)
+        job["finished_at_epoch"] = time.time()
+        job["updated_at_epoch"] = job["finished_at_epoch"]
+        finished_at = job["finished_at_epoch"]
+        if job.get("kind") == "progress":
+            retention = PROGRESS_JOB_RETENTION_SECONDS
+    cleanup_timer = threading.Timer(
+        retention, _expire_background_job, args=(job_id, finished_at)
+    )
+    cleanup_timer.daemon = True
+    cleanup_timer.start()
+
+
+def _run_progress_background_job(job_id, project_name):
+    try:
+        data = compute_progress_data(
+            db_manager,
+            project_name,
+            load_config(),
+            lambda percent, stage, message: _update_background_job(
+                job_id, percent, stage, message
+            ),
+        )
+        _finish_background_job(
+            job_id,
+            state="completed",
+            percent=100,
+            stage="completed",
+            message="文件级填写进展计算完成",
+            data=data,
+        )
+    except Exception as error:
+        print("[Progress Job] Failed for project '{}': {}".format(project_name, error), flush=True)
+        _finish_background_job(
+            job_id,
+            state="failed",
+            stage="failed",
+            message="填写进展计算失败，请查看服务端日志",
+        )
+    finally:
+        close_thread_db_manager()
+
+
+def write_full_detail_csv(manager, project_name, output_path, progress_callback=None):
+    """Write full details incrementally so million-row exports stay memory bounded."""
+    if progress_callback:
+        progress_callback(5, "counting", "正在统计需要导出的详细行数")
+    try:
+        total = manager.count_full_detail_rows(project_name)
+        batch_iterator = manager.iter_full_detail_batches(
+            project_name, batch_size=DETAIL_EXPORT_BATCH_SIZE
+        )
+    except AttributeError:
+        headers, rows = manager.export_report("full_detail", project_name)
+        total = len(rows)
+        batch_iterator = (rows[index:index + DETAIL_EXPORT_BATCH_SIZE]
+                          for index in range(0, total, DETAIL_EXPORT_BATCH_SIZE))
+        detail_headers = headers
+    else:
+        detail_headers = FULL_DETAIL_HEADERS
+
+    if progress_callback:
+        progress_callback(12, "exporting", "开始分批导出，共 {} 行".format(total))
+    written = 0
+    with open(output_path, "w", encoding="utf-8-sig", newline="") as output_file:
+        writer = csv.writer(output_file)
+        writer.writerow(detail_headers)
+        for batch in batch_iterator:
+            for row in batch:
+                writer.writerow(["" if value is None else value for value in row])
+            written += len(batch)
+            if progress_callback:
+                percent = 12 + int(written * 83.0 / float(total or 1))
+                progress_callback(
+                    min(95, percent), "exporting",
+                    "正在写入详细数据：{}/{} 行".format(written, total),
+                )
+    if progress_callback:
+        progress_callback(98, "finalizing", "正在完成 CSV 文件")
+    return written
+
+
+def _run_detail_export_background_job(job_id, project_name):
+    output_path = None
+    try:
+        output_dir = os.path.join(tempfile.gettempdir(), "coverage_tool_exports")
+        os.makedirs(output_dir, exist_ok=True)
+        file_descriptor, output_path = tempfile.mkstemp(
+            prefix="coverage_full_detail_", suffix=".csv", dir=output_dir
+        )
+        os.close(file_descriptor)
+        row_count = write_full_detail_csv(
+            db_manager,
+            project_name,
+            output_path,
+            lambda percent, stage, message: _update_background_job(
+                job_id, percent, stage, message
+            ),
+        )
+        filename = "coverage_full_detail_{}_{}.csv".format(
+            re.sub(r"[^A-Za-z0-9_.-]+", "_", project_name),
+            datetime.now().strftime("%Y%m%d_%H%M%S"),
+        )
+        _finish_background_job(
+            job_id,
+            state="completed",
+            percent=100,
+            stage="completed",
+            message="详细 CSV 已生成，可下载",
+            output_path=output_path,
+            filename=filename,
+            row_count=row_count,
+        )
+    except Exception as error:
+        if output_path:
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+        print("[Export Job] Failed for project '{}': {}".format(project_name, error), flush=True)
+        _finish_background_job(
+            job_id,
+            state="failed",
+            stage="failed",
+            message="详细数据导出失败，请查看服务端日志",
+        )
+    finally:
+        close_thread_db_manager()
+
+
+def start_background_job(kind, project_name):
+    project_name = str(project_name or "").strip()
+    if kind not in ("progress", "full_detail_export"):
+        raise ValueError("Unsupported background job kind")
+    now = time.time()
+    with _background_jobs_lock:
+        _cleanup_background_jobs_locked(now)
+        version = _project_data_versions.get(project_name, 0)
+        key = (kind, project_name, version)
+        existing_id = _background_job_keys.get(key)
+        existing = _background_jobs.get(existing_id)
+        if existing:
+            finished_at = existing.get("finished_at_epoch")
+            reusable = existing.get("state") == "running"
+            if kind == "progress" and existing.get("state") == "completed" and finished_at:
+                reusable = now - finished_at <= PROGRESS_CACHE_SECONDS
+            if kind == "full_detail_export" and existing.get("state") == "completed" and finished_at:
+                reusable = now - finished_at <= BACKGROUND_JOB_RETENTION_SECONDS
+            if reusable:
+                return public_background_job(existing_id)
+
+        job_id = uuid.uuid4().hex
+        job = {
+            "id": job_id,
+            "key": key,
+            "kind": kind,
+            "project_name": project_name,
+            "version": version,
+            "state": "running",
+            "percent": 1,
+            "stage": "queued",
+            "message": "任务已创建，等待后台执行",
+            "created_at_epoch": now,
+            "updated_at_epoch": now,
+        }
+        _background_jobs[job_id] = job
+        _background_job_keys[key] = job_id
+
+    target = _run_progress_background_job if kind == "progress" else _run_detail_export_background_job
+    worker = threading.Thread(target=target, args=(job_id, project_name))
+    worker.daemon = True
+    worker.start()
+    return public_background_job(job_id)
+
+
+def public_background_job(job_id):
+    with _background_jobs_lock:
+        job = _background_jobs.get(job_id)
+        if not job:
+            return None
+        now = time.time()
+        elapsed_until = job.get("finished_at_epoch") or now
+        public = {
+            "id": job["id"],
+            "kind": job["kind"],
+            "project_name": job["project_name"],
+            "state": job["state"],
+            "percent": job.get("percent", 0),
+            "stage": job.get("stage", ""),
+            "message": job.get("message", ""),
+            "elapsed_seconds": round(elapsed_until - job["created_at_epoch"], 1),
+        }
+        if job.get("state") == "completed" and job.get("kind") == "progress":
+            public["data"] = job.get("data") or {}
+        if job.get("state") == "completed" and job.get("kind") == "full_detail_export":
+            public["download_ready"] = bool(job.get("output_path"))
+            public["filename"] = job.get("filename")
+            public["row_count"] = job.get("row_count", 0)
+        return public
 
 
 def dict_rows_to_table(rows, fields):
@@ -1686,6 +2117,173 @@ class DatabaseManager:
             print(f"[DB Error] Review Excel export query failed: {e}")
             raise
 
+    def count_full_detail_rows(self, project_name):
+        """Count indexed detail rows without materializing them in application memory."""
+        if not project_name:
+            raise ValueError("project_name is required")
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT COUNT(*) AS total FROM coverage_line_index WHERE project_name = %s",
+                (project_name,),
+            )
+            row = cursor.fetchone()
+            total = int(row_value(row, "total", 0) or 0)
+            if not total:
+                cursor.execute(
+                    "SELECT COUNT(*) AS total FROM coverage_analysis WHERE project_name = %s",
+                    (project_name,),
+                )
+                row = cursor.fetchone()
+                total = int(row_value(row, "total", 0) or 0)
+            return total
+        finally:
+            if cursor is not None:
+                cursor.close()
+
+    def iter_full_detail_batches(self, project_name, batch_size=DETAIL_EXPORT_BATCH_SIZE):
+        """Yield detailed rows with indexed keyset pagination and bounded memory."""
+        if not project_name:
+            raise ValueError("project_name is required")
+        use_line_index = self.has_line_index(project_name)
+        last_file_hash = ""
+        last_line_number = 0
+        while True:
+            cursor = self.conn.cursor()
+            try:
+                if use_line_index:
+                    cursor.execute(f"""
+                        SELECT i.project_name, i.file_path, i.line_number, i.line_text,
+                               i.block_start_line, i.block_end_line, i.block_type,
+                               CASE WHEN a.id IS NULL THEN %s ELSE %s END AS fill_status,
+                               COALESCE(a.status, '') AS status,
+                               COALESCE(a.reviewer, '') AS reviewer,
+                               COALESCE(a.coverage_method, '') AS coverage_method,
+                               COALESCE(a.uncovered_reason, '') AS uncovered_reason,
+                               a.updated_at, i.file_path_hash
+                        FROM coverage_line_index i
+                        LEFT JOIN coverage_analysis a
+                          ON {source_file_join_condition("i", "a")}
+                        WHERE i.project_name = %s
+                          AND (
+                               i.file_path_hash > %s
+                               OR (i.file_path_hash = %s AND i.line_number > %s)
+                          )
+                        ORDER BY i.file_path_hash, i.line_number
+                        LIMIT %s
+                    """, (
+                        "未填写", "已填写", project_name,
+                        last_file_hash, last_file_hash, last_line_number, int(batch_size),
+                    ))
+                else:
+                    cursor.execute("""
+                        SELECT a.project_name, a.file_path, a.line_number, '' AS line_text,
+                               a.line_number AS block_start_line,
+                               a.line_number AS block_end_line,
+                               'analysis_only' AS block_type,
+                               '已填写' AS fill_status,
+                               a.status, a.reviewer, a.coverage_method,
+                               a.uncovered_reason, a.updated_at, a.file_path_hash
+                        FROM coverage_analysis a
+                        WHERE a.project_name = %s
+                          AND (
+                               a.file_path_hash > %s
+                               OR (a.file_path_hash = %s AND a.line_number > %s)
+                          )
+                        ORDER BY a.file_path_hash, a.line_number
+                        LIMIT %s
+                    """, (
+                        project_name, last_file_hash, last_file_hash,
+                        last_line_number, int(batch_size),
+                    ))
+                raw_rows = cursor.fetchall()
+            finally:
+                cursor.close()
+            if not raw_rows:
+                break
+            batch = []
+            for row in raw_rows:
+                batch.append([
+                    row_value(row, header, index)
+                    for index, header in enumerate(FULL_DETAIL_HEADERS)
+                ])
+            last_row = raw_rows[-1]
+            last_file_hash = row_value(last_row, "file_path_hash", 13)
+            last_line_number = int(row_value(last_row, "line_number", 2) or 0)
+            yield batch
+
+    def fetch_full_detail_page(self, project_name, file_path, page=1,
+                               page_size=DETAIL_PAGE_SIZE_DEFAULT):
+        """Return one bounded page of line details for a selected file."""
+        if not project_name or not file_path:
+            raise ValueError("project_name and file_path are required")
+        page = max(1, int(page))
+        page_size = max(1, min(DETAIL_PAGE_SIZE_MAX, int(page_size)))
+        file_path_hash = calc_file_path_hash(file_path)
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("""
+                SELECT COUNT(*) AS total
+                FROM coverage_line_index i
+                WHERE i.project_name = %s AND i.file_path_hash = %s
+            """, (project_name, file_path_hash))
+            count_row = cursor.fetchone()
+            total = int(row_value(count_row, "total", 0) or 0)
+            if total:
+                cursor.execute(f"""
+                    SELECT i.project_name, i.file_path, i.line_number, i.line_text,
+                           i.block_start_line, i.block_end_line, i.block_type,
+                           CASE WHEN a.id IS NULL THEN %s ELSE %s END AS fill_status,
+                           COALESCE(a.status, '') AS status,
+                           COALESCE(a.reviewer, '') AS reviewer,
+                           COALESCE(a.coverage_method, '') AS coverage_method,
+                           COALESCE(a.uncovered_reason, '') AS uncovered_reason,
+                           a.updated_at
+                    FROM coverage_line_index i
+                    LEFT JOIN coverage_analysis a
+                      ON {source_file_join_condition("i", "a")}
+                    WHERE i.project_name = %s AND i.file_path_hash = %s
+                    ORDER BY i.line_number
+                    LIMIT %s OFFSET %s
+                """, (
+                    "未填写", "已填写", project_name, file_path_hash,
+                    page_size, (page - 1) * page_size,
+                ))
+            else:
+                cursor.execute("""
+                    SELECT COUNT(*) AS total FROM coverage_analysis
+                    WHERE project_name = %s AND file_path_hash = %s
+                """, (project_name, file_path_hash))
+                total = int(row_value(cursor.fetchone(), "total", 0) or 0)
+                cursor.execute("""
+                    SELECT project_name, file_path, line_number, '' AS line_text,
+                           line_number AS block_start_line, line_number AS block_end_line,
+                           'analysis_only' AS block_type, '已填写' AS fill_status,
+                           status, reviewer, coverage_method, uncovered_reason, updated_at
+                    FROM coverage_analysis
+                    WHERE project_name = %s AND file_path_hash = %s
+                    ORDER BY line_number
+                    LIMIT %s OFFSET %s
+                """, (
+                    project_name, file_path_hash, page_size, (page - 1) * page_size,
+                ))
+            raw_rows = cursor.fetchall()
+            rows = [[
+                row_value(row, header, index)
+                for index, header in enumerate(FULL_DETAIL_HEADERS)
+            ] for row in raw_rows]
+            return {
+                "headers": list(FULL_DETAIL_HEADERS),
+                "rows": rows,
+                "page": page,
+                "page_size": page_size,
+                "total": total,
+                "total_pages": (total + page_size - 1) // page_size,
+            }
+        finally:
+            cursor.close()
+
     def fetch_project_dirs(self, project_name):
         if not project_name:
             raise ValueError("project_name is required")
@@ -1719,9 +2317,7 @@ class DatabaseManager:
             projects = {}
 
             cursor.execute("""
-                SELECT project_name, COUNT(*) AS saved_total,
-                       COUNT(DISTINCT file_path_hash) AS saved_file_total,
-                       MAX(updated_at) AS last_updated
+                SELECT project_name
                 FROM coverage_analysis
                 GROUP BY project_name
             """)
@@ -1729,16 +2325,15 @@ class DatabaseManager:
                 name = row_value(row, "project_name", 0)
                 projects[name] = {
                     "project_name": name,
-                    "saved_total": int(row_value(row, "saved_total", 1) or 0),
-                    "saved_file_total": int(row_value(row, "saved_file_total", 2) or 0),
+                    "saved_total": None,
+                    "saved_file_total": None,
                     "indexed_total": 0,
                     "indexed_file_total": 0,
-                    "last_updated": row_value(row, "last_updated", 3),
+                    "last_updated": None,
                 }
 
             cursor.execute("""
-                SELECT project_name, COUNT(*) AS indexed_total,
-                       COUNT(DISTINCT file_path_hash) AS indexed_file_total
+                SELECT project_name
                 FROM coverage_line_index
                 GROUP BY project_name
             """)
@@ -1746,18 +2341,40 @@ class DatabaseManager:
                 name = row_value(row, "project_name", 0)
                 item = projects.setdefault(name, {
                     "project_name": name,
-                    "saved_total": 0,
-                    "saved_file_total": 0,
+                    "saved_total": None,
+                    "saved_file_total": None,
                     "indexed_total": 0,
                     "indexed_file_total": 0,
                     "last_updated": None,
                 })
-                item["indexed_total"] = int(row_value(row, "indexed_total", 1) or 0)
-                item["indexed_file_total"] = int(row_value(row, "indexed_file_total", 2) or 0)
+                # Do not COUNT the potentially million-row line index merely to
+                # populate a project dropdown. Exact counts come from progress data.
+                item["indexed_total"] = None
+                item["indexed_file_total"] = None
 
             return sorted(projects.values(), key=lambda item: str(item["project_name"]))
         except Exception as e:
             print(f"[DB Error] Fetch projects failed: {e}")
+            raise
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+
+    def has_line_index(self, project_name):
+        """Fast indexed existence check used to distinguish complete and legacy data."""
+        cursor = None
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT 1 FROM coverage_line_index WHERE project_name = %s LIMIT 1",
+                (project_name,),
+            )
+            return bool(cursor.fetchone())
+        except Exception as e:
+            print(f"[DB Error] Line-index existence check failed: {e}")
             raise
         finally:
             if cursor is not None:
@@ -2004,7 +2621,7 @@ class DatabaseManager:
                     "confirmed_rate", "last_updated"
                 ]
                 sql = f"""
-                    SELECT i.project_name, i.file_path,
+                    SELECT i.project_name, MAX(i.file_path) AS file_path,
                            COUNT(*) AS total_uncovered,
                            SUM(CASE WHEN a.id IS NULL THEN 0 ELSE 1 END) AS filled_total,
                            SUM(CASE WHEN a.id IS NULL THEN 1 ELSE 0 END) AS unfilled_total,
@@ -2019,8 +2636,8 @@ class DatabaseManager:
                     LEFT JOIN coverage_analysis a
                       ON {source_file_join_condition("i", "a")}
                     {full_where_sql}
-                    GROUP BY i.project_name, i.file_path
-                    ORDER BY i.project_name, i.file_path
+                    GROUP BY i.project_name, i.file_path_hash
+                    ORDER BY i.project_name, file_path
                 """
                 summary_params = ["未确认", "可覆盖", "无法覆盖", "冗余代码", "未确认"] + full_params
                 cursor.execute(sql, summary_params)
@@ -2463,7 +3080,73 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_url = urllib.parse.urlparse(self.path)
         query_params = urllib.parse.parse_qs(parsed_url.query)
-        if parsed_url.path == "/api/coverage/export":
+        if parsed_url.path == "/api/coverage/progress/start":
+            project_name = query_params.get("project", [""])[0].strip()
+            if not project_name:
+                self.send_error_response(400, "Missing 'project' parameter")
+                return
+            job = start_background_job("progress", project_name)
+            self.send_json_response(202 if job.get("state") == "running" else 200, {
+                "status": "success", "job": job,
+            })
+        elif parsed_url.path == "/api/coverage/jobs/status":
+            job_id = query_params.get("id", [""])[0].strip()
+            job = public_background_job(job_id)
+            if not job:
+                self.send_error_response(404, "Background job not found or expired")
+                return
+            self.send_json_response(200, {"status": "success", "job": job})
+        elif parsed_url.path == "/api/coverage/details":
+            project_name = query_params.get("project", [""])[0].strip()
+            file_path = query_params.get("file", [""])[0]
+            try:
+                page = int(query_params.get("page", ["1"])[0])
+                page_size = int(query_params.get("page_size", [str(DETAIL_PAGE_SIZE_DEFAULT)])[0])
+            except ValueError:
+                self.send_error_response(400, "Invalid page or page_size")
+                return
+            if not project_name or not file_path:
+                self.send_error_response(400, "Missing 'project' or 'file' parameter")
+                return
+            try:
+                data = db_manager.fetch_full_detail_page(
+                    project_name, file_path, page=page, page_size=page_size
+                )
+            except Exception as error:
+                print("[Detail Page] Failed: {}".format(error), flush=True)
+                self.send_error_response(500, "Failed to query detail page")
+                return
+            self.send_json_response(200, {"status": "success", "data": data})
+        elif parsed_url.path == "/api/coverage/export/start":
+            report_type = query_params.get("type", [""])[0]
+            project_name = query_params.get("project", [""])[0].strip()
+            if report_type != "full_detail":
+                self.send_error_response(400, "Only full_detail background export is supported")
+                return
+            if not project_name:
+                self.send_error_response(400, "Missing 'project' parameter")
+                return
+            job = start_background_job("full_detail_export", project_name)
+            self.send_json_response(202 if job.get("state") == "running" else 200, {
+                "status": "success", "job": job,
+            })
+        elif parsed_url.path == "/api/coverage/export/download":
+            job_id = query_params.get("id", [""])[0].strip()
+            with _background_jobs_lock:
+                job = dict(_background_jobs.get(job_id) or {})
+            output_path = job.get("output_path")
+            if job.get("state") != "completed" or job.get("kind") != "full_detail_export":
+                self.send_error_response(409, "Export is not ready")
+                return
+            if not output_path or not os.path.isfile(output_path):
+                self.send_error_response(404, "Export file not found or expired")
+                return
+            self.send_file_response(
+                job.get("filename") or "coverage_full_detail.csv",
+                output_path,
+                "text/csv; charset=utf-8",
+            )
+        elif parsed_url.path == "/api/coverage/export":
             report_type = query_params.get("type", ["detail"])[0]
             report_type_aliases = {
                 "review_execel": "review_excel",
@@ -2519,24 +3202,24 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                     self.send_error_response(400, "full_progress_summary requires project=<project_name>")
                     return
                 try:
-                    project_headers, project_rows = db_manager.export_report("full_project_summary", project_name)
-                    dir_headers, dir_rows = db_manager.export_report("full_dir_summary", project_name)
-                    file_headers, file_rows = db_manager.export_report("full_file_summary", project_name)
-                    ownership_progress = build_ownership_progress(
-                        [dict(zip(file_headers, row)) for row in file_rows],
-                        load_config(),
+                    progress_data = compute_progress_data(db_manager, project_name, load_config())
+                    project_headers, project_rows = dict_rows_to_table(
+                        progress_data["project"], PROGRESS_PROJECT_HEADERS
                     )
-                    team_headers, team_rows = dict_rows_to_table(ownership_progress["teams"], (
+                    dir_headers, dir_rows = dict_rows_to_table(
+                        progress_data["dirs"], PROGRESS_DIR_HEADERS
+                    )
+                    team_headers, team_rows = dict_rows_to_table(progress_data["teams"], (
                         "team", "leader", "module_names", "file_total", "total_uncovered",
                         "filled_total", "unfilled_total", "confirmed_total", "coverable_total",
                         "uncoverable_total", "redundant_total", "fill_rate", "confirmed_rate",
                         "last_updated",
                     ))
-                    enriched_file_headers = list(file_headers) + [
+                    enriched_file_headers = list(PROGRESS_FILE_HEADERS) + [
                         "module", "team", "leader", "ownership_status"
                     ]
                     enriched_file_headers, enriched_file_rows = dict_rows_to_table(
-                        ownership_progress["files"], enriched_file_headers
+                        progress_data["files"], enriched_file_headers
                     )
                     progress_sections = [
                         ("项目进度", project_headers, project_rows),
@@ -2573,39 +3256,7 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 return
 
             try:
-                project_headers, project_rows = db_manager.export_report("full_project_summary", project_name)
-                dir_headers, dir_rows = db_manager.export_report("full_dir_summary", project_name)
-                file_headers, file_rows = db_manager.export_report("full_file_summary", project_name)
-                file_data = [dict(zip(file_headers, row)) for row in file_rows]
-                ownership_progress = build_ownership_progress(file_data, load_config())
-                project_meta = {
-                    "project_name": project_name,
-                    "indexed_total": 0,
-                    "saved_total": 0,
-                    "index_available": bool(project_rows),
-                    "scope_complete": bool(project_rows),
-                }
-                try:
-                    project_catalog = db_manager.fetch_projects()
-                    catalog_item = next(
-                        (item for item in project_catalog if item.get("project_name") == project_name),
-                        None,
-                    )
-                    if catalog_item:
-                        project_meta.update(catalog_item)
-                        project_meta["index_available"] = int(catalog_item.get("indexed_total") or 0) > 0
-                        project_meta["scope_complete"] = project_meta["index_available"]
-                except AttributeError:
-                    # Lightweight/mock managers used by embedded deployments may not expose discovery.
-                    pass
-                data = {
-                    "project": [dict(zip(project_headers, row)) for row in project_rows],
-                    "dirs": [dict(zip(dir_headers, row)) for row in dir_rows],
-                    "files": ownership_progress["files"],
-                    "teams": ownership_progress["teams"],
-                    "ownership": ownership_progress["ownership"],
-                    "meta": project_meta,
-                }
+                data = compute_progress_data(db_manager, project_name, load_config())
             except Exception:
                 self.send_error_response(500, "Failed to query progress")
                 return
@@ -2650,6 +3301,7 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
 
             success = db_manager.save_record(project_name, file_path, line_number, reviewer, status, method, reason)
             if success:
+                invalidate_project_background_jobs(project_name)
                 self.send_json_response(200, {"status": "success", "message": "Record saved successfully"})
             else:
                 self.send_error_response(500, "Failed to save record to database")
@@ -2739,6 +3391,7 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 project_name, file_path, normalized_blocks, is_draft=(mode == "draft")
             )
             if result:
+                invalidate_project_background_jobs(project_name)
                 response = {"status": "success", "mode": mode}
                 response.update(result)
                 self.send_json_response(200, response)
@@ -2780,6 +3433,24 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.safe_write(data)
+
+    def send_file_response(self, filename, file_path, content_type):
+        safe_filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename)
+        self.send_response(200)
+        self.send_cors_headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{safe_filename}"')
+        self.send_header("Content-Length", str(os.path.getsize(file_path)))
+        self.end_headers()
+        try:
+            with open(file_path, "rb") as source:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.safe_write(chunk)
+        except ConnectionError:
+            print("[Export] Client disconnected during file download.", flush=True)
 
     def send_zip_response(self, filename, data):
         safe_filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename)

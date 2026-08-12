@@ -686,5 +686,84 @@ class TestThreadLocalDatabase(unittest.TestCase):
         enhance_coverage.close_thread_db_manager()
 
 
+class TestScalableProgress(unittest.TestCase):
+    FILE_HEADERS = [
+        "project_name", "file_path", "total_uncovered", "filled_total",
+        "unfilled_total", "confirmed_total", "coverable_total",
+        "uncoverable_total", "redundant_total", "fill_rate",
+        "confirmed_rate", "last_updated",
+    ]
+
+    def test_progress_uses_one_file_level_query_and_returns_no_detail_rows(self):
+        class Manager:
+            def __init__(self):
+                self.calls = []
+
+            def has_line_index(self, project_name):
+                return True
+
+            def export_report(inner_self, report_type, project_name):
+                inner_self.calls.append((report_type, project_name))
+                return self.FILE_HEADERS, [
+                    [project_name, "src/a.c", 100000, 40000, 60000, 30000, 20000, 5000, 5000, 40, 30, "2026-08-12"],
+                    [project_name, "src/sub/b.c", 20, 10, 10, 8, 5, 2, 1, 50, 40, "2026-08-11"],
+                ]
+
+        manager = Manager()
+        progress_updates = []
+        data = enhance_coverage.compute_progress_data(
+            manager,
+            "large_project",
+            {"ownership": {"enabled": False}},
+            lambda percent, stage, message: progress_updates.append((percent, stage, message)),
+        )
+
+        self.assertEqual(manager.calls, [("full_file_summary", "large_project")])
+        self.assertEqual(data["project"][0]["total_uncovered"], 100020)
+        self.assertEqual(data["project"][0]["file_total"], 2)
+        self.assertEqual(len(data["dirs"]), 2)
+        self.assertEqual(len(data["files"]), 2)
+        self.assertEqual(data["meta"]["aggregation_level"], "file")
+        self.assertEqual(data["meta"]["detail_rows_returned"], 0)
+        self.assertTrue(any(stage == "database" for _, stage, _ in progress_updates))
+        self.assertTrue(any(stage == "ownership" for _, stage, _ in progress_updates))
+
+    def test_full_detail_csv_is_written_in_batches_with_progress(self):
+        class Manager:
+            def count_full_detail_rows(self, project_name):
+                return 3
+
+            def iter_full_detail_batches(self, project_name, batch_size):
+                yield [
+                    [project_name, "src/a.c", 1, "line 1", 1, 1, "single", "未填写", "", "", "", "", None],
+                    [project_name, "src/a.c", 2, "line 2", 2, 2, "single", "已填写", "可覆盖", "Alice", "case", "", "2026-08-12"],
+                ]
+                yield [[project_name, "src/b.c", 3, "line 3", 3, 3, "single", "未填写", "", "", "", "", None]]
+
+        updates = []
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = os.path.join(temp_dir, "details.csv")
+            written = enhance_coverage.write_full_detail_csv(
+                Manager(), "large_project", output_path,
+                lambda percent, stage, message: updates.append((percent, stage, message)),
+            )
+            with open(output_path, "r", encoding="utf-8-sig") as output_file:
+                content = output_file.read()
+
+        self.assertEqual(written, 3)
+        self.assertIn("project_name,file_path,line_number", content)
+        self.assertIn("large_project,src/a.c,2,line 2", content)
+        self.assertTrue(any(stage == "exporting" and "3/3" in message for _, stage, message in updates))
+
+    def test_progress_page_uses_background_jobs_and_paged_details(self):
+        with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as page_file:
+            content = page_file.read()
+        self.assertIn("/progress/start?project=", content)
+        self.assertIn("/jobs/status?id=", content)
+        self.assertIn("/details?project=", content)
+        self.assertIn("后台导出详细 CSV", content)
+        self.assertIn("未传输任何逐行明细", content)
+
+
 if __name__ == "__main__":
     unittest.main()

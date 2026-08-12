@@ -18,6 +18,7 @@
       --red: #b91c1c;
     }
     * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
     body {
       margin: 0;
       background: var(--bg);
@@ -133,6 +134,27 @@
       margin-top: 7px;
       color: var(--muted);
     }
+    .job-progress {
+      display: none;
+      margin-top: 12px;
+      max-width: 920px;
+      padding: 12px;
+      border: 1px solid #bfd3ff;
+      border-radius: 6px;
+      background: #f5f8ff;
+    }
+    .job-progress.visible { display: block; }
+    .job-progress-head { display: flex; justify-content: space-between; gap: 12px; font-weight: 700; }
+    .job-track { height: 10px; margin: 8px 0; overflow: hidden; border-radius: 5px; background: #dbe5f3; }
+    .job-track span { display: block; width: 0; height: 100%; background: var(--blue); transition: width .25s ease; }
+    .file-detail-link { height: auto; padding: 0; border: 0; background: transparent; text-align: left; font-weight: 600; }
+    .file-detail-link:hover { background: transparent; text-decoration: underline; }
+    .detail-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; background: var(--head); border-bottom: 1px solid var(--line); }
+    .detail-head h2 { padding: 0; border: 0; }
+    .detail-nav { display: flex; align-items: center; gap: 8px; padding: 10px 12px; }
+    .detail-nav button { height: 30px; }
+    #detailTable { min-width: 1500px; }
+    #detailTable td.code { max-width: 520px; white-space: pre-wrap; word-break: break-all; font-family: monospace; }
     @media (max-width: 900px) {
       .cards { grid-template-columns: repeat(2, minmax(150px, 1fr)); }
     }
@@ -147,8 +169,15 @@
       <button id="loadBtn" type="button">查看进度</button>
       <a id="csvLink" class="button" href="#" target="_blank">导出进度 Excel</a>
       <a id="excelLink" class="button" href="#" target="_blank">导出目录 Excel ZIP</a>
+      <button id="detailExportBtn" type="button">后台导出详细 CSV</button>
+      <a id="detailDownloadLink" class="button" href="#" hidden>下载详细 CSV</a>
     </div>
     <div id="status" class="status"></div>
+    <div id="jobProgress" class="job-progress" role="status" aria-live="polite">
+      <div class="job-progress-head"><span id="jobStage">准备中</span><span id="jobPercent">0%</span></div>
+      <div class="job-track"><span id="jobBar"></span></div>
+      <div id="jobMessage" class="status"></div>
+    </div>
   </header>
   <main>
     <div class="cards">
@@ -169,8 +198,13 @@
       <div class="table-wrap"><table id="dirTable"></table></div>
     </section>
     <section class="section">
-      <h2>文件进度</h2>
+      <h2>文件进度（点击文件路径查看详细填写数据）</h2>
       <div class="table-wrap"><table id="fileTable"></table></div>
+    </section>
+    <section id="detailSection" class="section" hidden>
+      <div class="detail-head"><h2 id="detailTitle">详细填写数据</h2><button id="closeDetailBtn" type="button">关闭</button></div>
+      <div id="detailStatus" class="detail-nav"></div>
+      <div class="table-wrap"><table id="detailTable"></table></div>
     </section>
   </main>
   <script>
@@ -182,8 +216,19 @@
     const statusEl = document.getElementById('status');
     const csvLink = document.getElementById('csvLink');
     const excelLink = document.getElementById('excelLink');
+    const detailExportBtn = document.getElementById('detailExportBtn');
+    const detailDownloadLink = document.getElementById('detailDownloadLink');
+    const jobProgress = document.getElementById('jobProgress');
+    const jobStage = document.getElementById('jobStage');
+    const jobPercent = document.getElementById('jobPercent');
+    const jobBar = document.getElementById('jobBar');
+    const jobMessage = document.getElementById('jobMessage');
     const PROGRESS_UPDATE_STORAGE_KEY = 'coverage-review-progress-updated';
     let resolvedApiBase = '';
+    let activeLoadToken = 0;
+    let currentFileRows = [];
+    let currentDetailFile = '';
+    let currentDetailPage = 1;
 
     if (reviewScope === 'incremental') {
       document.title = 'Incremental Coverage Analysis Progress';
@@ -283,9 +328,10 @@
     }
 
     function renderFileTable(rows) {
-      const body = !rows || rows.length === 0 ? '<tr><td colspan="14">暂无数据</td></tr>' : rows.map(row => `
+      currentFileRows = Array.isArray(rows) ? rows : [];
+      const body = currentFileRows.length === 0 ? '<tr><td colspan="14">暂无数据</td></tr>' : currentFileRows.map((row, index) => `
         <tr>
-          <td class="path">${escapeHtml(row.file_path || '')}</td>
+          <td class="path"><button class="file-detail-link" type="button" data-file-index="${index}">${escapeHtml(row.file_path || '')}</button></td>
           <td>${escapeHtml(row.module || '')}</td>
           <td>${escapeHtml(row.team || '')}</td>
           <td>${escapeHtml(row.leader || '')}</td>
@@ -309,6 +355,31 @@
         </tr></thead>
         <tbody>${body}</tbody>
       `;
+    }
+
+    function renderDetailTable(data) {
+      const rows = Array.isArray(data.rows) ? data.rows : [];
+      const body = rows.length ? rows.map(row => `
+        <tr>
+          <td>${asNumber(row[2])}</td><td class="code">${escapeHtml(row[3] || '')}</td>
+          <td>${escapeHtml(row[7] || '')}</td><td>${escapeHtml(row[8] || '')}</td>
+          <td>${escapeHtml(row[9] || '')}</td><td>${escapeHtml(row[10] || '')}</td>
+          <td>${escapeHtml(row[11] || '')}</td><td>${escapeHtml(row[12] || '')}</td>
+        </tr>
+      `).join('') : '<tr><td colspan="8">暂无详细数据</td></tr>';
+      document.getElementById('detailTable').innerHTML = `
+        <thead><tr><th>行号</th><th>代码行</th><th>填写状态</th><th>结论</th><th>责任人</th><th>覆盖方法</th><th>无法覆盖原因</th><th>更新时间</th></tr></thead>
+        <tbody>${body}</tbody>
+      `;
+      currentDetailPage = asNumber(data.page) || 1;
+      const totalPages = asNumber(data.total_pages);
+      document.getElementById('detailStatus').innerHTML = `
+        <button id="detailPrevBtn" type="button" ${currentDetailPage <= 1 ? 'disabled' : ''}>上一页</button>
+        <button id="detailNextBtn" type="button" ${!totalPages || currentDetailPage >= totalPages ? 'disabled' : ''}>下一页</button>
+        <span>第 ${currentDetailPage} / ${totalPages || 0} 页，共 ${asNumber(data.total)} 行，每页 ${asNumber(data.page_size)} 行</span>
+      `;
+      document.getElementById('detailPrevBtn').addEventListener('click', () => loadFileDetails(currentDetailFile, currentDetailPage - 1));
+      document.getElementById('detailNextBtn').addEventListener('click', () => loadFileDetails(currentDetailFile, currentDetailPage + 1));
     }
 
     function renderOwnershipStatus(ownership) {
@@ -378,6 +449,70 @@
       excelLink.href = `${base}/export?type=review_excel_by_dir&project=${encoded}`;
     }
 
+    const STAGE_LABELS = {
+      queued: '等待执行', preparing: '检查项目', database: '数据库聚合',
+      summary: '汇总项目/目录', ownership: '匹配文件归属', finalizing: '整理结果',
+      counting: '统计详细行', exporting: '生成详细 CSV', completed: '已完成', failed: '失败'
+    };
+
+    function showJobProgress(job, title) {
+      const percent = Math.max(0, Math.min(100, asNumber(job.percent)));
+      jobProgress.classList.add('visible');
+      jobStage.innerText = `${title || '后台任务'} · ${STAGE_LABELS[job.stage] || job.stage || '处理中'}`;
+      jobPercent.innerText = `${percent}%`;
+      jobBar.style.width = `${percent}%`;
+      jobMessage.innerText = `${job.message || '正在处理'}（已用时 ${asNumber(job.elapsed_seconds).toFixed(1)} 秒）`;
+    }
+
+    function sleep(milliseconds) {
+      return new Promise(resolve => setTimeout(resolve, milliseconds));
+    }
+
+    async function waitForJob(apiBase, job, title, token) {
+      let current = job;
+      let pollErrors = 0;
+      while (current && current.state === 'running') {
+        if (token != null && token !== activeLoadToken) {
+          throw new Error('已取消过期的页面加载');
+        }
+        showJobProgress(current, title);
+        await sleep(800);
+        try {
+          const payload = await fetchJsonWithTimeout(`${apiBase}/jobs/status?id=${encodeURIComponent(current.id)}`, 10000);
+          current = payload.job || {};
+          pollErrors = 0;
+        } catch (error) {
+          pollErrors += 1;
+          if (pollErrors >= 5) throw error;
+          jobMessage.innerText = `后台任务仍在执行，第 ${pollErrors} 次进度查询未响应，正在重试…`;
+        }
+      }
+      showJobProgress(current || {}, title);
+      if (!current || current.state !== 'completed') {
+        throw new Error(current && current.message ? current.message : '后台任务失败');
+      }
+      return current;
+    }
+
+    function renderProgressData(project, apiBase, data) {
+      const projectRows = Array.isArray(data.project) ? data.project : [];
+      const projectRow = projectRows[0] || {};
+      const meta = data.meta || {};
+      metric('totalUncovered', asNumber(projectRow.total_uncovered));
+      metric('filledTotal', asNumber(projectRow.filled_total));
+      metric('fillRate', fmtRate(projectRow.fill_rate));
+      metric('confirmedRate', fmtRate(projectRow.confirmed_rate));
+      renderOwnershipStatus(data.ownership || {});
+      renderTeamTable(data.teams || []);
+      renderTable('dirTable', data.dirs || [], 'dir_path');
+      renderFileTable(data.files || []);
+      if (projectRows.length === 0) {
+        statusEl.innerHTML = `<span class="warning">未找到项目“${escapeHtml(project)}”的审查行索引。请在数据库可连接时重新执行 incremental 或 inject。</span>`;
+      } else {
+        statusEl.innerText = `已加载 ${asNumber(meta.indexed_file_total)} 个文件的填写摘要；未传输任何逐行明细。项目：${project}，接口：${apiBase}`;
+      }
+    }
+
     async function loadProgress() {
       const project = projectInput.value.trim();
       if (!project) {
@@ -386,7 +521,8 @@
       }
       const loadBtn = document.getElementById('loadBtn');
       loadBtn.disabled = true;
-      loadBtn.innerText = '正在加载...';
+      loadBtn.innerText = '后台计算中...';
+      const token = ++activeLoadToken;
 
       const encodedProject = encodeURIComponent(project);
       const candidates = apiBaseCandidates();
@@ -397,30 +533,15 @@
       try {
         for (const apiBase of candidates) {
           try {
-            statusEl.innerText = `正在加载：${apiBase}`;
-            const payload = await fetchJsonWithTimeout(`${apiBase}/progress?project=${encodedProject}`, 15000);
+            statusEl.innerText = `正在启动文件级进度任务：${apiBase}`;
+            const payload = await fetchJsonWithTimeout(`${apiBase}/progress/start?project=${encodedProject}`, 10000);
             if (!payload || payload.status !== 'success') {
               throw new Error(payload && payload.message ? payload.message : '加载失败');
             }
+            const completedJob = await waitForJob(apiBase, payload.job || {}, '填写进展', token);
             resolvedApiBase = apiBase;
             updateLinks(project, apiBase);
-            const data = payload.data || {};
-            const projectRows = Array.isArray(data.project) ? data.project : [];
-            const projectRow = projectRows[0] || {};
-            const meta = data.meta || {};
-            metric('totalUncovered', asNumber(projectRow.total_uncovered)); metric('filledTotal', asNumber(projectRow.filled_total));
-            metric('fillRate', fmtRate(projectRow.fill_rate)); metric('confirmedRate', fmtRate(projectRow.confirmed_rate));
-            renderOwnershipStatus(data.ownership || {});
-            renderTeamTable(data.teams || []);
-            renderTable('dirTable', data.dirs || [], 'dir_path');
-            renderFileTable(data.files || []);
-            if (projectRows.length === 0) {
-              statusEl.innerHTML = `<span class="warning">未找到项目“${escapeHtml(project)}”的审查行索引。填写记录可能已保存，但生成报告时未同步索引；请在数据库可连接时重新执行 incremental 或 inject。</span>`;
-            } else if (meta.scope_complete === false && asNumber(meta.saved_total) > 0) {
-              statusEl.innerHTML = `<span class="warning">项目“${escapeHtml(project)}”当前仅有 ${asNumber(meta.saved_total)} 条已保存记录、没有覆盖率行索引；页面和导出可查看这些数据库记录，但未填写总量暂时无法计算。重新执行 incremental 或 inject 后可恢复完整进度。</span>`;
-            } else {
-              statusEl.innerText = `已加载项目：${project}，接口：${apiBase}`;
-            }
+            renderProgressData(project, apiBase, completedJob.data || {});
             const url = new URL(window.location.href);
             url.searchParams.set('project', project);
             if (params.get('api')) {
@@ -434,8 +555,68 @@
         }
         statusEl.innerHTML = `<span class="error">加载失败：${escapeHtml(lastError ? lastError.message : '无法连接接口')}。已尝试：${escapeHtml(candidates.join(' , '))}</span>`;
       } finally {
-        loadBtn.disabled = false;
-        loadBtn.innerText = '查看进度';
+        if (token === activeLoadToken) {
+          loadBtn.disabled = false;
+          loadBtn.innerText = '查看进度';
+        }
+      }
+    }
+
+    async function loadFileDetails(filePath, page) {
+      const project = projectInput.value.trim();
+      if (!project || !filePath) return;
+      currentDetailFile = filePath;
+      const section = document.getElementById('detailSection');
+      section.hidden = false;
+      document.getElementById('detailTitle').innerText = `详细填写数据：${filePath}`;
+      document.getElementById('detailStatus').innerText = '正在加载当前页…';
+      const apiBase = resolvedApiBase || apiBaseCandidates()[0];
+      try {
+        const payload = await fetchJsonWithTimeout(
+          `${apiBase}/details?project=${encodeURIComponent(project)}&file=${encodeURIComponent(filePath)}&page=${Math.max(1, page || 1)}&page_size=200`,
+          15000
+        );
+        renderDetailTable(payload.data || {});
+        section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } catch (error) {
+        document.getElementById('detailStatus').innerHTML = `<span class="error">详细数据加载失败：${escapeHtml(error.message)}</span>`;
+      }
+    }
+
+    async function exportFullDetails() {
+      const project = projectInput.value.trim();
+      if (!project) {
+        statusEl.innerHTML = '<span class="error">请先输入项目名。</span>';
+        return;
+      }
+      detailExportBtn.disabled = true;
+      detailExportBtn.innerText = '详细 CSV 生成中...';
+      detailDownloadLink.hidden = true;
+      let lastError = null;
+      try {
+        for (const apiBase of apiBaseCandidates()) {
+          try {
+            const payload = await fetchJsonWithTimeout(
+              `${apiBase}/export/start?type=full_detail&project=${encodeURIComponent(project)}`, 10000
+            );
+            const completedJob = await waitForJob(apiBase, payload.job || {}, '详细数据导出');
+            resolvedApiBase = apiBase;
+            detailDownloadLink.href = `${apiBase}/export/download?id=${encodeURIComponent(completedJob.id)}`;
+            detailDownloadLink.hidden = false;
+            detailDownloadLink.innerText = `下载详细 CSV（${asNumber(completedJob.row_count)} 行）`;
+            statusEl.innerText = `详细 CSV 已在后台生成，共 ${asNumber(completedJob.row_count)} 行，正在开始下载。`;
+            window.location.assign(detailDownloadLink.href);
+            return;
+          } catch (error) {
+            lastError = error;
+          }
+        }
+        throw lastError || new Error('无法连接导出接口');
+      } catch (error) {
+        statusEl.innerHTML = `<span class="error">详细数据导出失败：${escapeHtml(error.message)}</span>`;
+      } finally {
+        detailExportBtn.disabled = false;
+        detailExportBtn.innerText = '后台导出详细 CSV';
       }
     }
 
@@ -451,7 +632,9 @@
           const projects = Array.isArray(payload.projects) ? payload.projects : [];
           projectOptions.innerHTML = projects.map(item => {
             const name = escapeHtml(item.project_name || '');
-            const label = `已存 ${asNumber(item.saved_total)} / 索引 ${asNumber(item.indexed_total)}`;
+            const savedLabel = item.saved_total == null ? '已有数据' : `已存 ${asNumber(item.saved_total)}`;
+            const indexLabel = item.indexed_total == null ? '进度页计算精确数量' : `索引 ${asNumber(item.indexed_total)}`;
+            const label = `${savedLabel} / ${indexLabel}`;
             return `<option value="${name}" label="${escapeHtml(label)}"></option>`;
           }).join('');
           if (!projectInput.value.trim() && projects.length === 1) {
@@ -473,6 +656,16 @@
     }
 
     document.getElementById('loadBtn').addEventListener('click', loadProgress);
+    detailExportBtn.addEventListener('click', exportFullDetails);
+    document.getElementById('fileTable').addEventListener('click', event => {
+      const button = event.target.closest('.file-detail-link');
+      if (!button) return;
+      const row = currentFileRows[asNumber(button.dataset.fileIndex)];
+      if (row && row.file_path) loadFileDetails(row.file_path, 1);
+    });
+    document.getElementById('closeDetailBtn').addEventListener('click', () => {
+      document.getElementById('detailSection').hidden = true;
+    });
     projectInput.addEventListener('keydown', event => {
       if (event.key === 'Enter') {
         loadProgress();
@@ -491,9 +684,10 @@
         // Ignore malformed cross-tab notifications.
       }
     });
-    loadProjectOptions();
     if (projectInput.value.trim()) {
       loadProgress();
+    } else {
+      loadProjectOptions();
     }
   </script>
 </body>

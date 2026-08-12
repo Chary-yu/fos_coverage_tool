@@ -525,6 +525,8 @@ curl -o coverage_full_detail.csv \
   "http://127.0.0.1:9528/api/coverage/export?type=full_detail"
 ```
 
+对百万行级项目，推荐在进度页点击“后台导出详细 CSV”。后台会按 5000 行一批写入临时文件，页面持续显示阶段、百分比和已用时，完成后自动下载。这条链路不会把全部明细一次性放入 Python 内存。
+
 导出全量文件汇总：
 
 ```bash
@@ -669,9 +671,15 @@ http://服务器IP/coverage/review_main_202606/coverage_progress.html?project=re
 * 按小组和组长汇总的填写、确认进度；
 * 各目录进度；
 * 各文件进度及其模块、小组、组长、匹配状态；
+* 点击文件路径后，每页 200 行查看该文件的详细填写数据；
 * 归属表已匹配/未匹配文件计数，目录无法识别的文件会集中归入“未匹配小组”；
 * 进度 Excel 导出入口；
-* 按目录拆分的 Excel ZIP 导出入口。
+* 按目录拆分的 Excel ZIP 导出入口；
+* 带实时任务进度的全量详细 CSV 后台导出入口。
+
+“填写进展”只有文件级粒度：数据库执行一次按文件聚合，每个文件向服务端和浏览器返回一行摘要。即使单文件有 10 万条未覆盖行，进度结果中仍只占一行；逐行数据仅在用户点击文件或启动详细导出时查询。
+
+进度计算使用后台任务。数据库聚合期间无法获得 MySQL 内部的精确扫描行数，页面会保持在“数据库聚合”阶段并持续刷新已用时；查询完成后，项目/目录汇总和文件归属匹配会显示精确百分比。
 
 ### 小组和组长归属表
 
@@ -711,11 +719,17 @@ http://服务器IP/coverage/review_main_202606/coverage_progress.html?project=re
 
 读取 xlsx 只使用 Python 标准库，不依赖 `openpyxl`，可在 Python 3.6.8 环境运行。
 
-该页面依赖后台服务提供的接口：
+该页面主要使用下列后台接口：
 
 ```text
-/api/coverage/progress?project=<project_name>
+/api/coverage/progress/start?project=<project_name>
+/api/coverage/jobs/status?id=<job_id>
+/api/coverage/details?project=<project_name>&file=<file_path>&page=1&page_size=200
+/api/coverage/export/start?type=full_detail&project=<project_name>
+/api/coverage/export/download?id=<job_id>
 ```
+
+旧的同步 `/api/coverage/progress?project=<project_name>` 仍保留兼容，但浏览器页面使用上述后台任务接口，不再受单次 HTTP 请求超时限制。
 
 如果已经生成过旧报表，需要重新执行一次 `inject`，把新的 `coverage_progress.html` 复制到报表目录，并更新覆盖率页面使用的 JS/CSS 版本。
 
