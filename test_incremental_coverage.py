@@ -53,7 +53,8 @@ diff --git a/src/not_in_lcov.c b/src/not_in_lcov.c
 +missing();
 """
         result = coverage_check.calculate_incremental_coverage(
-            self.repo_dir, "old", "new", self.info_path, diff_text
+            self.repo_dir, "old", "new", self.info_path, diff_text,
+            developer_file_changes=[],
         )
 
         self.assertEqual(result["summary"]["changed_lines"], 4)
@@ -69,6 +70,8 @@ diff --git a/src/not_in_lcov.c b/src/not_in_lcov.c
         with zipfile.ZipFile(xlsx_path) as workbook:
             self.assertIn("xl/worksheets/sheet1.xml", workbook.namelist())
             self.assertIn("xl/worksheets/sheet2.xml", workbook.namelist())
+            self.assertIn("xl/worksheets/sheet3.xml", workbook.namelist())
+            self.assertIn("Developer Summary", workbook.read("xl/workbook.xml").decode("utf-8"))
 
     @unittest.mock.patch("coverage_check.subprocess.Popen")
     def test_git_diff_uses_python36_compatible_subprocess_api(self, mock_popen):
@@ -84,8 +87,56 @@ diff --git a/src/not_in_lcov.c b/src/not_in_lcov.c
         self.assertNotIn("text", kwargs)
         self.assertNotIn("encoding", kwargs)
 
+    @unittest.mock.patch("coverage_check.subprocess.Popen")
+    def test_git_log_collects_author_and_committed_files(self, mock_popen):
+        process = mock_popen.return_value
+        process.communicate.return_value = (
+            b"abc1234\x1fAlice\x1falice@example.com\x1f2026-08-13T10:00:00+08:00\x1fadd coverage\n"
+            b"M\tsrc/main.c\nR100\tsrc/old.c\tsrc/new.c\nD\tsrc/deleted.c\n",
+            b"",
+        )
+        process.returncode = 0
+
+        changes = coverage_check.run_git_developer_file_changes(
+            self.repo_dir, "old", "new", "platform"
+        )
+
+        self.assertEqual([item["file_path"] for item in changes], ["src/main.c", "src/new.c"])
+        self.assertTrue(all(item["author_email"] == "alice@example.com" for item in changes))
+        self.assertTrue(all(item["repository"] == "platform" for item in changes))
+        self.assertIn("--name-status", mock_popen.call_args[0][0])
+
+    def test_developer_tasks_show_each_author_their_jointly_changed_file(self):
+        details = [
+            {"repository": "platform", "file_path": "src/main.c", "review_file_path": "/repo/src/main.c",
+             "status": coverage_check.STATUS_UNCOVERED},
+            {"repository": "platform", "file_path": "src/main.c", "review_file_path": "/repo/src/main.c",
+             "status": coverage_check.STATUS_UNCOVERED},
+            {"repository": "platform", "file_path": "src/main.c", "review_file_path": "/repo/src/main.c",
+             "status": coverage_check.STATUS_COVERED},
+            {"repository": "platform", "file_path": "docs/readme.md", "review_file_path": "/repo/docs/readme.md",
+             "status": coverage_check.STATUS_IGNORED},
+        ]
+        changes = [
+            {"repository": "platform", "commit": "a1", "author_name": "Alice", "author_email": "alice@example.com",
+             "committed_at": "2026-08-13T10:00:00+08:00", "subject": "main", "file_path": "src/main.c", "change_type": "M"},
+            {"repository": "platform", "commit": "b1", "author_name": "Bob", "author_email": "bob@example.com",
+             "committed_at": "2026-08-13T11:00:00+08:00", "subject": "joint", "file_path": "src/main.c", "change_type": "M"},
+            {"repository": "platform", "commit": "b1", "author_name": "Bob", "author_email": "bob@example.com",
+             "committed_at": "2026-08-13T11:00:00+08:00", "subject": "docs", "file_path": "docs/readme.md", "change_type": "A"},
+        ]
+
+        tasks = coverage_check.build_developer_tasks(details, changes)["developers"]
+        alice = next(item for item in tasks if item["email"] == "alice@example.com")
+        bob = next(item for item in tasks if item["email"] == "bob@example.com")
+        self.assertEqual(alice["review_file_total"], 1)
+        self.assertEqual(alice["review_uncovered_total"], 2)
+        self.assertEqual(bob["changed_file_total"], 2)
+        self.assertEqual(bob["files"][0]["file_path"], "src/main.c")
+
+    @unittest.mock.patch("coverage_check.run_git_developer_file_changes", return_value=[])
     @unittest.mock.patch("coverage_check.run_git_diff")
-    def test_calculate_multiple_repositories_uses_absolute_lcov_paths(self, mock_git_diff):
+    def test_calculate_multiple_repositories_uses_absolute_lcov_paths(self, mock_git_diff, mock_developer_changes):
         repo_b = os.path.join(self.temp_dir, "repo_b")
         repo_c = os.path.join(self.temp_dir, "repo_c")
         os.makedirs(repo_b)
@@ -127,8 +178,9 @@ diff --git a/src/not_in_lcov.c b/src/not_in_lcov.c
         with zipfile.ZipFile(xlsx_path) as workbook:
             self.assertIn("xl/worksheets/sheet3.xml", workbook.namelist())
 
+    @unittest.mock.patch("coverage_check.run_git_developer_file_changes", return_value=[])
     @unittest.mock.patch("coverage_check.run_git_diff")
-    def test_repositories_config_resolves_relative_repository_paths(self, mock_git_diff):
+    def test_repositories_config_resolves_relative_repository_paths(self, mock_git_diff, mock_developer_changes):
         config_path = os.path.join(self.temp_dir, "repositories.json")
         with open(config_path, "w", encoding="utf-8") as config_file:
             json.dump({"repositories": [{
@@ -140,8 +192,9 @@ diff --git a/src/not_in_lcov.c b/src/not_in_lcov.c
 
         self.assertEqual(result["repositories"][0]["path"], self.repo_dir)
 
+    @unittest.mock.patch("coverage_check.run_git_developer_file_changes", return_value=[])
     @unittest.mock.patch("coverage_check.run_git_diff")
-    def test_multi_repository_rejects_relative_lcov_source_paths(self, mock_git_diff):
+    def test_multi_repository_rejects_relative_lcov_source_paths(self, mock_git_diff, mock_developer_changes):
         repo_b = os.path.join(self.temp_dir, "repo_b")
         os.makedirs(repo_b)
         with open(self.info_path, "w", encoding="utf-8") as info_file:
@@ -276,6 +329,7 @@ class TestIncrementalReviewInjection(unittest.TestCase):
         with open(os.path.join(self.output_dir, "coverage_progress.js"), "r", encoding="utf-8") as progress_js_file:
             self.assertIn('const DEFAULT_REVIEW_SCOPE = "incremental";', progress_js_file.read())
         self.assertTrue(os.path.exists(os.path.join(self.output_dir, "incremental_coverage.html")))
+        self.assertTrue(os.path.exists(os.path.join(self.output_dir, "incremental_developer_tasks.html")))
         self.assertTrue(os.path.exists(os.path.join(self.output_dir, "incremental_coverage.xlsx")))
         with open(os.path.join(self.output_dir, "incremental_coverage.json"), "r", encoding="utf-8") as result_file:
             self.assertEqual(json.load(result_file)["review_scope"], "incremental")
@@ -372,6 +426,40 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         self.assertIn('data-sort-key="changed"', summary_html)
         self.assertIn('data-sort-key="covered"', summary_html)
         self.assertIn('data-sort-key="uncovered"', summary_html)
+
+    def test_developer_task_page_lists_files_and_pending_fill(self):
+        os.makedirs(self.output_dir)
+        result = {
+            "generated_at": "2026-08-13 12:00:00",
+            "oldgit": "old123",
+            "newgit": "new456",
+            "summary": {
+                "changed_lines": 2, "covered": 0, "uncovered": 2, "ignored": 0,
+                "missing": 0, "coverable_total": 2, "coverage_rate": 0.0,
+            },
+            "details": [],
+            "developer_tasks": {"developers": [{
+                "name": "Alice", "email": "alice@example.com", "commit_total": 1,
+                "changed_file_total": 1, "review_file_total": 1, "review_uncovered_total": 2,
+                "files": [{
+                    "repository": "platform", "file_path": "src/main.c",
+                    "review_file_path": "src/main.c", "change_types": ["M"],
+                    "commits": [{"commit": "abcdef123456", "subject": "add main", "committed_at": "2026-08-13T12:00:00+08:00"}],
+                    "changed": 2, "covered": 0, "uncovered": 2, "ignored": 0, "missing": 0,
+                }],
+            }]},
+        }
+
+        enhance_coverage.write_incremental_developer_tasks_page(
+            self.output_dir, "developer_test", result
+        )
+
+        with open(os.path.join(self.output_dir, "incremental_developer_tasks.html"), "r", encoding="utf-8") as page:
+            page_html = page.read()
+        self.assertIn("Alice", page_html)
+        self.assertIn("src/main.c", page_html)
+        self.assertIn("待填写 2 行", page_html)
+        self.assertIn("多人提交同一文件", page_html)
 
 
 if __name__ == "__main__":

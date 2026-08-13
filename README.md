@@ -222,7 +222,7 @@ python3 enhance_coverage.py incremental \
 
 参数说明：
 
-* `--repo`：包含 `oldgit` 和 `newgit` 的 Git 仓库；脚本会执行 `git diff oldgit newgit`；
+* `--repo`：包含 `oldgit` 和 `newgit` 的 Git 仓库；脚本会执行 `git diff oldgit newgit`，并读取 `oldgit..newgit` 中的 Git author 与提交文件；
 * `--info`：单个 LCOV `.info` 文件，或仅包含多个 `.info` 文件的目录；多个文件会在 Python 内合并，不依赖系统 `lcov` 命令；
 * `--dir`：由 `genhtml` 生成的原始全量 HTML 报告，只读；
 * `--out`：增量审查网页输出目录。和全量 `inject` 一样，若目录已存在会被重新生成；
@@ -232,11 +232,13 @@ python3 enhance_coverage.py incremental \
 输出目录的 `html/` 中会包含：
 
 * `incremental_coverage.html`：增量覆盖率汇总页，点击文件可打开源码页；
-* `incremental_coverage.json` / `incremental_coverage.xlsx`：每条新增行的计算结果；
+* `incremental_developer_tasks.html`：按开发人员列出的提交文件和待填写清单，可直接跳转到相应源码页；
+* `incremental_coverage.json` / `incremental_coverage.xlsx`：每条新增行的计算结果；JSON 包含开发人员与文件映射，Excel 额外提供 `Developer Summary`、`Developer Files` 工作表；
 * `coverage_progress.html`：增量填写进度页；
 * 原始 LCOV 源码页：仍保留完整红绿覆盖率显示，但**只在 Git 新增且 LCOV 未覆盖的行旁显示填写控件**。
 
 汇总页默认将未覆盖新增行最多的文件排在前面；可点击仓库、文件、新增行、已覆盖、未覆盖、无需覆盖或覆盖信息缺失表头，按对应列升序或降序排序。
+“开发人员待填写清单”按 Git author 的“姓名 + 邮箱”识别人员，并列出该人员在 commit 范围内提交的全部文件、关联 commit 与每个文件的待填写新增行。多人共同提交同一文件时，文件会同时列给相关人员，便于协作确认；待填写行仍以最终 Git diff 中 LCOV 未覆盖的新增行为准。
 源码填写面板中的“上一个”和“下一个”按钮可在当前文件内跳转至相邻的可填写控件；到达首个或末个控件时，对应按钮会禁用。
 当前文件填写多个控件后，可使用右下角“定位首个待填写”跳转到第一个未确认或暂存控件；随后可在面板中使用“上一个/下一个”继续跳转。单击“继承”只复制上方最近一条已填写结果；单击某个控件的“批量继承”，会把该来源之后至当前控件之间的整段控件一起复制并标记为待暂存。填写完成后，可使用“暂存草稿”一次批量写入数据库；草稿允许保留“未确认”及未完成字段，计入填写进度但不计入已确认结论。“确认提交”会对待暂存控件执行状态、确认人和覆盖说明校验后再批量提交；离开含未暂存内容的页面会收到提示。
 
@@ -288,7 +290,7 @@ python3.6 coverage_check.py \
   --json multi_incremental.json
 ```
 
-多仓库模式会分别执行每个仓库的 `git diff`，最后汇总总覆盖率；汇总网页与 Excel 会显示仓库列，Excel 额外提供 `Repositories` 工作表。为避免同名文件混淆，`.info` 的 `SF:` 必须是**绝对路径**，且应与 LCOV HTML 源码页标题中的路径一致。若检测到相对 `SF:` 路径，脚本会中止而不是生成可能串数据的结果。
+多仓库模式会分别执行每个仓库的 `git diff` 和 Git author 提交文件采集，最后汇总总覆盖率；汇总网页与 Excel 会显示仓库列，Excel 额外提供 `Repositories`、开发人员任务工作表。为避免同名文件混淆，`.info` 的 `SF:` 必须是**绝对路径**，且应与 LCOV HTML 源码页标题中的路径一致。若检测到相对 `SF:` 路径，脚本会中止而不是生成可能串数据的结果。
 
 访问增量汇总页：
 

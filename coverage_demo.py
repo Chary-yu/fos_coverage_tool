@@ -498,10 +498,53 @@ pre.source > span{{display:block;position:relative;white-space:pre}}.lineCov{{ba
     with open(os.path.join(html_dir, "calculator.c.gcov.html"), "w", encoding="utf-8") as target:
         target.write(page)
 
+    # Also expose the new incremental author-to-file workflow in the browser
+    # demo.  The two developers deliberately share one source file so the
+    # collaboration rule is visible on the generated task page.
+    demo_details = [
+        {"repository": "demo_repo", "file_path": DEMO_FILE, "coverage_file": DEMO_FILE,
+         "review_file_path": DEMO_FILE, "line_number": 3, "execution_count": 0,
+         "status": enhance_coverage.coverage_check.STATUS_UNCOVERED},
+        {"repository": "demo_repo", "file_path": DEMO_FILE, "coverage_file": DEMO_FILE,
+         "review_file_path": DEMO_FILE, "line_number": 5, "execution_count": 0,
+         "status": enhance_coverage.coverage_check.STATUS_UNCOVERED},
+        {"repository": "demo_repo", "file_path": DEMO_FILE, "coverage_file": DEMO_FILE,
+         "review_file_path": DEMO_FILE, "line_number": 7, "execution_count": 1,
+         "status": enhance_coverage.coverage_check.STATUS_COVERED},
+    ]
+    developer_changes = [
+        {"repository": "demo_repo", "commit": "demoa1234567", "author_name": "Alice Chen",
+         "author_email": "alice@example.com", "committed_at": "2026-08-13T09:30:00+08:00",
+         "subject": "add calculator branches", "file_path": DEMO_FILE, "change_type": "M"},
+        {"repository": "demo_repo", "commit": "demob7654321", "author_name": "Bob Li",
+         "author_email": "bob@example.com", "committed_at": "2026-08-13T10:15:00+08:00",
+         "subject": "complete boundary branch", "file_path": DEMO_FILE, "change_type": "M"},
+    ]
+    demo_result = {
+        "schema_version": 2,
+        "generated_at": "2026-08-13 10:30:00",
+        "oldgit": "demo-old", "newgit": "demo-new",
+        "summary": {"changed_lines": 3, "covered": 1, "uncovered": 2, "ignored": 0,
+                    "missing": 0, "coverable_total": 3, "coverage_rate": 33.3333333333},
+        "details": demo_details,
+        "developer_file_changes": developer_changes,
+        "developer_tasks": enhance_coverage.coverage_check.build_developer_tasks(
+            demo_details, developer_changes
+        ),
+    }
+    enhance_coverage.write_incremental_summary_page(html_dir, DEMO_PROJECT, demo_result)
+    enhance_coverage.write_incremental_developer_tasks_page(html_dir, DEMO_PROJECT, demo_result)
+    enhance_coverage.coverage_check.write_result_json(
+        demo_result, os.path.join(html_dir, "incremental_coverage.json")
+    )
+    enhance_coverage.coverage_check.write_result_excel(
+        demo_result, os.path.join(html_dir, "incremental_coverage.xlsx")
+    )
+
     index = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Coverage Tool Demo</title>
 <style>body{font:16px/1.6 Arial,"Microsoft YaHei",sans-serif;max-width:850px;margin:50px auto;padding:0 20px;color:#172033}h1{font-size:28px}.card{padding:22px;border:1px solid #d8e0ea;border-radius:8px;background:#f8fafc}a{display:inline-block;margin:8px 8px 0 0;padding:9px 14px;border-radius:5px;background:#1769e0;color:white;text-decoration:none}.secondary{background:#7c3aed}code{background:#eef2f7;padding:2px 5px}</style></head>
-<body><h1>Coverage Tool 浏览器 Demo</h1><div class="card"><p>项目：<code>coverage_demo</code>。示例使用 SQLite 持久化，不需要安装 MySQL。</p><p>建议先打开源码填写页，填写一条后暂存，再到进展页查看并导出报表。</p><a href="html/calculator.c.gcov.html?mode=immediate">打开源码填写页</a><a class="secondary" href="html/coverage_progress.html?project=coverage_demo">查看进展与导出</a></div></body></html>"""
+<body><h1>Coverage Tool 浏览器 Demo</h1><div class="card"><p>项目：<code>coverage_demo</code>。示例使用 SQLite 持久化，不需要安装 MySQL。</p><p>建议先打开源码填写页，填写一条后暂存，再到进展页查看并导出报表。也可打开增量任务清单，查看 Git 作者、提交文件和待填写行的关联效果。</p><a href="html/calculator.c.gcov.html?mode=immediate">打开源码填写页</a><a class="secondary" href="html/coverage_progress.html?project=coverage_demo">查看进展与导出</a><a href="html/incremental_developer_tasks.html">查看开发人员增量清单</a></div></body></html>"""
     with open(os.path.join(output_dir, "index.html"), "w", encoding="utf-8") as target:
         target.write(index)
 

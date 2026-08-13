@@ -56,6 +56,69 @@ def run_git_diff(repo_path, oldgit, newgit):
     return stdout
 
 
+def run_git_developer_file_changes(repo_path, oldgit, newgit, repository_name=""):
+    """Return author-to-file changes for commits in ``oldgit..newgit``.
+
+    Git author information is deliberately collected from commit history instead
+    of the local operating-system account.  A file may be associated with more
+    than one author when several commits touched it in the selected range.
+    Deleted files are excluded because they cannot contain a current coverage
+    review target.  Renames and copies are assigned to their destination path.
+    """
+    proc = subprocess.Popen(
+        [
+            "git", "log", "--no-ext-diff", "--no-color", "--find-renames",
+            "--date=iso-strict", "--format=%H%x1f%an%x1f%ae%x1f%ad%x1f%s",
+            "--name-status", "{}..{}".format(oldgit, newgit),
+        ],
+        cwd=repo_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout, stderr = proc.communicate()
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", "replace")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    if proc.returncode != 0:
+        message = stderr.strip() or "git log failed"
+        raise RuntimeError(
+            "git log {}..{} failed: {}".format(oldgit, newgit, message)
+        )
+
+    changes = []
+    current_commit = None
+    for raw_line in stdout.splitlines():
+        if "\x1f" in raw_line:
+            fields = raw_line.split("\x1f", 4)
+            if len(fields) == 5 and re.match(r"^[0-9a-fA-F]{7,64}$", fields[0]):
+                current_commit = {
+                    "repository": repository_name,
+                    "commit": fields[0],
+                    "author_name": fields[1] or "Unknown",
+                    "author_email": fields[2] or "",
+                    "committed_at": fields[3] or "",
+                    "subject": fields[4] or "",
+                }
+                continue
+        if not current_commit or not raw_line:
+            continue
+
+        parts = raw_line.split("\t")
+        status = parts[0] if parts else ""
+        if not status or status.startswith("D"):
+            continue
+        # R100 old/path new/path and C100 old/path new/path use the target file.
+        file_path = parts[-1] if len(parts) > 1 else ""
+        file_path = normalize_path(file_path)
+        if not file_path:
+            continue
+        item = dict(current_commit)
+        item.update({"file_path": file_path, "change_type": status})
+        changes.append(item)
+    return changes
+
+
 def generate_diff_files(repo_path, oldgit, newgit, out_file):
     """Generate a diff file. Kept for backward compatibility with the old CLI."""
     diff_text = run_git_diff(repo_path, oldgit, newgit)
@@ -256,12 +319,145 @@ def build_summary(counters):
     }
 
 
+def build_developer_tasks(details, developer_file_changes):
+    """Join Git authors with the coverage summary for each changed file.
+
+    The coverage result is calculated from the final diff, while Git history is
+    calculated per commit.  Therefore a jointly modified file is deliberately
+    listed for every author who touched it; this makes the hand-off visible
+    instead of arbitrarily assigning the file to the last committer.
+    """
+    metrics_by_file = {}
+    for item in details:
+        key = (item.get("repository", ""), normalize_path(item.get("file_path", "")))
+        metrics = metrics_by_file.setdefault(key, {
+            "repository": item.get("repository", ""),
+            "file_path": key[1],
+            "review_file_path": item.get("review_file_path") or item.get("coverage_file") or key[1],
+            "changed": 0,
+            "covered": 0,
+            "uncovered": 0,
+            "ignored": 0,
+            "missing": 0,
+        })
+        metrics["changed"] += 1
+        status = item.get("status")
+        if status == STATUS_COVERED:
+            metrics["covered"] += 1
+        elif status == STATUS_UNCOVERED:
+            metrics["uncovered"] += 1
+        elif status == STATUS_IGNORED:
+            metrics["ignored"] += 1
+        elif status == STATUS_MISSING:
+            metrics["missing"] += 1
+
+    developers = {}
+    for change in developer_file_changes or []:
+        repository = change.get("repository", "")
+        file_path = normalize_path(change.get("file_path", ""))
+        if not file_path:
+            continue
+        author_name = change.get("author_name") or "Unknown"
+        author_email = change.get("author_email") or ""
+        # Email is the stable identity.  Name fallback keeps older repositories
+        # with missing author email address usable as well.
+        identity = author_email.strip().lower() or author_name.strip().lower()
+        if not identity:
+            identity = "unknown"
+        developer = developers.setdefault(identity, {
+            "name": author_name,
+            "email": author_email,
+            "commits": {},
+            "files": {},
+        })
+
+        commit_id = change.get("commit") or ""
+        if commit_id:
+            developer["commits"]["{}:{}".format(repository, commit_id)] = {
+                "repository": repository,
+                "commit": commit_id,
+                "committed_at": change.get("committed_at") or "",
+                "subject": change.get("subject") or "",
+            }
+
+        file_key = (repository, file_path)
+        file_task = developer["files"].setdefault(file_key, {
+            "repository": repository,
+            "file_path": file_path,
+            "change_types": set(),
+            "commits": {},
+        })
+        change_type = change.get("change_type") or ""
+        if change_type:
+            file_task["change_types"].add(change_type)
+        if commit_id:
+            file_task["commits"][commit_id] = {
+                "commit": commit_id,
+                "committed_at": change.get("committed_at") or "",
+                "subject": change.get("subject") or "",
+            }
+
+    result_developers = []
+    for developer in developers.values():
+        tasks = []
+        for file_task in developer["files"].values():
+            metrics = metrics_by_file.get(
+                (file_task["repository"], file_task["file_path"]), {}
+            )
+            task = {
+                "repository": file_task["repository"],
+                "file_path": file_task["file_path"],
+                "review_file_path": metrics.get("review_file_path", file_task["file_path"]),
+                "change_types": sorted(file_task["change_types"]),
+                "commits": sorted(
+                    file_task["commits"].values(),
+                    key=lambda item: (item["committed_at"], item["commit"]),
+                    reverse=True,
+                ),
+                "changed": metrics.get("changed", 0),
+                "covered": metrics.get("covered", 0),
+                "uncovered": metrics.get("uncovered", 0),
+                "ignored": metrics.get("ignored", 0),
+                "missing": metrics.get("missing", 0),
+            }
+            tasks.append(task)
+
+        tasks.sort(key=lambda item: (
+            -item["uncovered"], -item["changed"], item["repository"], item["file_path"]
+        ))
+        commits = sorted(
+            developer["commits"].values(),
+            key=lambda item: (item["committed_at"], item["commit"]),
+            reverse=True,
+        )
+        result_developers.append({
+            "name": developer["name"],
+            "email": developer["email"],
+            "commit_total": len(commits),
+            "changed_file_total": len(tasks),
+            "review_file_total": sum(1 for item in tasks if item["uncovered"]),
+            "review_uncovered_total": sum(item["uncovered"] for item in tasks),
+            "commits": commits,
+            "files": tasks,
+        })
+
+    result_developers.sort(key=lambda item: (
+        -item["review_uncovered_total"], -item["review_file_total"],
+        item["name"].lower(), item["email"].lower(),
+    ))
+    return {"developers": result_developers}
+
+
 def calculate_repository_coverage(repo_path, oldgit, newgit, coverage_data, info_files,
-                                  diff_text=None, repository_name=""):
+                                  diff_text=None, repository_name="", developer_file_changes=None):
     """Calculate one repository against already-loaded LCOV data."""
     repo_path = os.path.abspath(repo_path)
     if diff_text is None:
         diff_text = run_git_diff(repo_path, oldgit, newgit)
+    if developer_file_changes is None:
+        developer_file_changes = run_git_developer_file_changes(
+            repo_path, oldgit, newgit, repository_name
+        )
     changes = parse_diff_text(diff_text)
 
     details = []
@@ -296,7 +492,7 @@ def calculate_repository_coverage(repo_path, oldgit, newgit, coverage_data, info
             })
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "repo_path": repo_path,
         "oldgit": oldgit,
@@ -310,14 +506,18 @@ def calculate_repository_coverage(repo_path, oldgit, newgit, coverage_data, info
         "review_lines_by_file": {
             filename: sorted(lines) for filename, lines in sorted(review_lines_by_file.items())
         },
+        "developer_file_changes": developer_file_changes,
+        "developer_tasks": build_developer_tasks(details, developer_file_changes),
     }
 
 
-def calculate_incremental_coverage(repo_path, oldgit, newgit, info_path, diff_text=None):
+def calculate_incremental_coverage(repo_path, oldgit, newgit, info_path, diff_text=None,
+                                   developer_file_changes=None):
     """Calculate coverage of Git-added lines in one repository."""
     coverage_data, info_files = load_lcov_info(info_path)
     return calculate_repository_coverage(
-        repo_path, oldgit, newgit, coverage_data, info_files, diff_text
+        repo_path, oldgit, newgit, coverage_data, info_files, diff_text,
+        developer_file_changes=developer_file_changes,
     )
 
 
@@ -336,6 +536,7 @@ def calculate_multi_repo_incremental_coverage(repositories, info_path):
     raw_uncovered_lines = {}
     review_lines_by_file = defaultdict(list)
     repository_summaries = []
+    developer_file_changes = []
 
     for repository in repositories:
         name = repository["name"]
@@ -357,6 +558,7 @@ def calculate_multi_repo_incremental_coverage(repositories, info_path):
                 )
             counters[item["status"]] += 1
         details.extend(result["details"])
+        developer_file_changes.extend(result.get("developer_file_changes") or [])
         for file_path, lines in result["uncovered_lines_by_file"].items():
             raw_uncovered_lines["{}:{}".format(name, file_path)] = lines
         for file_path, lines in result["review_lines_by_file"].items():
@@ -370,7 +572,7 @@ def calculate_multi_repo_incremental_coverage(repositories, info_path):
         })
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "repo_path": "",
         "oldgit": "multiple",
@@ -383,6 +585,8 @@ def calculate_multi_repo_incremental_coverage(repositories, info_path):
         "review_lines_by_file": {
             filename: sorted(set(lines)) for filename, lines in sorted(review_lines_by_file.items())
         },
+        "developer_file_changes": developer_file_changes,
+        "developer_tasks": build_developer_tasks(details, developer_file_changes),
     }
 
 
@@ -489,7 +693,7 @@ def _build_simple_xlsx(sheet_defs):
 
 
 def write_result_excel(result, output_path):
-    """Write the familiar Details/Summary workbook without external dependencies."""
+    """Write incremental line details plus developer-facing task sheets."""
     details_rows = [["Repository", "File", "Coverage File", "Line", "Execution Count", "Coverage"]]
     for item in result["details"]:
         details_rows.append([
@@ -528,6 +732,39 @@ def write_result_excel(result, output_path):
                 repository_summary["uncovered"], "{:.2f}%".format(rate) if rate is not None else "N/A",
             ])
         sheet_defs.append(("Repositories", repository_rows))
+
+    developer_tasks = result.get("developer_tasks") or {}
+    developer_rows = [[
+        "Developer", "Email", "Commits", "Changed Files", "Files Need Fill",
+        "Uncovered Lines Need Fill",
+    ]]
+    developer_file_rows = [[
+        "Developer", "Email", "Repository", "File", "Change Types", "Commits",
+        "Changed Lines", "Covered", "Uncovered Need Fill", "Ignored", "Coverage Missing",
+        "Commit Subjects",
+    ]]
+    for developer in developer_tasks.get("developers") or []:
+        developer_rows.append([
+            developer.get("name", ""), developer.get("email", ""),
+            developer.get("commit_total", 0), developer.get("changed_file_total", 0),
+            developer.get("review_file_total", 0), developer.get("review_uncovered_total", 0),
+        ])
+        for file_task in developer.get("files") or []:
+            commits = file_task.get("commits") or []
+            developer_file_rows.append([
+                developer.get("name", ""), developer.get("email", ""),
+                file_task.get("repository", ""), file_task.get("file_path", ""),
+                ", ".join(file_task.get("change_types") or []),
+                ", ".join(item.get("commit", "")[:12] for item in commits),
+                file_task.get("changed", 0), file_task.get("covered", 0),
+                file_task.get("uncovered", 0), file_task.get("ignored", 0),
+                file_task.get("missing", 0),
+                " | ".join(item.get("subject", "") for item in commits),
+            ])
+    sheet_defs.extend([
+        ("Developer Summary", developer_rows),
+        ("Developer Files", developer_file_rows),
+    ])
     with open(output_path, "wb") as handle:
         handle.write(_build_simple_xlsx(sheet_defs))
 

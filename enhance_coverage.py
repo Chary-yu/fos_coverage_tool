@@ -3900,6 +3900,12 @@ def get_report_page_link(source_path, report_pages):
     return ""
 
 
+def incremental_developer_anchor(developer):
+    """Return a stable, HTML-safe anchor for one Git author."""
+    identity = "{}\n{}".format(developer.get("name", ""), developer.get("email", ""))
+    return "developer-{}".format(hashlib.sha1(identity.encode("utf-8")).hexdigest()[:12])
+
+
 def write_incremental_summary_page(output_html_dir, project_name, result):
     """Create an auditable landing page for the generated incremental review site."""
     summary = result["summary"]
@@ -3970,6 +3976,26 @@ def write_incremental_summary_page(output_html_dir, project_name, result):
     rate = summary["coverage_rate"]
     rate_text = "N/A" if rate is None else "{:.2f}%".format(rate)
     table_rows = "".join(rows) or '<tr><td colspan="7">本次 Git diff 没有新增代码行。</td></tr>'
+    developer_rows = []
+    for index, developer in enumerate(
+            (result.get("developer_tasks") or {}).get("developers") or [], start=1):
+        anchor = incremental_developer_anchor(developer)
+        name = escaped(developer.get("name", "Unknown"))
+        email = escaped(developer.get("email", ""))
+        display_name = name if not email else "{} &lt;{}&gt;".format(name, email)
+        developer_rows.append(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"incremental_developer_tasks.html#{}\">查看清单</a></td></tr>".format(
+                display_name,
+                developer.get("commit_total", 0),
+                developer.get("changed_file_total", 0),
+                developer.get("review_file_total", 0),
+                developer.get("review_uncovered_total", 0),
+                anchor,
+            )
+        )
+    developer_table_rows = "".join(developer_rows) or (
+        '<tr><td colspan="6">未找到此 Git 范围内可映射的提交作者。</td></tr>'
+    )
     repositories = result.get("repositories") or []
     if repositories:
         git_range_text = "{} 个仓库的 Git 范围".format(len(repositories))
@@ -3991,8 +4017,9 @@ main{{max-width:1180px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}
 </style></head><body><main>
 <h1>增量覆盖率审查</h1>
 <div class="muted">项目：{project}；Git 范围：{git_range_text}；生成时间：{generated_at}</div>{repository_ranges}
-<div class="links"><a href="coverage_progress.html?scope=incremental&amp;project={project_url}">查看填写进度</a>　<a href="incremental_coverage.json">下载计算结果 JSON</a>　<a href="incremental_coverage.xlsx">下载计算结果 Excel</a></div>
+<div class="links"><a href="coverage_progress.html?scope=incremental&amp;project={project_url}">查看填写进度</a>　<a href="incremental_developer_tasks.html">开发人员待填写清单</a>　<a href="incremental_coverage.json">下载计算结果 JSON</a>　<a href="incremental_coverage.xlsx">下载计算结果 Excel</a></div>
 <div class="cards"><div class="card"><div class="label">新增行</div><div class="value">{changed}</div></div><div class="card"><div class="label">已覆盖</div><div class="value">{covered}</div></div><div class="card"><div class="label">增量未覆盖（可填写）</div><div class="value">{uncovered}</div></div><div class="card"><div class="label">有效增量覆盖率</div><div class="value">{rate}</div></div><div class="card"><div class="label">覆盖信息缺失</div><div class="value warning">{missing}</div></div></div>
+<section><h2>开发人员待填写概览（同一文件被多人提交时会同时列给相关人员）</h2><table><thead><tr><th>开发人员</th><th>提交数</th><th>提交文件</th><th>需填写文件</th><th>待填写行</th><th>操作</th></tr></thead><tbody>{developer_table_rows}</tbody></table></section>
 <section><h2>文件明细（点击表头可排序；默认未覆盖新增行从多到少）</h2><table id="incremental-file-table"><thead><tr><th data-sort-key="repository" aria-sort="none"><button type="button" class="sort-button" data-sort-key="repository" data-sort-type="text">仓库 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="file" aria-sort="none"><button type="button" class="sort-button" data-sort-key="file" data-sort-type="text">文件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="changed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="changed" data-sort-type="number">新增行 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="covered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="covered" data-sort-type="number">已覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="uncovered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="uncovered" data-sort-type="number">未覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ignored" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ignored" data-sort-type="number">无需覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="missing" aria-sort="none"><button type="button" class="sort-button" data-sort-key="missing" data-sort-type="number">覆盖信息缺失 <span class="sort-indicator" aria-hidden="true">↕</span></button></th></tr></thead><tbody>{table_rows}</tbody></table></section>
 </main><script>
 (function() {{
@@ -4058,9 +4085,123 @@ main{{max-width:1180px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}
         uncovered=summary["uncovered"],
         rate=rate_text,
         missing=summary["missing"],
+        developer_table_rows=developer_table_rows,
         table_rows=table_rows,
     )
     with open(os.path.join(output_html_dir, "incremental_coverage.html"), "w", encoding="utf-8") as page_file:
+        page_file.write(page)
+
+
+def write_incremental_developer_tasks_page(output_html_dir, project_name, result):
+    """Create a static, CSP-safe task list grouped by Git author.
+
+    This page intentionally contains no executable inline JavaScript: it must
+    also work when the review site is published with a strict CSP.
+    """
+    report_pages = find_report_page_links(output_html_dir)
+    developers = (result.get("developer_tasks") or {}).get("developers") or []
+
+    def escaped(value):
+        return html.escape(str(value), quote=True)
+
+    summary_rows = []
+    developer_sections = []
+    for developer in developers:
+        anchor = incremental_developer_anchor(developer)
+        name = escaped(developer.get("name", "Unknown"))
+        email = escaped(developer.get("email", ""))
+        display_name = name if not email else "{} &lt;{}&gt;".format(name, email)
+        summary_rows.append(
+            "<tr><td><a href=\"#{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                anchor, display_name, developer.get("commit_total", 0),
+                developer.get("changed_file_total", 0), developer.get("review_file_total", 0),
+                developer.get("review_uncovered_total", 0),
+            )
+        )
+
+        file_rows = []
+        for file_task in developer.get("files") or []:
+            source_path = file_task.get("review_file_path") or file_task.get("file_path", "")
+            page_link = get_report_page_link(source_path, report_pages)
+            file_path = escaped(file_task.get("file_path", ""))
+            source_cell = file_path
+            if page_link:
+                source_cell = '<a href="{}">{}</a>'.format(
+                    escaped(urllib.parse.quote(page_link, safe="/%#?=&-_.~")), file_path
+                )
+
+            commits = file_task.get("commits") or []
+            commit_text = "".join(
+                '<div><code>{}</code> {}{}</div>'.format(
+                    escaped(item.get("commit", "")[:12]),
+                    escaped(item.get("subject", "")),
+                    " <span class=\"muted\">{}</span>".format(
+                        escaped(item.get("committed_at", ""))
+                    ) if item.get("committed_at") else "",
+                ) for item in commits
+            ) or "-"
+
+            uncovered = file_task.get("uncovered", 0)
+            changed = file_task.get("changed", 0)
+            if uncovered:
+                if page_link:
+                    action = '<a class="fill-link" href="{}">填写 {} 行</a>'.format(
+                        escaped(urllib.parse.quote(page_link, safe="/%#?=&-_.~")), uncovered
+                    )
+                else:
+                    action = '<span class="todo">待填写 {} 行（未找到源码页）</span>'.format(uncovered)
+            elif changed:
+                action = '<span class="done">本次新增行无需填写</span>'
+            else:
+                action = '<span class="muted">本次提交未产生新增代码行</span>'
+
+            file_rows.append(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>"
+                "<td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                    escaped(file_task.get("repository", "") or "-"), source_cell,
+                    escaped(", ".join(file_task.get("change_types") or [])), commit_text,
+                    changed, file_task.get("covered", 0), uncovered,
+                    file_task.get("missing", 0), action,
+                )
+            )
+        if not file_rows:
+            file_rows.append('<tr><td colspan="9">此开发人员没有可展示的提交文件。</td></tr>')
+        developer_sections.append(
+            '<section id="{}"><h2>{}</h2><div class="person-stats">提交 <strong>{}</strong> 个；'
+            '提交文件 <strong>{}</strong> 个；需填写文件 <strong>{}</strong> 个；'
+            '待填写新增行 <strong class="todo">{}</strong> 行。</div><div class="table-wrap"><table>'
+            '<thead><tr><th>仓库</th><th>提交文件</th><th>变更类型</th><th>关联提交</th>'
+            '<th>新增行</th><th>已覆盖</th><th>待填写</th><th>覆盖信息缺失</th><th>操作</th></tr></thead>'
+            '<tbody>{}</tbody></table></div></section>'.format(
+                anchor, display_name, developer.get("commit_total", 0),
+                developer.get("changed_file_total", 0), developer.get("review_file_total", 0),
+                developer.get("review_uncovered_total", 0), "".join(file_rows),
+            )
+        )
+
+    summary_table_rows = "".join(summary_rows) or (
+        '<tr><td colspan="5">未找到此 Git 范围内可映射的提交作者。</td></tr>'
+    )
+    sections_html = "".join(developer_sections) or (
+        '<section><h2>暂无开发人员任务</h2><p>请确认提交范围内存在 Git commit，且当前执行用户可读取仓库历史。</p></section>'
+    )
+    page = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>开发人员待填写清单</title><style>
+body{{margin:0;background:#f5f7fb;color:#172033;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"Microsoft YaHei",sans-serif}}main{{max-width:1320px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}}h2{{margin:0;padding:12px 14px;font-size:16px;border-bottom:1px solid #d8e0ea}}.muted{{color:#64748b}}.links{{margin:16px 0}}a{{color:#1f5fbf}}section{{background:#fff;border:1px solid #d8e0ea;border-radius:6px;margin:16px 0;overflow:hidden}}.person-stats{{padding:10px 14px;background:#f8fafc;border-bottom:1px solid #e7edf4}}.table-wrap{{overflow:auto}}table{{width:100%;border-collapse:collapse;min-width:960px}}th,td{{padding:9px 10px;border-bottom:1px solid #e7edf4;text-align:left;vertical-align:top}}th{{background:#f8fafc}}code{{font-size:12px}}.todo{{color:#b45309;font-weight:700}}.done{{color:#15803d;font-weight:700}}.fill-link{{display:inline-block;background:#eef4ff;border:1px solid #c7d8ff;border-radius:4px;padding:3px 8px;text-decoration:none;font-weight:700}}@media(max-width:700px){{main{{padding:20px 12px}}}}
+</style></head><body><main>
+<h1>开发人员待填写清单</h1><div class="muted">项目：{project}；数据来源：Git 提交作者与增量覆盖率结果。</div>
+<div class="links"><a href="incremental_coverage.html">返回增量覆盖率汇总</a>　<a href="coverage_progress.html?scope=incremental&amp;project={project_url}">查看填写进度</a>　<a href="incremental_coverage.xlsx">下载 Excel</a></div>
+<section><h2>人员概览</h2><div class="table-wrap"><table><thead><tr><th>开发人员</th><th>提交数</th><th>提交文件</th><th>需填写文件</th><th>待填写行</th></tr></thead><tbody>{summary_rows}</tbody></table></div></section>
+<aside class="muted">说明：按 Git author 的“姓名 + 邮箱”区分人员。多人提交同一文件时，文件会同时出现在每位相关开发人员的清单中；“待填写”仅统计本次 Git diff 中 LCOV 未覆盖的新增行。</aside>
+{sections}
+</main></body></html>""".format(
+        project=escaped(project_name),
+        project_url=escaped(urllib.parse.quote(str(project_name), safe="")),
+        summary_rows=summary_table_rows,
+        sections=sections_html,
+    )
+    with open(os.path.join(output_html_dir, "incremental_developer_tasks.html"), "w", encoding="utf-8") as page_file:
         page_file.write(page)
 
 
@@ -4110,8 +4251,12 @@ def build_incremental_review_site(result, input_dir, output_dir, project_name,
         shutil.copy2(excel_path, html_excel_path)
 
     write_incremental_summary_page(real_output_html, project_name, result)
+    write_incremental_developer_tasks_page(real_output_html, project_name, result)
     print("[Incremental] Review home page: {}".format(
         os.path.join(real_output_html, "incremental_coverage.html")
+    ))
+    print("[Incremental] Developer task page: {}".format(
+        os.path.join(real_output_html, "incremental_developer_tasks.html")
     ))
     print("[Incremental] Result JSON: {}".format(output_json))
     print("[Incremental] Result Excel: {}".format(excel_path))
