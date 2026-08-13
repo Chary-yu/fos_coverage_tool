@@ -3982,11 +3982,16 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
                 escaped(item["ownership_status"]), ownership_cell
             )
         rows.append(
-            "<tr><td data-sort-value=\"{}\">{}</td><td data-sort-value=\"{}\">{}</td>"
+            "<tr data-repo=\"{}\" data-team=\"{}\" data-leader=\"{}\" data-ownership=\"{}\">"
+            "<td data-sort-value=\"{}\">{}</td><td data-sort-value=\"{}\">{}</td>"
             "<td data-sort-value=\"{}\">{}</td>"
             "<td data-sort-value=\"{}\">{}</td><td data-sort-value=\"{}\">{}</td>"
             "<td data-sort-value=\"{}\">{}</td><td data-sort-value=\"{}\">{}</td>"
             "<td data-sort-value=\"{}\">{}</td></tr>".format(
+                escaped(repository_name),
+                escaped(item["team"]),
+                escaped(item["leader"]),
+                escaped(ownership_text),
                 escaped(repository_name),
                 escaped(repository_name or "-"),
                 escaped(ownership_text),
@@ -4022,17 +4027,124 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
 <title>增量覆盖率审查</title><style>
 body{{margin:0;background:#f5f7fb;color:#172033;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"Microsoft YaHei",sans-serif}}
 main{{max-width:1180px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}}.muted{{color:#64748b}}.links{{margin:16px 0}}a{{color:#1f5fbf}}.repo-ranges{{margin:8px 0 0;padding-left:20px;color:#475569}}.cards{{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:12px;margin:20px 0}}.card,section{{background:#fff;border:1px solid #d8e0ea;border-radius:6px}}.card{{padding:12px}}.label{{font-size:12px;color:#64748b}}.value{{font-size:24px;font-weight:800;margin-top:4px}}section{{overflow:auto}}h2{{margin:0;padding:12px 14px;font-size:16px;border-bottom:1px solid #d8e0ea}}table{{width:100%;border-collapse:collapse;min-width:840px}}th,td{{padding:9px 10px;border-bottom:1px solid #e7edf4;text-align:left}}th{{background:#f8fafc}}.sort-button{{appearance:none;border:0;background:transparent;color:inherit;cursor:pointer;font:inherit;font-weight:700;padding:0;white-space:nowrap}}.sort-button:hover{{color:#1f5fbf}}.sort-button:focus{{outline:2px solid #93c5fd;outline-offset:2px}}.sort-indicator{{display:inline-block;min-width:1em;color:#64748b}}.warning{{color:#b45309}}@media(max-width:820px){{.cards{{grid-template-columns:repeat(2,minmax(120px,1fr))}}}}
+.filters{{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px 14px;background:#f8fafc;border-bottom:1px solid #d8e0ea}}
+.filter-group{{display:flex;align-items:center;gap:6px;font-size:13px;font-weight:600;color:#334155}}
+.filters select,.filters input[type="text"]{{height:30px;padding:0 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:13px;background:#fff;color:#1e293b}}
+.filters input[type="text"]{{width:180px}}
+.reset-btn{{height:30px;padding:0 12px;border:1px solid #cbd5e1;border-radius:4px;background:#f1f5f9;cursor:pointer;font-size:13px;font-weight:600;color:#475569}}
+.reset-btn:hover{{background:#e2e8f0;color:#1e293b}}
+.filter-count{{margin-left:auto;font-size:12px;color:#64748b;font-weight:600}}
 </style></head><body><main>
 <h1>增量覆盖率审查</h1>
 <div class="muted">项目：{project}；Git 范围：{git_range_text}；生成时间：{generated_at}</div>{repository_ranges}
 <div class="links"><a href="coverage_progress.html?scope=incremental&amp;project={project_url}">查看填写进度</a>　<a href="incremental_developer_tasks.html">开发人员待填写清单</a>　<a href="incremental_coverage.json">下载计算结果 JSON</a>　<a href="incremental_coverage.xlsx">下载计算结果 Excel</a></div>
 <div class="cards"><div class="card"><div class="label">新增行</div><div class="value">{changed}</div></div><div class="card"><div class="label">已覆盖</div><div class="value">{covered}</div></div><div class="card"><div class="label">增量未覆盖（可填写）</div><div class="value">{uncovered}</div></div><div class="card"><div class="label">有效增量覆盖率</div><div class="value">{rate}</div></div><div class="card"><div class="label">覆盖信息缺失</div><div class="value warning">{missing}</div></div></div>
-<section><h2>文件明细（点击表头可排序；默认未覆盖新增行从多到少）</h2><table id="incremental-file-table"><thead><tr><th data-sort-key="repository" aria-sort="none"><button type="button" class="sort-button" data-sort-key="repository" data-sort-type="text">仓库 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ownership" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ownership" data-sort-type="text">小组 / 组长 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="file" aria-sort="none"><button type="button" class="sort-button" data-sort-key="file" data-sort-type="text">文件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="changed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="changed" data-sort-type="number">新增行 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="covered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="covered" data-sort-type="number">已覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="uncovered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="uncovered" data-sort-type="number">未覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ignored" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ignored" data-sort-type="number">无需覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="missing" aria-sort="none"><button type="button" class="sort-button" data-sort-key="missing" data-sort-type="number">覆盖信息缺失 <span class="sort-indicator" aria-hidden="true">↕</span></button></th></tr></thead><tbody>{table_rows}</tbody></table></section>
+<section><h2>文件明细（点击表头可排序；默认未覆盖新增行从多到少）</h2>
+<div class="filters">
+  <div class="filter-group"><label for="repo-filter">仓库：</label><select id="repo-filter"><option value="">全部仓库</option></select></div>
+  <div class="filter-group"><label for="team-filter">小组：</label><select id="team-filter"><option value="">全部小组</option></select></div>
+  <div class="filter-group"><label for="leader-filter">组长：</label><select id="leader-filter"><option value="">全部组长</option></select></div>
+  <div class="filter-group"><label for="file-search">文件搜索：</label><input type="text" id="file-search" placeholder="输入文件路径关键字..."></div>
+  <button type="button" id="reset-filters-btn" class="reset-btn">重置筛选</button>
+  <span id="filter-count" class="filter-count"></span>
+</div>
+<table id="incremental-file-table"><thead><tr><th data-sort-key="repository" aria-sort="none"><button type="button" class="sort-button" data-sort-key="repository" data-sort-type="text">仓库 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ownership" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ownership" data-sort-type="text">小组 / 组长 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="file" aria-sort="none"><button type="button" class="sort-button" data-sort-key="file" data-sort-type="text">文件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="changed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="changed" data-sort-type="number">新增行 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="covered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="covered" data-sort-type="number">已覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="uncovered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="uncovered" data-sort-type="number">未覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ignored" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ignored" data-sort-type="number">无需覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="missing" aria-sort="none"><button type="button" class="sort-button" data-sort-key="missing" data-sort-type="number">覆盖信息缺失 <span class="sort-indicator" aria-hidden="true">↕</span></button></th></tr></thead><tbody>{table_rows}</tbody></table></section>
 </main><script>
 (function() {{
     var table = document.getElementById("incremental-file-table");
     if (!table || !table.tBodies.length) {{ return; }}
     var body = table.tBodies[0];
+
+    var repoFilter = document.getElementById("repo-filter");
+    var teamFilter = document.getElementById("team-filter");
+    var leaderFilter = document.getElementById("leader-filter");
+    var fileSearch = document.getElementById("file-search");
+    var resetBtn = document.getElementById("reset-filters-btn");
+    var filterCount = document.getElementById("filter-count");
+
+    var repos = new Set();
+    var teams = new Set();
+    var leaders = new Set();
+
+    var rows = Array.prototype.slice.call(body.rows);
+    for (var i = 0; i < rows.length; i++) {{
+        var r = rows[i];
+        var repo = r.getAttribute("data-repo");
+        var team = r.getAttribute("data-team");
+        var leader = r.getAttribute("data-leader");
+        if (repo) repos.add(repo);
+        if (team) teams.add(team);
+        if (leader) leaders.add(leader);
+    }}
+
+    function populateSelect(selectEl, values) {{
+        if (!selectEl) return;
+        Array.from(values).sort().forEach(function(val) {{
+            var opt = document.createElement("option");
+            opt.value = val;
+            opt.textContent = val;
+            selectEl.appendChild(opt);
+        }});
+    }}
+
+    populateSelect(repoFilter, repos);
+    populateSelect(teamFilter, teams);
+    populateSelect(leaderFilter, leaders);
+
+    function applyFilters() {{
+        var selRepo = repoFilter ? repoFilter.value : "";
+        var selTeam = teamFilter ? teamFilter.value : "";
+        var selLeader = leaderFilter ? leaderFilter.value : "";
+        var kw = fileSearch ? fileSearch.value.trim().toLowerCase() : "";
+
+        var total = body.rows.length;
+        var visible = 0;
+
+        for (var i = 0; i < total; i++) {{
+            var row = body.rows[i];
+            var rRepo = row.getAttribute("data-repo") || "";
+            var rTeam = row.getAttribute("data-team") || "";
+            var rLeader = row.getAttribute("data-leader") || "";
+            var rFile = (row.cells[2] ? row.cells[2].getAttribute("data-sort-value") || "" : "").toLowerCase();
+
+            var mRepo = !selRepo || rRepo === selRepo;
+            var mTeam = !selTeam || rTeam === selTeam;
+            var mLeader = !selLeader || rLeader === selLeader;
+            var mKw = !kw || rFile.indexOf(kw) !== -1;
+
+            if (mRepo && mTeam && mLeader && mKw) {{
+                row.style.display = "";
+                visible++;
+            }} else {{
+                row.style.display = "none";
+            }}
+        }}
+
+        if (filterCount) {{
+            if (selRepo || selTeam || selLeader || kw) {{
+                filterCount.textContent = "筛选匹配 " + visible + " / " + total + " 个文件";
+            }} else {{
+                filterCount.textContent = "共 " + total + " 个文件";
+            }}
+        }}
+    }}
+
+    if (repoFilter) repoFilter.addEventListener("change", applyFilters);
+    if (teamFilter) teamFilter.addEventListener("change", applyFilters);
+    if (leaderFilter) leaderFilter.addEventListener("change", applyFilters);
+    if (fileSearch) fileSearch.addEventListener("input", applyFilters);
+    if (resetBtn) {{
+        resetBtn.addEventListener("click", function() {{
+            if (repoFilter) repoFilter.value = "";
+            if (teamFilter) teamFilter.value = "";
+            if (leaderFilter) leaderFilter.value = "";
+            if (fileSearch) fileSearch.value = "";
+            applyFilters();
+        }});
+    }}
+
+    applyFilters();
+
     var keyToColumn = {{repository: 0, ownership: 1, file: 2, changed: 3, covered: 4, uncovered: 5, ignored: 6, missing: 7}};
     var currentKey = "";
     var currentDirection = 1;
