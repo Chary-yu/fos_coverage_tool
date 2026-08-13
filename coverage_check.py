@@ -33,6 +33,16 @@ def normalize_path(path):
     return normalized
 
 
+VALID_SOURCE_EXTENSIONS = ('.c', '.h')
+
+def is_valid_source_file(file_path):
+    """Return True if the file path ends with .c or .h (case-insensitive)."""
+    if not file_path:
+        return False
+    lower_path = str(file_path).lower()
+    return lower_path.endswith(VALID_SOURCE_EXTENSIONS)
+
+
 def run_git_diff(repo_path, oldgit, newgit):
     """Return the textual diff between two revisions without invoking a shell.
 
@@ -111,7 +121,7 @@ def run_git_developer_file_changes(repo_path, oldgit, newgit, repository_name=""
         # R100 old/path new/path and C100 old/path new/path use the target file.
         file_path = parts[-1] if len(parts) > 1 else ""
         file_path = normalize_path(file_path)
-        if not file_path:
+        if not file_path or not is_valid_source_file(file_path):
             continue
         item = dict(current_commit)
         item.update({"file_path": file_path, "change_type": status})
@@ -143,10 +153,12 @@ def parse_diff_text(diff_text):
             if candidate == "/dev/null":
                 current_file = None
             elif candidate.startswith("b/"):
-                current_file = normalize_path(candidate[2:])
-                file_changes.setdefault(current_file, [])
+                normalized = normalize_path(candidate[2:])
+                current_file = normalized if is_valid_source_file(normalized) else None
             else:
-                current_file = normalize_path(candidate)
+                normalized = normalize_path(candidate)
+                current_file = normalized if is_valid_source_file(normalized) else None
+            if current_file:
                 file_changes.setdefault(current_file, [])
             new_line_num = None
             continue
@@ -183,8 +195,12 @@ def parse_lcov_info(info_file):
         for raw_line in handle:
             line = raw_line.strip()
             if line.startswith("SF:"):
-                current_file = normalize_path(line[3:])
-                coverage_data.setdefault(current_file, {})
+                normalized = normalize_path(line[3:])
+                if is_valid_source_file(normalized):
+                    current_file = normalized
+                    coverage_data.setdefault(current_file, {})
+                else:
+                    current_file = None
             elif line.startswith("DA:") and current_file:
                 parts = line[3:].split(",", 2)
                 try:

@@ -37,6 +37,31 @@ end_of_record
     def tearDown(self):
         shutil.rmtree(self.temp_dir)
 
+    def test_file_extension_filtering(self):
+        self.assertTrue(coverage_check.is_valid_source_file("src/main.c"))
+        self.assertTrue(coverage_check.is_valid_source_file("include/header.h"))
+        self.assertFalse(coverage_check.is_valid_source_file("Makefile"))
+        self.assertFalse(coverage_check.is_valid_source_file("config.json"))
+        self.assertFalse(coverage_check.is_valid_source_file("libfoo.so"))
+
+        diff_text = """diff --git a/src/main.c b/src/main.c
++++ b/src/main.c
+@@ -10,0 +10,1 @@
++covered();
+diff --git a/Makefile b/Makefile
++++ b/Makefile
+@@ -1,0 +1,5 @@
++ALL: target
+diff --git a/config.json b/config.json
++++ b/config.json
+@@ -1,0 +1,5 @@
++{"key": "value"}
+"""
+        file_changes = coverage_check.parse_diff_text(diff_text)
+        self.assertIn("src/main.c", file_changes)
+        self.assertNotIn("Makefile", file_changes)
+        self.assertNotIn("config.json", file_changes)
+
     def test_calculate_added_line_statuses_and_xlsx(self):
         diff_text = """diff --git a/src/main.c b/src/main.c
 index 111..222 100644
@@ -143,7 +168,7 @@ diff --git a/src/not_in_lcov.c b/src/not_in_lcov.c
         os.makedirs(repo_c)
         with open(self.info_path, "w", encoding="utf-8") as info_file:
             for repo_path in (self.repo_dir, repo_b, repo_c):
-                info_file.write("SF:{}/src/shared.c\nDA:10,1\nDA:11,0\nend_of_record\n".format(repo_path))
+                info_file.write("SF:{}/src/shared.c\nDA:10,1\nDA:11,0\nend_of_record\n".format(coverage_check.normalize_path(repo_path)))
 
         repositories = [
             {"name": "repo_a", "path": self.repo_dir, "oldgit": "a1", "newgit": "a2"},
@@ -167,9 +192,9 @@ diff --git a/src/not_in_lcov.c b/src/not_in_lcov.c
         self.assertEqual(
             result["review_lines_by_file"],
             {
-                os.path.join(self.repo_dir, "src", "shared.c"): [11],
-                os.path.join(repo_b, "src", "shared.c"): [11],
-                os.path.join(repo_c, "src", "shared.c"): [11],
+                coverage_check.normalize_path(os.path.join(self.repo_dir, "src", "shared.c")): [11],
+                coverage_check.normalize_path(os.path.join(repo_b, "src", "shared.c")): [11],
+                coverage_check.normalize_path(os.path.join(repo_c, "src", "shared.c")): [11],
             },
         )
 
@@ -270,7 +295,7 @@ class TestIncrementalReviewInjection(unittest.TestCase):
         self.output_dir = os.path.join(self.temp_dir, "review")
         os.makedirs(self.repo_dir)
         os.makedirs(self.input_dir)
-        self.page_path = os.path.join(self.input_dir, "module.gcov.html")
+        self.page_path = os.path.join(self.input_dir, "module.c.gcov.html")
         with open(self.page_path, "w", encoding="utf-8") as page:
             page.write("""<!doctype html><html><head><title>LCOV - cov - src/main.c</title></head>
 <body><pre class="source">
@@ -310,7 +335,7 @@ class TestIncrementalReviewInjection(unittest.TestCase):
             self.output_dir, "incremental_test", workers=1, render_mode="lazy",
         )
 
-        with open(os.path.join(self.output_dir, "module.gcov.html"), "r", encoding="utf-8") as page:
+        with open(os.path.join(self.output_dir, "module.c.gcov.html"), "r", encoding="utf-8") as page:
             enhanced = page.read()
         self.assertIn('data-coverage-review="incremental"', enhanced)
         self.assertEqual(enhanced.count('data-coverage-review="incremental"'), 1)
@@ -340,10 +365,10 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         self.temp_dir = tempfile.mkdtemp()
         self.input_dir = os.path.join(self.temp_dir, "coverage")
         self.output_dir = os.path.join(self.temp_dir, "review")
-        self.repo_a_source = os.path.join(self.temp_dir, "repo_a", "src", "shared.c")
-        self.repo_b_source = os.path.join(self.temp_dir, "repo_b", "src", "shared.c")
+        self.repo_a_source = coverage_check.normalize_path(os.path.join(self.temp_dir, "repo_a", "src", "shared.c"))
+        self.repo_b_source = coverage_check.normalize_path(os.path.join(self.temp_dir, "repo_b", "src", "shared.c"))
         os.makedirs(self.input_dir)
-        for filename, source_path in (("repo_a.gcov.html", self.repo_a_source), ("repo_b.gcov.html", self.repo_b_source)):
+        for filename, source_path in (("repo_a.c.gcov.html", self.repo_a_source), ("repo_b.c.gcov.html", self.repo_b_source)):
             with open(os.path.join(self.input_dir, filename), "w", encoding="utf-8") as page:
                 page.write("""<!doctype html><html><head><title>LCOV - cov - {}</title></head>
 <body><pre class="source"><span class="lineNum"> 11 </span><span class="lineNoCov"> target();</span></pre></body></html>""".format(source_path))
@@ -384,7 +409,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
             result, self.input_dir, self.output_dir, "multi_review", workers=1, render_mode="lazy"
         )
 
-        for filename in ("repo_a.gcov.html", "repo_b.gcov.html"):
+        for filename in ("repo_a.c.gcov.html", "repo_b.c.gcov.html"):
             with open(os.path.join(self.output_dir, filename), "r", encoding="utf-8") as page:
                 self.assertIn('data-coverage-review="incremental"', page.read())
         with open(os.path.join(self.output_dir, "incremental_coverage.html"), "r", encoding="utf-8") as summary_page:

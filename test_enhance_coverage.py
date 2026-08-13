@@ -395,7 +395,7 @@ class TestIntegration(unittest.TestCase):
         </body>
         </html>
         """
-        with open(os.path.join(self.input_dir, "module.gcov.html"), "w", encoding="utf-8") as f:
+        with open(os.path.join(self.input_dir, "module.c.gcov.html"), "w", encoding="utf-8") as f:
             f.write(self.mock_html)
 
     def tearDown(self):
@@ -457,7 +457,7 @@ class TestIntegration(unittest.TestCase):
         )
 
         # Verify HTML injection and file copies
-        enhanced_html = os.path.join(self.output_dir, "module.gcov.html")
+        enhanced_html = os.path.join(self.output_dir, "module.c.gcov.html")
         self.assertTrue(os.path.exists(enhanced_html))
         with open(enhanced_html, "r", encoding="utf-8") as f:
             html_content = f.read()

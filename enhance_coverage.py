@@ -3797,7 +3797,7 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
     for root, dirs, files in os.walk(real_output_html):
         dirs.sort()
         for file in sorted(files):
-            if file.endswith(".gcov.html"):
+            if file.endswith(".c.gcov.html") or file.endswith(".h.gcov.html"):
                 file_path = os.path.join(root, file)
                 rel_path = os.path.relpath(file_path, real_output_html)
                 gcov_files.append((file_path, rel_path))
@@ -3872,7 +3872,7 @@ def find_report_page_links(report_html_dir):
     for root, dirs, files in os.walk(report_html_dir):
         dirs.sort()
         for filename in sorted(files):
-            if not filename.endswith(".gcov.html"):
+            if not (filename.endswith(".c.gcov.html") or filename.endswith(".h.gcov.html")):
                 continue
             page_path = os.path.join(root, filename)
             try:
@@ -4004,26 +4004,6 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
     rate = summary["coverage_rate"]
     rate_text = "N/A" if rate is None else "{:.2f}%".format(rate)
     table_rows = "".join(rows) or '<tr><td colspan="8">本次 Git diff 没有新增代码行。</td></tr>'
-    developer_rows = []
-    for index, developer in enumerate(
-            (result.get("developer_tasks") or {}).get("developers") or [], start=1):
-        anchor = incremental_developer_anchor(developer)
-        name = escaped(developer.get("name", "Unknown"))
-        email = escaped(developer.get("email", ""))
-        display_name = name if not email else "{} &lt;{}&gt;".format(name, email)
-        developer_rows.append(
-            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td><a href=\"incremental_developer_tasks.html#{}\">查看清单</a></td></tr>".format(
-                display_name,
-                developer.get("commit_total", 0),
-                developer.get("changed_file_total", 0),
-                developer.get("review_file_total", 0),
-                developer.get("review_uncovered_total", 0),
-                anchor,
-            )
-        )
-    developer_table_rows = "".join(developer_rows) or (
-        '<tr><td colspan="6">未找到此 Git 范围内可映射的提交作者。</td></tr>'
-    )
     repositories = result.get("repositories") or []
     if repositories:
         git_range_text = "{} 个仓库的 Git 范围".format(len(repositories))
@@ -4047,7 +4027,6 @@ main{{max-width:1180px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}
 <div class="muted">项目：{project}；Git 范围：{git_range_text}；生成时间：{generated_at}</div>{repository_ranges}
 <div class="links"><a href="coverage_progress.html?scope=incremental&amp;project={project_url}">查看填写进度</a>　<a href="incremental_developer_tasks.html">开发人员待填写清单</a>　<a href="incremental_coverage.json">下载计算结果 JSON</a>　<a href="incremental_coverage.xlsx">下载计算结果 Excel</a></div>
 <div class="cards"><div class="card"><div class="label">新增行</div><div class="value">{changed}</div></div><div class="card"><div class="label">已覆盖</div><div class="value">{covered}</div></div><div class="card"><div class="label">增量未覆盖（可填写）</div><div class="value">{uncovered}</div></div><div class="card"><div class="label">有效增量覆盖率</div><div class="value">{rate}</div></div><div class="card"><div class="label">覆盖信息缺失</div><div class="value warning">{missing}</div></div></div>
-<section><h2>开发人员待填写概览（同一文件被多人提交时会同时列给相关人员）</h2><table><thead><tr><th>开发人员</th><th>提交数</th><th>提交文件</th><th>需填写文件</th><th>待填写行</th><th>操作</th></tr></thead><tbody>{developer_table_rows}</tbody></table></section>
 <section><h2>文件明细（点击表头可排序；默认未覆盖新增行从多到少）</h2><table id="incremental-file-table"><thead><tr><th data-sort-key="repository" aria-sort="none"><button type="button" class="sort-button" data-sort-key="repository" data-sort-type="text">仓库 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ownership" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ownership" data-sort-type="text">小组 / 组长 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="file" aria-sort="none"><button type="button" class="sort-button" data-sort-key="file" data-sort-type="text">文件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="changed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="changed" data-sort-type="number">新增行 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="covered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="covered" data-sort-type="number">已覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="uncovered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="uncovered" data-sort-type="number">未覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ignored" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ignored" data-sort-type="number">无需覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="missing" aria-sort="none"><button type="button" class="sort-button" data-sort-key="missing" data-sort-type="number">覆盖信息缺失 <span class="sort-indicator" aria-hidden="true">↕</span></button></th></tr></thead><tbody>{table_rows}</tbody></table></section>
 </main><script>
 (function() {{
@@ -4113,7 +4092,6 @@ main{{max-width:1180px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}
         uncovered=summary["uncovered"],
         rate=rate_text,
         missing=summary["missing"],
-        developer_table_rows=developer_table_rows,
         table_rows=table_rows,
     )
     with open(os.path.join(output_html_dir, "incremental_coverage.html"), "w", encoding="utf-8") as page_file:
