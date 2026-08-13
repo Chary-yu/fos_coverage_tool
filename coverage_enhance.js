@@ -27,6 +27,7 @@
 
     let totalUncovered = 0;       // 物理未覆盖代码行总数
     let blocks = [];              // 合并与隔离切分后的 Block 列表 (元素为 [{span, lineNum}])
+    let blockRanges = [];         // 保存 Block 行号范围以用于动态代码折叠
     let panelsMap = new Map();     // startLine -> {select, reviewerInput, methodInput, reasonInput, saveBtn, block}
     let legacyPanelSyncers = [];
     let legacyRefreshRequested = false;
@@ -703,13 +704,273 @@
                     progress.innerText = `Coverage controls ready: ${totalBlocks} (${elapsed}s)`;
                     setTimeout(() => progress.remove(), 1500);
                 }
+                blockRanges = blocks.map(b => ({
+                    startLine: getBlockStartItem(b).lineNum,
+                    endLine: getBlockEndLineNum(b),
+                    block: b
+                }));
                 blocks = [];
+                applyFrontendFolding(false);
                 requestLegacyPanelRefresh(4);
                 updateReviewNavigation();
                 onComplete();
             }
 
             scheduleNextRender(renderBatch);
+        }
+
+        let isFoldedModeActive = false;
+        let foldBars = [];
+        const CONTEXT_LINES_DEFAULT = 10;
+        const MERGE_GAP_THRESHOLD = 15;
+
+        function getLineContainer(item) {
+            if (!item || !item.span) return null;
+            if (item.span.closest) {
+                const tr = item.span.closest('tr');
+                if (tr) return tr;
+            }
+            if (item.lineNumSpan && item.lineNumSpan.closest) {
+                const parentTr = item.lineNumSpan.closest('tr');
+                if (parentTr) return parentTr;
+            }
+            return item.span;
+        }
+
+        function removeExistingFoldBars() {
+            foldBars.forEach(bar => {
+                if (bar && bar.parentNode) {
+                    bar.parentNode.removeChild(bar);
+                }
+            });
+            foldBars = [];
+        }
+
+        function unfoldAllLines() {
+            if (!sourceLines) return;
+            removeExistingFoldBars();
+            for (let i = 0; i < sourceLines.length; i++) {
+                const item = sourceLines.get(i);
+                if (item) {
+                    const container = getLineContainer(item);
+                    if (container) {
+                        container.style.display = '';
+                    }
+                }
+            }
+            isFoldedModeActive = false;
+            updateFoldToggleButton();
+        }
+
+        function applyFrontendFolding(forceUnfold) {
+            const totalLinesCount = sourceLines ? sourceLines.length : 0;
+            if (!sourceLines || totalLinesCount === 0) return;
+
+            if (forceUnfold || blockRanges.length === 0) {
+                unfoldAllLines();
+                return;
+            }
+
+            const ranges = [];
+            blockRanges.forEach(b => {
+                const vStart = Math.max(1, b.startLine - CONTEXT_LINES_DEFAULT);
+                const vEnd = Math.min(totalLinesCount, b.endLine + CONTEXT_LINES_DEFAULT);
+                ranges.push({ start: vStart, end: vEnd });
+            });
+
+            ranges.sort((a, b) => a.start - b.start);
+
+            const merged = [];
+            ranges.forEach(r => {
+                if (merged.length === 0) {
+                    merged.push(r);
+                } else {
+                    const last = merged[merged.length - 1];
+                    if (r.start <= last.end + MERGE_GAP_THRESHOLD) {
+                        last.end = Math.max(last.end, r.end);
+                    } else {
+                        merged.push(r);
+                    }
+                }
+            });
+
+            removeExistingFoldBars();
+
+            const visibleSet = new Set();
+            merged.forEach(r => {
+                for (let l = r.start; l <= r.end; l++) {
+                    visibleSet.add(l);
+                }
+            });
+
+            let lastVisibleLine = 0;
+            for (let index = 0; index < totalLinesCount; index++) {
+                const item = sourceLines.get(index);
+                if (!item) continue;
+                const lineNum = item.lineNum;
+                const container = getLineContainer(item);
+                if (!container) continue;
+
+                if (visibleSet.has(lineNum)) {
+                    container.style.display = '';
+                    if (lastVisibleLine > 0 && lineNum > lastVisibleLine + 1) {
+                        const hiddenStart = lastVisibleLine + 1;
+                        const hiddenEnd = lineNum - 1;
+                        const hiddenCount = lineNum - lastVisibleLine - 1;
+                        createFoldBar(container, hiddenStart, hiddenEnd, hiddenCount, false);
+                    }
+                    lastVisibleLine = lineNum;
+                } else {
+                    container.style.display = 'none';
+                }
+            }
+
+            if (lastVisibleLine > 0 && lastVisibleLine < totalLinesCount) {
+                const trailingItem = sourceLines.get(totalLinesCount - 1);
+                if (trailingItem) {
+                    const container = getLineContainer(trailingItem);
+                    const hiddenStart = lastVisibleLine + 1;
+                    const hiddenEnd = totalLinesCount;
+                    const hiddenCount = totalLinesCount - lastVisibleLine;
+                    createFoldBar(container, hiddenStart, hiddenEnd, hiddenCount, true);
+                }
+            }
+
+            isFoldedModeActive = true;
+            updateFoldToggleButton();
+        }
+
+        function createFoldBar(targetContainer, hiddenStart, hiddenEnd, count, isAtEnd) {
+            const isTable = targetContainer.tagName === 'TR';
+            let foldRow;
+
+            if (isTable) {
+                foldRow = document.createElement('tr');
+                foldRow.className = 'coverage-fold-bar-row';
+                const td = document.createElement('td');
+                td.colSpan = targetContainer.cells ? targetContainer.cells.length : 3;
+                td.className = 'coverage-fold-bar-cell';
+                td.appendChild(buildFoldControlButtons(hiddenStart, hiddenEnd, count));
+                foldRow.appendChild(td);
+            } else {
+                foldRow = document.createElement('div');
+                foldRow.className = 'coverage-fold-bar-block';
+                foldRow.appendChild(buildFoldControlButtons(hiddenStart, hiddenEnd, count));
+            }
+
+            if (isAtEnd) {
+                if (targetContainer.nextSibling) {
+                    targetContainer.parentNode.insertBefore(foldRow, targetContainer.nextSibling);
+                } else {
+                    targetContainer.parentNode.appendChild(foldRow);
+                }
+            } else {
+                targetContainer.parentNode.insertBefore(foldRow, targetContainer);
+            }
+            foldBars.push(foldRow);
+        }
+
+        function buildFoldControlButtons(hiddenStart, hiddenEnd, count) {
+            const bar = document.createElement('div');
+            bar.className = 'coverage-fold-controls';
+
+            const upBtn = document.createElement('button');
+            upBtn.type = 'button';
+            upBtn.className = 'coverage-fold-btn';
+            upBtn.innerHTML = '▲ 向上展开 20 行';
+            upBtn.onclick = function(e) {
+                e.preventDefault();
+                expandFoldRange(hiddenEnd - Math.min(count, 20) + 1, hiddenEnd);
+            };
+
+            const allBtn = document.createElement('button');
+            allBtn.type = 'button';
+            allBtn.className = 'coverage-fold-btn highlight';
+            allBtn.innerHTML = `↕ 展开中间全部 ${count} 行代码 (${hiddenStart}-${hiddenEnd})`;
+            allBtn.onclick = function(e) {
+                e.preventDefault();
+                expandFoldRange(hiddenStart, hiddenEnd);
+            };
+
+            const downBtn = document.createElement('button');
+            downBtn.type = 'button';
+            downBtn.className = 'coverage-fold-btn';
+            downBtn.innerHTML = '▼ 向下展开 20 行';
+            downBtn.onclick = function(e) {
+                e.preventDefault();
+                expandFoldRange(hiddenStart, hiddenStart + Math.min(count, 20) - 1);
+            };
+
+            bar.appendChild(upBtn);
+            bar.appendChild(allBtn);
+            bar.appendChild(downBtn);
+            return bar;
+        }
+
+        function expandFoldRange(startLine, endLine) {
+            if (!sourceLines) return;
+            for (let i = 0; i < sourceLines.length; i++) {
+                const item = sourceLines.get(i);
+                if (item && item.lineNum >= startLine && item.lineNum <= endLine) {
+                    const container = getLineContainer(item);
+                    if (container) {
+                        container.style.display = '';
+                    }
+                }
+            }
+            recheckFoldBars();
+        }
+
+        function recheckFoldBars() {
+            removeExistingFoldBars();
+            const totalLinesCount = sourceLines ? sourceLines.length : 0;
+            let inGap = false;
+            let gapStart = 0;
+            let lastVisibleContainer = null;
+
+            for (let i = 0; i < totalLinesCount; i++) {
+                const item = sourceLines.get(i);
+                if (!item) continue;
+                const container = getLineContainer(item);
+                if (!container) continue;
+
+                const isHidden = container.style.display === 'none';
+                if (isHidden) {
+                    if (!inGap) {
+                        inGap = true;
+                        gapStart = item.lineNum;
+                    }
+                } else {
+                    if (inGap) {
+                        const gapEnd = item.lineNum - 1;
+                        const gapCount = gapEnd - gapStart + 1;
+                        createFoldBar(container, gapStart, gapEnd, gapCount, false);
+                        inGap = false;
+                    }
+                    lastVisibleContainer = container;
+                }
+            }
+            if (inGap && lastVisibleContainer) {
+                const gapEnd = totalLinesCount;
+                const gapCount = gapEnd - gapStart + 1;
+                createFoldBar(lastVisibleContainer, gapStart, gapEnd, gapCount, true);
+            }
+        }
+
+        function updateFoldToggleButton() {
+            const toggleBtn = document.getElementById('coverage-fold-toggle-btn');
+            if (toggleBtn) {
+                toggleBtn.innerText = isFoldedModeActive ? '👁️ 展开全部源码' : '🔍 上下文折叠';
+            }
+        }
+
+        function ensureBlockLinesVisible(block) {
+            if (!block || !sourceLines) return;
+            const bStart = getBlockStartItem(block).lineNum;
+            const bEnd = getBlockEndLineNum(block);
+            const startLine = Math.max(1, bStart - CONTEXT_LINES_DEFAULT);
+            const endLine = Math.min(sourceLines.length, bEnd + CONTEXT_LINES_DEFAULT);
+            expandFoldRange(startLine, endLine);
         }
 
         function getLineCodeInfo(span) {
@@ -878,6 +1139,9 @@
         }
 
         function focusReviewPanel(panel) {
+            if (panel && panel.block) {
+                ensureBlockLinesVisible(panel.block);
+            }
             const focusTarget = panel && (panel.select || panel.placeholder);
             if (!focusTarget) {
                 return;
@@ -1448,8 +1712,22 @@
                 window.location.href = url.toString();
             });
 
+            const foldToggleBtn = document.createElement('button');
+            foldToggleBtn.type = 'button';
+            foldToggleBtn.className = 'coverage-fold-toggle-btn';
+            foldToggleBtn.id = 'coverage-fold-toggle-btn';
+            foldToggleBtn.innerText = isFoldedModeActive ? '👁️ 展开全部源码' : '🔍 上下文折叠';
+            foldToggleBtn.onclick = function() {
+                if (isFoldedModeActive) {
+                    unfoldAllLines();
+                } else {
+                    applyFrontendFolding(false);
+                }
+            };
+
             container.appendChild(label);
             container.appendChild(select);
+            container.appendChild(foldToggleBtn);
             document.body.appendChild(container);
         }
 
