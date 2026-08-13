@@ -4055,15 +4055,39 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
     page = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>增量覆盖率审查</title><style>
-body{{margin:0;background:#f5f7fb;color:#172033;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"Microsoft YaHei",sans-serif}}
-main{{max-width:1180px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}}.muted{{color:#64748b}}.links{{margin:16px 0}}a{{color:#1f5fbf}}.repo-ranges{{margin:8px 0 0;padding-left:20px;color:#475569}}.cards{{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:12px;margin:20px 0}}.card,section{{background:#fff;border:1px solid #d8e0ea;border-radius:6px}}.card{{padding:12px}}.label{{font-size:12px;color:#64748b}}.value{{font-size:24px;font-weight:800;margin-top:4px}}section{{overflow:auto}}h2{{margin:0;padding:12px 14px;font-size:16px;border-bottom:1px solid #d8e0ea}}table{{width:100%;border-collapse:collapse;min-width:840px}}th,td{{padding:9px 10px;border-bottom:1px solid #e7edf4;text-align:left}}th{{background:#f8fafc}}.sort-button{{appearance:none;border:0;background:transparent;color:inherit;cursor:pointer;font:inherit;font-weight:700;padding:0;white-space:nowrap}}.sort-button:hover{{color:#1f5fbf}}.sort-button:focus{{outline:2px solid #93c5fd;outline-offset:2px}}.sort-indicator{{display:inline-block;min-width:1em;color:#64748b}}.warning{{color:#b45309}}@media(max-width:820px){{.cards{{grid-template-columns:repeat(2,minmax(120px,1fr))}}}}
-.filters{{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:10px 14px;background:#f8fafc;border-bottom:1px solid #d8e0ea}}
-.filter-group{{display:flex;align-items:center;gap:6px;font-size:13px;font-weight:600;color:#334155}}
-.filters select,.filters input[type="text"]{{height:30px;padding:0 8px;border:1px solid #cbd5e1;border-radius:4px;font-size:13px;background:#fff;color:#1e293b}}
+body{{margin:0;background:#f2f2f7;color:#000000;font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}}
+main{{max-width:1200px;margin:0 auto;padding:24px 22px 48px}}
+h1{{margin:0 0 6px;font-size:24px;font-weight:800;letter-spacing:-0.5px}}
+.muted{{color:#8e8e93;font-size:13px}}
+.links{{margin:16px 0;display:flex;gap:10px;flex-wrap:wrap}}
+.links a{{color:#007aff;text-decoration:none;font-weight:600;background:rgba(0,122,255,0.08);padding:6px 12px;border-radius:10px;transition:all 0.2s}}
+.links a:hover{{background:rgba(0,122,255,0.16);transform:translateY(-1px)}}
+.repo-ranges{{margin:8px 0 0;padding-left:20px;color:#636366}}
+.cards{{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:12px;margin:20px 0}}
+.card,section{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:16px;box-shadow:0 4px 20px -2px rgba(0,0,0,0.05)}}
+.card{{padding:14px;transition:transform 0.2s,box-shadow 0.2s}}
+.card:hover{{transform:translateY(-2px);box-shadow:0 6px 24px -2px rgba(0,0,0,0.08)}}
+.label{{font-size:12px;color:#8e8e93;font-weight:500}}
+.value{{font-size:24px;font-weight:800;margin-top:6px;letter-spacing:-0.6px;color:#1c1c1e}}
+section{{overflow:hidden}}
+h2{{margin:0;padding:14px 16px;font-size:15px;font-weight:700;background:rgba(242,242,247,0.8);border-bottom:1px solid rgba(60,60,67,0.12)}}
+table{{width:100%;border-collapse:collapse;min-width:840px}}
+th,td{{padding:10px 12px;border-bottom:1px solid rgba(60,60,67,0.08);text-align:left;vertical-align:middle}}
+th{{background:rgba(242,242,247,0.95);font-size:12px;font-weight:600;color:#8e8e93;text-transform:uppercase;letter-spacing:0.2px}}
+tr:hover td{{background:rgba(0,122,255,0.02)}}
+.sort-button{{appearance:none;border:0;background:transparent;color:inherit;cursor:pointer;font:inherit;font-weight:600;padding:0;white-space:nowrap}}
+.sort-button:hover{{color:#007aff}}
+.sort-indicator{{display:inline-block;min-width:1em;color:#8e8e93}}
+.warning{{color:#ff9500;font-weight:600}}
+@media(max-width:820px){{.cards{{grid-template-columns:repeat(2,minmax(120px,1fr))}}}}
+.filters{{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:12px 16px;background:rgba(242,242,247,0.5);border-bottom:1px solid rgba(60,60,67,0.12)}}
+.filter-group{{display:flex;align-items:center;gap:6px;font-size:13px;font-weight:600;color:#1c1c1e}}
+.filters select,.filters input[type="text"]{{height:32px;padding:0 10px;border:1px solid rgba(0,0,0,0.08);border-radius:10px;font-size:13px;background:rgba(118,118,128,0.12);color:#000;outline:none;transition:all 0.2s}}
+.filters select:focus,.filters input[type="text"]:focus{{background:#ffffff;border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,0.15)}}
 .filters input[type="text"]{{width:180px}}
-.reset-btn{{height:30px;padding:0 12px;border:1px solid #cbd5e1;border-radius:4px;background:#f1f5f9;cursor:pointer;font-size:13px;font-weight:600;color:#475569}}
-.reset-btn:hover{{background:#e2e8f0;color:#1e293b}}
-.filter-count{{margin-left:auto;font-size:12px;color:#64748b;font-weight:600}}
+.reset-btn{{height:32px;padding:0 14px;border:none;border-radius:10px;background:rgba(118,118,128,0.12);cursor:pointer;font-size:13px;font-weight:600;color:#007aff;transition:all 0.2s}}
+.reset-btn:hover{{background:rgba(118,118,128,0.24)}}
+.filter-count{{margin-left:auto;font-size:12px;color:#8e8e93;font-weight:600}}
 </style></head><body><main>
 <h1>增量覆盖率审查</h1>
 <div class="muted">项目：{project}；Git 范围：{git_range_text}；生成时间：{generated_at}</div>{repository_ranges}
