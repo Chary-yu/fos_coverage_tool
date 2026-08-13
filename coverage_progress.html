@@ -28,7 +28,7 @@
       -webkit-font-smoothing: antialiased;
     }
     header {
-      padding: 20px 24px 18px;
+      padding: 18px 0;
       background: rgba(255, 255, 255, 0.82);
       backdrop-filter: blur(20px);
       -webkit-backdrop-filter: blur(20px);
@@ -40,25 +40,26 @@
     .header-inner {
       max-width: 1400px;
       margin: 0 auto;
+      padding: 0 24px;
       display: flex;
       flex-direction: column;
-      align-items: center;
-      text-align: center;
+      align-items: flex-start;
+      text-align: left;
     }
-    h1 { margin: 0 0 12px; font-size: 24px; font-weight: 800; letter-spacing: -0.5px; text-align: center; }
-    .controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; justify-content: center; width: 100%; }
+    h1 { margin: 0 0 10px; font-size: 22px; font-weight: 700; letter-spacing: -0.4px; text-align: left; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; justify-content: flex-start; width: 100%; }
     input {
       width: min(380px, 100%);
-      height: 36px;
+      height: 34px;
       border: 1px solid rgba(0, 0, 0, 0.08);
       border-radius: 10px;
-      padding: 0 14px;
+      padding: 0 12px;
       font-size: 13px;
       background: rgba(118, 118, 128, 0.08);
       color: #000;
       outline: none;
       transition: all 0.2s ease;
-      text-align: center;
+      text-align: left;
     }
     input:focus {
       background: #ffffff;
@@ -133,18 +134,18 @@
       vertical-align: middle;
     }
     .bar span { display: block; height: 100%; background: var(--green); border-radius: 999px; }
-    .status { margin-top: 10px; color: var(--muted); font-size: 13px; text-align: center; }
-    .page-version { margin-top: 6px; color: var(--muted); font-size: 12px; text-align: center; }
+    .status { margin-top: 8px; color: var(--muted); font-size: 13px; text-align: left; }
+    .page-version { margin-top: 6px; color: var(--muted); font-size: 12px; text-align: left; }
     .error { color: var(--red); font-weight: 600; }
     .warning { color: var(--orange); font-weight: 600; }
     .matched { color: var(--green); font-weight: 600; }
     .unmatched { color: var(--red); font-weight: 700; }
-    .ownership-status { margin-top: 8px; color: var(--muted); font-size: 13px; text-align: center; }
+    .ownership-status { margin-top: 8px; color: var(--muted); font-size: 13px; text-align: left; }
     .job-progress {
       display: none;
-      margin: 12px auto 0;
+      margin-top: 12px;
       width: 100%;
-      max-width: 840px;
+      max-width: 100%;
       padding: 14px;
       border: 1px solid rgba(0, 122, 255, 0.2);
       border-radius: 12px;
