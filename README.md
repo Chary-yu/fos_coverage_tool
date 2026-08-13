@@ -231,7 +231,7 @@ python3 enhance_coverage.py incremental \
 
 输出目录的 `html/` 中会包含：
 
-* `incremental_coverage.html`：增量覆盖率汇总页，点击文件可打开源码页；
+* `incremental_coverage.html`：增量覆盖率汇总页；文件明细会在“仓库”和“文件”之间显示该文件归属的“小组 / 组长”，点击文件可打开源码页；
 * `incremental_developer_tasks.html`：按开发人员列出的提交文件和待填写清单，可直接跳转到相应源码页；
 * `incremental_coverage.json` / `incremental_coverage.xlsx`：每条新增行的计算结果；JSON 包含开发人员与文件映射，Excel 额外提供 `Developer Summary`、`Developer Files` 工作表；
 * `coverage_progress.html`：增量填写进度页；

@@ -427,6 +427,46 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         self.assertIn('data-sort-key="covered"', summary_html)
         self.assertIn('data-sort-key="uncovered"', summary_html)
 
+    @unittest.mock.patch("enhance_coverage.load_ownership_workbook")
+    def test_summary_shows_team_and_leader_between_repository_and_file(self, mock_workbook):
+        os.makedirs(self.output_dir)
+        rule = {
+            "module": "NETWORK", "module_key": "NETWORK",
+            "segments": ("src", "network"),
+        }
+        mock_workbook.return_value = {
+            "available": True,
+            "suffix_rules": {("src", "network"): rule},
+            "owner_rules": {"NETWORK": {"team": "网络平台组", "leader": "王工"}},
+        }
+        result = {
+            "generated_at": "2026-08-13 12:00:00",
+            "oldgit": "old123", "newgit": "new456",
+            "summary": {
+                "changed_lines": 1, "covered": 0, "uncovered": 1, "ignored": 0,
+                "missing": 0, "coverable_total": 1, "coverage_rate": 0.0,
+            },
+            "details": [{
+                "repository": "platform", "file_path": "src/network/main.c",
+                "review_file_path": "/build/repo/src/network/main.c", "line_number": 10,
+                "execution_count": 0, "status": coverage_check.STATUS_UNCOVERED,
+            }],
+        }
+
+        enhance_coverage.write_incremental_summary_page(
+            self.output_dir, "ownership_test", result
+        )
+
+        with open(os.path.join(self.output_dir, "incremental_coverage.html"), "r", encoding="utf-8") as summary_page:
+            summary_html = summary_page.read()
+        self.assertIn("网络平台组 / 王工", summary_html)
+        self.assertIn('data-sort-key="ownership"', summary_html)
+        repository_header = summary_html.index('data-sort-key="repository"')
+        ownership_header = summary_html.index('data-sort-key="ownership"')
+        file_header = summary_html.index('data-sort-key="file"')
+        self.assertLess(repository_header, ownership_header)
+        self.assertLess(ownership_header, file_header)
+
     def test_developer_task_page_lists_files_and_pending_fill(self):
         os.makedirs(self.output_dir)
         result = {

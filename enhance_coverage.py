@@ -3906,10 +3906,16 @@ def incremental_developer_anchor(developer):
     return "developer-{}".format(hashlib.sha1(identity.encode("utf-8")).hexdigest()[:12])
 
 
-def write_incremental_summary_page(output_html_dir, project_name, result):
+def write_incremental_summary_page(output_html_dir, project_name, result, config=None):
     """Create an auditable landing page for the generated incremental review site."""
     summary = result["summary"]
     report_pages = find_report_page_links(output_html_dir)
+    # Use the very same ownership workbook and matching rules as the progress
+    # page so an incremental file never appears under a different leader on the
+    # two pages.  Load it once: incremental reports can contain many files.
+    ownership_workbook = load_ownership_workbook(
+        load_config() if config is None else config
+    )
     details_by_file = {}
     for item in result["details"]:
         key = (item.get("repository", ""), item.get("review_file_path") or item["file_path"])
@@ -3929,8 +3935,20 @@ def write_incremental_summary_page(output_html_dir, project_name, result):
         )}
         for item in items:
             counts[item["status"]] += 1
+        if ownership_workbook.get("available"):
+            ownership = match_file_ownership(review_file_path, ownership_workbook)
+        else:
+            ownership = {
+                "module": "",
+                "team": OWNERSHIP_UNMATCHED_TEAM,
+                "leader": OWNERSHIP_UNMATCHED_LEADER,
+                "ownership_status": "归属表不可用",
+            }
         file_rows.append({
             "repository": repository_name or "",
+            "team": ownership["team"],
+            "leader": ownership["leader"],
+            "ownership_status": ownership["ownership_status"],
             "file_path": items[0]["file_path"],
             "review_file_path": review_file_path,
             "changed": len(items),
@@ -3943,7 +3961,8 @@ def write_incremental_summary_page(output_html_dir, project_name, result):
     # The first render already prioritizes files that need the most review; the
     # browser-side table controls below let reviewers switch to any other metric.
     file_rows.sort(key=lambda item: (
-        -item["uncovered"], -item["changed"], item["repository"], item["file_path"]
+        -item["uncovered"], -item["changed"], item["repository"],
+        item["team"], item["leader"], item["file_path"]
     ))
 
     rows = []
@@ -3956,13 +3975,22 @@ def write_incremental_summary_page(output_html_dir, project_name, result):
             source_cell = '<a href="{}">{}</a>'.format(
                 escaped(urllib.parse.quote(page_link, safe="/%#?=&-_.~")), source_cell
             )
+        ownership_text = "{} / {}".format(item["team"], item["leader"])
+        ownership_cell = escaped(ownership_text)
+        if item["ownership_status"] != "已匹配":
+            ownership_cell = '<span class="warning" title="{}">{}</span>'.format(
+                escaped(item["ownership_status"]), ownership_cell
+            )
         rows.append(
             "<tr><td data-sort-value=\"{}\">{}</td><td data-sort-value=\"{}\">{}</td>"
+            "<td data-sort-value=\"{}\">{}</td>"
             "<td data-sort-value=\"{}\">{}</td><td data-sort-value=\"{}\">{}</td>"
             "<td data-sort-value=\"{}\">{}</td><td data-sort-value=\"{}\">{}</td>"
             "<td data-sort-value=\"{}\">{}</td></tr>".format(
                 escaped(repository_name),
                 escaped(repository_name or "-"),
+                escaped(ownership_text),
+                ownership_cell,
                 escaped(item["file_path"]),
                 source_cell,
                 item["changed"], item["changed"],
@@ -3975,7 +4003,7 @@ def write_incremental_summary_page(output_html_dir, project_name, result):
 
     rate = summary["coverage_rate"]
     rate_text = "N/A" if rate is None else "{:.2f}%".format(rate)
-    table_rows = "".join(rows) or '<tr><td colspan="7">本次 Git diff 没有新增代码行。</td></tr>'
+    table_rows = "".join(rows) or '<tr><td colspan="8">本次 Git diff 没有新增代码行。</td></tr>'
     developer_rows = []
     for index, developer in enumerate(
             (result.get("developer_tasks") or {}).get("developers") or [], start=1):
@@ -4013,20 +4041,20 @@ def write_incremental_summary_page(output_html_dir, project_name, result):
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>增量覆盖率审查</title><style>
 body{{margin:0;background:#f5f7fb;color:#172033;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"Microsoft YaHei",sans-serif}}
-main{{max-width:1180px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}}.muted{{color:#64748b}}.links{{margin:16px 0}}a{{color:#1f5fbf}}.repo-ranges{{margin:8px 0 0;padding-left:20px;color:#475569}}.cards{{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:12px;margin:20px 0}}.card,section{{background:#fff;border:1px solid #d8e0ea;border-radius:6px}}.card{{padding:12px}}.label{{font-size:12px;color:#64748b}}.value{{font-size:24px;font-weight:800;margin-top:4px}}section{{overflow:auto}}h2{{margin:0;padding:12px 14px;font-size:16px;border-bottom:1px solid #d8e0ea}}table{{width:100%;border-collapse:collapse;min-width:720px}}th,td{{padding:9px 10px;border-bottom:1px solid #e7edf4;text-align:left}}th{{background:#f8fafc}}.sort-button{{appearance:none;border:0;background:transparent;color:inherit;cursor:pointer;font:inherit;font-weight:700;padding:0;white-space:nowrap}}.sort-button:hover{{color:#1f5fbf}}.sort-button:focus{{outline:2px solid #93c5fd;outline-offset:2px}}.sort-indicator{{display:inline-block;min-width:1em;color:#64748b}}.warning{{color:#b45309}}@media(max-width:820px){{.cards{{grid-template-columns:repeat(2,minmax(120px,1fr))}}}}
+main{{max-width:1180px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}}.muted{{color:#64748b}}.links{{margin:16px 0}}a{{color:#1f5fbf}}.repo-ranges{{margin:8px 0 0;padding-left:20px;color:#475569}}.cards{{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:12px;margin:20px 0}}.card,section{{background:#fff;border:1px solid #d8e0ea;border-radius:6px}}.card{{padding:12px}}.label{{font-size:12px;color:#64748b}}.value{{font-size:24px;font-weight:800;margin-top:4px}}section{{overflow:auto}}h2{{margin:0;padding:12px 14px;font-size:16px;border-bottom:1px solid #d8e0ea}}table{{width:100%;border-collapse:collapse;min-width:840px}}th,td{{padding:9px 10px;border-bottom:1px solid #e7edf4;text-align:left}}th{{background:#f8fafc}}.sort-button{{appearance:none;border:0;background:transparent;color:inherit;cursor:pointer;font:inherit;font-weight:700;padding:0;white-space:nowrap}}.sort-button:hover{{color:#1f5fbf}}.sort-button:focus{{outline:2px solid #93c5fd;outline-offset:2px}}.sort-indicator{{display:inline-block;min-width:1em;color:#64748b}}.warning{{color:#b45309}}@media(max-width:820px){{.cards{{grid-template-columns:repeat(2,minmax(120px,1fr))}}}}
 </style></head><body><main>
 <h1>增量覆盖率审查</h1>
 <div class="muted">项目：{project}；Git 范围：{git_range_text}；生成时间：{generated_at}</div>{repository_ranges}
 <div class="links"><a href="coverage_progress.html?scope=incremental&amp;project={project_url}">查看填写进度</a>　<a href="incremental_developer_tasks.html">开发人员待填写清单</a>　<a href="incremental_coverage.json">下载计算结果 JSON</a>　<a href="incremental_coverage.xlsx">下载计算结果 Excel</a></div>
 <div class="cards"><div class="card"><div class="label">新增行</div><div class="value">{changed}</div></div><div class="card"><div class="label">已覆盖</div><div class="value">{covered}</div></div><div class="card"><div class="label">增量未覆盖（可填写）</div><div class="value">{uncovered}</div></div><div class="card"><div class="label">有效增量覆盖率</div><div class="value">{rate}</div></div><div class="card"><div class="label">覆盖信息缺失</div><div class="value warning">{missing}</div></div></div>
 <section><h2>开发人员待填写概览（同一文件被多人提交时会同时列给相关人员）</h2><table><thead><tr><th>开发人员</th><th>提交数</th><th>提交文件</th><th>需填写文件</th><th>待填写行</th><th>操作</th></tr></thead><tbody>{developer_table_rows}</tbody></table></section>
-<section><h2>文件明细（点击表头可排序；默认未覆盖新增行从多到少）</h2><table id="incremental-file-table"><thead><tr><th data-sort-key="repository" aria-sort="none"><button type="button" class="sort-button" data-sort-key="repository" data-sort-type="text">仓库 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="file" aria-sort="none"><button type="button" class="sort-button" data-sort-key="file" data-sort-type="text">文件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="changed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="changed" data-sort-type="number">新增行 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="covered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="covered" data-sort-type="number">已覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="uncovered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="uncovered" data-sort-type="number">未覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ignored" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ignored" data-sort-type="number">无需覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="missing" aria-sort="none"><button type="button" class="sort-button" data-sort-key="missing" data-sort-type="number">覆盖信息缺失 <span class="sort-indicator" aria-hidden="true">↕</span></button></th></tr></thead><tbody>{table_rows}</tbody></table></section>
+<section><h2>文件明细（点击表头可排序；默认未覆盖新增行从多到少）</h2><table id="incremental-file-table"><thead><tr><th data-sort-key="repository" aria-sort="none"><button type="button" class="sort-button" data-sort-key="repository" data-sort-type="text">仓库 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ownership" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ownership" data-sort-type="text">小组 / 组长 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="file" aria-sort="none"><button type="button" class="sort-button" data-sort-key="file" data-sort-type="text">文件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="changed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="changed" data-sort-type="number">新增行 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="covered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="covered" data-sort-type="number">已覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="uncovered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="uncovered" data-sort-type="number">未覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ignored" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ignored" data-sort-type="number">无需覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="missing" aria-sort="none"><button type="button" class="sort-button" data-sort-key="missing" data-sort-type="number">覆盖信息缺失 <span class="sort-indicator" aria-hidden="true">↕</span></button></th></tr></thead><tbody>{table_rows}</tbody></table></section>
 </main><script>
 (function() {{
     var table = document.getElementById("incremental-file-table");
     if (!table || !table.tBodies.length) {{ return; }}
     var body = table.tBodies[0];
-    var keyToColumn = {{repository: 0, file: 1, changed: 2, covered: 3, uncovered: 4, ignored: 5, missing: 6}};
+    var keyToColumn = {{repository: 0, ownership: 1, file: 2, changed: 3, covered: 4, uncovered: 5, ignored: 6, missing: 7}};
     var currentKey = "";
     var currentDirection = 1;
 
@@ -4046,7 +4074,7 @@ main{{max-width:1180px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}
         var column = keyToColumn[key];
         if (column === undefined) {{ return; }}
         var rows = Array.prototype.slice.call(body.rows);
-        if (!rows.length || rows[0].cells.length !== 7) {{ return; }}
+        if (!rows.length || rows[0].cells.length !== 8) {{ return; }}
         rows = rows.map(function(row, index) {{ return {{row: row, index: index}}; }});
         rows.sort(function(left, right) {{
             var leftValue = left.row.cells[column].getAttribute("data-sort-value") || "";
