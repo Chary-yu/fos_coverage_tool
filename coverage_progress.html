@@ -107,6 +107,28 @@
     .detail-nav button { height: 30px; }
     #detailTable { min-width: 1500px; }
     #detailTable td.code { max-width: 520px; white-space: pre-wrap; word-break: break-all; font-family: monospace; }
+    .toggle-team-btn {
+      height: 20px;
+      width: 20px;
+      padding: 0;
+      border: 1px solid #cbd5e1;
+      border-radius: 3px;
+      background: #ffffff;
+      color: #475569;
+      font-size: 10px;
+      font-weight: bold;
+      cursor: pointer;
+      margin-right: 6px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      line-height: 1;
+    }
+    .toggle-team-btn:hover { background: #e2e8f0; color: #1e293b; }
+    .toggle-team-spacer { display: inline-block; width: 26px; }
+    .section-header-flex { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; background: var(--head); border-bottom: 1px solid var(--line); }
+    .section-header-flex h2 { padding: 0 !important; border: 0 !important; background: transparent !important; }
+    .small-btn { height: 26px; padding: 0 8px; font-size: 12px; font-weight: 600; }
     @media (max-width: 900px) { .cards { grid-template-columns: repeat(2, minmax(150px, 1fr)); } }
   </style>
 </head>
@@ -141,7 +163,13 @@
     </div>
     <div id="ownershipStatus" class="ownership-status"></div>
     <section class="section">
-      <h2>小组 / 组长填写进度</h2>
+      <div class="section-header-flex">
+        <h2>小组 / 组长填写进度（支持展开模块明细）</h2>
+        <div>
+          <button id="expandAllTeamModulesBtn" type="button" class="small-btn">▶ 展开全部模块</button>
+          <button id="collapseAllTeamModulesBtn" type="button" class="small-btn">▼ 折叠全部模块</button>
+        </div>
+      </div>
       <div class="table-wrap"><table id="teamTable"></table></div>
     </section>
     <section class="section">

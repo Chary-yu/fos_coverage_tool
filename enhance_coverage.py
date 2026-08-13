@@ -545,7 +545,7 @@ def build_ownership_progress(file_rows, config=None, progress_callback=None):
         group = grouped.setdefault(group_key, {
             "team": ownership["team"],
             "leader": ownership["leader"],
-            "modules": set(),
+            "module_map": {},
             "file_total": 0,
             "total_uncovered": 0,
             "filled_total": 0,
@@ -556,30 +556,60 @@ def build_ownership_progress(file_rows, config=None, progress_callback=None):
             "redundant_total": 0,
             "last_updated": "",
         })
-        if ownership["module"]:
-            group["modules"].add(ownership["module"])
         group["file_total"] += 1
+
+        module_name = (ownership.get("module") or "").strip() if isinstance(ownership.get("module"), str) else str(ownership.get("module") or "").strip()
+        module_name = module_name or "未归类模块"
+        mod_stat = group["module_map"].setdefault(module_name, {
+            "module": module_name,
+            "file_total": 0,
+            "total_uncovered": 0,
+            "filled_total": 0,
+            "unfilled_total": 0,
+            "confirmed_total": 0,
+            "coverable_total": 0,
+            "uncoverable_total": 0,
+            "redundant_total": 0,
+            "last_updated": "",
+        })
+        mod_stat["file_total"] += 1
+
         for field in (
             "total_uncovered", "filled_total", "unfilled_total", "confirmed_total",
             "coverable_total", "uncoverable_total", "redundant_total",
         ):
-            group[field] += _progress_number(row.get(field))
+            val = _progress_number(row.get(field))
+            group[field] += val
+            mod_stat[field] += val
+
         last_updated = row.get("last_updated")
         if last_updated is not None:
             last_updated_text = json_safe_default(last_updated)
             if last_updated_text > group["last_updated"]:
                 group["last_updated"] = last_updated_text
+            if last_updated_text > mod_stat["last_updated"]:
+                mod_stat["last_updated"] = last_updated_text
+
         if progress_callback and (file_index == file_total or file_index % callback_interval == 0):
             progress_callback(file_index, file_total)
 
     team_rows = []
     for group in grouped.values():
         total = group["total_uncovered"]
-        group["module_total"] = len(group["modules"])
-        group["module_names"] = "、".join(sorted(group["modules"]))
+        mod_map = group.pop("module_map", {})
+        modules_list = []
+        for m_name, m_stat in mod_map.items():
+            m_total = m_stat["total_uncovered"]
+            m_stat["fill_rate"] = round(m_stat["filled_total"] * 100.0 / m_total, 2) if m_total else 0.0
+            m_stat["confirmed_rate"] = round(m_stat["confirmed_total"] * 100.0 / m_total, 2) if m_total else 0.0
+            modules_list.append(m_stat)
+        modules_list.sort(key=lambda m: (-m["total_uncovered"], m["module"]))
+
+        group["modules_detail"] = modules_list
+        group["module_total"] = len(modules_list)
+        group["module_names"] = "、".join(m["module"] for m in modules_list if m["module"] != "未归类模块") or ("未归类模块" if modules_list else "")
         group["fill_rate"] = round(group["filled_total"] * 100.0 / total, 2) if total else 0.0
         group["confirmed_rate"] = round(group["confirmed_total"] * 100.0 / total, 2) if total else 0.0
-        group.pop("modules", None)
         team_rows.append(group)
     team_rows.sort(key=lambda row: (
         row["team"] == OWNERSHIP_UNMATCHED_TEAM,

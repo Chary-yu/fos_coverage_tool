@@ -81,19 +81,82 @@
   }
 
   function renderTeamTable(rows) {
-    const body = !rows || rows.length === 0 ? '<tr><td colspan="14">暂无数据</td></tr>' : rows.map(row => `
-      <tr><td>${escapeHtml(row.team || '')}</td><td>${escapeHtml(row.leader || '')}</td>
-      <td class="path">${escapeHtml(row.module_names || '')}</td><td>${asNumber(row.file_total)}</td>
-      <td>${asNumber(row.total_uncovered)}</td><td>${asNumber(row.filled_total)}</td>
-      <td>${asNumber(row.unfilled_total)}</td><td>${asNumber(row.confirmed_total)}</td>
-      <td>${asNumber(row.coverable_total)}</td><td>${asNumber(row.uncoverable_total)}</td>
-      <td>${asNumber(row.redundant_total)}</td><td>${fmtRate(row.fill_rate)} ${bar(row.fill_rate)}</td>
-      <td>${fmtRate(row.confirmed_rate)} ${bar(row.confirmed_rate)}</td>
-      <td>${escapeHtml(row.last_updated || '')}</td></tr>`).join('');
+    if (!rows || rows.length === 0) {
+      document.getElementById('teamTable').innerHTML = `
+        <thead><tr><th>小组</th><th>组长</th><th>模块</th><th>文件数</th><th>未覆盖</th>
+        <th>已填</th><th>未填</th><th>已确认</th><th>可覆盖</th><th>无法覆盖</th>
+        <th>冗余</th><th>填写率</th><th>确认率</th><th>最后更新</th></tr></thead>
+        <tbody><tr><td colspan="14">暂无数据</td></tr></tbody>`;
+      return;
+    }
+
+    const htmlParts = [];
+    rows.forEach((row, teamIdx) => {
+      const modules = Array.isArray(row.modules_detail) ? row.modules_detail : [];
+      const hasModules = modules.length > 0;
+      const toggleBtn = hasModules
+        ? `<button type="button" class="toggle-team-btn" data-team-index="${teamIdx}" title="点击展开/折叠该小组下的模块明细">▶</button>`
+        : '<span class="toggle-team-spacer"></span>';
+
+      const parentTr = `
+        <tr class="team-parent-row" data-team-index="${teamIdx}">
+          <td>${toggleBtn} <strong>${escapeHtml(row.team || '')}</strong></td>
+          <td>${escapeHtml(row.leader || '')}</td>
+          <td class="path">${escapeHtml(row.module_names || '')} <span class="muted" style="font-size:12px;">(${modules.length}个模块)</span></td>
+          <td>${asNumber(row.file_total)}</td>
+          <td>${asNumber(row.total_uncovered)}</td>
+          <td>${asNumber(row.filled_total)}</td>
+          <td>${asNumber(row.unfilled_total)}</td>
+          <td>${asNumber(row.confirmed_total)}</td>
+          <td>${asNumber(row.coverable_total)}</td>
+          <td>${asNumber(row.uncoverable_total)}</td>
+          <td>${asNumber(row.redundant_total)}</td>
+          <td>${fmtRate(row.fill_rate)} ${bar(row.fill_rate)}</td>
+          <td>${fmtRate(row.confirmed_rate)} ${bar(row.confirmed_rate)}</td>
+          <td>${escapeHtml(row.last_updated || '')}</td>
+        </tr>`;
+      htmlParts.push(parentTr);
+
+      modules.forEach(mod => {
+        const subTr = `
+          <tr class="module-subrow team-subrow-${teamIdx}" style="display:none; background-color: #f8fafc;">
+            <td style="padding-left: 28px; font-weight: 600; color: #334155;">└─ ${escapeHtml(mod.module || '')}</td>
+            <td class="muted">-</td>
+            <td class="path muted">${escapeHtml(mod.module || '')}</td>
+            <td>${asNumber(mod.file_total)}</td>
+            <td>${asNumber(mod.total_uncovered)}</td>
+            <td>${asNumber(mod.filled_total)}</td>
+            <td>${asNumber(mod.unfilled_total)}</td>
+            <td>${asNumber(mod.confirmed_total)}</td>
+            <td>${asNumber(mod.coverable_total)}</td>
+            <td>${asNumber(mod.uncoverable_total)}</td>
+            <td>${asNumber(mod.redundant_total)}</td>
+            <td>${fmtRate(mod.fill_rate)} ${bar(mod.fill_rate)}</td>
+            <td>${fmtRate(mod.confirmed_rate)} ${bar(mod.confirmed_rate)}</td>
+            <td>${escapeHtml(mod.last_updated || '')}</td>
+          </tr>`;
+        htmlParts.push(subTr);
+      });
+    });
+
     document.getElementById('teamTable').innerHTML = `
       <thead><tr><th>小组</th><th>组长</th><th>模块</th><th>文件数</th><th>未覆盖</th>
       <th>已填</th><th>未填</th><th>已确认</th><th>可覆盖</th><th>无法覆盖</th>
-      <th>冗余</th><th>填写率</th><th>确认率</th><th>最后更新</th></tr></thead><tbody>${body}</tbody>`;
+      <th>冗余</th><th>填写率</th><th>确认率</th><th>最后更新</th></tr></thead>
+      <tbody>${htmlParts.join('')}</tbody>`;
+
+    document.querySelectorAll('.toggle-team-btn').forEach(btn => {
+      btn.addEventListener('click', function(e) {
+        e.preventDefault();
+        const idx = this.getAttribute('data-team-index');
+        const subrows = document.querySelectorAll(`.team-subrow-${idx}`);
+        const isCollapsed = this.textContent.trim() === '▶';
+        this.textContent = isCollapsed ? '▼' : '▶';
+        subrows.forEach(r => {
+          r.style.display = isCollapsed ? 'table-row' : 'none';
+        });
+      });
+    });
   }
 
   function renderFileTable(rows) {
@@ -398,6 +461,20 @@
 
   document.getElementById('loadBtn').addEventListener('click', loadProgress);
   detailExportBtn.addEventListener('click', exportFullDetails);
+  const expandAllBtn = document.getElementById('expandAllTeamModulesBtn');
+  const collapseAllBtn = document.getElementById('collapseAllTeamModulesBtn');
+  if (expandAllBtn) {
+    expandAllBtn.addEventListener('click', function() {
+      document.querySelectorAll('.module-subrow').forEach(r => r.style.display = 'table-row');
+      document.querySelectorAll('.toggle-team-btn').forEach(b => b.textContent = '▼');
+    });
+  }
+  if (collapseAllBtn) {
+    collapseAllBtn.addEventListener('click', function() {
+      document.querySelectorAll('.module-subrow').forEach(r => r.style.display = 'none');
+      document.querySelectorAll('.toggle-team-btn').forEach(b => b.textContent = '▶');
+    });
+  }
   document.getElementById('fileTable').addEventListener('click', event => {
     const button = event.target.closest('.file-detail-link');
     if (!button) return;
