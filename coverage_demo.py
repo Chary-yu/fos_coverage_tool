@@ -427,6 +427,19 @@ class DemoHTTPRequestHandler(CoverageHTTPRequestHandler):
             return
         if os.path.isdir(candidate):
             candidate = os.path.join(candidate, "index.html")
+        filename = os.path.basename(candidate)
+        if filename == "coverage_progress.html":
+            src = os.path.join(enhance_coverage.SCRIPT_DIR, "coverage_progress.html")
+            if os.path.isfile(src):
+                shutil.copy2(src, candidate)
+        elif filename == "coverage_enhance.css":
+            src = os.path.join(enhance_coverage.SCRIPT_DIR, "coverage_enhance.css")
+            if os.path.isfile(src):
+                shutil.copy2(src, candidate)
+        elif filename == "coverage_progress.js":
+            src = os.path.join(enhance_coverage.SCRIPT_DIR, "coverage_progress.js")
+            if os.path.isfile(src):
+                shutil.copy2(src, candidate)
         if not os.path.isfile(candidate):
             self.send_error(404)
             return
