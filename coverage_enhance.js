@@ -4,7 +4,7 @@
  * 强行将 C 语言控制流分支关键字所在的行 (if, else, for, while, do, switch, case, default) 进行物理隔离单行展示，确保科学细致的分析。
  */
 (function() {
-    const ENHANCE_VERSION = 'batch-inherit-20260812';
+    const ENHANCE_VERSION = 'visible-progress-20260813';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const RENDER_MODE = 'lazy'; // 'lazy' or 'immediate'
@@ -1354,6 +1354,7 @@
                 );
                 progressUrl.searchParams.set('project', DEFAULT_PROJECT);
                 progressUrl.searchParams.set('scope', REVIEW_SCOPE);
+                progressUrl.searchParams.set('v', ENHANCE_VERSION);
                 const apiUrl = resolvedServerUrl || EXPLICIT_API_URL;
                 if (apiUrl) {
                     progressUrl.searchParams.set('api', apiUrl);

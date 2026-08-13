@@ -272,7 +272,9 @@ class TestIncrementalReviewInjection(unittest.TestCase):
         with open(os.path.join(self.output_dir, "coverage_enhance.js"), "r", encoding="utf-8") as js_file:
             self.assertIn('const REVIEW_SCOPE = "incremental";', js_file.read())
         with open(os.path.join(self.output_dir, "coverage_progress.html"), "r", encoding="utf-8") as progress_file:
-            self.assertIn('const DEFAULT_REVIEW_SCOPE = "incremental";', progress_file.read())
+            self.assertIn('data-review-scope="incremental"', progress_file.read())
+        with open(os.path.join(self.output_dir, "coverage_progress.js"), "r", encoding="utf-8") as progress_js_file:
+            self.assertIn('const DEFAULT_REVIEW_SCOPE = "incremental";', progress_js_file.read())
         self.assertTrue(os.path.exists(os.path.join(self.output_dir, "incremental_coverage.html")))
         self.assertTrue(os.path.exists(os.path.join(self.output_dir, "incremental_coverage.xlsx")))
         with open(os.path.join(self.output_dir, "incremental_coverage.json"), "r", encoding="utf-8") as result_file:

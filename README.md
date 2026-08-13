@@ -43,6 +43,7 @@ Demo 使用 `.coverage_demo/coverage_demo.sqlite3` 持久化，刷新页面后�
   repositories.example.json  # 多仓库增量覆盖率配置示例
   clear_coverage_data.py     # 调试脚本：清空单项目或全部数据库数据
   coverage_progress.html     # 独立网页：查看项目/小组/组长/目录/文件分析进度
+  coverage_progress.js       # 进度页外部脚本：后台任务轮询，兼容严格 CSP
   代码目录归属模块统计.xlsx   # 目录 -> 模块 -> 小组/组长归属表
   coverage_enhance.js        # 前端增强脚本
   coverage_enhance.css       # 前端样式
@@ -681,6 +682,8 @@ http://服务器IP/coverage/review_main_202606/coverage_progress.html?project=re
 
 进度计算使用后台任务。数据库聚合期间无法获得 MySQL 内部的精确扫描行数，页面会保持在“数据库聚合”阶段并持续刷新已用时；查询完成后，项目/目录汇总和文件归属匹配会显示精确百分比。
 
+点击“查看进度”后，进度条会在发出第一个 HTTP 请求前立即出现，并以动画和已用时显示连接、数据库聚合等阶段。进度页逻辑放在同源外部文件 `coverage_progress.js` 中，可在 Nginx 配置 `script-src 'self'` 的严格 CSP 下执行，不需要放开 `unsafe-inline`。
+
 ### 小组和组长归属表
 
 进度接口每次查询都会检查 `ownership.xlsx_path` 指向文件的修改时间、大小和文件标识。表格未变化时使用内存缓存；替换或修改表格后会在下一次查询时自动重新读取，不需要重启服务。建议先生成完整新文件，再用同名文件替换旧文件，避免服务恰好读取到保存中的半成品。
@@ -731,7 +734,7 @@ http://服务器IP/coverage/review_main_202606/coverage_progress.html?project=re
 
 旧的同步 `/api/coverage/progress?project=<project_name>` 仍保留兼容，但浏览器页面使用上述后台任务接口，不再受单次 HTTP 请求超时限制。
 
-如果已经生成过旧报表，需要重新执行一次 `inject`，把新的 `coverage_progress.html` 复制到报表目录，并更新覆盖率页面使用的 JS/CSS 版本。
+如果已经生成过旧报表，需要重新执行一次 `inject`，把新的 `coverage_progress.html` 和 `coverage_progress.js` 复制到报表目录，并更新覆盖率页面使用的 JS/CSS 版本。如果只替换后台 Python 文件而没有重新 `inject`，旧报表目录中的静态进度页不会自动更新。
 
 ---
 

@@ -436,6 +436,10 @@ class DemoHTTPRequestHandler(CoverageHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'",
+        )
         self.end_headers()
         self.safe_write(data)
 
@@ -447,7 +451,7 @@ def build_demo_site(output_dir):
         os.path.join(html_dir, "coverage_enhance.js"), DEMO_PROJECT, "immediate", "full"
     )
     shutil.copy2(enhance_coverage.CSS_SOURCE_PATH, os.path.join(html_dir, "coverage_enhance.css"))
-    shutil.copy2(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, os.path.join(html_dir, "coverage_progress.html"))
+    enhance_coverage.write_progress_page_targets(output_dir, html_dir, "full")
 
     source_lines = [
         (1, "lineCov", "int calculate(int left, int right, char op) {"),

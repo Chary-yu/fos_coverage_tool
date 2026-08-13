@@ -54,8 +54,9 @@ CONFIG_PATH = os.path.join(SCRIPT_DIR, "coverage_config.json")
 JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
 CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
 PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
+PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "scalable-progress-20260812"
+ASSET_VERSION = "visible-progress-20260813"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 REVIEW_STATUS_UNCONFIRMED = "未确认"
 REVIEW_CONFIRMED_STATUSES = ("可覆盖", "无法覆盖", "冗余代码")
@@ -1385,17 +1386,40 @@ def write_progress_page_targets(output_dir, real_output_html, review_scope="full
         if source_exists:
             with open(PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as source:
                 progress_content = source.read()
-            scope_literal = json.dumps(str(review_scope), ensure_ascii=False)
             progress_content, replacement_count = re.subn(
-                r"const\s+DEFAULT_REVIEW_SCOPE\s*=\s*(['\"]).*?\1\s*;",
-                f"const DEFAULT_REVIEW_SCOPE = {scope_literal};",
+                r'(<body\b[^>]*\bdata-review-scope=)["\'][^"\']*["\']',
+                rf'\1"{review_scope}"',
                 progress_content,
                 count=1,
             )
             if replacement_count != 1:
-                raise RuntimeError("Failed to inject DEFAULT_REVIEW_SCOPE into coverage_progress.html")
+                raise RuntimeError("Failed to inject review scope into coverage_progress.html")
+            progress_content = re.sub(
+                r'(src="coverage_progress\.js)(?:\?v=[^"]*)?("\s*>)',
+                rf'\1?v={ASSET_VERSION}\2',
+                progress_content,
+                count=1,
+            )
             with open(target, "w", encoding="utf-8") as target_file:
                 target_file.write(progress_content)
+            if not os.path.exists(PROGRESS_JS_SOURCE_PATH):
+                raise RuntimeError("coverage_progress.js is required by coverage_progress.html")
+            with open(PROGRESS_JS_SOURCE_PATH, "r", encoding="utf-8") as source:
+                runtime_content = source.read()
+            scope_literal = json.dumps(str(review_scope), ensure_ascii=False)
+            runtime_content, runtime_replacement_count = re.subn(
+                r"const\s+DEFAULT_REVIEW_SCOPE\s*=\s*(['\"]).*?\1\s*;",
+                f"const DEFAULT_REVIEW_SCOPE = {scope_literal};",
+                runtime_content,
+                count=1,
+            )
+            if runtime_replacement_count != 1:
+                raise RuntimeError("Failed to inject DEFAULT_REVIEW_SCOPE into coverage_progress.js")
+            with open(
+                os.path.join(os.path.dirname(target), "coverage_progress.js"),
+                "w", encoding="utf-8"
+            ) as runtime_target:
+                runtime_target.write(runtime_content)
         else:
             with open(target, "w", encoding="utf-8") as f:
                 f.write(DEFAULT_PROGRESS_PAGE_HTML)

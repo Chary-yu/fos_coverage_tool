@@ -481,12 +481,17 @@ class TestIntegration(unittest.TestCase):
         self.assertTrue(os.path.exists(progress_html))
         with open(progress_html, "r", encoding="utf-8") as f:
             progress_content = f.read()
-        self.assertIn('coverage-review-progress-updated', progress_content)
-        self.assertIn('未找到项目“${escapeHtml(project)}”的审查行索引', progress_content)
+        self.assertIn('src="coverage_progress.js?v=', progress_content)
+        self.assertNotIn('<script>\n', progress_content)
         self.assertIn('id="teamTable"', progress_content)
         self.assertIn('小组 / 组长填写进度', progress_content)
-        self.assertIn('function renderOwnershipStatus', progress_content)
-        self.assertIn('ownership_status', progress_content)
+        progress_js = os.path.join(self.output_dir, "coverage_progress.js")
+        self.assertTrue(os.path.exists(progress_js))
+        with open(progress_js, "r", encoding="utf-8") as f:
+            progress_runtime = f.read()
+        self.assertIn('coverage-review-progress-updated', progress_runtime)
+        self.assertIn('function renderOwnershipStatus', progress_runtime)
+        self.assertIn('ownership_status', progress_runtime)
 
 
 class TestInheritAnalysis(unittest.TestCase):
@@ -756,13 +761,19 @@ class TestScalableProgress(unittest.TestCase):
         self.assertTrue(any(stage == "exporting" and "3/3" in message for _, stage, message in updates))
 
     def test_progress_page_uses_background_jobs_and_paged_details(self):
-        with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as page_file:
+        with open(enhance_coverage.PROGRESS_JS_SOURCE_PATH, "r", encoding="utf-8") as page_file:
             content = page_file.read()
         self.assertIn("/progress/start?project=", content)
         self.assertIn("/jobs/status?id=", content)
         self.assertIn("/details?project=", content)
         self.assertIn("后台导出详细 CSV", content)
         self.assertIn("未传输任何逐行明细", content)
+        self.assertIn("showConnecting();", content)
+        with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as html_file:
+            html_content = html_file.read()
+        self.assertIn('src="coverage_progress.js?v=', html_content)
+        self.assertIn("页面版本 visible-progress-20260813", html_content)
+        self.assertNotIn('<script>\n    const DEFAULT_REVIEW_SCOPE', html_content)
 
 
 if __name__ == "__main__":
