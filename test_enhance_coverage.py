@@ -776,5 +776,112 @@ class TestScalableProgress(unittest.TestCase):
         self.assertNotIn('<script>\n    const DEFAULT_REVIEW_SCOPE', html_content)
 
 
+class TestNewFeaturesAndIntegrity(unittest.TestCase):
+    """Automated tests validating new features: CSS integrity, code folding, filters, and module tree rows."""
+
+    def test_css_integrity_and_balanced_braces(self):
+        css_path = enhance_coverage.CSS_SOURCE_PATH
+        self.assertTrue(os.path.isfile(css_path), "coverage_enhance.css file should exist")
+        with open(css_path, "r", encoding="utf-8") as f:
+            css_content = f.read()
+
+        open_count = css_content.count("{")
+        close_count = css_content.count("}")
+        self.assertEqual(
+            open_count, close_count,
+            f"coverage_enhance.css braces count mismatch: open={open_count}, close={close_count}"
+        )
+        self.assertNotIn('pre.source::after {\n    content: "" !important;\npre.source', css_content)
+
+    def test_frontend_folding_engine_contracts(self):
+        js_path = os.path.join(enhance_coverage.SCRIPT_DIR, "coverage_enhance.js")
+        self.assertTrue(os.path.isfile(js_path), "coverage_enhance.js file should exist")
+        with open(js_path, "r", encoding="utf-8") as f:
+            js_content = f.read()
+
+        self.assertIn("applyFrontendFolding", js_content)
+        self.assertIn("createFoldBar", js_content)
+        self.assertIn("MERGE_GAP_THRESHOLD", js_content)
+        self.assertIn("ensureBlockLinesVisible", js_content)
+        self.assertIn("CONTEXT_LINES_DEFAULT", js_content)
+
+    def test_incremental_summary_dropdown_filters_markup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = {
+                "schema_version": 2,
+                "generated_at": "2026-08-13 12:00:00",
+                "oldgit": "old", "newgit": "new",
+                "summary": {"changed_lines": 2, "covered": 1, "uncovered": 1, "ignored": 0, "missing": 0, "coverable_total": 2, "coverage_rate": 50.0},
+                "details": [
+                    {
+                        "file_path": "src/main.c",
+                        "review_file_path": "src/main.c",
+                        "repository": "repo_alpha",
+                        "team": "Team A",
+                        "leader": "Leader 1",
+                        "ownership_status": "已匹配",
+                        "status": "未覆盖",
+                        "line_number": 1,
+                    },
+                    {
+                        "file_path": "src/main.c",
+                        "review_file_path": "src/main.c",
+                        "repository": "repo_alpha",
+                        "team": "Team A",
+                        "leader": "Leader 1",
+                        "ownership_status": "已匹配",
+                        "status": "已覆盖",
+                        "line_number": 2,
+                    }
+                ],
+            }
+            enhance_coverage.write_incremental_summary_page(temp_dir, "test_proj", result)
+            summary_html = os.path.join(temp_dir, "incremental_coverage.html")
+            with open(summary_html, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            self.assertIn('id="repo-filter"', content)
+            self.assertIn('id="team-filter"', content)
+            self.assertIn('id="leader-filter"', content)
+            self.assertIn('id="file-search"', content)
+            self.assertIn('data-repo="repo_alpha"', content)
+
+    def test_progress_module_tree_rows_aggregation_and_markup(self):
+        file_rows = [
+            {
+                "file_path": "src/module1/file1.c",
+                "total_uncovered": 10,
+                "filled_total": 2,
+                "unfilled_total": 8,
+                "confirmed_total": 1,
+                "coverable_total": 2,
+                "uncoverable_total": 0,
+                "redundant_total": 0,
+                "fill_rate": 20.0,
+                "confirmed_rate": 10.0,
+                "last_updated": "2026-08-13",
+            }
+        ]
+        res = enhance_coverage.build_ownership_progress(file_rows, None)
+        team_rows = res["teams"]
+        self.assertTrue(len(team_rows) > 0)
+        team_row = team_rows[0]
+        self.assertIn("modules_detail", team_row)
+        self.assertTrue(len(team_row["modules_detail"]) > 0)
+        mod_detail = team_row["modules_detail"][0]
+        self.assertEqual(mod_detail["file_total"], 1)
+        self.assertEqual(mod_detail["total_uncovered"], 10)
+
+        with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as f:
+            html_content = f.read()
+        self.assertIn('id="expandAllTeamModulesBtn"', html_content)
+        self.assertIn('id="collapseAllTeamModulesBtn"', html_content)
+
+        with open(enhance_coverage.PROGRESS_JS_SOURCE_PATH, "r", encoding="utf-8") as f:
+            js_content = f.read()
+        self.assertIn("toggle-team-btn", js_content)
+        self.assertIn("module-subrow", js_content)
+
+
 if __name__ == "__main__":
     unittest.main()

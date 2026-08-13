@@ -24,19 +24,6 @@ pre.source > span[id^="L"] {
 /* 浮动元素会导致父容器高度塌陷，使用伪元素完美闭合清除浮动 */
 pre.source::after {
     content: "" !important;
-pre.source > span[id^="L"] {
-    float: left !important;
-    width: 100% !important;
-    box-sizing: border-box !important;
-    min-height: 24px !important;
-    line-height: 24px !important;
-    position: relative !important;
-    padding-right: 10px !important;
-}
-
-/* 浮动元素会导致父容器高度塌陷，使用伪元素完美闭合清除浮动 */
-pre.source::after {
-    content: "" !important;
     display: table !important;
     clear: both !important;
 }
