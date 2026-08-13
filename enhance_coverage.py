@@ -4057,12 +4057,12 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
 <title>增量覆盖率审查</title><style>
 body{{margin:0;background:#f2f2f7;color:#000000;font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}}
 main{{max-width:1200px;margin:0 auto;padding:24px 22px 48px}}
-h1{{margin:0 0 6px;font-size:24px;font-weight:800;letter-spacing:-0.5px}}
-.muted{{color:#8e8e93;font-size:13px}}
-.links{{margin:16px 0;display:flex;gap:10px;flex-wrap:wrap}}
+h1{{margin:0 0 6px;font-size:24px;font-weight:800;letter-spacing:-0.5px;text-align:center}}
+.muted{{color:#8e8e93;font-size:13px;text-align:center}}
+.links{{margin:16px 0;display:flex;gap:10px;flex-wrap:wrap;justify-content:center}}
 .links a{{color:#007aff;text-decoration:none;font-weight:600;background:rgba(0,122,255,0.08);padding:6px 12px;border-radius:10px;transition:all 0.2s}}
 .links a:hover{{background:rgba(0,122,255,0.16);transform:translateY(-1px)}}
-.repo-ranges{{margin:8px 0 0;padding-left:20px;color:#636366}}
+.repo-ranges{{margin:8px 0 0;padding-left:20px;color:#636366;text-align:center}}
 .cards{{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:12px;margin:20px 0}}
 .card,section{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:16px;box-shadow:0 4px 20px -2px rgba(0,0,0,0.05)}}
 .card{{padding:14px;transition:transform 0.2s,box-shadow 0.2s}}
