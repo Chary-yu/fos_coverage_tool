@@ -37,6 +37,10 @@
       top: 0;
       z-index: 100;
     }
+    .header-inner {
+      max-width: 1400px;
+      margin: 0 auto;
+    }
     h1 { margin: 0 0 10px; font-size: 22px; font-weight: 700; letter-spacing: -0.4px; }
     .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
     input {
@@ -187,22 +191,24 @@
 </head>
 <body data-review-scope="full">
   <header>
-    <h1 id="pageTitle">全量覆盖率分析进度</h1>
-    <div class="controls">
-      <input id="projectInput" list="projectOptions" placeholder="输入或选择数据库中的项目">
-      <datalist id="projectOptions"></datalist>
-      <button id="loadBtn" type="button">查看进度</button>
-      <a id="csvLink" class="button" href="#" target="_blank">导出进度 Excel</a>
-      <a id="excelLink" class="button" href="#" target="_blank">导出目录 Excel ZIP</a>
-      <button id="detailExportBtn" type="button">后台导出详细 CSV</button>
-      <a id="detailDownloadLink" class="button" href="#" hidden>下载详细 CSV</a>
-    </div>
-    <div class="page-version">页面版本 visible-progress-20260813 · 点击后应立即显示进度条</div>
-    <div id="status" class="status"></div>
-    <div id="jobProgress" class="job-progress" role="status" aria-live="polite">
-      <div class="job-progress-head"><span id="jobStage">准备中</span><span id="jobPercent">0%</span></div>
-      <div class="job-track"><span id="jobBar"></span></div>
-      <div id="jobMessage" class="status"></div>
+    <div class="header-inner">
+      <h1 id="pageTitle">全量覆盖率分析进度</h1>
+      <div class="controls">
+        <input id="projectInput" list="projectOptions" placeholder="输入或选择数据库中的项目">
+        <datalist id="projectOptions"></datalist>
+        <button id="loadBtn" type="button">查看进度</button>
+        <a id="csvLink" class="button" href="#" target="_blank">导出进度 Excel</a>
+        <a id="excelLink" class="button" href="#" target="_blank">导出目录 Excel ZIP</a>
+        <button id="detailExportBtn" type="button">后台导出详细 CSV</button>
+        <a id="detailDownloadLink" class="button" href="#" hidden>下载详细 CSV</a>
+      </div>
+      <div class="page-version">页面版本 visible-progress-20260813 · 点击后应立即显示进度条</div>
+      <div id="status" class="status"></div>
+      <div id="jobProgress" class="job-progress" role="status" aria-live="polite">
+        <div class="job-progress-head"><span id="jobStage">准备中</span><span id="jobPercent">0%</span></div>
+        <div class="job-track"><span id="jobBar"></span></div>
+        <div id="jobMessage" class="status"></div>
+      </div>
     </div>
   </header>
   <main>
