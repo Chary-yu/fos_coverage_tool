@@ -161,16 +161,22 @@
 
   function renderFileTable(rows) {
     currentFileRows = Array.isArray(rows) ? rows : [];
-    const body = currentFileRows.length === 0 ? '<tr><td colspan="14">暂无数据</td></tr>' : currentFileRows.map((row, index) => `
-      <tr><td class="path"><button class="file-detail-link" type="button" data-file-index="${index}">${escapeHtml(row.file_path || '')}</button></td>
-      <td>${escapeHtml(row.module || '')}</td><td>${escapeHtml(row.team || '')}</td>
-      <td>${escapeHtml(row.leader || '')}</td>
-      <td class="${row.ownership_status === '已匹配' ? 'matched' : 'unmatched'}">${escapeHtml(row.ownership_status || '')}</td>
-      <td>${asNumber(row.total_uncovered)}</td><td>${asNumber(row.filled_total)}</td>
-      <td>${asNumber(row.unfilled_total)}</td><td>${asNumber(row.confirmed_total)}</td>
-      <td>${asNumber(row.coverable_total)}</td><td>${asNumber(row.uncoverable_total)}</td>
-      <td>${asNumber(row.redundant_total)}</td><td>${fmtRate(row.fill_rate)} ${bar(row.fill_rate)}</td>
-      <td>${fmtRate(row.confirmed_rate)} ${bar(row.confirmed_rate)}</td></tr>`).join('');
+    const body = currentFileRows.length === 0
+      ? '<tr><td colspan="14" style="text-align:center; padding: 24px; color:#8e8e93;">✨ 暂无文件覆盖率数据</td></tr>'
+      : currentFileRows.map((row, index) => {
+        const isMatched = row.ownership_status === '已匹配';
+        const badgeClass = isMatched ? 'badge-matched' : 'badge-unmatched';
+        return `
+          <tr><td class="path"><button class="file-detail-link" type="button" data-file-index="${index}">${escapeHtml(row.file_path || '')}</button></td>
+          <td>${escapeHtml(row.module || '')}</td><td>${escapeHtml(row.team || '')}</td>
+          <td>${escapeHtml(row.leader || '')}</td>
+          <td><span class="badge-pill ${badgeClass}">${escapeHtml(row.ownership_status || '')}</span></td>
+          <td>${asNumber(row.total_uncovered)}</td><td>${asNumber(row.filled_total)}</td>
+          <td>${asNumber(row.unfilled_total)}</td><td>${asNumber(row.confirmed_total)}</td>
+          <td>${asNumber(row.coverable_total)}</td><td>${asNumber(row.uncoverable_total)}</td>
+          <td>${asNumber(row.redundant_total)}</td><td>${fmtRate(row.fill_rate)} ${bar(row.fill_rate)}</td>
+          <td>${fmtRate(row.confirmed_rate)} ${bar(row.confirmed_rate)}</td></tr>`;
+      }).join('');
     document.getElementById('fileTable').innerHTML = `
       <thead><tr><th>文件路径</th><th>模块</th><th>小组</th><th>组长</th><th>匹配状态</th>
       <th>未覆盖</th><th>已填</th><th>未填</th><th>已确认</th><th>可覆盖</th>

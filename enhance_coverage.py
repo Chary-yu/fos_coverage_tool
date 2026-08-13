@@ -4360,7 +4360,27 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
     page = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>开发人员待填写清单</title><style>
-body{{margin:0;background:#f5f7fb;color:#172033;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Arial,"Microsoft YaHei",sans-serif}}main{{max-width:1320px;margin:0 auto;padding:28px 22px 42px}}h1{{margin:0 0 6px}}h2{{margin:0;padding:12px 14px;font-size:16px;border-bottom:1px solid #d8e0ea}}.muted{{color:#64748b}}.links{{margin:16px 0}}a{{color:#1f5fbf}}section{{background:#fff;border:1px solid #d8e0ea;border-radius:6px;margin:16px 0;overflow:hidden}}.person-stats{{padding:10px 14px;background:#f8fafc;border-bottom:1px solid #e7edf4}}.table-wrap{{overflow:auto}}table{{width:100%;border-collapse:collapse;min-width:960px}}th,td{{padding:9px 10px;border-bottom:1px solid #e7edf4;text-align:left;vertical-align:top}}th{{background:#f8fafc}}code{{font-size:12px}}.todo{{color:#b45309;font-weight:700}}.done{{color:#15803d;font-weight:700}}.fill-link{{display:inline-block;background:#eef4ff;border:1px solid #c7d8ff;border-radius:4px;padding:3px 8px;text-decoration:none;font-weight:700}}@media(max-width:700px){{main{{padding:20px 12px}}}}
+body{{margin:0;background:#f2f2f7;color:#000000;font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}}
+main{{max-width:1320px;margin:0 auto;padding:24px 22px 48px}}
+h1{{margin:0 0 6px;font-size:24px;font-weight:800;letter-spacing:-0.5px}}
+h2{{margin:0;padding:14px 16px;font-size:16px;font-weight:700;background:rgba(242,242,247,0.8);border-bottom:1px solid rgba(60,60,67,0.12);letter-spacing:-0.3px}}
+.muted{{color:#8e8e93;font-size:13px}}
+.links{{margin:16px 0;display:flex;gap:10px;flex-wrap:wrap}}
+.links a{{color:#007aff;text-decoration:none;font-weight:600;background:rgba(0,122,255,0.08);padding:6px 12px;border-radius:10px;transition:all 0.2s}}
+.links a:hover{{background:rgba(0,122,255,0.16);transform:translateY(-1px)}}
+section{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:16px;margin:20px 0;overflow:hidden;box-shadow:0 4px 20px -2px rgba(0,0,0,0.05);transition:all 0.2s ease}}
+.person-stats{{padding:12px 16px;background:rgba(242,242,247,0.4);border-bottom:1px solid rgba(60,60,67,0.08);font-size:13px}}
+.table-wrap{{overflow:auto}}
+table{{width:100%;border-collapse:collapse;min-width:960px}}
+th,td{{padding:10px 12px;border-bottom:1px solid rgba(60,60,67,0.08);text-align:left;vertical-align:middle}}
+th{{background:rgba(242,242,247,0.95);font-size:12px;font-weight:600;color:#8e8e93;text-transform:uppercase;letter-spacing:0.2px}}
+tr:hover td{{background:rgba(0,122,255,0.02)}}
+code{{font-family:SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;background:rgba(118,118,128,0.1);padding:2px 6px;border-radius:6px}}
+.todo{{color:#ff9500;font-weight:700}}
+.done{{color:#34c759;font-weight:700}}
+.fill-link{{display:inline-flex;align-items:center;background:#007aff;color:#ffffff;border-radius:8px;padding:4px 10px;text-decoration:none;font-weight:600;font-size:12px;transition:all 0.2s;box-shadow:0 2px 6px rgba(0,122,255,0.2)}}
+.fill-link:hover{{background:#0062cc;transform:translateY(-1px)}}
+@media(max-width:700px){{main{{padding:20px 12px}}}}
 </style></head><body><main>
 <h1>开发人员待填写清单</h1><div class="muted">项目：{project}；数据来源：Git 提交作者与增量覆盖率结果。</div>
 <div class="links"><a href="incremental_coverage.html">返回增量覆盖率汇总</a>　<a href="coverage_progress.html?scope=incremental&amp;project={project_url}">查看填写进度</a>　<a href="incremental_coverage.xlsx">下载 Excel</a></div>
