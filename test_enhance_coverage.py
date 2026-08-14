@@ -1085,6 +1085,40 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         with enhance_coverage._background_jobs_lock:
             self.assertNotIn("stale_job_999", enhance_coverage._background_jobs)
 
+    def test_simulated_two_process_db_version_update_and_stale_job_expiry(self):
+        import time
+        cursor_a = unittest.mock.MagicMock()
+        cursor_a.fetchone.return_value = {"data_version": 3}
+        manager_a = unittest.mock.MagicMock()
+        manager_a.conn.cursor.return_value = cursor_a
+
+        cursor_b = unittest.mock.MagicMock()
+        cursor_b.fetchone.return_value = {"data_version": 4}
+        manager_b = unittest.mock.MagicMock()
+        manager_b.conn.cursor.return_value = cursor_b
+
+        ver_a1 = enhance_coverage.get_project_data_version("proj_cross_sim", manager=manager_a)
+        self.assertEqual(ver_a1, 3)
+
+        with enhance_coverage._background_jobs_lock:
+            enhance_coverage._background_jobs["job_sim_v3"] = {
+                "id": "job_sim_v3",
+                "kind": "progress",
+                "project_name": "proj_cross_sim",
+                "version": 3,
+                "state": "completed",
+                "created_at_epoch": time.time(),
+            }
+
+        new_ver_b = enhance_coverage.invalidate_project_background_jobs("proj_cross_sim", manager=manager_b)
+        self.assertEqual(new_ver_b, 4)
+
+        ver_a2 = enhance_coverage.get_project_data_version("proj_cross_sim", manager=manager_b)
+        self.assertEqual(ver_a2, 4)
+
+        res = enhance_coverage.public_background_job("job_sim_v3")
+        self.assertIsNone(res, "Process A querying old version 3 job after Process B updated DB to version 4 MUST return None")
+
 
 if __name__ == "__main__":
     unittest.main()

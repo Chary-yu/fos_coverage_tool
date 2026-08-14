@@ -88,11 +88,23 @@ def main():
             except OSError:
                 pass
     else:
+        cursor.execute("SELECT result_path FROM coverage_background_jobs WHERE project_name = %s", (project_name,))
+        job_rows = cursor.fetchall()
+        for job_row in job_rows:
+            res_path = job_row.get("result_path") if isinstance(job_row, dict) else (job_row[0] if job_row else None)
+            if res_path:
+                for target_file in (res_path, res_path + ".part"):
+                    if os.path.exists(target_file):
+                        try:
+                            os.remove(target_file)
+                        except OSError:
+                            pass
+
         cursor.execute("DELETE FROM coverage_analysis WHERE project_name = %s", (project_name,))
         cursor.execute("DELETE FROM coverage_line_index WHERE project_name = %s", (project_name,))
         cursor.execute("DELETE FROM coverage_background_jobs WHERE project_name = %s", (project_name,))
         cursor.execute("DELETE FROM coverage_project_state WHERE project_name = %s", (project_name,))
-        invalidate_project_background_jobs(project_name)
+        invalidate_project_background_jobs(project_name, manager=manager)
 
     manager.conn.commit()
 
