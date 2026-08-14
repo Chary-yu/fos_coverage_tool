@@ -855,66 +855,96 @@ def atomic_write_file(filepath, content_bytes_or_str):
     os.replace(part_path, filepath)
 
 
-def get_project_data_version(project_name):
-    """Retrieve current data_version for project_name with DB backing."""
+def _get_active_db_manager(manager=None):
+    if manager is not None and hasattr(manager, "conn") and manager.conn:
+        return manager
+    if "db_manager" in globals() and db_manager and hasattr(db_manager, "conn") and db_manager.conn:
+        return db_manager
+    try:
+        cfg = load_config()
+        temp_mgr = DatabaseManager(cfg, exit_on_error=False, init_schema=False)
+        if temp_mgr.conn:
+            return temp_mgr
+    except Exception:
+        pass
+    return None
+
+
+def get_project_data_version(project_name, manager=None):
+    """Retrieve current data_version for project_name from MySQL (authoritative source of truth)."""
     project_name = str(project_name or "").strip()
     if not project_name:
         return 0
-    with _background_jobs_lock:
-        if project_name in _project_data_versions:
-            return _project_data_versions[project_name]
 
-    version = 0
-    try:
-        if db_manager and hasattr(db_manager, "conn") and db_manager.conn:
-            cursor = db_manager.conn.cursor()
+    active_mgr = _get_active_db_manager(manager)
+    version = None
+    if active_mgr and active_mgr.conn:
+        try:
+            cursor = active_mgr.conn.cursor()
             cursor.execute("SELECT data_version FROM coverage_project_state WHERE project_name = %s", (project_name,))
             row = cursor.fetchone()
             cursor.close()
             if row:
                 version = row.get("data_version", 0) if isinstance(row, dict) else row[0]
-    except Exception:
-        pass
+        except Exception:
+            pass
 
     with _background_jobs_lock:
-        _project_data_versions[project_name] = version
-    return version
+        if version is not None:
+            _project_data_versions[project_name] = version
+            return version
+        return _project_data_versions.get(project_name, 0)
 
 
-def increment_project_data_version(project_name):
-    """Increment data_version for project_name in DB and update in-memory version."""
+def increment_project_data_version(project_name, manager=None):
+    """Increment data_version for project_name in DB (source of truth), update in-memory version, and expire stale jobs."""
     project_name = str(project_name or "").strip()
     if not project_name:
         return 0
-    new_version = get_project_data_version(project_name) + 1
-    try:
-        if db_manager and hasattr(db_manager, "conn") and db_manager.conn:
-            cursor = db_manager.conn.cursor()
+
+    active_mgr = _get_active_db_manager(manager)
+    new_version = None
+    if active_mgr and active_mgr.conn:
+        try:
+            cursor = active_mgr.conn.cursor()
             cursor.execute("""
                 INSERT INTO coverage_project_state (project_name, data_version, updated_at)
                 VALUES (%s, 1, NOW(6))
                 ON DUPLICATE KEY UPDATE data_version = data_version + 1, updated_at = NOW(6)
             """, (project_name,))
-            db_manager.conn.commit()
+            active_mgr.conn.commit()
             cursor.execute("SELECT data_version FROM coverage_project_state WHERE project_name = %s", (project_name,))
             row = cursor.fetchone()
             cursor.close()
             if row:
-                new_version = row.get("data_version", new_version) if isinstance(row, dict) else row[0]
-    except Exception as e:
-        print(f"[Warning] Failed to update project_state version in DB: {e}", flush=True)
+                new_version = row.get("data_version", 1) if isinstance(row, dict) else row[0]
+        except Exception as e:
+            print(f"[Warning] Failed to update project_state version in DB: {e}", flush=True)
 
     with _background_jobs_lock:
+        if new_version is None:
+            new_version = _project_data_versions.get(project_name, 0) + 1
         _project_data_versions[project_name] = new_version
+
+        # Purge keys for project
         for key in list(_background_job_keys):
             if len(key) > 1 and key[1] == project_name:
                 _background_job_keys.pop(key, None)
+
+        stale_job_ids = [
+            job_id for job_id, job in _background_jobs.items()
+            if job.get("project_name") == project_name and job.get("version", 0) < new_version
+        ]
+
+    for job_id in stale_job_ids:
+        _expire_background_job(job_id)
+
     return new_version
 
 
-def invalidate_project_background_jobs(project_name):
+def invalidate_project_background_jobs(project_name, manager=None):
     """Make cached progress/export results stale after review data changes."""
-    increment_project_data_version(project_name)
+    return increment_project_data_version(project_name, manager=manager)
 
 
 def save_job_to_db(job):
@@ -1273,6 +1303,13 @@ def public_background_job(job_id):
                 _background_jobs[job_id] = job
 
         if not job:
+            return None
+
+        # Validate job version against current MySQL project data_version
+        project_name = job.get("project_name", "")
+        current_version = get_project_data_version(project_name)
+        if job.get("version", 0) < current_version:
+            _expire_background_job(job_id)
             return None
 
         now = time.time()

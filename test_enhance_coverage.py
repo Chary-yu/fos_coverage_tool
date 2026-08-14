@@ -1059,6 +1059,32 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         recover_pos = py_content.find("recover_background_jobs()", bind_pos)
         self.assertGreater(recover_pos, bind_pos, "recover_background_jobs must execute AFTER socket bind in run_server")
 
+    def test_cli_cross_process_data_version_db_invalidation_and_stale_job_expiry(self):
+        import time
+        mock_cursor = unittest.mock.MagicMock()
+        mock_cursor.fetchone.return_value = {"data_version": 5}
+        mock_mgr = unittest.mock.MagicMock()
+        mock_mgr.conn.cursor.return_value = mock_cursor
+
+        ver = enhance_coverage.get_project_data_version("test_cross_proj", manager=mock_mgr)
+        self.assertEqual(ver, 5)
+        self.assertTrue(mock_cursor.execute.called)
+
+        with enhance_coverage._background_jobs_lock:
+            enhance_coverage._background_jobs["stale_job_999"] = {
+                "id": "stale_job_999",
+                "kind": "progress",
+                "project_name": "test_cross_proj",
+                "version": 1,
+                "state": "completed",
+                "created_at_epoch": time.time(),
+            }
+
+        res = enhance_coverage.public_background_job("stale_job_999")
+        self.assertIsNone(res, "Stale job ID query with old version < current version must return None and expire")
+        with enhance_coverage._background_jobs_lock:
+            self.assertNotIn("stale_job_999", enhance_coverage._background_jobs)
+
 
 if __name__ == "__main__":
     unittest.main()
