@@ -75,9 +75,24 @@ def main():
     from enhance_coverage import BACKGROUND_JOBS_STORAGE_DIR, invalidate_project_background_jobs
 
     if clear_all:
+        known_projects = set()
+        for tbl in ("coverage_project_state", "coverage_background_jobs", "coverage_analysis", "coverage_line_index"):
+            try:
+                cursor.execute(f"SELECT DISTINCT project_name FROM {tbl}")
+                for row in cursor.fetchall():
+                    pname = row.get("project_name") if isinstance(row, dict) else row[0]
+                    if pname:
+                        known_projects.add(str(pname).strip())
+            except Exception:
+                pass
+
         cursor.execute("DELETE FROM coverage_analysis")
         cursor.execute("DELETE FROM coverage_line_index")
         cursor.execute("DELETE FROM coverage_background_jobs")
+
+        for pname in known_projects:
+            invalidate_project_background_jobs(pname, manager=manager)
+
         cursor.execute("UPDATE coverage_project_state SET data_version = data_version + 1, updated_at = NOW(6)")
         cursor.execute("ALTER TABLE coverage_analysis AUTO_INCREMENT = 1")
         cursor.execute("ALTER TABLE coverage_line_index AUTO_INCREMENT = 1")

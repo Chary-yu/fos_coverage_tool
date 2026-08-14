@@ -897,9 +897,28 @@ def get_project_data_version(project_name, manager=None):
             cursor = active_mgr.conn.cursor()
             cursor.execute("SELECT data_version FROM coverage_project_state WHERE project_name = %s", (project_name,))
             row = cursor.fetchone()
-            cursor.close()
             if row:
-                version = row.get("data_version", 0) if isinstance(row, dict) else row[0]
+                if isinstance(row, dict):
+                    version = row.get("data_version", 1)
+                elif isinstance(row, (tuple, list)):
+                    version = row[0]
+                else:
+                    try:
+                        version = int(row[0])
+                    except Exception:
+                        version = 1
+            else:
+                cursor.execute("""
+                    INSERT INTO coverage_project_state (project_name, data_version, updated_at)
+                    VALUES (%s, 1, NOW(6))
+                    ON DUPLICATE KEY UPDATE data_version = data_version
+                """, (project_name,))
+                if hasattr(active_mgr.conn, "commit"):
+                    active_mgr.conn.commit()
+                version = 1
+
+            if hasattr(cursor, "close"):
+                cursor.close()
         except Exception:
             pass
         finally:
@@ -915,6 +934,9 @@ def get_project_data_version(project_name, manager=None):
             _project_data_version_ttl[project_name] = (version, now)
             return version
         cached_ver = _project_data_versions.get(project_name, 0)
+        if cached_ver == 0:
+            cached_ver = 1
+            _project_data_versions[project_name] = 1
         _project_data_version_ttl[project_name] = (cached_ver, now)
         return cached_ver
 

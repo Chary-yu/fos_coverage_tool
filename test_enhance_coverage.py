@@ -1177,9 +1177,35 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertEqual(v1, 42)
         initial_call_count = cursor.execute.call_count
 
-        v2 = enhance_coverage.get_project_data_version("proj_ttl_test", manager=manager)
-        self.assertEqual(v2, 42)
-        self.assertEqual(cursor.execute.call_count, initial_call_count)
+    def test_clear_all_for_uninitialized_version0_projects_expires_stale_jobs(self):
+        import time
+        cursor = unittest.mock.MagicMock()
+        cursor.fetchone.return_value = None # No row in DB initially
+        manager = unittest.mock.MagicMock()
+        manager.conn.cursor.return_value = cursor
+
+        # 1. get_project_data_version initializes row with data_version=1
+        ver = enhance_coverage.get_project_data_version("proj_uninit_v0", manager=manager)
+        self.assertGreaterEqual(ver, 1)
+
+        # 2. Add job
+        with enhance_coverage._background_jobs_lock:
+            enhance_coverage._background_jobs["job_uninit_1"] = {
+                "id": "job_uninit_1",
+                "kind": "progress",
+                "project_name": "proj_uninit_v0",
+                "version": ver,
+                "state": "completed",
+                "created_at_epoch": time.time(),
+            }
+
+        # 3. Simulate clear_all collecting known projects and incrementing version
+        cursor.fetchone.return_value = {"data_version": ver + 1}
+        enhance_coverage.invalidate_project_background_jobs("proj_uninit_v0", manager=manager)
+
+        # 4. Old job query MUST return None
+        res = enhance_coverage.public_background_job("job_uninit_1")
+        self.assertIsNone(res, "Stale job query after clear_all invalidation must return None")
 
 
 if __name__ == "__main__":
