@@ -845,6 +845,10 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
             self.assertIn('id="leader-filter"', content)
             self.assertIn('id="file-search"', content)
             self.assertIn('data-repo="repo_alpha"', content)
+            self.assertIn('addUnique(repos,', content)
+            self.assertIn('populateSelect(repoFilter, repos);', content)
+            self.assertIn('thead.addEventListener("click"', content)
+            self.assertNotIn('Array.from(values)', content)
 
     def test_progress_module_tree_rows_aggregation_and_markup(self):
         file_rows = [

@@ -4116,29 +4116,33 @@ tr:hover td{{background:rgba(0,122,255,0.02)}}
     var resetBtn = document.getElementById("reset-filters-btn");
     var filterCount = document.getElementById("filter-count");
 
-    var repos = new Set();
-    var teams = new Set();
-    var leaders = new Set();
+    var repos = [];
+    var teams = [];
+    var leaders = [];
+
+    function addUnique(arr, val) {{
+        if (val && arr.indexOf(val) === -1) {{
+            arr.push(val);
+        }}
+    }}
 
     var rows = Array.prototype.slice.call(body.rows);
     for (var i = 0; i < rows.length; i++) {{
         var r = rows[i];
-        var repo = r.getAttribute("data-repo");
-        var team = r.getAttribute("data-team");
-        var leader = r.getAttribute("data-leader");
-        if (repo) repos.add(repo);
-        if (team) teams.add(team);
-        if (leader) leaders.add(leader);
+        addUnique(repos, r.getAttribute("data-repo"));
+        addUnique(teams, r.getAttribute("data-team"));
+        addUnique(leaders, r.getAttribute("data-leader"));
     }}
 
-    function populateSelect(selectEl, values) {{
+    function populateSelect(selectEl, list) {{
         if (!selectEl) return;
-        Array.from(values).sort().forEach(function(val) {{
+        list.sort();
+        for (var j = 0; j < list.length; j++) {{
             var opt = document.createElement("option");
-            opt.value = val;
-            opt.textContent = val;
+            opt.value = list[j];
+            opt.textContent = list[j];
             selectEl.appendChild(opt);
-        }});
+        }}
     }}
 
     populateSelect(repoFilter, repos);
@@ -4159,7 +4163,7 @@ tr:hover td{{background:rgba(0,122,255,0.02)}}
             var rRepo = row.getAttribute("data-repo") || "";
             var rTeam = row.getAttribute("data-team") || "";
             var rLeader = row.getAttribute("data-leader") || "";
-            var rFile = (row.cells[2] ? row.cells[2].getAttribute("data-sort-value") || "" : "").toLowerCase();
+            var rFile = (row.cells[2] ? row.cells[2].getAttribute("data-sort-value") || row.cells[2].textContent || "" : "").toLowerCase();
 
             var mRepo = !selRepo || rRepo === selRepo;
             var mTeam = !selTeam || rTeam === selTeam;
@@ -4219,15 +4223,23 @@ tr:hover td{{background:rgba(0,122,255,0.02)}}
         var column = keyToColumn[key];
         if (column === undefined) {{ return; }}
         var rows = Array.prototype.slice.call(body.rows);
-        if (!rows.length || rows[0].cells.length !== 8) {{ return; }}
+        if (!rows.length) {{ return; }}
         rows = rows.map(function(row, index) {{ return {{row: row, index: index}}; }});
         rows.sort(function(left, right) {{
-            var leftValue = left.row.cells[column].getAttribute("data-sort-value") || "";
-            var rightValue = right.row.cells[column].getAttribute("data-sort-value") || "";
-            var numeric = table.querySelector('.sort-button[data-sort-key="' + key + '"]').getAttribute("data-sort-type") === "number";
+            var leftCell = left.row.cells[column];
+            var rightCell = right.row.cells[column];
+            var leftValue = leftCell ? (leftCell.getAttribute("data-sort-value") || leftCell.textContent.trim()) : "";
+            var rightValue = rightCell ? (rightCell.getAttribute("data-sort-value") || rightCell.textContent.trim()) : "";
+            var btn = table.querySelector('.sort-button[data-sort-key="' + key + '"]');
+            var numeric = btn ? btn.getAttribute("data-sort-type") === "number" : false;
             var comparison;
-            if (numeric) {{ comparison = Number(leftValue) - Number(rightValue); }}
-            else {{ comparison = leftValue.localeCompare(rightValue); }}
+            if (numeric) {{
+                var nLeft = parseFloat(leftValue) || 0;
+                var nRight = parseFloat(rightValue) || 0;
+                comparison = nLeft - nRight;
+            }} else {{
+                comparison = leftValue.localeCompare(rightValue);
+            }}
             return comparison ? comparison * direction : left.index - right.index;
         }});
         for (var index = 0; index < rows.length; index += 1) {{ body.appendChild(rows[index].row); }}
@@ -4236,15 +4248,27 @@ tr:hover td{{background:rgba(0,122,255,0.02)}}
         updateIndicators();
     }}
 
-    var buttons = table.querySelectorAll(".sort-button");
-    for (var index = 0; index < buttons.length; index += 1) {{
-        buttons[index].addEventListener("click", function() {{
-            var key = this.getAttribute("data-sort-key");
-            var type = this.getAttribute("data-sort-type");
-            var direction = key === currentKey ? -currentDirection : (type === "number" ? -1 : 1);
-            sortRows(key, direction);
+    var thead = table.querySelector("thead");
+    if (thead) {{
+        thead.addEventListener("click", function(e) {{
+            var target = e.target;
+            var btn = target;
+            while (btn && btn !== thead && (!btn.classList || !btn.classList.contains("sort-button"))) {{
+                if (btn.tagName === "TH" && btn.getAttribute("data-sort-key")) {{
+                    btn = btn.querySelector(".sort-button");
+                    break;
+                }}
+                btn = btn.parentElement;
+            }}
+            if (btn && btn.classList && btn.classList.contains("sort-button")) {{
+                var key = btn.getAttribute("data-sort-key");
+                var type = btn.getAttribute("data-sort-type");
+                var direction = key === currentKey ? -currentDirection : (type === "number" ? -1 : 1);
+                sortRows(key, direction);
+            }}
         }});
     }}
+
     sortRows("uncovered", -1);
 }})();
 </script></body></html>""".format(
