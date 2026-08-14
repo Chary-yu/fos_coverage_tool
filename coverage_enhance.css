@@ -579,19 +579,24 @@ textarea.coverage-analysis-input.multiline {
 }
 
 .coverage-fold-bar-block {
+    clear: both !important;
+    float: left !important;
+    width: 100% !important;
+    box-sizing: border-box !important;
     margin: 8px 0 !important;
-    padding: 6px 12px !important;
+    padding: 8px 16px !important;
     background: #f2f2f7 !important;
     border-top: 1px solid rgba(60, 60, 67, 0.12) !important;
     border-bottom: 1px solid rgba(60, 60, 67, 0.12) !important;
-    text-align: center !important;
+    text-align: left !important;
 }
 
 .coverage-fold-controls {
     display: inline-flex !important;
     gap: 8px !important;
     align-items: center !important;
-    justify-content: center !important;
+    justify-content: flex-start !important;
+    flex-wrap: wrap !important;
 }
 
 .coverage-fold-btn {

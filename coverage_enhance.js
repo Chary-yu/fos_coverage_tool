@@ -803,6 +803,7 @@
                 }
             });
 
+            const MIN_FOLD_GAP = 15;
             let lastVisibleLine = 0;
             for (let index = 0; index < totalLinesCount; index++) {
                 const item = sourceLines.get(index);
@@ -817,7 +818,18 @@
                         const hiddenStart = lastVisibleLine + 1;
                         const hiddenEnd = lineNum - 1;
                         const hiddenCount = lineNum - lastVisibleLine - 1;
-                        createFoldBar(container, hiddenStart, hiddenEnd, hiddenCount, false);
+                        if (hiddenCount >= MIN_FOLD_GAP) {
+                            createFoldBar(container, hiddenStart, hiddenEnd, hiddenCount, false);
+                        } else {
+                            for (let l = hiddenStart; l <= hiddenEnd; l++) {
+                                visibleSet.add(l);
+                                const gItem = sourceLines.get(l - 1);
+                                if (gItem) {
+                                    const gContainer = getLineContainer(gItem);
+                                    if (gContainer) gContainer.style.display = '';
+                                }
+                            }
+                        }
                     }
                     lastVisibleLine = lineNum;
                 } else {
@@ -832,7 +844,17 @@
                     const hiddenStart = lastVisibleLine + 1;
                     const hiddenEnd = totalLinesCount;
                     const hiddenCount = totalLinesCount - lastVisibleLine;
-                    createFoldBar(container, hiddenStart, hiddenEnd, hiddenCount, true);
+                    if (hiddenCount >= MIN_FOLD_GAP) {
+                        createFoldBar(container, hiddenStart, hiddenEnd, hiddenCount, true);
+                    } else {
+                        for (let l = hiddenStart; l <= hiddenEnd; l++) {
+                            const gItem = sourceLines.get(l - 1);
+                            if (gItem) {
+                                const gContainer = getLineContainer(gItem);
+                                if (gContainer) gContainer.style.display = '';
+                            }
+                        }
+                    }
                 }
             }
 
