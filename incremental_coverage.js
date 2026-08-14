@@ -140,7 +140,7 @@
                 comparison = leftValue.localeCompare(rightValue, "zh-CN");
             }
             return comparison !== 0 ? comparison * direction : 0;
-        }});
+        });
 
         for (var i = 0; i < allRows.length; i++) {
             body.appendChild(allRows[i]);
