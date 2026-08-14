@@ -970,6 +970,35 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("bar-high", js_content)
         self.assertIn("visible-progress-20260814_ios_ui", js_content)
 
+    def test_atomic_write_file_creates_and_renames(self):
+        target_path = os.path.join(enhance_coverage.BACKGROUND_JOBS_STORAGE_DIR, "test_atomic.json")
+        if os.path.exists(target_path):
+            os.remove(target_path)
+        enhance_coverage.atomic_write_file(target_path, '{"status": "ok"}')
+        self.assertTrue(os.path.isfile(target_path))
+        self.assertFalse(os.path.exists(target_path + ".part"))
+        with open(target_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), '{"status": "ok"}')
+        if os.path.exists(target_path):
+            os.remove(target_path)
+
+    def test_project_data_version_increments(self):
+        v1 = enhance_coverage.get_project_data_version("test_persisted_project")
+        v2 = enhance_coverage.increment_project_data_version("test_persisted_project")
+        self.assertGreater(v2, v1)
+        self.assertEqual(enhance_coverage.get_project_data_version("test_persisted_project"), v2)
+
+    def test_persistent_background_jobs_schema_and_methods(self):
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "enhance_coverage.py")
+        with open(py_path, "r", encoding="utf-8") as f:
+            py_content = f.read()
+
+        self.assertIn("CREATE TABLE IF NOT EXISTS coverage_background_jobs", py_content)
+        self.assertIn("CREATE TABLE IF NOT EXISTS coverage_project_state", py_content)
+        self.assertIn("def recover_background_jobs", py_content)
+        self.assertIn("def start_background_job_cleanup_loop", py_content)
+        self.assertIn("BACKGROUND_JOBS_STORAGE_DIR", py_content)
+
 
 if __name__ == "__main__":
     unittest.main()

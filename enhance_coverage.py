@@ -828,21 +828,142 @@ FULL_DETAIL_HEADERS = [
 ]
 
 
-def invalidate_project_background_jobs(project_name):
-    """Make cached progress/export results stale after review data changes."""
-    project_name = str(project_name or "")
+BACKGROUND_JOBS_STORAGE_DIR = os.path.join(SCRIPT_DIR, "background_jobs")
+_cleanup_thread_started = False
+
+
+def _ensure_background_jobs_storage_dir():
+    try:
+        os.makedirs(BACKGROUND_JOBS_STORAGE_DIR, exist_ok=True)
+    except OSError:
+        pass
+
+
+def atomic_write_file(filepath, content_bytes_or_str):
+    """Write content to temporary .part file first, then atomically rename to target path."""
+    _ensure_background_jobs_storage_dir()
+    part_path = filepath + ".part"
+    mode = "wb" if isinstance(content_bytes_or_str, bytes) else "w"
+    encoding = None if isinstance(content_bytes_or_str, bytes) else "utf-8"
+    with open(part_path, mode, encoding=encoding) as f:
+        f.write(content_bytes_or_str)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            pass
+    os.replace(part_path, filepath)
+
+
+def get_project_data_version(project_name):
+    """Retrieve current data_version for project_name with DB backing."""
+    project_name = str(project_name or "").strip()
     if not project_name:
-        return
+        return 0
     with _background_jobs_lock:
-        _project_data_versions[project_name] = _project_data_versions.get(project_name, 0) + 1
+        if project_name in _project_data_versions:
+            return _project_data_versions[project_name]
+
+    version = 0
+    try:
+        if db_manager and hasattr(db_manager, "conn") and db_manager.conn:
+            cursor = db_manager.conn.cursor()
+            cursor.execute("SELECT data_version FROM coverage_project_state WHERE project_name = %s", (project_name,))
+            row = cursor.fetchone()
+            cursor.close()
+            if row:
+                version = row.get("data_version", 0) if isinstance(row, dict) else row[0]
+    except Exception:
+        pass
+
+    with _background_jobs_lock:
+        _project_data_versions[project_name] = version
+    return version
+
+
+def increment_project_data_version(project_name):
+    """Increment data_version for project_name in DB and update in-memory version."""
+    project_name = str(project_name or "").strip()
+    if not project_name:
+        return 0
+    new_version = get_project_data_version(project_name) + 1
+    try:
+        if db_manager and hasattr(db_manager, "conn") and db_manager.conn:
+            cursor = db_manager.conn.cursor()
+            cursor.execute("""
+                INSERT INTO coverage_project_state (project_name, data_version, updated_at)
+                VALUES (%s, 1, NOW(6))
+                ON DUPLICATE KEY UPDATE data_version = data_version + 1, updated_at = NOW(6)
+            """, (project_name,))
+            db_manager.conn.commit()
+            cursor.execute("SELECT data_version FROM coverage_project_state WHERE project_name = %s", (project_name,))
+            row = cursor.fetchone()
+            cursor.close()
+            if row:
+                new_version = row.get("data_version", new_version) if isinstance(row, dict) else row[0]
+    except Exception as e:
+        print(f"[Warning] Failed to update project_state version in DB: {e}", flush=True)
+
+    with _background_jobs_lock:
+        _project_data_versions[project_name] = new_version
         for key in list(_background_job_keys):
             if len(key) > 1 and key[1] == project_name:
                 _background_job_keys.pop(key, None)
+    return new_version
+
+
+def invalidate_project_background_jobs(project_name):
+    """Make cached progress/export results stale after review data changes."""
+    increment_project_data_version(project_name)
+
+
+def save_job_to_db(job):
+    """Save or update background job record in MySQL table coverage_background_jobs."""
+    if not job or not job.get("id"):
+        return
+    try:
+        if db_manager and hasattr(db_manager, "conn") and db_manager.conn:
+            cursor = db_manager.conn.cursor()
+            sql = """
+                INSERT INTO coverage_background_jobs
+                (job_id, kind, project_name, data_version, state, percent, stage, message, result_path, filename, row_count, error_message, created_at, updated_at, heartbeat_at, finished_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(6), NOW(6), NOW(6), NULL)
+                ON DUPLICATE KEY UPDATE
+                state = VALUES(state),
+                percent = VALUES(percent),
+                stage = VALUES(stage),
+                message = VALUES(message),
+                result_path = VALUES(result_path),
+                filename = VALUES(filename),
+                row_count = VALUES(row_count),
+                error_message = VALUES(error_message),
+                updated_at = NOW(6),
+                heartbeat_at = NOW(6),
+                finished_at = IF(VALUES(state) IN ('completed', 'failed', 'expired'), NOW(6), finished_at);
+            """
+            cursor.execute(sql, (
+                job["id"],
+                job.get("kind", ""),
+                job.get("project_name", ""),
+                job.get("version", 0),
+                job.get("state", "running"),
+                job.get("percent", 0),
+                job.get("stage", ""),
+                job.get("message", ""),
+                job.get("result_path") or job.get("output_path") or "",
+                job.get("filename", ""),
+                job.get("row_count", 0),
+                job.get("error_message", ""),
+            ))
+            db_manager.conn.commit()
+            cursor.close()
+    except Exception:
+        pass
 
 
 def _cleanup_background_jobs_locked(now):
     expired_ids = []
-    for job_id, job in _background_jobs.items():
+    for job_id, job in list(_background_jobs.items()):
         finished_at = job.get("finished_at_epoch")
         retention = (PROGRESS_JOB_RETENTION_SECONDS if job.get("kind") == "progress"
                      else BACKGROUND_JOB_RETENTION_SECONDS)
@@ -853,12 +974,32 @@ def _cleanup_background_jobs_locked(now):
         key = job.get("key")
         if key and _background_job_keys.get(key) == job_id:
             _background_job_keys.pop(key, None)
-        output_path = job.get("output_path")
+        output_path = job.get("output_path") or job.get("result_path")
         if output_path:
             try:
                 os.remove(output_path)
             except OSError:
                 pass
+            if os.path.exists(output_path + ".part"):
+                try:
+                    os.remove(output_path + ".part")
+                except OSError:
+                    pass
+
+    # Cleanup DB records
+    try:
+        if db_manager and hasattr(db_manager, "conn") and db_manager.conn:
+            cursor = db_manager.conn.cursor()
+            cursor.execute("""
+                DELETE FROM coverage_background_jobs
+                WHERE state IN ('completed', 'failed', 'expired')
+                AND finished_at IS NOT NULL
+                AND finished_at < DATE_SUB(NOW(6), INTERVAL 30 MINUTE)
+            """)
+            db_manager.conn.commit()
+            cursor.close()
+    except Exception:
+        pass
 
 
 def _expire_background_job(job_id, expected_finished_at):
@@ -870,7 +1011,7 @@ def _expire_background_job(job_id, expected_finished_at):
         if key and _background_job_keys.get(key) == job_id:
             _background_job_keys.pop(key, None)
         _background_jobs.pop(job_id, None)
-        output_path = job.get("output_path")
+        output_path = job.get("output_path") or job.get("result_path")
     if output_path:
         try:
             os.remove(output_path)
@@ -887,6 +1028,8 @@ def _update_background_job(job_id, percent, stage, message):
         job["stage"] = stage
         job["message"] = message
         job["updated_at_epoch"] = time.time()
+        job_copy = dict(job)
+    save_job_to_db(job_copy)
 
 
 def _finish_background_job(job_id, **values):
@@ -902,6 +1045,21 @@ def _finish_background_job(job_id, **values):
         finished_at = job["finished_at_epoch"]
         if job.get("kind") == "progress":
             retention = PROGRESS_JOB_RETENTION_SECONDS
+
+        if "data" in values and job.get("kind") == "progress":
+            _ensure_background_jobs_storage_dir()
+            res_path = os.path.join(BACKGROUND_JOBS_STORAGE_DIR, f"progress_{job_id}.json")
+            try:
+                json_str = json.dumps(values["data"], ensure_ascii=False)
+                atomic_write_file(res_path, json_str)
+                job["result_path"] = res_path
+                job["output_path"] = res_path
+            except Exception as e:
+                print(f"[Error] Failed to write progress JSON result file: {e}", flush=True)
+
+        job_copy = dict(job)
+
+    save_job_to_db(job_copy)
     cleanup_timer = threading.Timer(
         retention, _expire_background_job, args=(job_id, finished_at)
     )
@@ -934,6 +1092,7 @@ def _run_progress_background_job(job_id, project_name):
             state="failed",
             stage="failed",
             message="填写进展计算失败，请查看服务端日志",
+            error_message=str(error),
         )
     finally:
         close_thread_db_manager()
@@ -981,24 +1140,24 @@ def write_full_detail_csv(manager, project_name, output_path, progress_callback=
 def _run_detail_export_background_job(job_id, project_name):
     output_path = None
     try:
-        output_dir = os.path.join(tempfile.gettempdir(), "coverage_tool_exports")
-        os.makedirs(output_dir, exist_ok=True)
-        file_descriptor, output_path = tempfile.mkstemp(
-            prefix="coverage_full_detail_", suffix=".csv", dir=output_dir
-        )
-        os.close(file_descriptor)
-        row_count = write_full_detail_csv(
-            db_manager,
-            project_name,
-            output_path,
-            lambda percent, stage, message: _update_background_job(
-                job_id, percent, stage, message
-            ),
-        )
+        _ensure_background_jobs_storage_dir()
         filename = "coverage_full_detail_{}_{}.csv".format(
             re.sub(r"[^A-Za-z0-9_.-]+", "_", project_name),
             datetime.now().strftime("%Y%m%d_%H%M%S"),
         )
+        output_path = os.path.join(BACKGROUND_JOBS_STORAGE_DIR, f"export_{job_id}.csv")
+        temp_export_path = output_path + ".part"
+
+        row_count = write_full_detail_csv(
+            db_manager,
+            project_name,
+            temp_export_path,
+            lambda percent, stage, message: _update_background_job(
+                job_id, percent, stage, message
+            ),
+        )
+        os.replace(temp_export_path, output_path)
+
         _finish_background_job(
             job_id,
             state="completed",
@@ -1006,13 +1165,14 @@ def _run_detail_export_background_job(job_id, project_name):
             stage="completed",
             message="详细 CSV 已生成，可下载",
             output_path=output_path,
+            result_path=output_path,
             filename=filename,
             row_count=row_count,
         )
     except Exception as error:
-        if output_path:
+        if output_path and os.path.exists(output_path + ".part"):
             try:
-                os.remove(output_path)
+                os.remove(output_path + ".part")
             except OSError:
                 pass
         print("[Export Job] Failed for project '{}': {}".format(project_name, error), flush=True)
@@ -1021,6 +1181,7 @@ def _run_detail_export_background_job(job_id, project_name):
             state="failed",
             stage="failed",
             message="详细数据导出失败，请查看服务端日志",
+            error_message=str(error),
         )
     finally:
         close_thread_db_manager()
@@ -1031,9 +1192,10 @@ def start_background_job(kind, project_name):
     if kind not in ("progress", "full_detail_export"):
         raise ValueError("Unsupported background job kind")
     now = time.time()
+    start_background_job_cleanup_loop()
     with _background_jobs_lock:
         _cleanup_background_jobs_locked(now)
-        version = _project_data_versions.get(project_name, 0)
+        version = get_project_data_version(project_name)
         key = (kind, project_name, version)
         existing_id = _background_job_keys.get(key)
         existing = _background_jobs.get(existing_id)
@@ -1063,6 +1225,7 @@ def start_background_job(kind, project_name):
         }
         _background_jobs[job_id] = job
         _background_job_keys[key] = job_id
+        save_job_to_db(job)
 
     target = _run_progress_background_job if kind == "progress" else _run_detail_export_background_job
     worker = threading.Thread(target=target, args=(job_id, project_name))
@@ -1075,6 +1238,12 @@ def public_background_job(job_id):
     with _background_jobs_lock:
         job = _background_jobs.get(job_id)
         if not job:
+            # Query DB fallback
+            job = query_job_from_db(job_id)
+            if job:
+                _background_jobs[job_id] = job
+
+        if not job:
             return None
         now = time.time()
         elapsed_until = job.get("finished_at_epoch") or now
@@ -1086,15 +1255,154 @@ def public_background_job(job_id):
             "percent": job.get("percent", 0),
             "stage": job.get("stage", ""),
             "message": job.get("message", ""),
-            "elapsed_seconds": round(elapsed_until - job["created_at_epoch"], 1),
+            "elapsed_seconds": round(elapsed_until - job.get("created_at_epoch", now), 1),
         }
         if job.get("state") == "completed" and job.get("kind") == "progress":
+            if "data" not in job and job.get("result_path") and os.path.exists(job["result_path"]):
+                try:
+                    with open(job["result_path"], "r", encoding="utf-8") as f:
+                        job["data"] = json.load(f)
+                except Exception:
+                    pass
             public["data"] = job.get("data") or {}
         if job.get("state") == "completed" and job.get("kind") == "full_detail_export":
-            public["download_ready"] = bool(job.get("output_path"))
+            res_path = job.get("result_path") or job.get("output_path")
+            public["download_ready"] = bool(res_path and os.path.isfile(res_path))
             public["filename"] = job.get("filename")
             public["row_count"] = job.get("row_count", 0)
         return public
+
+
+def query_job_from_db(job_id):
+    """Query background job from MySQL table coverage_background_jobs."""
+    if not (db_manager and hasattr(db_manager, "conn") and db_manager.conn):
+        return None
+    try:
+        cursor = db_manager.conn.cursor()
+        cursor.execute("""
+            SELECT job_id, kind, project_name, data_version, state, percent, stage, message, result_path, filename, row_count, created_at, updated_at
+            FROM coverage_background_jobs
+            WHERE job_id = %s
+        """, (job_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        if not row:
+            return None
+        if isinstance(row, dict):
+            return {
+                "id": row["job_id"],
+                "kind": row["kind"],
+                "project_name": row["project_name"],
+                "version": row["data_version"],
+                "state": row["state"],
+                "percent": row["percent"],
+                "stage": row["stage"],
+                "message": row["message"],
+                "result_path": row["result_path"],
+                "output_path": row["result_path"],
+                "filename": row["filename"],
+                "row_count": row["row_count"],
+                "created_at_epoch": time.time(),
+            }
+        else:
+            return {
+                "id": row[0],
+                "kind": row[1],
+                "project_name": row[2],
+                "version": row[3],
+                "state": row[4],
+                "percent": row[5],
+                "stage": row[6],
+                "message": row[7],
+                "result_path": row[8],
+                "output_path": row[8],
+                "filename": row[9],
+                "row_count": row[10],
+                "created_at_epoch": time.time(),
+            }
+    except Exception:
+        return None
+
+
+def start_background_job_cleanup_loop():
+    """Start unified background daemon thread for periodic DB and file cleanup."""
+    global _cleanup_thread_started
+    with _background_jobs_lock:
+        if _cleanup_thread_started:
+            return
+        _cleanup_thread_started = True
+
+    def _loop():
+        while True:
+            try:
+                time.sleep(60)
+                now = time.time()
+                with _background_jobs_lock:
+                    _cleanup_background_jobs_locked(now)
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_loop, daemon=True)
+    t.start()
+
+
+def recover_background_jobs():
+    """On server startup, recover or resubmit interrupted/stale background jobs from DB."""
+    if not (db_manager and hasattr(db_manager, "conn") and db_manager.conn):
+        return
+    try:
+        cursor = db_manager.conn.cursor()
+        cursor.execute("""
+            SELECT job_id, kind, project_name, data_version, state, percent, stage, message, result_path, filename, row_count, created_at, updated_at, heartbeat_at
+            FROM coverage_background_jobs
+            WHERE state IN ('queued', 'running', 'interrupted')
+        """)
+        rows = cursor.fetchall()
+        cursor.close()
+        if not rows:
+            return
+
+        print(f"[Recovery] Found {len(rows)} interrupted/stale job(s) in DB. Auto-recovering...", flush=True)
+        for row in rows:
+            if isinstance(row, dict):
+                job_id = row["job_id"]
+                kind = row["kind"]
+                project_name = row["project_name"]
+                version = row["data_version"]
+            else:
+                job_id, kind, project_name, version = row[0], row[1], row[2], row[3]
+
+            current_ver = get_project_data_version(project_name)
+            if version != current_ver:
+                save_job_to_db({"id": job_id, "state": "failed", "message": "服务重启，前一个进程中的数据版本已更新，任务已作废"})
+                continue
+
+            key = (kind, project_name, version)
+            now = time.time()
+            job = {
+                "id": job_id,
+                "key": key,
+                "kind": kind,
+                "project_name": project_name,
+                "version": version,
+                "state": "running",
+                "percent": 1,
+                "stage": "queued",
+                "message": "服务重启，已自动恢复并开始重新计算",
+                "created_at_epoch": now,
+                "updated_at_epoch": now,
+            }
+            with _background_jobs_lock:
+                _background_jobs[job_id] = job
+                _background_job_keys[key] = job_id
+
+            target = _run_progress_background_job if kind == "progress" else _run_detail_export_background_job
+            worker = threading.Thread(target=target, args=(job_id, project_name))
+            worker.daemon = True
+            worker.start()
+            print(f"[Recovery] Resubmitted background worker for job '{job_id}' ({kind}, {project_name})", flush=True)
+    except Exception as e:
+        print(f"[Recovery] Failed to recover background jobs from DB: {e}", flush=True)
 
 
 def dict_rows_to_table(rows, fields):
@@ -1744,6 +2052,47 @@ class DatabaseManager:
             if not inherit_index_rows:
                 print("[DB] Creating index idx_line_index_inherit on coverage_line_index...")
                 cursor.execute("CREATE INDEX idx_line_index_inherit ON coverage_line_index (project_name(32), source_file_name(64), function_hash, code_line_hash, code_occurrence)")
+            cursor.close()
+
+            # Create coverage_background_jobs table
+            cursor = self.conn.cursor()
+            jobs_table_sql = """
+            CREATE TABLE IF NOT EXISTS coverage_background_jobs (
+                job_id VARCHAR(64) NOT NULL,
+                kind VARCHAR(32) NOT NULL,
+                project_name VARCHAR(128) NOT NULL,
+                data_version BIGINT NOT NULL DEFAULT 0,
+                state VARCHAR(32) NOT NULL,
+                percent INT NOT NULL DEFAULT 0,
+                stage VARCHAR(64) DEFAULT '',
+                message VARCHAR(512) DEFAULT '',
+                result_path VARCHAR(1024) DEFAULT '',
+                filename VARCHAR(512) DEFAULT '',
+                row_count BIGINT NOT NULL DEFAULT 0,
+                error_message TEXT,
+                created_at DATETIME(6) NOT NULL,
+                updated_at DATETIME(6) NOT NULL,
+                heartbeat_at DATETIME(6),
+                finished_at DATETIME(6),
+                PRIMARY KEY (job_id),
+                KEY idx_job_project (project_name),
+                KEY idx_job_state (state),
+                KEY idx_job_kind_project (kind, project_name)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            """
+            cursor.execute(jobs_table_sql)
+            self.conn.commit()
+
+            # Create coverage_project_state table
+            proj_state_table_sql = """
+            CREATE TABLE IF NOT EXISTS coverage_project_state (
+                project_name VARCHAR(128) NOT NULL,
+                data_version BIGINT NOT NULL DEFAULT 0,
+                updated_at DATETIME(6) NOT NULL,
+                PRIMARY KEY (project_name)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+            """
+            cursor.execute(proj_state_table_sql)
             self.conn.commit()
 
             cursor.close()
@@ -4700,6 +5049,10 @@ def run_server():
 
     # Use thread-local database proxy for safe request handling
     db_manager = ThreadLocalDatabaseManagerProxy(config)
+
+    # Recover any interrupted jobs from DB & start daemon cleanup loop
+    start_background_job_cleanup_loop()
+    recover_background_jobs()
 
     host = config["server"]["host"]
     port = int(config["server"]["port"])
