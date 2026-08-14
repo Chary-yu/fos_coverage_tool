@@ -75,6 +75,33 @@ class PerfTimer(object):
         print(f"[PERF] {self.name} - {phase_name}: {duration:.3f}s (total: {total:.3f}s)", flush=True)
         self.last_time = now
         return duration
+
+
+def compute_directory_signature(input_html_dir):
+    """Compute a lightweight directory signature (count, max mtime, total size) for input HTML reports."""
+    file_count = 0
+    latest_mtime = 0.0
+    total_size = 0
+
+    if os.path.exists(input_html_dir):
+        for root, dirs, files in os.walk(input_html_dir):
+            for f in files:
+                if f.endswith(".html") or f.endswith(".css") or f.endswith(".js"):
+                    file_count += 1
+                    fp = os.path.join(root, f)
+                    try:
+                        st = os.stat(fp)
+                        total_size += st.st_size
+                        if st.st_mtime > latest_mtime:
+                            latest_mtime = st.st_mtime
+                    except OSError:
+                        pass
+
+    return {
+        "file_count": file_count,
+        "latest_mtime": round(latest_mtime, 3),
+        "total_size": total_size
+    }
 REVIEW_STATUS_UNCONFIRMED = "未确认"
 REVIEW_CONFIRMED_STATUSES = ("可覆盖", "无法覆盖", "冗余代码")
 REVIEW_VALID_STATUSES = (REVIEW_STATUS_UNCONFIRMED,) + REVIEW_CONFIRMED_STATUSES
@@ -3781,12 +3808,12 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
 
 
 def inject_coverage_report(input_dir, output_dir, project_name=None, workers=None, render_mode=None,
-                           review_scope="full", incremental_lines_by_file=None):
+                           review_scope="full", incremental_lines_by_file=None, reuse_output=None):
     """
     非破坏性注入覆盖率报告：
-    1. 若 output_dir 与 input_dir 不同，则先自动将整个 input_dir 复制至 output_dir (清除已有的 output_dir)
+    1. 若 output_dir 与 input_dir 不同，且未关联指纹重用，则自动复制 input_dir 至 output_dir (清除已有的 output_dir)
     2. 在 output_dir 中注入样式表、增强脚本并复制静态资源。
-    3. ``review_scope=incremental`` 时，仅为 ``incremental_lines_by_file`` 中的
+    3. ``review_scope=incremental`` 时，仅为变动源码文件所对应的 .gcov.html
        未覆盖行注入可填写控件和数据库索引。
     """
     if not os.path.exists(input_dir):
@@ -3799,18 +3826,44 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
     config = load_config()
     if project_name is None:
         project_name = config.get("project_name", DEFAULT_PROJECT_NAME)
+    if reuse_output is None:
+        reuse_output = config.get("reuse_output", False)
+
     timer = PerfTimer(f"InjectCoverageReport[{project_name}]")
+    sig_file = os.path.join(output_dir, ".onesensor_source_signature.json")
+    current_sig = compute_directory_signature(real_input_html)
+    can_reuse = False
+
     if input_dir != output_dir:
-        print(f"[Injector] Copying input directory '{input_dir}' to '{output_dir}' (protecting original files)...")
-        try:
-            if os.path.exists(output_dir):
-                shutil.rmtree(output_dir)
-            shutil.copytree(input_dir, output_dir)
-            print("[Injector] Copy complete.")
-            timer.mark("copy_html_directory")
-        except Exception as e:
-            print(f"[Error] Failed to copy directory: {e}")
-            return
+        if reuse_output and os.path.exists(output_dir) and os.path.exists(sig_file):
+            try:
+                with open(sig_file, "r", encoding="utf-8") as sf:
+                    old_sig = json.load(sf)
+                if old_sig == current_sig:
+                    can_reuse = True
+            except Exception:
+                can_reuse = False
+
+        if can_reuse:
+            print(f"[Injector] Reusing existing output directory '{output_dir}' (source signature matches).")
+            timer.mark("reuse_html_directory")
+        else:
+            print(f"[Injector] Copying input directory '{input_dir}' to '{output_dir}' (protecting original files)...")
+            try:
+                if os.path.exists(output_dir):
+                    shutil.rmtree(output_dir)
+                shutil.copytree(input_dir, output_dir)
+                print("[Injector] Copy complete.")
+                timer.mark("copy_html_directory")
+            except Exception as e:
+                print(f"[Error] Failed to copy directory: {e}")
+                return
+
+            try:
+                with open(sig_file, "w", encoding="utf-8") as sf:
+                    json.dump(current_sig, sf, indent=2)
+            except Exception:
+                pass
     else:
         print("[Warning] Input and output directories are the same. Original files will be modified.")
 
@@ -3844,15 +3897,31 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
         print(f"[Warning] Failed to initialize database for full coverage line index: {e}")
         print("[Warning] Inject will continue, but full export requires a successful line-index sync.")
 
+    target_rel_paths = None
+    if review_scope == "incremental" and incremental_lines_by_file:
+        report_pages = find_report_page_links(real_output_html)
+        target_rel_paths = set()
+        for src_path in incremental_lines_by_file.keys():
+            link = get_report_page_link(src_path, report_pages)
+            if link:
+                target_rel_paths.add(link)
+            base = os.path.basename(src_path)
+            if base:
+                target_rel_paths.add(base + ".gcov.html")
+
     print(f"[Injector] Scanning report files under: {real_output_html}")
     gcov_files = []
     for root, dirs, files in os.walk(real_output_html):
         dirs.sort()
         for file in sorted(files):
-            if file.endswith(".c.gcov.html") or file.endswith(".h.gcov.html"):
-                file_path = os.path.join(root, file)
-                rel_path = os.path.relpath(file_path, real_output_html)
-                gcov_files.append((file_path, rel_path))
+            if not (file.endswith(".c.gcov.html") or file.endswith(".h.gcov.html")):
+                continue
+            file_path = os.path.join(root, file)
+            rel_path = os.path.relpath(file_path, real_output_html)
+            rel_path_posix = rel_path.replace(os.sep, "/")
+            if target_rel_paths is not None and rel_path_posix not in target_rel_paths and file not in target_rel_paths:
+                continue
+            gcov_files.append((file_path, rel_path))
 
     total_files = len(gcov_files)
     if total_files == 0:
@@ -3922,13 +3991,15 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
     timer.mark("inject_total_complete")
 
 
-def find_report_page_links(report_html_dir):
+def find_report_page_links(report_html_dir, target_basenames=None):
     """Build a source-path -> report-page mapping from LCOV page titles."""
     report_pages = {}
     for root, dirs, files in os.walk(report_html_dir):
         dirs.sort()
         for filename in sorted(files):
             if not (filename.endswith(".c.gcov.html") or filename.endswith(".h.gcov.html")):
+                continue
+            if target_basenames is not None and filename not in target_basenames:
                 continue
             page_path = os.path.join(root, filename)
             try:
@@ -3965,7 +4036,9 @@ def incremental_developer_anchor(developer):
 def write_incremental_summary_page(output_html_dir, project_name, result, config=None):
     """Create an auditable landing page for the generated incremental review site."""
     summary = result["summary"]
-    report_pages = find_report_page_links(output_html_dir)
+    target_files = list(result.get("uncovered_lines_by_file", {}).keys()) + list(result.get("review_lines_by_file", {}).keys())
+    target_basenames = {os.path.basename(f) + ".gcov.html" for f in target_files if os.path.basename(f)}
+    report_pages = find_report_page_links(output_html_dir, target_basenames=target_basenames if target_basenames else None)
     # Use the very same ownership workbook and matching rules as the progress
     # page so an incremental file never appears under a different leader on the
     # two pages.  Load it once: incremental reports can contain many files.
@@ -4448,7 +4521,7 @@ code{{font-family:SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;
 
 
 def build_incremental_review_site(result, input_dir, output_dir, project_name,
-                                  workers=None, render_mode=None, excel_path=None):
+                                  workers=None, render_mode=None, excel_path=None, reuse_output=None):
     """Build a fillable incremental review site from a calculated result."""
     if not os.path.isdir(input_dir):
         raise ValueError("LCOV HTML 报告目录不存在: {}".format(input_dir))
@@ -4468,6 +4541,7 @@ def build_incremental_review_site(result, input_dir, output_dir, project_name,
         render_mode=render_mode,
         review_scope="incremental",
         incremental_lines_by_file=result.get("review_lines_by_file") or result["uncovered_lines_by_file"],
+        reuse_output=reuse_output,
     )
     timer.mark("inject_coverage_report")
     real_output_html = (
@@ -4510,7 +4584,7 @@ def build_incremental_review_site(result, input_dir, output_dir, project_name,
 
 
 def generate_incremental_review(repo_path, oldgit, newgit, info_path, input_dir, output_dir,
-                                project_name, workers=None, render_mode=None, excel_path=None):
+                                project_name, workers=None, render_mode=None, excel_path=None, reuse_output=None):
     """Calculate one repository and build a fillable incremental review site."""
     if not os.path.isdir(repo_path):
         raise ValueError("Git 仓库目录不存在: {}".format(repo_path))
@@ -4518,18 +4592,18 @@ def generate_incremental_review(repo_path, oldgit, newgit, info_path, input_dir,
         repo_path, oldgit, newgit, info_path
     )
     return build_incremental_review_site(
-        result, input_dir, output_dir, project_name, workers, render_mode, excel_path
+        result, input_dir, output_dir, project_name, workers, render_mode, excel_path, reuse_output
     )
 
 
 def generate_multi_repo_incremental_review(repos_config_path, info_path, input_dir, output_dir,
-                                           project_name, workers=None, render_mode=None, excel_path=None):
+                                           project_name, workers=None, render_mode=None, excel_path=None, reuse_output=None):
     """Calculate configured repositories together and build one review site."""
     result = coverage_check.calculate_multi_repo_incremental_coverage_from_config(
         repos_config_path, info_path
     )
     return build_incremental_review_site(
-        result, input_dir, output_dir, project_name, workers, render_mode, excel_path
+        result, input_dir, output_dir, project_name, workers, render_mode, excel_path, reuse_output
     )
 
 
@@ -4607,6 +4681,7 @@ if __name__ == "__main__":
         workers = get_arg_value(args, "--workers")
         render_mode = get_arg_value(args, "--mode")
         use_config_project = has_arg(args, "--use-config-project")
+        reuse_output = has_arg(args, "--reuse-output")
 
         if not dir_path:
             dir_path = os.path.join(SCRIPT_DIR, "../build/coverage")
@@ -4631,7 +4706,7 @@ if __name__ == "__main__":
         print(f"[Main] Project : {project_name}")
         print(f"[Main] Input (ReadOnly) : {dir_path}")
         print(f"[Main] Output (Enhanced) : {out_path}")
-        inject_coverage_report(dir_path, out_path, project_name, workers, render_mode)
+        inject_coverage_report(dir_path, out_path, project_name, workers, render_mode, reuse_output=reuse_output)
     elif cmd == "server":
         run_server()
     elif cmd == "inherit":
@@ -4678,6 +4753,7 @@ if __name__ == "__main__":
         render_mode = get_arg_value(args, "--mode")
         excel_path = get_arg_value(args, "--excel")
         use_config_project = has_arg(args, "--use-config-project")
+        reuse_output = has_arg(args, "--reuse-output")
 
         required_values = {
             "--info": info_path,
@@ -4725,12 +4801,12 @@ if __name__ == "__main__":
             if repos_config_path:
                 generate_multi_repo_incremental_review(
                     repos_config_path, info_path, dir_path, out_path,
-                    project_name, workers, render_mode, excel_path,
+                    project_name, workers, render_mode, excel_path, reuse_output,
                 )
             else:
                 generate_incremental_review(
                     repo_path, oldgit, newgit, info_path, dir_path, out_path,
-                    project_name, workers, render_mode, excel_path,
+                    project_name, workers, render_mode, excel_path, reuse_output,
                 )
         except Exception as error:
             print("[Error] Failed to generate incremental review: {}".format(error))

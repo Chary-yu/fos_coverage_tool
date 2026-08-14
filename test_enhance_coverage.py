@@ -910,6 +910,21 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("file_counter % 100 == 0:", py_content)
         self.assertIn("file_index % 50 == 0:", py_content)
 
+    def test_phase4_and_phase5_performance_optimizations(self):
+        sig = enhance_coverage.compute_directory_signature(enhance_coverage.SCRIPT_DIR)
+        self.assertIn("file_count", sig)
+        self.assertIn("latest_mtime", sig)
+        self.assertIn("total_size", sig)
+
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "enhance_coverage.py")
+        with open(py_path, "r", encoding="utf-8") as f:
+            py_content = f.read()
+
+        self.assertIn("def compute_directory_signature", py_content)
+        self.assertIn(".onesensor_source_signature.json", py_content)
+        self.assertIn("target_rel_paths", py_content)
+        self.assertIn("--reuse-output", py_content)
+
 
 if __name__ == "__main__":
     unittest.main()
