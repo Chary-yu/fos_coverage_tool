@@ -897,6 +897,19 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("return panelState;", js_content)
         self.assertIn("const MIN_FOLD_GAP = 15;", js_content)
 
+    def test_phase1_performance_optimization_integrity(self):
+        timer = enhance_coverage.PerfTimer("UnitTest")
+        duration = timer.mark("phase_test")
+        self.assertGreaterEqual(duration, 0.0)
+
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "enhance_coverage.py")
+        with open(py_path, "r", encoding="utf-8") as f:
+            py_content = f.read()
+
+        self.assertIn("class PerfTimer", py_content)
+        self.assertIn("file_counter % 100 == 0:", py_content)
+        self.assertIn("file_index % 50 == 0:", py_content)
+
 
 if __name__ == "__main__":
     unittest.main()

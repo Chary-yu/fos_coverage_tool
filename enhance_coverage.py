@@ -58,6 +58,23 @@ PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
 ASSET_VERSION = "visible-progress-20260813"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
+
+
+class PerfTimer(object):
+    """Performance timing logger for benchmark and profiling execution phases."""
+
+    def __init__(self, name="Execution"):
+        self.name = name
+        self.start_time = time.time()
+        self.last_time = self.start_time
+
+    def mark(self, phase_name):
+        now = time.time()
+        duration = now - self.last_time
+        total = now - self.start_time
+        print(f"[PERF] {self.name} - {phase_name}: {duration:.3f}s (total: {total:.3f}s)", flush=True)
+        self.last_time = now
+        return duration
 REVIEW_STATUS_UNCONFIRMED = "未确认"
 REVIEW_CONFIRMED_STATUSES = ("可覆盖", "无法覆盖", "冗余代码")
 REVIEW_VALID_STATUSES = (REVIEW_STATUS_UNCONFIRMED,) + REVIEW_CONFIRMED_STATUSES
@@ -1849,6 +1866,7 @@ class DatabaseManager:
             """
             synced_total = 0
             if records:
+                file_counter = 0
                 for file_hash, file_records in records_by_file.items():
                     cursor.execute(
                         "DELETE FROM coverage_line_index WHERE project_name = %s AND file_path_hash = %s",
@@ -1876,7 +1894,10 @@ class DatabaseManager:
                         ]
                         cursor.executemany(insert_sql, payload)
                         synced_total += len(batch)
-                    self.conn.commit()
+                    file_counter += 1
+                    if file_counter % 100 == 0:
+                        self.conn.commit()
+                self.conn.commit()
             cursor.close()
             print(f"[DB] Synced {synced_total} uncovered line index record(s) across {len(records_by_file)} file(s) for project '{project_name}'.")
             return True
@@ -3775,6 +3796,10 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
     real_input_html = os.path.join(input_dir, "html") if os.path.exists(os.path.join(input_dir, "html")) else input_dir
     real_output_html = os.path.join(output_dir, "html") if os.path.exists(os.path.join(input_dir, "html")) else output_dir
 
+    config = load_config()
+    if project_name is None:
+        project_name = config.get("project_name", DEFAULT_PROJECT_NAME)
+    timer = PerfTimer(f"InjectCoverageReport[{project_name}]")
     if input_dir != output_dir:
         print(f"[Injector] Copying input directory '{input_dir}' to '{output_dir}' (protecting original files)...")
         try:
@@ -3782,6 +3807,7 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
                 shutil.rmtree(output_dir)
             shutil.copytree(input_dir, output_dir)
             print("[Injector] Copy complete.")
+            timer.mark("copy_html_directory")
         except Exception as e:
             print(f"[Error] Failed to copy directory: {e}")
             return
@@ -3791,10 +3817,6 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
     if not os.path.exists(real_output_html):
         print(f"[Error] Real output html directory '{real_output_html}' does not exist.")
         return
-
-    config = load_config()
-    if project_name is None:
-        project_name = config.get("project_name", DEFAULT_PROJECT_NAME)
 
     if render_mode is None:
         render_mode = config.get("render_mode", "lazy")
@@ -3877,14 +3899,16 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
             rate = file_index / elapsed if elapsed > 0 else 0
             remaining = (total_files - file_index) / rate if rate > 0 else 0
             index_status = "synced" if file_index_synced else "empty" if not file_record_count else "skipped"
-            print(
-                f"[Injector] Progress {file_index}/{total_files} ({percent:.1f}%) "
-                f"elapsed={elapsed:.1f}s eta={remaining:.1f}s "
-                f"uncovered={file_record_count} index={index_status} "
-                f"total_indexed={indexed_records} file={rel_path}",
-                flush=True
-            )
+            if file_index == 1 or file_index == total_files or file_index % 50 == 0:
+                print(
+                    f"[Injector] Progress {file_index}/{total_files} ({percent:.1f}%) "
+                    f"elapsed={elapsed:.1f}s eta={remaining:.1f}s "
+                    f"uncovered={file_record_count} index={index_status} "
+                    f"total_indexed={indexed_records} file={rel_path}",
+                    flush=True
+                )
 
+    timer.mark("gcov_injection_and_line_index_sync")
     print(f"[Injector] Non-destructively enhanced {injected_count} new html report file(s), updated {updated_count} existing enhanced file(s) in: {output_dir}")
     if index_manager:
         index_manager = DatabaseManager(config, exit_on_error=False, init_schema=False)
@@ -3892,8 +3916,10 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
         if index_manager.conn:
             index_manager.conn.close()
         print(f"[Injector] Synced full coverage line index: {indexed_records} record(s) across {indexed_files} file(s).")
+        timer.mark("prune_obsolete_line_index")
     else:
         print("[Injector] Full coverage line index was not synced because database initialization failed.")
+    timer.mark("inject_total_complete")
 
 
 def find_report_page_links(report_html_dir):
@@ -4427,6 +4453,7 @@ def build_incremental_review_site(result, input_dir, output_dir, project_name,
     if not os.path.isdir(input_dir):
         raise ValueError("LCOV HTML 报告目录不存在: {}".format(input_dir))
 
+    timer = PerfTimer(f"BuildIncrementalSite[{project_name}]")
     summary = result["summary"]
     print(
         "[Incremental] Git-added lines={changed_lines}, covered={covered}, uncovered={uncovered}, "
@@ -4442,6 +4469,7 @@ def build_incremental_review_site(result, input_dir, output_dir, project_name,
         review_scope="incremental",
         incremental_lines_by_file=result.get("review_lines_by_file") or result["uncovered_lines_by_file"],
     )
+    timer.mark("inject_coverage_report")
     real_output_html = (
         os.path.join(output_dir, "html")
         if os.path.isdir(os.path.join(input_dir, "html")) else output_dir
@@ -4468,6 +4496,7 @@ def build_incremental_review_site(result, input_dir, output_dir, project_name,
 
     write_incremental_summary_page(real_output_html, project_name, result)
     write_incremental_developer_tasks_page(real_output_html, project_name, result)
+    timer.mark("write_summary_pages")
     print("[Incremental] Review home page: {}".format(
         os.path.join(real_output_html, "incremental_coverage.html")
     ))
@@ -4476,6 +4505,7 @@ def build_incremental_review_site(result, input_dir, output_dir, project_name,
     ))
     print("[Incremental] Result JSON: {}".format(output_json))
     print("[Incremental] Result Excel: {}".format(excel_path))
+    timer.mark("build_site_total_complete")
     return result
 
 
