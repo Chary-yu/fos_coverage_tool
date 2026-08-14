@@ -1111,10 +1111,13 @@
             const placeholder = current.placeholder;
             const block = current.block;
             const values = Object.assign({}, current.values || {});
-            const panel = renderBlockPanel(block);
-            setStoredPanelValues(panel, values);
-            if ((values.isDraft || (values.status && values.status !== '未确认')) && panel.saveBtn) {
-                setPanelPersistedState(panel);
+            renderBlockPanel(block);
+            const panelState = panelsMap.get(startLineNum);
+            if (panelState) {
+                setStoredPanelValues(panelState, values);
+                if ((values.isDraft || (values.status && values.status !== '未确认')) && panelState.saveBtn) {
+                    setPanelPersistedState(panelState);
+                }
             }
             if (placeholder) {
                 if (current.placeholderIsAnchor) {
@@ -1137,7 +1140,7 @@
                     placeholder.remove();
                 }
             }
-            return panel;
+            return panelState;
         }
 
         function getReviewPanelLineNumbers() {

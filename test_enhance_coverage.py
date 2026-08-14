@@ -886,6 +886,17 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("toggle-team-btn", js_content)
         self.assertIn("module-subrow", js_content)
 
+    def test_lazy_mode_expansion_contract(self):
+        js_path = os.path.join(enhance_coverage.SCRIPT_DIR, "coverage_enhance.js")
+        with open(js_path, "r", encoding="utf-8") as f:
+            js_content = f.read()
+
+        self.assertIn("function expandBlockPanel(startLineNum)", js_content)
+        self.assertIn("const panelState = panelsMap.get(startLineNum);", js_content)
+        self.assertIn("setStoredPanelValues(panelState, values);", js_content)
+        self.assertIn("return panelState;", js_content)
+        self.assertIn("const MIN_FOLD_GAP = 15;", js_content)
+
 
 if __name__ == "__main__":
     unittest.main()
