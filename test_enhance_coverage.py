@@ -1036,8 +1036,8 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         with open(py_path, "r", encoding="utf-8") as f:
             py_content = f.read()
 
-        self.assertIn("invalidate_project_background_jobs(project_name)", py_content)
-        self.assertIn("invalidate_project_background_jobs(target_project)", py_content)
+        self.assertIn("invalidate_project_background_jobs(project_name", py_content)
+        self.assertIn("invalidate_project_background_jobs(target_project", py_content)
 
         clear_path = os.path.join(enhance_coverage.SCRIPT_DIR, "clear_coverage_data.py")
         with open(clear_path, "r", encoding="utf-8") as f:
@@ -1045,7 +1045,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
 
         self.assertIn("invalidate_project_background_jobs", clear_content)
         self.assertIn("DELETE FROM coverage_background_jobs", clear_content)
-        self.assertIn("DELETE FROM coverage_project_state", clear_content)
+        self.assertIn("coverage_project_state", clear_content)
 
     def test_server_port_bind_order(self):
         py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "enhance_coverage.py")
@@ -1118,6 +1118,68 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
 
         res = enhance_coverage.public_background_job("job_sim_v3")
         self.assertIsNone(res, "Process A querying old version 3 job after Process B updated DB to version 4 MUST return None")
+
+    def test_monotonic_version_increment_and_mismatch_invalidation(self):
+        import time
+        cursor = unittest.mock.MagicMock()
+        cursor.fetchone.return_value = {"data_version": 11}
+        manager = unittest.mock.MagicMock()
+        manager.conn.cursor.return_value = cursor
+
+        with enhance_coverage._background_jobs_lock:
+            enhance_coverage._background_jobs["job_v10"] = {
+                "id": "job_v10",
+                "kind": "progress",
+                "project_name": "proj_mono",
+                "version": 10,
+                "state": "completed",
+                "created_at_epoch": time.time(),
+            }
+
+        new_ver = enhance_coverage.increment_project_data_version("proj_mono", manager=manager)
+        self.assertEqual(new_ver, 11)
+
+        res = enhance_coverage.public_background_job("job_v10")
+        self.assertIsNone(res, "Job version 10 must be expired when current version is 11")
+
+    def test_db_version_update_failure_fails_closed(self):
+        class FakeRealDBConnection:
+            def cursor(self):
+                raise Exception("MySQL connection lost")
+
+        class FakeRealDBManager:
+            conn = FakeRealDBConnection()
+
+        with self.assertRaises(RuntimeError):
+            enhance_coverage.increment_project_data_version("proj_fail_closed", manager=FakeRealDBManager())
+
+    def test_temporary_db_manager_connection_closed_cleanly(self):
+        mock_temp_mgr = unittest.mock.MagicMock()
+        mock_temp_mgr.conn = unittest.mock.MagicMock()
+
+        with enhance_coverage._project_data_version_ttl_lock:
+            enhance_coverage._project_data_version_ttl.pop("proj_owned_test_unique", None)
+            enhance_coverage._project_data_versions.pop("proj_owned_test_unique", None)
+
+        with unittest.mock.patch("enhance_coverage.DatabaseManager", return_value=mock_temp_mgr):
+            mgr, owned = enhance_coverage._get_db_manager_context(manager=None)
+            self.assertTrue(owned)
+            enhance_coverage.get_project_data_version("proj_owned_test_unique")
+            self.assertTrue(mock_temp_mgr.conn.close.called)
+
+    def test_data_version_ttl_cache_avoids_redundant_queries(self):
+        cursor = unittest.mock.MagicMock()
+        cursor.fetchone.return_value = {"data_version": 42}
+        manager = unittest.mock.MagicMock()
+        manager.conn.cursor.return_value = cursor
+
+        v1 = enhance_coverage.get_project_data_version("proj_ttl_test", manager=manager)
+        self.assertEqual(v1, 42)
+        initial_call_count = cursor.execute.call_count
+
+        v2 = enhance_coverage.get_project_data_version("proj_ttl_test", manager=manager)
+        self.assertEqual(v2, 42)
+        self.assertEqual(cursor.execute.call_count, initial_call_count)
 
 
 if __name__ == "__main__":

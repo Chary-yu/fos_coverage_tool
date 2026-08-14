@@ -78,7 +78,7 @@ def main():
         cursor.execute("DELETE FROM coverage_analysis")
         cursor.execute("DELETE FROM coverage_line_index")
         cursor.execute("DELETE FROM coverage_background_jobs")
-        cursor.execute("DELETE FROM coverage_project_state")
+        cursor.execute("UPDATE coverage_project_state SET data_version = data_version + 1, updated_at = NOW(6)")
         cursor.execute("ALTER TABLE coverage_analysis AUTO_INCREMENT = 1")
         cursor.execute("ALTER TABLE coverage_line_index AUTO_INCREMENT = 1")
         if os.path.exists(BACKGROUND_JOBS_STORAGE_DIR):
@@ -103,7 +103,6 @@ def main():
         cursor.execute("DELETE FROM coverage_analysis WHERE project_name = %s", (project_name,))
         cursor.execute("DELETE FROM coverage_line_index WHERE project_name = %s", (project_name,))
         cursor.execute("DELETE FROM coverage_background_jobs WHERE project_name = %s", (project_name,))
-        cursor.execute("DELETE FROM coverage_project_state WHERE project_name = %s", (project_name,))
         invalidate_project_background_jobs(project_name, manager=manager)
 
     manager.conn.commit()
