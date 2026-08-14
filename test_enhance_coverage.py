@@ -925,6 +925,51 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("target_rel_paths", py_content)
         self.assertIn("--reuse-output", py_content)
 
+    def test_directory_signature_invalidation_on_context_change(self):
+        sig1 = enhance_coverage.compute_directory_signature(
+            enhance_coverage.SCRIPT_DIR, project_name="ProjA", review_scope="full", render_mode="lazy"
+        )
+        sig2 = enhance_coverage.compute_directory_signature(
+            enhance_coverage.SCRIPT_DIR, project_name="ProjB", review_scope="full", render_mode="lazy"
+        )
+        sig3 = enhance_coverage.compute_directory_signature(
+            enhance_coverage.SCRIPT_DIR, project_name="ProjA", review_scope="incremental", render_mode="lazy"
+        )
+        self.assertNotEqual(sig1, sig2)
+        self.assertNotEqual(sig1, sig3)
+        self.assertEqual(sig1["tool_version"], enhance_coverage.ASSET_VERSION)
+
+    def test_thread_local_database_connection_cleanup(self):
+        config = {"mysql": {"host": "127.0.0.1", "port": 3306, "user": "root", "password": "", "database": "cov"}}
+        manager = enhance_coverage.DatabaseManager(config, exit_on_error=False, init_schema=False)
+        mock_conn = unittest.mock.MagicMock()
+        manager.conn = mock_conn
+
+        self.assertEqual(manager.conn, mock_conn)
+        manager.close_thread_connection()
+        self.assertTrue(mock_conn.close.called)
+
+    def test_ios_ui_template_integrity(self):
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "enhance_coverage.py")
+        with open(py_path, "r", encoding="utf-8") as f:
+            py_content = f.read()
+
+        self.assertIn("hero-card", py_content)
+        self.assertIn("badge-unmatched-pill", py_content)
+        self.assertIn("links-segmented", py_content)
+        self.assertIn("commit-chip", py_content)
+        self.assertIn("stat-pill", py_content)
+        self.assertIn("fill-link", py_content)
+
+        js_path = os.path.join(enhance_coverage.SCRIPT_DIR, "coverage_progress.js")
+        with open(js_path, "r", encoding="utf-8") as f:
+            js_content = f.read()
+
+        self.assertIn("mod-chip", js_content)
+        self.assertIn("mod-more-chip", js_content)
+        self.assertIn("bar-high", js_content)
+        self.assertIn("visible-progress-20260814_ios_ui", js_content)
+
 
 if __name__ == "__main__":
     unittest.main()
