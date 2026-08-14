@@ -840,15 +840,20 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
             with open(summary_html, "r", encoding="utf-8") as f:
                 content = f.read()
 
+            summary_js = os.path.join(temp_dir, "incremental_coverage.js")
+            self.assertTrue(os.path.exists(summary_js))
+            with open(summary_js, "r", encoding="utf-8") as f_js:
+                js_content = f_js.read()
+
             self.assertIn('id="repo-filter"', content)
             self.assertIn('id="team-filter"', content)
             self.assertIn('id="leader-filter"', content)
             self.assertIn('id="file-search"', content)
             self.assertIn('data-repo="repo_alpha"', content)
-            self.assertIn('addUnique(repos,', content)
-            self.assertIn('populateSelect(repoFilter, repos);', content)
-            self.assertIn('thead.addEventListener("click"', content)
-            self.assertNotIn('Array.from(values)', content)
+            self.assertIn('<script src="incremental_coverage.js?v=', content)
+            self.assertIn('addUnique(repos,', js_content)
+            self.assertIn('populateSelect(repoFilter, repos);', js_content)
+            self.assertIn('thead.addEventListener("click"', js_content)
 
     def test_progress_module_tree_rows_aggregation_and_markup(self):
         file_rows = [

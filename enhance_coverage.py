@@ -55,6 +55,7 @@ JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
 CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
 PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
+INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
 ASSET_VERSION = "visible-progress-20260814_ios_ui"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
@@ -4648,7 +4649,6 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
         -item["uncovered"], -item["changed"], item["repository"],
         item["team"], item["leader"], item["file_path"]
     ))
-
     rows = []
     for item in file_rows:
         repository_name = item["repository"]
@@ -4690,6 +4690,12 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
             )
         )
 
+    target_js_path = os.path.join(output_html_dir, "incremental_coverage.js")
+    if os.path.exists(INCREMENTAL_JS_SOURCE_PATH):
+        shutil.copy2(INCREMENTAL_JS_SOURCE_PATH, target_js_path)
+    else:
+        raise RuntimeError(f"Required static asset {INCREMENTAL_JS_SOURCE_PATH} not found beside enhance_coverage.py")
+
     rate = summary["coverage_rate"]
     rate_text = "N/A" if rate is None else "{:.2f}%".format(rate)
     table_rows = "".join(rows) or '<tr><td colspan="8">本次 Git diff 没有新增代码行。</td></tr>'
@@ -4718,14 +4724,13 @@ h1{{margin:0 0 8px;font-size:26px;font-weight:800;letter-spacing:-0.6px;color:#1
 .repo-chip{{display:inline-flex;align-items:center;gap:6px;background:rgba(0,122,255,0.08);padding:4px 10px;border-radius:8px;font-size:12px}}
 .repo-name{{color:#007aff;font-weight:700}}
 .commit-range{{font-family:SFMono-Regular,Menlo,Monaco,Consolas,monospace;color:#3a3a3c;font-size:11px}}
-.links-segmented{{display:inline-flex;gap:4px;background:rgba(118,118,128,0.12);padding:4px;border-radius:12px;margin-top:16px;flex-wrap:wrap;justify-content:center}}
-.links-segmented a{{color:#007aff;text-decoration:none;font-weight:600;font-size:13px;padding:6px 14px;border-radius:9px;transition:all 0.15s ease}}
-.links-segmented a:hover{{background:#ffffff;color:#0051a8;box-shadow:0 2px 8px rgba(0,0,0,0.08)}}
-.cards{{display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));gap:14px;margin-bottom:20px}}
-.card{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:16px;padding:16px 18px;box-shadow:0 4px 20px -2px rgba(0,0,0,0.04);transition:all 0.2s cubic-bezier(0.4,0,0.2,1)}}
-.card:hover{{transform:translateY(-2px);box-shadow:0 6px 24px -2px rgba(0,0,0,0.08)}}
-.label{{font-size:12px;color:#8e8e93;font-weight:500;letter-spacing:-0.1px}}
-.value{{font-size:26px;font-weight:800;margin-top:6px;letter-spacing:-0.6px;color:#1c1c1e;font-variant-numeric:tabular-nums}}
+.links-segmented{{display:inline-flex;gap:4px;background:rgba(118,118,128,0.12);padding:3px;border-radius:10px;margin-top:16px;flex-wrap:wrap;justify-content:center}}
+.links-segmented a{{display:inline-flex;align-items:center;padding:6px 14px;border-radius:7px;font-size:13px;font-weight:600;color:#007aff;text-decoration:none;transition:all 0.15s ease}}
+.links-segmented a:hover{{background:#ffffff;box-shadow:0 2px 8px rgba(0,0,0,0.08);color:#0051a8}}
+.cards{{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:20px}}
+.card{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:14px;padding:16px;box-shadow:0 4px 20px -2px rgba(0,0,0,0.04)}}
+.label{{font-size:12px;color:#8e8e93;font-weight:600;margin-bottom:6px}}
+.value{{font-size:22px;font-weight:800;letter-spacing:-0.5px}}
 .val-changed{{color:#1c1c1e}}
 .val-covered{{color:#34c759}}
 .val-uncovered{{color:#007aff}}
@@ -4780,175 +4785,8 @@ td a:hover{{text-decoration:underline}}
   <span id="filter-count" class="filter-count"></span>
 </div>
 <table id="incremental-file-table"><thead><tr><th data-sort-key="repository" aria-sort="none"><button type="button" class="sort-button" data-sort-key="repository" data-sort-type="text">仓库 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ownership" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ownership" data-sort-type="text">小组 / 组长 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="file" aria-sort="none"><button type="button" class="sort-button" data-sort-key="file" data-sort-type="text">文件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="changed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="changed" data-sort-type="number">新增行 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="covered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="covered" data-sort-type="number">已覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="uncovered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="uncovered" data-sort-type="number">未覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ignored" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ignored" data-sort-type="number">无需覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="missing" aria-sort="none"><button type="button" class="sort-button" data-sort-key="missing" data-sort-type="number">覆盖信息缺失 <span class="sort-indicator" aria-hidden="true">↕</span></button></th></tr></thead><tbody>{table_rows}</tbody></table></section>
-</main><script>
-(function() {{
-    var table = document.getElementById("incremental-file-table");
-    if (!table || !table.tBodies.length) {{ return; }}
-    var body = table.tBodies[0];
-
-    var repoFilter = document.getElementById("repo-filter");
-    var teamFilter = document.getElementById("team-filter");
-    var leaderFilter = document.getElementById("leader-filter");
-    var fileSearch = document.getElementById("file-search");
-    var resetBtn = document.getElementById("reset-filters-btn");
-    var filterCount = document.getElementById("filter-count");
-
-    var repos = [];
-    var teams = [];
-    var leaders = [];
-
-    function addUnique(arr, val) {{
-        if (val && arr.indexOf(val) === -1) {{
-            arr.push(val);
-        }}
-    }}
-
-    var rows = Array.prototype.slice.call(body.rows);
-    for (var i = 0; i < rows.length; i++) {{
-        var r = rows[i];
-        addUnique(repos, r.getAttribute("data-repo"));
-        addUnique(teams, r.getAttribute("data-team"));
-        addUnique(leaders, r.getAttribute("data-leader"));
-    }}
-
-    function populateSelect(selectEl, list) {{
-        if (!selectEl) return;
-        list.sort();
-        for (var j = 0; j < list.length; j++) {{
-            var opt = document.createElement("option");
-            opt.value = list[j];
-            opt.textContent = list[j];
-            selectEl.appendChild(opt);
-        }}
-    }}
-
-    populateSelect(repoFilter, repos);
-    populateSelect(teamFilter, teams);
-    populateSelect(leaderFilter, leaders);
-
-    function applyFilters() {{
-        var selRepo = repoFilter ? repoFilter.value : "";
-        var selTeam = teamFilter ? teamFilter.value : "";
-        var selLeader = leaderFilter ? leaderFilter.value : "";
-        var kw = fileSearch ? fileSearch.value.trim().toLowerCase() : "";
-
-        var total = body.rows.length;
-        var visible = 0;
-
-        for (var i = 0; i < total; i++) {{
-            var row = body.rows[i];
-            var rRepo = row.getAttribute("data-repo") || "";
-            var rTeam = row.getAttribute("data-team") || "";
-            var rLeader = row.getAttribute("data-leader") || "";
-            var rFile = (row.cells[2] ? row.cells[2].getAttribute("data-sort-value") || row.cells[2].textContent || "" : "").toLowerCase();
-
-            var mRepo = !selRepo || rRepo === selRepo;
-            var mTeam = !selTeam || rTeam === selTeam;
-            var mLeader = !selLeader || rLeader === selLeader;
-            var mKw = !kw || rFile.indexOf(kw) !== -1;
-
-            if (mRepo && mTeam && mLeader && mKw) {{
-                row.style.display = "";
-                visible++;
-            }} else {{
-                row.style.display = "none";
-            }}
-        }}
-
-        if (filterCount) {{
-            if (selRepo || selTeam || selLeader || kw) {{
-                filterCount.textContent = "筛选匹配 " + visible + " / " + total + " 个文件";
-            }} else {{
-                filterCount.textContent = "共 " + total + " 个文件";
-            }}
-        }}
-    }}
-
-    if (repoFilter) repoFilter.addEventListener("change", applyFilters);
-    if (teamFilter) teamFilter.addEventListener("change", applyFilters);
-    if (leaderFilter) leaderFilter.addEventListener("change", applyFilters);
-    if (fileSearch) fileSearch.addEventListener("input", applyFilters);
-    if (resetBtn) {{
-        resetBtn.addEventListener("click", function() {{
-            if (repoFilter) repoFilter.value = "";
-            if (teamFilter) teamFilter.value = "";
-            if (leaderFilter) leaderFilter.value = "";
-            if (fileSearch) fileSearch.value = "";
-            applyFilters();
-        }});
-    }}
-
-    applyFilters();
-
-    var keyToColumn = {{repository: 0, ownership: 1, file: 2, changed: 3, covered: 4, uncovered: 5, ignored: 6, missing: 7}};
-    var currentKey = "";
-    var currentDirection = 1;
-
-    function updateIndicators() {{
-        var buttons = table.querySelectorAll(".sort-button");
-        for (var index = 0; index < buttons.length; index += 1) {{
-            var button = buttons[index];
-            var key = button.getAttribute("data-sort-key");
-            var active = key === currentKey;
-            var indicator = button.querySelector(".sort-indicator");
-            if (indicator) {{ indicator.textContent = active ? (currentDirection < 0 ? "↓" : "↑") : "↕"; }}
-            button.parentNode.setAttribute("aria-sort", active ? (currentDirection < 0 ? "descending" : "ascending") : "none");
-        }}
-    }}
-
-    function sortRows(key, direction) {{
-        var column = keyToColumn[key];
-        if (column === undefined) {{ return; }}
-        var rows = Array.prototype.slice.call(body.rows);
-        if (!rows.length) {{ return; }}
-        rows = rows.map(function(row, index) {{ return {{row: row, index: index}}; }});
-        rows.sort(function(left, right) {{
-            var leftCell = left.row.cells[column];
-            var rightCell = right.row.cells[column];
-            var leftValue = leftCell ? (leftCell.getAttribute("data-sort-value") || leftCell.textContent.trim()) : "";
-            var rightValue = rightCell ? (rightCell.getAttribute("data-sort-value") || rightCell.textContent.trim()) : "";
-            var btn = table.querySelector('.sort-button[data-sort-key="' + key + '"]');
-            var numeric = btn ? btn.getAttribute("data-sort-type") === "number" : false;
-            var comparison;
-            if (numeric) {{
-                var nLeft = parseFloat(leftValue) || 0;
-                var nRight = parseFloat(rightValue) || 0;
-                comparison = nLeft - nRight;
-            }} else {{
-                comparison = leftValue.localeCompare(rightValue);
-            }}
-            return comparison ? comparison * direction : left.index - right.index;
-        }});
-        for (var index = 0; index < rows.length; index += 1) {{ body.appendChild(rows[index].row); }}
-        currentKey = key;
-        currentDirection = direction;
-        updateIndicators();
-    }}
-
-    var thead = table.querySelector("thead");
-    if (thead) {{
-        thead.addEventListener("click", function(e) {{
-            var target = e.target;
-            var btn = target;
-            while (btn && btn !== thead && (!btn.classList || !btn.classList.contains("sort-button"))) {{
-                if (btn.tagName === "TH" && btn.getAttribute("data-sort-key")) {{
-                    btn = btn.querySelector(".sort-button");
-                    break;
-                }}
-                btn = btn.parentElement;
-            }}
-            if (btn && btn.classList && btn.classList.contains("sort-button")) {{
-                var key = btn.getAttribute("data-sort-key");
-                var type = btn.getAttribute("data-sort-type");
-                var direction = key === currentKey ? -currentDirection : (type === "number" ? -1 : 1);
-                sortRows(key, direction);
-            }}
-        }});
-    }}
-
-    sortRows("uncovered", -1);
-}})();
-</script></body></html>""".format(
+</main><script src="incremental_coverage.js?v={asset_version}"></script></body></html>""".format(
+        asset_version=ASSET_VERSION,
         project=escaped(project_name),
         project_url=escaped(urllib.parse.quote(str(project_name), safe="")),
         git_range_text=git_range_text,

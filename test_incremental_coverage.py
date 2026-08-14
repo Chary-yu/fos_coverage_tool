@@ -418,7 +418,9 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         self.assertIn("repo_a", summary_html)
         self.assertIn("repo_b", summary_html)
         self.assertIn('data-sort-key="uncovered"', summary_html)
-        self.assertIn('sortRows("uncovered", -1)', summary_html)
+        self.assertIn('<script src="incremental_coverage.js?v=', summary_html)
+        with open(os.path.join(self.output_dir, "incremental_coverage.js"), "r", encoding="utf-8") as summary_js:
+            self.assertIn('sortRows("uncovered", -1)', summary_js.read())
         self.assertIn('data-sort-value="1"', summary_html)
         with zipfile.ZipFile(os.path.join(self.output_dir, "incremental_coverage.xlsx")) as workbook:
             self.assertIn("xl/worksheets/sheet3.xml", workbook.namelist())
