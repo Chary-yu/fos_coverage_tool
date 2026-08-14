@@ -56,7 +56,7 @@ CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
 PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "visible-progress-20260813"
+ASSET_VERSION = "visible-progress-20260814_ios_ui"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 
 
@@ -77,8 +77,8 @@ class PerfTimer(object):
         return duration
 
 
-def compute_directory_signature(input_html_dir):
-    """Compute a lightweight directory signature (count, max mtime, total size) for input HTML reports."""
+def compute_directory_signature(input_html_dir, project_name=None, review_scope=None, render_mode=None):
+    """Compute a comprehensive directory signature (count, max mtime, size, project, scope, mode) for input HTML reports."""
     file_count = 0
     latest_mtime = 0.0
     total_size = 0
@@ -98,9 +98,13 @@ def compute_directory_signature(input_html_dir):
                         pass
 
     return {
+        "project_name": str(project_name or ""),
+        "review_scope": str(review_scope or ""),
+        "render_mode": str(render_mode or ""),
         "file_count": file_count,
         "latest_mtime": round(latest_mtime, 3),
-        "total_size": total_size
+        "total_size": total_size,
+        "tool_version": ASSET_VERSION,
     }
 REVIEW_STATUS_UNCONFIRMED = "未确认"
 REVIEW_CONFIRMED_STATUSES = ("可覆盖", "无法覆盖", "冗余代码")
@@ -1512,7 +1516,8 @@ class DatabaseManager:
     def __init__(self, config, exit_on_error=True, init_schema=True):
         self.config = config["mysql"]
         self.exit_on_error = exit_on_error
-        self.conn = None
+        self._local = threading.local()
+        self._default_conn = None
         if not db_module:
             print("[CRITICAL] Missing MySQL driver. Please install PyMySQL to enable database support:")
             print("           pip install pymysql")
@@ -1528,6 +1533,34 @@ class DatabaseManager:
             self.init_database()
         else:
             self.conn = self.get_connection(select_db=True)
+
+    @property
+    def conn(self):
+        _local = getattr(self, "_local", None)
+        if _local is not None:
+            local_conn = getattr(_local, "conn", None)
+            if local_conn is not None:
+                return local_conn
+        return getattr(self, "_default_conn", None)
+
+    @conn.setter
+    def conn(self, value):
+        if not hasattr(self, "_local"):
+            self._local = threading.local()
+        self._local.conn = value
+        self._default_conn = value
+
+    def close_thread_connection(self):
+        """Close the thread-local database connection safely if initialized."""
+        _local = getattr(self, "_local", None)
+        if _local is not None:
+            thread_conn = getattr(_local, "conn", None)
+            if thread_conn is not None:
+                try:
+                    thread_conn.close()
+                except Exception:
+                    pass
+                _local.conn = None
 
     def get_connection(self, select_db=True):
         """建立并返回 MySQL 连接"""
@@ -3174,6 +3207,14 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         except ConnectionError:
             print("[Server] Client disconnected before response write completed.", flush=True)
 
+    def finish(self):
+        """Ensure thread-local DB connections and sockets are closed safely."""
+        try:
+            super().finish()
+        finally:
+            if "db_manager" in globals() and db_manager and hasattr(db_manager, "close_thread_connection"):
+                db_manager.close_thread_connection()
+
     def do_OPTIONS(self):
         self.send_response(200)
         self.send_cors_headers()
@@ -3831,7 +3872,9 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
 
     timer = PerfTimer(f"InjectCoverageReport[{project_name}]")
     sig_file = os.path.join(output_dir, ".onesensor_source_signature.json")
-    current_sig = compute_directory_signature(real_input_html)
+    current_sig = compute_directory_signature(
+        real_input_html, project_name=project_name, review_scope=review_scope, render_mode=render_mode
+    )
     can_reuse = False
 
     if input_dir != output_dir:

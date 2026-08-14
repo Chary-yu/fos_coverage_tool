@@ -772,7 +772,7 @@ class TestScalableProgress(unittest.TestCase):
         with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as html_file:
             html_content = html_file.read()
         self.assertIn('src="coverage_progress.js?v=', html_content)
-        self.assertIn("页面版本 visible-progress-20260813", html_content)
+        self.assertIn("页面版本 visible-progress-20260814_ios_ui", html_content)
         self.assertNotIn('<script>\n    const DEFAULT_REVIEW_SCOPE', html_content)
 
 

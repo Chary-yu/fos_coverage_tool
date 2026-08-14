@@ -2,7 +2,7 @@
 (function () {
   'use strict';
 
-  const PROGRESS_PAGE_VERSION = 'visible-progress-20260813';
+  const PROGRESS_PAGE_VERSION = 'visible-progress-20260814_ios_ui';
   const DEFAULT_REVIEW_SCOPE = 'full';
   const params = new URLSearchParams(window.location.search);
   const configuredScope = document.body.getAttribute('data-review-scope') || DEFAULT_REVIEW_SCOPE;
