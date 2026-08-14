@@ -1002,21 +1002,51 @@ def _cleanup_background_jobs_locked(now):
         pass
 
 
-def _expire_background_job(job_id, expected_finished_at):
+def _parse_db_timestamp(val):
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if hasattr(val, "timestamp"):
+        return val.timestamp()
+    if isinstance(val, str):
+        try:
+            return datetime.strptime(val.split(".")[0], "%Y-%m-%d %H:%M:%S").timestamp()
+        except Exception:
+            pass
+    return None
+
+
+def _expire_background_job(job_id, expected_finished_at=None):
     with _background_jobs_lock:
         job = _background_jobs.get(job_id)
-        if not job or job.get("finished_at_epoch") != expected_finished_at:
+        if expected_finished_at and job and job.get("finished_at_epoch") != expected_finished_at:
             return
-        key = job.get("key")
+        key = job.get("key") if job else None
         if key and _background_job_keys.get(key) == job_id:
             _background_job_keys.pop(key, None)
-        _background_jobs.pop(job_id, None)
-        output_path = job.get("output_path") or job.get("result_path")
+        removed_job = _background_jobs.pop(job_id, None) or {}
+        output_path = (job.get("output_path") or job.get("result_path")) if job else removed_job.get("result_path")
+
     if output_path:
         try:
             os.remove(output_path)
         except OSError:
             pass
+        if os.path.exists(output_path + ".part"):
+            try:
+                os.remove(output_path + ".part")
+            except OSError:
+                pass
+
+    try:
+        if db_manager and hasattr(db_manager, "conn") and db_manager.conn:
+            cursor = db_manager.conn.cursor()
+            cursor.execute("DELETE FROM coverage_background_jobs WHERE job_id = %s", (job_id,))
+            db_manager.conn.commit()
+            cursor.close()
+    except Exception:
+        pass
 
 
 def _update_background_job(job_id, percent, stage, message):
@@ -1238,15 +1268,23 @@ def public_background_job(job_id):
     with _background_jobs_lock:
         job = _background_jobs.get(job_id)
         if not job:
-            # Query DB fallback
             job = query_job_from_db(job_id)
             if job:
                 _background_jobs[job_id] = job
 
         if not job:
             return None
+
         now = time.time()
-        elapsed_until = job.get("finished_at_epoch") or now
+        finished_at = job.get("finished_at_epoch")
+        retention = (PROGRESS_JOB_RETENTION_SECONDS if job.get("kind") == "progress"
+                     else BACKGROUND_JOB_RETENTION_SECONDS)
+
+        if finished_at and now - finished_at > retention:
+            _expire_background_job(job_id, finished_at)
+            return None
+
+        elapsed_until = finished_at or now
         public = {
             "id": job["id"],
             "kind": job["kind"],
@@ -1280,7 +1318,7 @@ def query_job_from_db(job_id):
     try:
         cursor = db_manager.conn.cursor()
         cursor.execute("""
-            SELECT job_id, kind, project_name, data_version, state, percent, stage, message, result_path, filename, row_count, created_at, updated_at
+            SELECT job_id, kind, project_name, data_version, state, percent, stage, message, result_path, filename, row_count, created_at, updated_at, finished_at
             FROM coverage_background_jobs
             WHERE job_id = %s
         """, (job_id,))
@@ -1289,6 +1327,8 @@ def query_job_from_db(job_id):
         if not row:
             return None
         if isinstance(row, dict):
+            created_at_epoch = _parse_db_timestamp(row.get("created_at")) or time.time()
+            finished_at_epoch = _parse_db_timestamp(row.get("finished_at"))
             return {
                 "id": row["job_id"],
                 "kind": row["kind"],
@@ -1302,9 +1342,12 @@ def query_job_from_db(job_id):
                 "output_path": row["result_path"],
                 "filename": row["filename"],
                 "row_count": row["row_count"],
-                "created_at_epoch": time.time(),
+                "created_at_epoch": created_at_epoch,
+                "finished_at_epoch": finished_at_epoch,
             }
         else:
+            created_at_epoch = _parse_db_timestamp(row[11]) or time.time()
+            finished_at_epoch = _parse_db_timestamp(row[13])
             return {
                 "id": row[0],
                 "kind": row[1],
@@ -1318,7 +1361,8 @@ def query_job_from_db(job_id):
                 "output_path": row[8],
                 "filename": row[9],
                 "row_count": row[10],
-                "created_at_epoch": time.time(),
+                "created_at_epoch": created_at_epoch,
+                "finished_at_epoch": finished_at_epoch,
             }
     except Exception:
         return None
@@ -2527,6 +2571,8 @@ class DatabaseManager:
                 inherited += len(batch)
 
             cursor.close()
+            if inherited > 0:
+                invalidate_project_background_jobs(target_project)
             return {
                 "source_project": source_project,
                 "target_project": target_project,
@@ -4380,6 +4426,7 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
         timer.mark("prune_obsolete_line_index")
     else:
         print("[Injector] Full coverage line index was not synced because database initialization failed.")
+    invalidate_project_background_jobs(project_name)
     timer.mark("inject_total_complete")
 
 
@@ -5050,16 +5097,18 @@ def run_server():
     # Use thread-local database proxy for safe request handling
     db_manager = ThreadLocalDatabaseManagerProxy(config)
 
-    # Recover any interrupted jobs from DB & start daemon cleanup loop
-    start_background_job_cleanup_loop()
-    recover_background_jobs()
-
     host = config["server"]["host"]
     port = int(config["server"]["port"])
     server_address = (host, port)
 
+    # Bind port first so if another instance is running, we fail immediately before recovering jobs
     httpd = ThreadingHTTPServer(server_address, CoverageHTTPRequestHandler)
     print(f"[Server] Microservice running on http://{host}:{port} ...")
+
+    # Recover any interrupted jobs from DB & start daemon cleanup loop after successful socket bind
+    start_background_job_cleanup_loop()
+    recover_background_jobs()
+
     print("[Server] Press Ctrl+C to terminate.")
     
     try:

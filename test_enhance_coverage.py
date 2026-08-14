@@ -999,6 +999,66 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("def start_background_job_cleanup_loop", py_content)
         self.assertIn("BACKGROUND_JOBS_STORAGE_DIR", py_content)
 
+    def test_completed_job_db_restoration_restores_finished_at_and_enforces_retention(self):
+        import time
+        from datetime import datetime
+        old_finished = time.time() - 3600
+        dt_str = datetime.fromtimestamp(old_finished).strftime("%Y-%m-%d %H:%M:%S")
+        mock_cursor = unittest.mock.MagicMock()
+        mock_cursor.fetchone.return_value = {
+            "job_id": "expired_job_123",
+            "kind": "progress",
+            "project_name": "test_proj",
+            "data_version": 1,
+            "state": "completed",
+            "percent": 100,
+            "stage": "completed",
+            "message": "done",
+            "result_path": "",
+            "filename": "",
+            "row_count": 0,
+            "created_at": dt_str,
+            "updated_at": dt_str,
+            "finished_at": dt_str,
+        }
+        with unittest.mock.patch("enhance_coverage.db_manager") as mock_db:
+            mock_db.conn.cursor.return_value = mock_cursor
+            job = enhance_coverage.query_job_from_db("expired_job_123")
+            self.assertIsNotNone(job)
+            self.assertIsNotNone(job.get("finished_at_epoch"))
+            self.assertAlmostEqual(job["finished_at_epoch"], old_finished, delta=2)
+
+            res = enhance_coverage.public_background_job("expired_job_123")
+            self.assertIsNone(res, "Expired job query from DB should return None and expire DB row")
+
+    def test_cli_ops_paths_invalidate_data_version(self):
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "enhance_coverage.py")
+        with open(py_path, "r", encoding="utf-8") as f:
+            py_content = f.read()
+
+        self.assertIn("invalidate_project_background_jobs(project_name)", py_content)
+        self.assertIn("invalidate_project_background_jobs(target_project)", py_content)
+
+        clear_path = os.path.join(enhance_coverage.SCRIPT_DIR, "clear_coverage_data.py")
+        with open(clear_path, "r", encoding="utf-8") as f:
+            clear_content = f.read()
+
+        self.assertIn("invalidate_project_background_jobs", clear_content)
+        self.assertIn("DELETE FROM coverage_background_jobs", clear_content)
+        self.assertIn("DELETE FROM coverage_project_state", clear_content)
+
+    def test_server_port_bind_order(self):
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "enhance_coverage.py")
+        with open(py_path, "r", encoding="utf-8") as f:
+            py_content = f.read()
+
+        server_def_pos = py_content.find("def run_server():")
+        self.assertNotEqual(server_def_pos, -1)
+        bind_pos = py_content.find("ThreadingHTTPServer(server_address", server_def_pos)
+        self.assertNotEqual(bind_pos, -1)
+        recover_pos = py_content.find("recover_background_jobs()", bind_pos)
+        self.assertGreater(recover_pos, bind_pos, "recover_background_jobs must execute AFTER socket bind in run_server")
+
 
 if __name__ == "__main__":
     unittest.main()
