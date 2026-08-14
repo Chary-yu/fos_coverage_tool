@@ -125,15 +125,40 @@
     td.path { word-break: break-all; font-weight: 500; }
     .bar {
       display: inline-block;
-      width: 80px;
-      height: 6px;
+      width: 76px;
+      height: 8px;
       background: rgba(120, 120, 128, 0.16);
       border-radius: 999px;
       overflow: hidden;
-      margin-left: 8px;
+      margin-left: 6px;
       vertical-align: middle;
     }
-    .bar span { display: block; height: 100%; background: var(--green); border-radius: 999px; }
+    .bar span { display: block; height: 100%; background: var(--blue); border-radius: 999px; transition: width 0.3s ease; }
+    .bar.bar-high span { background: var(--green); }
+    .bar.bar-mid span { background: var(--orange); }
+    .bar.bar-low span { background: var(--blue); }
+    .mod-chip {
+      display: inline-block;
+      background: rgba(0, 122, 255, 0.08);
+      color: #007aff;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 6px;
+      margin: 1px 2px;
+      white-space: nowrap;
+    }
+    .mod-more-chip {
+      display: inline-block;
+      background: rgba(118, 118, 128, 0.12);
+      color: #8e8e93;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 6px;
+      margin: 1px 2px;
+    }
+    td, th { font-variant-numeric: tabular-nums; }
     .status { margin-top: 8px; color: var(--muted); font-size: 13px; text-align: left; }
     .page-version { margin-top: 6px; color: var(--muted); font-size: 12px; text-align: left; }
     .error { color: var(--red); font-weight: 600; }

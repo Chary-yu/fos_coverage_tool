@@ -46,7 +46,13 @@
 
   function bar(rate) {
     const value = Math.max(0, Math.min(100, asNumber(rate)));
-    return `<span class="bar"><span style="width:${value}%"></span></span>`;
+    let barColorClass = 'bar-low';
+    if (value >= 100) {
+      barColorClass = 'bar-high';
+    } else if (value >= 30) {
+      barColorClass = 'bar-mid';
+    }
+    return `<span class="bar ${barColorClass}"><span style="width:${value}%"></span></span>`;
   }
 
   function metric(id, value) {
@@ -98,11 +104,22 @@
         ? `<button type="button" class="toggle-team-btn" data-team-index="${teamIdx}" title="点击展开/折叠该小组下的模块明细">▶</button>`
         : '<span class="toggle-team-spacer"></span>';
 
+      let moduleCellHtml = '';
+      if (hasModules) {
+        const visibleMods = modules.slice(0, 2);
+        const modChips = visibleMods.map(m => `<span class="mod-chip">${escapeHtml(m.module || '')}</span>`).join('');
+        const moreCount = modules.length - visibleMods.length;
+        const moreChip = moreCount > 0 ? `<span class="mod-more-chip">+${moreCount}</span>` : '';
+        moduleCellHtml = `${modChips}${moreChip}`;
+      } else {
+        moduleCellHtml = escapeHtml(row.module_names || '-');
+      }
+
       const parentTr = `
         <tr class="team-parent-row" data-team-index="${teamIdx}">
           <td>${toggleBtn} <strong>${escapeHtml(row.team || '')}</strong></td>
           <td>${escapeHtml(row.leader || '')}</td>
-          <td class="path">${escapeHtml(row.module_names || '')} <span class="muted" style="font-size:12px;">(${modules.length}个模块)</span></td>
+          <td class="path">${moduleCellHtml}</td>
           <td>${asNumber(row.file_total)}</td>
           <td>${asNumber(row.total_uncovered)}</td>
           <td>${asNumber(row.filled_total)}</td>

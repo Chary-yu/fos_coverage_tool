@@ -4107,7 +4107,7 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
         ownership_text = "{} / {}".format(item["team"], item["leader"])
         ownership_cell = escaped(ownership_text)
         if item["ownership_status"] != "已匹配":
-            ownership_cell = '<span class="warning" title="{}">{}</span>'.format(
+            ownership_cell = '<span class="badge-unmatched-pill" title="{}">{}</span>'.format(
                 escaped(item["ownership_status"]), ownership_cell
             )
         rows.append(
@@ -4141,9 +4141,9 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
     repositories = result.get("repositories") or []
     if repositories:
         git_range_text = "{} 个仓库的 Git 范围".format(len(repositories))
-        repository_ranges = "<ul class=\"repo-ranges\">{}</ul>".format("".join(
-            "<li><strong>{}</strong>：<code>{}</code> → <code>{}</code></li>".format(
-                escaped(repository["name"]), escaped(repository["oldgit"]), escaped(repository["newgit"])
+        repository_ranges = '<div class="repo-badges">{}</div>'.format("".join(
+            '<span class="repo-chip"><strong class="repo-name">{}</strong> <code class="commit-range">{} → {}</code></span>'.format(
+                escaped(repository["name"]), escaped(repository["oldgit"][:8]), escaped(repository["newgit"][:8])
             ) for repository in repositories
         ))
     else:
@@ -4154,44 +4154,67 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
     page = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>增量覆盖率审查</title><style>
-body{{margin:0;background:#f2f2f7;color:#000000;font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}}
-main{{max-width:1200px;margin:0 auto;padding:24px 22px 48px}}
-h1{{margin:0 0 6px;font-size:24px;font-weight:800;letter-spacing:-0.5px;text-align:center}}
-.muted{{color:#8e8e93;font-size:13px;text-align:center}}
-.links{{margin:16px 0;display:flex;gap:10px;flex-wrap:wrap;justify-content:center}}
-.links a{{color:#007aff;text-decoration:none;font-weight:600;background:rgba(0,122,255,0.08);padding:6px 12px;border-radius:10px;transition:all 0.2s}}
-.links a:hover{{background:rgba(0,122,255,0.16);transform:translateY(-1px)}}
-.repo-ranges{{margin:8px 0 0;padding-left:20px;color:#636366;text-align:center}}
-.cards{{display:grid;grid-template-columns:repeat(5,minmax(120px,1fr));gap:12px;margin:20px 0}}
-.card,section{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:16px;box-shadow:0 4px 20px -2px rgba(0,0,0,0.05)}}
-.card{{padding:14px;transition:transform 0.2s,box-shadow 0.2s}}
+body{{margin:0;background:#f2f2f7;color:#1c1c1e;font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}}
+main{{max-width:1280px;margin:0 auto;padding:24px 24px 48px}}
+.hero-card{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:18px;padding:24px 28px;box-shadow:0 4px 20px -2px rgba(0,0,0,0.04);text-align:center;margin-bottom:20px}}
+h1{{margin:0 0 8px;font-size:26px;font-weight:800;letter-spacing:-0.6px;color:#1c1c1e}}
+.muted{{color:#8e8e93;font-size:13px}}
+.repo-badges{{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:10px}}
+.repo-chip{{display:inline-flex;align-items:center;gap:6px;background:rgba(0,122,255,0.08);padding:4px 10px;border-radius:8px;font-size:12px}}
+.repo-name{{color:#007aff;font-weight:700}}
+.commit-range{{font-family:SFMono-Regular,Menlo,Monaco,Consolas,monospace;color:#3a3a3c;font-size:11px}}
+.links-segmented{{display:inline-flex;gap:4px;background:rgba(118,118,128,0.12);padding:4px;border-radius:12px;margin-top:16px;flex-wrap:wrap;justify-content:center}}
+.links-segmented a{{color:#007aff;text-decoration:none;font-weight:600;font-size:13px;padding:6px 14px;border-radius:9px;transition:all 0.15s ease}}
+.links-segmented a:hover{{background:#ffffff;color:#0051a8;box-shadow:0 2px 8px rgba(0,0,0,0.08)}}
+.cards{{display:grid;grid-template-columns:repeat(5,minmax(130px,1fr));gap:14px;margin-bottom:20px}}
+.card{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:16px;padding:16px 18px;box-shadow:0 4px 20px -2px rgba(0,0,0,0.04);transition:all 0.2s cubic-bezier(0.4,0,0.2,1)}}
 .card:hover{{transform:translateY(-2px);box-shadow:0 6px 24px -2px rgba(0,0,0,0.08)}}
-.label{{font-size:12px;color:#8e8e93;font-weight:500}}
-.value{{font-size:24px;font-weight:800;margin-top:6px;letter-spacing:-0.6px;color:#1c1c1e}}
-section{{overflow:hidden}}
-h2{{margin:0;padding:14px 16px;font-size:15px;font-weight:700;background:rgba(242,242,247,0.8);border-bottom:1px solid rgba(60,60,67,0.12)}}
-table{{width:100%;border-collapse:collapse;min-width:840px}}
-th,td{{padding:10px 12px;border-bottom:1px solid rgba(60,60,67,0.08);text-align:left;vertical-align:middle}}
+.label{{font-size:12px;color:#8e8e93;font-weight:500;letter-spacing:-0.1px}}
+.value{{font-size:26px;font-weight:800;margin-top:6px;letter-spacing:-0.6px;color:#1c1c1e;font-variant-numeric:tabular-nums}}
+.val-changed{{color:#1c1c1e}}
+.val-covered{{color:#34c759}}
+.val-uncovered{{color:#007aff}}
+.val-rate{{color:#007aff}}
+.val-missing{{color:#ff9500}}
+section{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:16px;overflow:hidden;box-shadow:0 4px 20px -2px rgba(0,0,0,0.04)}}
+h2{{margin:0;padding:16px 20px;font-size:16px;font-weight:700;background:rgba(242,242,247,0.7);border-bottom:1px solid rgba(60,60,67,0.1)}}
+.filters{{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 20px;background:rgba(242,242,247,0.4);border-bottom:1px solid rgba(60,60,67,0.08)}}
+.filter-group{{display:flex;align-items:center;gap:6px;font-size:13px;font-weight:600;color:#1c1c1e}}
+.filters select,.filters input[type="text"]{{height:34px;padding:0 12px;border:1px solid rgba(0,0,0,0.06);border-radius:10px;font-size:13px;background:rgba(118,118,128,0.1);color:#000;outline:none;transition:all 0.2s ease}}
+.filters select:focus,.filters input[type="text"]:focus{{background:#ffffff;border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,0.15)}}
+.filters input[type="text"]{{width:210px}}
+.reset-btn{{height:34px;padding:0 14px;border:none;border-radius:10px;background:rgba(0,122,255,0.1);cursor:pointer;font-size:13px;font-weight:600;color:#007aff;transition:all 0.2s ease}}
+.reset-btn:hover{{background:rgba(0,122,255,0.2)}}
+.filter-count{{margin-left:auto;font-size:12px;color:#8e8e93;font-weight:600}}
+table{{width:100%;border-collapse:collapse;min-width:880px}}
+th,td{{padding:12px 16px;border-bottom:1px solid rgba(60,60,67,0.08);text-align:left;vertical-align:middle;font-variant-numeric:tabular-nums}}
 th{{background:rgba(242,242,247,0.95);font-size:12px;font-weight:600;color:#8e8e93;text-transform:uppercase;letter-spacing:0.2px}}
-tr:hover td{{background:rgba(0,122,255,0.02)}}
+tr:hover td{{background:rgba(0,122,255,0.03)}}
 .sort-button{{appearance:none;border:0;background:transparent;color:inherit;cursor:pointer;font:inherit;font-weight:600;padding:0;white-space:nowrap}}
 .sort-button:hover{{color:#007aff}}
 .sort-indicator{{display:inline-block;min-width:1em;color:#8e8e93}}
-.warning{{color:#ff9500;font-weight:600}}
-@media(max-width:820px){{.cards{{grid-template-columns:repeat(2,minmax(120px,1fr))}}}}
-.filters{{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:12px 16px;background:rgba(242,242,247,0.5);border-bottom:1px solid rgba(60,60,67,0.12)}}
-.filter-group{{display:flex;align-items:center;gap:6px;font-size:13px;font-weight:600;color:#1c1c1e}}
-.filters select,.filters input[type="text"]{{height:32px;padding:0 10px;border:1px solid rgba(0,0,0,0.08);border-radius:10px;font-size:13px;background:rgba(118,118,128,0.12);color:#000;outline:none;transition:all 0.2s}}
-.filters select:focus,.filters input[type="text"]:focus{{background:#ffffff;border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,0.15)}}
-.filters input[type="text"]{{width:180px}}
-.reset-btn{{height:32px;padding:0 14px;border:none;border-radius:10px;background:rgba(118,118,128,0.12);cursor:pointer;font-size:13px;font-weight:600;color:#007aff;transition:all 0.2s}}
-.reset-btn:hover{{background:rgba(118,118,128,0.24)}}
-.filter-count{{margin-left:auto;font-size:12px;color:#8e8e93;font-weight:600}}
+.badge-unmatched-pill{{display:inline-flex;align-items:center;background:rgba(255,149,0,0.12);color:#c67600;padding:3px 10px;border-radius:999px;font-weight:600;font-size:12px}}
+td a{{color:#007aff;text-decoration:none;font-weight:600}}
+td a:hover{{text-decoration:underline}}
+@media(max-width:850px){{.cards{{grid-template-columns:repeat(2,minmax(130px,1fr))}}main{{padding:16px 12px}}}}
 </style></head><body><main>
-<h1>增量覆盖率审查</h1>
-<div class="muted">项目：{project}；Git 范围：{git_range_text}；生成时间：{generated_at}</div>{repository_ranges}
-<div class="links"><a href="coverage_progress.html?scope=incremental&amp;project={project_url}">查看填写进度</a>　<a href="incremental_developer_tasks.html">开发人员待填写清单</a>　<a href="incremental_coverage.json">下载计算结果 JSON</a>　<a href="incremental_coverage.xlsx">下载计算结果 Excel</a></div>
-<div class="cards"><div class="card"><div class="label">新增行</div><div class="value">{changed}</div></div><div class="card"><div class="label">已覆盖</div><div class="value">{covered}</div></div><div class="card"><div class="label">增量未覆盖（可填写）</div><div class="value">{uncovered}</div></div><div class="card"><div class="label">有效增量覆盖率</div><div class="value">{rate}</div></div><div class="card"><div class="label">覆盖信息缺失</div><div class="value warning">{missing}</div></div></div>
+<div class="hero-card">
+  <h1>增量覆盖率审查</h1>
+  <div class="muted">项目：{project}；Git 范围：{git_range_text}；生成时间：{generated_at}</div>{repository_ranges}
+  <div class="links-segmented">
+    <a href="coverage_progress.html?scope=incremental&amp;project={project_url}">📊 查看填写进度</a>
+    <a href="incremental_developer_tasks.html">👨‍💻 开发人员待填写清单</a>
+    <a href="incremental_coverage.json">📥 下载计算结果 JSON</a>
+    <a href="incremental_coverage.xlsx">📈 下载计算结果 Excel</a>
+  </div>
+</div>
+<div class="cards">
+  <div class="card"><div class="label">新增行</div><div class="value val-changed">{changed}</div></div>
+  <div class="card"><div class="label">已覆盖</div><div class="value val-covered">{covered}</div></div>
+  <div class="card"><div class="label">增量未覆盖（可填写）</div><div class="value val-uncovered">{uncovered}</div></div>
+  <div class="card"><div class="label">有效增量覆盖率</div><div class="value val-rate">{rate}</div></div>
+  <div class="card"><div class="label">覆盖信息缺失</div><div class="value val-missing">{missing}</div></div>
+</div>
 <section><h2>文件明细（点击表头可排序；默认未覆盖新增行从多到少）</h2>
 <div class="filters">
   <div class="filter-group"><label for="repo-filter">仓库：</label><select id="repo-filter"><option value="">全部仓库</option></select></div>
@@ -4427,10 +4450,10 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
 
             commits = file_task.get("commits") or []
             commit_text = "".join(
-                '<div><code>{}</code> {}{}</div>'.format(
-                    escaped(item.get("commit", "")[:12]),
+                '<div class="commit-chip"><code class="commit-hash">{}</code> <span class="commit-subject">{}</span>{}</div>'.format(
+                    escaped(item.get("commit", "")[:8]),
                     escaped(item.get("subject", "")),
-                    " <span class=\"muted\">{}</span>".format(
+                    ' <span class="commit-date">{}</span>'.format(
                         escaped(item.get("committed_at", ""))
                     ) if item.get("committed_at") else "",
                 ) for item in commits
@@ -4462,9 +4485,9 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
         if not file_rows:
             file_rows.append('<tr><td colspan="9">此开发人员没有可展示的提交文件。</td></tr>')
         developer_sections.append(
-            '<section id="{}"><h2>{}</h2><div class="person-stats">提交 <strong>{}</strong> 个；'
-            '提交文件 <strong>{}</strong> 个；需填写文件 <strong>{}</strong> 个；'
-            '待填写新增行 <strong class="todo">{}</strong> 行。</div><div class="table-wrap"><table>'
+            '<section id="{}"><h2>👤 {}</h2><div class="person-stats"><span class="stat-pill">提交 <strong>{}</strong> 个</span>'
+            '<span class="stat-pill">提交文件 <strong>{}</strong> 个</span><span class="stat-pill">需填写文件 <strong>{}</strong> 个</span>'
+            '<span class="stat-pill warn">待填写 <strong>{}</strong> 行</span></div><div class="table-wrap"><table>'
             '<thead><tr><th>仓库</th><th>提交文件</th><th>变更类型</th><th>关联提交</th>'
             '<th>新增行</th><th>已覆盖</th><th>待填写</th><th>覆盖信息缺失</th><th>操作</th></tr></thead>'
             '<tbody>{}</tbody></table></div></section>'.format(
@@ -4483,32 +4506,47 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
     page = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>开发人员待填写清单</title><style>
-body{{margin:0;background:#f2f2f7;color:#000000;font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}}
-main{{max-width:1320px;margin:0 auto;padding:24px 22px 48px}}
-h1{{margin:0 0 6px;font-size:24px;font-weight:800;letter-spacing:-0.5px}}
-h2{{margin:0;padding:14px 16px;font-size:16px;font-weight:700;background:rgba(242,242,247,0.8);border-bottom:1px solid rgba(60,60,67,0.12);letter-spacing:-0.3px}}
+body{{margin:0;background:#f2f2f7;color:#1c1c1e;font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}}
+main{{max-width:1320px;margin:0 auto;padding:24px 24px 48px}}
+.hero-card{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:18px;padding:24px 28px;box-shadow:0 4px 20px -2px rgba(0,0,0,0.04);margin-bottom:20px}}
+h1{{margin:0 0 8px;font-size:26px;font-weight:800;letter-spacing:-0.6px;color:#1c1c1e}}
+h2{{margin:0;padding:16px 20px;font-size:16px;font-weight:700;background:rgba(242,242,247,0.7);border-bottom:1px solid rgba(60,60,67,0.1);letter-spacing:-0.3px}}
 .muted{{color:#8e8e93;font-size:13px}}
-.links{{margin:16px 0;display:flex;gap:10px;flex-wrap:wrap}}
-.links a{{color:#007aff;text-decoration:none;font-weight:600;background:rgba(0,122,255,0.08);padding:6px 12px;border-radius:10px;transition:all 0.2s}}
-.links a:hover{{background:rgba(0,122,255,0.16);transform:translateY(-1px)}}
-section{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:16px;margin:20px 0;overflow:hidden;box-shadow:0 4px 20px -2px rgba(0,0,0,0.05);transition:all 0.2s ease}}
-.person-stats{{padding:12px 16px;background:rgba(242,242,247,0.4);border-bottom:1px solid rgba(60,60,67,0.08);font-size:13px}}
+.links-segmented{{display:inline-flex;gap:4px;background:rgba(118,118,128,0.12);padding:4px;border-radius:12px;margin-top:14px;flex-wrap:wrap}}
+.links-segmented a{{color:#007aff;text-decoration:none;font-weight:600;font-size:13px;padding:6px 14px;border-radius:9px;transition:all 0.15s ease}}
+.links-segmented a:hover{{background:#ffffff;color:#0051a8;box-shadow:0 2px 8px rgba(0,0,0,0.08)}}
+section{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:16px;margin:20px 0;overflow:hidden;box-shadow:0 4px 20px -2px rgba(0,0,0,0.04);transition:all 0.2s ease}}
+.person-stats{{display:flex;gap:10px;flex-wrap:wrap;align-items:center;padding:12px 20px;background:rgba(242,242,247,0.4);border-bottom:1px solid rgba(60,60,67,0.08);font-size:13px}}
+.stat-pill{{display:inline-flex;align-items:center;gap:4px;background:rgba(118,118,128,0.1);padding:4px 12px;border-radius:8px;font-size:12px;color:#3a3a3c}}
+.stat-pill.warn{{background:rgba(255,149,0,0.12);color:#c67600;font-weight:700}}
 .table-wrap{{overflow:auto}}
 table{{width:100%;border-collapse:collapse;min-width:960px}}
-th,td{{padding:10px 12px;border-bottom:1px solid rgba(60,60,67,0.08);text-align:left;vertical-align:middle}}
+th,td{{padding:12px 16px;border-bottom:1px solid rgba(60,60,67,0.08);text-align:left;vertical-align:middle;font-variant-numeric:tabular-nums}}
 th{{background:rgba(242,242,247,0.95);font-size:12px;font-weight:600;color:#8e8e93;text-transform:uppercase;letter-spacing:0.2px}}
-tr:hover td{{background:rgba(0,122,255,0.02)}}
-code{{font-family:SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;background:rgba(118,118,128,0.1);padding:2px 6px;border-radius:6px}}
+tr:hover td{{background:rgba(0,122,255,0.03)}}
+.commit-chip{{display:flex;align-items:center;gap:6px;margin:3px 0;font-size:12px}}
+.commit-hash{{font-family:SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:11px;background:rgba(0,122,255,0.1);color:#007aff;padding:2px 6px;border-radius:6px;font-weight:600;white-space:nowrap}}
+.commit-subject{{color:#1c1c1e;font-weight:500}}
+.commit-date{{color:#8e8e93;font-size:11px;white-space:nowrap;margin-left:auto}}
 .todo{{color:#ff9500;font-weight:700}}
 .done{{color:#34c759;font-weight:700}}
-.fill-link{{display:inline-flex;align-items:center;background:#007aff;color:#ffffff;border-radius:8px;padding:4px 10px;text-decoration:none;font-weight:600;font-size:12px;transition:all 0.2s;box-shadow:0 2px 6px rgba(0,122,255,0.2)}}
-.fill-link:hover{{background:#0062cc;transform:translateY(-1px)}}
-@media(max-width:700px){{main{{padding:20px 12px}}}}
+.fill-link{{display:inline-flex;align-items:center;gap:4px;background:linear-gradient(180deg,#007aff 0%,#0062cc 100%);color:#ffffff;border-radius:9px;padding:6px 14px;text-decoration:none;font-weight:600;font-size:12px;transition:all 0.2s cubic-bezier(0.4,0,0.2,1);box-shadow:0 3px 8px rgba(0,122,255,0.25);white-space:nowrap}}
+.fill-link:hover{{transform:translateY(-1px);box-shadow:0 5px 12px rgba(0,122,255,0.4)}}
+td a{{color:#007aff;text-decoration:none;font-weight:600}}
+td a:hover{{text-decoration:underline}}
+@media(max-width:700px){{main{{padding:16px 12px}}}}
 </style></head><body><main>
-<h1>开发人员待填写清单</h1><div class="muted">项目：{project}；数据来源：Git 提交作者与增量覆盖率结果。</div>
-<div class="links"><a href="incremental_coverage.html">返回增量覆盖率汇总</a>　<a href="coverage_progress.html?scope=incremental&amp;project={project_url}">查看填写进度</a>　<a href="incremental_coverage.xlsx">下载 Excel</a></div>
-<section><h2>人员概览</h2><div class="table-wrap"><table><thead><tr><th>开发人员</th><th>提交数</th><th>提交文件</th><th>需填写文件</th><th>待填写行</th></tr></thead><tbody>{summary_rows}</tbody></table></div></section>
-<aside class="muted">说明：按 Git author 的“姓名 + 邮箱”区分人员。多人提交同一文件时，文件会同时出现在每位相关开发人员的清单中；“待填写”仅统计本次 Git diff 中 LCOV 未覆盖的新增行。</aside>
+<div class="hero-card">
+  <h1>开发人员待填写清单</h1>
+  <div class="muted">项目：{project}；数据来源：Git 提交作者与增量覆盖率结果。</div>
+  <div class="links-segmented">
+    <a href="incremental_coverage.html">↩ 返回增量审查汇总</a>
+    <a href="coverage_progress.html?scope=incremental&amp;project={project_url}">📊 查看填写进度</a>
+    <a href="incremental_coverage.xlsx">📈 下载 Excel</a>
+  </div>
+</div>
+<section><h2>👥 人员概览</h2><div class="table-wrap"><table><thead><tr><th>开发人员</th><th>提交数</th><th>提交文件</th><th>需填写文件</th><th>待填写行</th></tr></thead><tbody>{summary_rows}</tbody></table></div></section>
+<aside class="muted" style="margin:12px 0 20px;text-align:center">说明：按 Git author 的“姓名 + 邮箱”区分人员。多人提交同一文件时，文件会同时出现在每位相关开发人员的清单中；“待填写”仅统计本次 Git diff 中 LCOV 未覆盖的新增行。</aside>
 {sections}
 </main></body></html>""".format(
         project=escaped(project_name),
