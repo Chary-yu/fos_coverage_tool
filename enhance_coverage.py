@@ -57,7 +57,7 @@ PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "visible-progress-20260814_ios_ui"
+ASSET_VERSION = "visible-progress-20260814_v7_legacy_fix"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 
 
