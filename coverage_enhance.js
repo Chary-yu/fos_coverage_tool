@@ -766,7 +766,10 @@
             const totalLinesCount = sourceLines ? sourceLines.length : 0;
             if (!sourceLines || totalLinesCount === 0) return;
 
-            if (forceUnfold || blockRanges.length === 0) {
+            const firstItem = sourceLines.get(0);
+            const isLegacyInline = firstItem && (firstItem.legacyInline === true || !firstItem.span || !firstItem.span.closest || !firstItem.span.closest('tr'));
+
+            if (forceUnfold || blockRanges.length === 0 || isLegacyInline) {
                 unfoldAllLines();
                 return;
             }
@@ -1012,6 +1015,8 @@
             }
             let maxCodeLen = 0;
             let commonPrefixLen = 0;
+            const startLineItem = getBlockStartItem(block);
+            const isLegacyInline = startLineItem && (startLineItem.legacyInline === true || !startLineItem.span || !startLineItem.span.closest || !startLineItem.span.closest('tr'));
             forEachBlockItem(block, item => {
                 const info = getLineCodeInfo(item.span);
                 if (info.codeLen > maxCodeLen) {
@@ -1021,7 +1026,7 @@
                     commonPrefixLen = info.prefixLen;
                 }
             });
-            const targetCodeCol = maxCodeLen <= 120 ? 121 : (maxCodeLen + 2);
+            const targetCodeCol = isLegacyInline ? (maxCodeLen + 3) : (maxCodeLen <= 120 ? 121 : (maxCodeLen + 2));
             return {
                 maxCodeLen,
                 commonPrefixLen,

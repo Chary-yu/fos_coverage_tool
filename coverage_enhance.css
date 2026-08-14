@@ -649,4 +649,12 @@ textarea.coverage-analysis-input.multiline {
     background-color: rgba(0, 122, 255, 0.2) !important;
 }
 
+/* Ensure fixed bottom toolbar never obscures the last lines of source code */
+body,
+pre,
+table,
+.source {
+    padding-bottom: 140px !important;
+}
+
 
