@@ -4673,9 +4673,11 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
             "covered": counts[coverage_check.STATUS_COVERED],
             "uncovered": counts[coverage_check.STATUS_UNCOVERED],
             "ignored": counts[coverage_check.STATUS_IGNORED],
-            "missing": counts[coverage_check.STATUS_MISSING],
+            "missing": unanalyzed_count,
             "unanalyzed": unanalyzed_count,
         })
+
+    summary["missing"] = sum(item["missing"] for item in file_rows)
 
     # The first render already prioritizes files that need the most review; the
     # browser-side table controls below let reviewers switch to any other metric.
