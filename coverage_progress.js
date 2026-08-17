@@ -116,19 +116,26 @@
         : '<span class="toggle-team-spacer"></span>';
 
       let moduleCellHtml = '';
+      const isIncremental = reviewScope === 'incremental';
       const teamQuery = encodeURIComponent(row.team || '');
       const teamLinkHtml = row.team
-        ? `<a href="${getReviewHomeUrl(`team=${teamQuery}`)}" class="progress-link" title="点击查看 [${escapeHtml(row.team)}] 文件审查明细"><strong>${escapeHtml(row.team)}</strong></a>`
+        ? (isIncremental
+            ? `<a href="incremental_coverage.html?team=${teamQuery}" class="progress-link" title="点击查看 [${escapeHtml(row.team)}] 文件审查明细"><strong>${escapeHtml(row.team)}</strong></a>`
+            : `<strong>${escapeHtml(row.team)}</strong>`)
         : '';
       const leaderLinkHtml = row.leader
-        ? `<a href="${getReviewHomeUrl(`leader=${encodeURIComponent(row.leader)}`)}" class="progress-link" title="点击查看 [${escapeHtml(row.leader)}] 文件审查明细">${escapeHtml(row.leader)}</a>`
+        ? (isIncremental
+            ? `<a href="incremental_coverage.html?leader=${encodeURIComponent(row.leader)}" class="progress-link" title="点击查看 [${escapeHtml(row.leader)}] 文件审查明细">${escapeHtml(row.leader)}</a>`
+            : escapeHtml(row.leader))
         : '-';
 
       if (hasModules) {
         const visibleMods = modules.slice(0, 2);
         const modChips = visibleMods.map(m => {
           const modQuery = encodeURIComponent(m.module || '');
-          return `<a href="${getReviewHomeUrl(`module=${modQuery}&team=${teamQuery}`)}" class="mod-chip progress-link" title="点击查看 [${escapeHtml(m.module || '')}] 文件审查明细">${escapeHtml(m.module || '')}</a>`;
+          return isIncremental
+            ? `<a href="incremental_coverage.html?module=${modQuery}&team=${teamQuery}" class="mod-chip progress-link" title="点击查看 [${escapeHtml(m.module || '')}] 文件审查明细">${escapeHtml(m.module || '')}</a>`
+            : `<span class="mod-chip">${escapeHtml(m.module || '')}</span>`;
         }).join('');
         const moreCount = modules.length - visibleMods.length;
         const moreChip = moreCount > 0 ? `<span class="mod-more-chip">+${moreCount}</span>` : '';
@@ -158,7 +165,9 @@
 
       modules.forEach(mod => {
         const modQuery = encodeURIComponent(mod.module || '');
-        const subModLinkHtml = `<a href="${getReviewHomeUrl(`module=${modQuery}&team=${teamQuery}`)}" class="progress-link" title="点击查看 [${escapeHtml(mod.module || '')}] 文件审查明细">└─ ${escapeHtml(mod.module || '')}</a>`;
+        const subModLinkHtml = isIncremental
+          ? `<a href="incremental_coverage.html?module=${modQuery}&team=${teamQuery}" class="progress-link" title="点击查看 [${escapeHtml(mod.module || '')}] 文件审查明细">└─ ${escapeHtml(mod.module || '')}</a>`
+          : `└─ ${escapeHtml(mod.module || '')}`;
         const subTr = `
           <tr class="module-subrow team-subrow-${teamIdx}" style="display:none; background-color: #f8fafc;">
             <td style="padding-left: 28px; font-weight: 600; color: #334155;">${subModLinkHtml}</td>
