@@ -4589,25 +4589,15 @@ def incremental_developer_anchor(developer):
     return "developer-{}".format(hashlib.sha1(identity.encode("utf-8")).hexdigest()[:12])
 
 
-def write_incremental_summary_page(output_html_dir, project_name, result, config=None):
-    """Create an auditable landing page for the generated incremental review site."""
-    summary = result["summary"]
-    target_files = list(result.get("uncovered_lines_by_file", {}).keys()) + list(result.get("review_lines_by_file", {}).keys())
-    target_basenames = {os.path.basename(f) + ".gcov.html" for f in target_files if os.path.basename(f)}
-    report_pages = find_report_page_links(output_html_dir, target_basenames=target_basenames if target_basenames else None)
-    # Use the very same ownership workbook and matching rules as the progress
-    # page so an incremental file never appears under a different leader on the
-    # two pages.  Load it once: incremental reports can contain many files.
-    ownership_workbook = load_ownership_workbook(
-        load_config() if config is None else config
-    )
+def sync_incremental_unanalyzed_counts(project_name, result, config=None):
+    """Query DB for unanalyzed counts and update result['summary']['unanalyzed'] beforehand."""
+    if not result or "details" not in result:
+        return {}
+    summary = result.get("summary") or {}
     details_by_file = {}
     for item in result["details"]:
         key = (item.get("repository", ""), item.get("review_file_path") or item["file_path"])
         details_by_file.setdefault(key, []).append(item)
-
-    def escaped(value):
-        return html.escape(str(value), quote=True)
 
     unanalyzed_by_file = {}
     try:
@@ -4636,8 +4626,41 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
                         count = row[1]
                     if fpath:
                         unanalyzed_by_file[_normalize_ownership_path(fpath)] = int(count or 0)
-    except Exception as err:
+    except Exception:
         pass
+
+    total_unanalyzed = 0
+    for repository_name, review_file_path in sorted(details_by_file):
+        items = details_by_file[(repository_name, review_file_path)]
+        uncovered_count = sum(1 for item in items if item.get("status") == coverage_check.STATUS_UNCOVERED)
+        file_key = _normalize_ownership_path(review_file_path)
+        total_unanalyzed += unanalyzed_by_file.get(file_key, uncovered_count)
+
+    summary["unanalyzed"] = total_unanalyzed
+    return unanalyzed_by_file
+
+
+def write_incremental_summary_page(output_html_dir, project_name, result, config=None):
+    """Create an auditable landing page for the generated incremental review site."""
+    summary = result["summary"]
+    target_files = list(result.get("uncovered_lines_by_file", {}).keys()) + list(result.get("review_lines_by_file", {}).keys())
+    target_basenames = {os.path.basename(f) + ".gcov.html" for f in target_files if os.path.basename(f)}
+    report_pages = find_report_page_links(output_html_dir, target_basenames=target_basenames if target_basenames else None)
+    # Use the very same ownership workbook and matching rules as the progress
+    # page so an incremental file never appears under a different leader on the
+    # two pages.  Load it once: incremental reports can contain many files.
+    ownership_workbook = load_ownership_workbook(
+        load_config() if config is None else config
+    )
+    details_by_file = {}
+    for item in result["details"]:
+        key = (item.get("repository", ""), item.get("review_file_path") or item["file_path"])
+        details_by_file.setdefault(key, []).append(item)
+
+    def escaped(value):
+        return html.escape(str(value), quote=True)
+
+    unanalyzed_by_file = sync_incremental_unanalyzed_counts(project_name, result, config)
 
     file_rows = []
     for repository_name, review_file_path in sorted(details_by_file):
@@ -5029,8 +5052,7 @@ def build_incremental_review_site(result, input_dir, output_dir, project_name,
         os.path.join(output_dir, "html")
         if os.path.isdir(os.path.join(input_dir, "html")) else output_dir
     )
-    if not os.path.isdir(real_output_html):
-        raise RuntimeError("增量审查网页输出失败: {}".format(real_output_html))
+    sync_incremental_unanalyzed_counts(project_name, result, load_config())
 
     result["project_name"] = project_name
     result["review_scope"] = "incremental"

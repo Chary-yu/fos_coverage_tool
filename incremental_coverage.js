@@ -121,21 +121,10 @@
     }
 
     function updateFilterDropdowns() {
-        var kw = fileSearch ? fileSearch.value.trim().toLowerCase() : "";
-
         var validRepos = [];
         for (var i = 0; i < allRows.length; i++) {
             var rRepo = allRows[i].getAttribute("data-repo") || "";
-            var rTeam = allRows[i].getAttribute("data-team") || "";
-            var rLeader = allRows[i].getAttribute("data-leader") || "";
-            var rModule = allRows[i].getAttribute("data-module") || "";
-            var rOwnership = allRows[i].getAttribute("data-ownership") || "";
-            var rFile = (allRows[i].cells[4] ? allRows[i].cells[4].getAttribute("data-sort-value") || allRows[i].cells[4].textContent || "" : "");
-            var fullText = (rRepo + " " + rModule + " " + rTeam + " " + rLeader + " " + rOwnership + " " + rFile).toLowerCase();
-
-            if (!kw || fullText.indexOf(kw) !== -1) {
-                addUnique(validRepos, rRepo);
-            }
+            addUnique(validRepos, rRepo);
         }
         var curRepo = repoFilter ? repoFilter.value : "";
         updateSelectOptions(repoFilter, validRepos, curRepo);
@@ -145,15 +134,8 @@
         for (var i = 0; i < allRows.length; i++) {
             var rRepo = allRows[i].getAttribute("data-repo") || "";
             var rTeam = allRows[i].getAttribute("data-team") || "";
-            var rLeader = allRows[i].getAttribute("data-leader") || "";
-            var rModule = allRows[i].getAttribute("data-module") || "";
-            var rOwnership = allRows[i].getAttribute("data-ownership") || "";
-            var rFile = (allRows[i].cells[4] ? allRows[i].cells[4].getAttribute("data-sort-value") || allRows[i].cells[4].textContent || "" : "");
-            var fullText = (rRepo + " " + rModule + " " + rTeam + " " + rLeader + " " + rOwnership + " " + rFile).toLowerCase();
-
             var mRepo = !activeRepo || rRepo === activeRepo;
-            var mKw = !kw || fullText.indexOf(kw) !== -1;
-            if (mRepo && mKw) {
+            if (mRepo) {
                 addUnique(validTeams, rTeam);
             }
         }
@@ -166,15 +148,9 @@
             var rRepo = allRows[i].getAttribute("data-repo") || "";
             var rTeam = allRows[i].getAttribute("data-team") || "";
             var rLeader = allRows[i].getAttribute("data-leader") || "";
-            var rModule = allRows[i].getAttribute("data-module") || "";
-            var rOwnership = allRows[i].getAttribute("data-ownership") || "";
-            var rFile = (allRows[i].cells[4] ? allRows[i].cells[4].getAttribute("data-sort-value") || allRows[i].cells[4].textContent || "" : "");
-            var fullText = (rRepo + " " + rModule + " " + rTeam + " " + rLeader + " " + rOwnership + " " + rFile).toLowerCase();
-
             var mRepo = !activeRepo || rRepo === activeRepo;
             var mTeam = !activeTeam || rTeam === activeTeam;
-            var mKw = !kw || fullText.indexOf(kw) !== -1;
-            if (mRepo && mTeam && mKw) {
+            if (mRepo && mTeam) {
                 addUnique(validLeaders, rLeader);
             }
         }
@@ -188,15 +164,10 @@
             var rTeam = allRows[i].getAttribute("data-team") || "";
             var rLeader = allRows[i].getAttribute("data-leader") || "";
             var rModule = allRows[i].getAttribute("data-module") || "";
-            var rOwnership = allRows[i].getAttribute("data-ownership") || "";
-            var rFile = (allRows[i].cells[4] ? allRows[i].cells[4].getAttribute("data-sort-value") || allRows[i].cells[4].textContent || "" : "");
-            var fullText = (rRepo + " " + rModule + " " + rTeam + " " + rLeader + " " + rOwnership + " " + rFile).toLowerCase();
-
             var mRepo = !activeRepo || rRepo === activeRepo;
             var mTeam = !activeTeam || rTeam === activeTeam;
             var mLeader = !activeLeader || rLeader === activeLeader;
-            var mKw = !kw || fullText.indexOf(kw) !== -1;
-            if (mRepo && mTeam && mLeader && mKw) {
+            if (mRepo && mTeam && mLeader) {
                 addUnique(validModules, rModule);
             }
         }
@@ -241,7 +212,11 @@
         }
 
         if (filterCount) {
-            filterCount.textContent = "已筛选出 " + visible + " / " + total + " 个文件";
+            if (selRepo || selTeam || selLeader || selModule || kw) {
+                filterCount.textContent = "已筛选出 " + visible + " / " + total + " 个文件";
+            } else {
+                filterCount.textContent = "共 " + total + " 个文件";
+            }
         }
     }
 
@@ -309,7 +284,7 @@
     if (moduleFilter) moduleFilter.addEventListener("change", applyFilters);
     if (teamFilter) teamFilter.addEventListener("change", applyFilters);
     if (leaderFilter) leaderFilter.addEventListener("change", applyFilters);
-    if (fileSearch) fileSearch.addEventListener("input", applyFilters);
+    if (fileSearch) fileSearch.addEventListener("input", debouncedApplyFilters);
     if (resetBtn) {
         resetBtn.addEventListener("click", function() {
             if (repoFilter) repoFilter.value = "";

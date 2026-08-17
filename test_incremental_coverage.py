@@ -570,10 +570,36 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
 
         self.assertIn('function updateSelectOptions', js_content)
         self.assertIn('function updateFilterDropdowns', js_content)
+        self.assertIn('function updateSelectOptions', js_content)
+        self.assertIn('function updateFilterDropdowns', js_content)
         self.assertIn('updateSelectOptions(repoFilter, validRepos, curRepo);', js_content)
         self.assertIn('updateSelectOptions(teamFilter, validTeams, curTeam);', js_content)
         self.assertIn('updateSelectOptions(leaderFilter, validLeaders, curLeader);', js_content)
         self.assertIn('updateSelectOptions(moduleFilter, validModules, curModule);', js_content)
+        self.assertIn('if (fileSearch) fileSearch.addEventListener("input", debouncedApplyFilters);', js_content)
+
+    def test_search_keyword_decoupled_from_dropdown_candidates(self):
+        js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH
+        with open(js_path, "r", encoding="utf-8") as f:
+            js_content = f.read()
+
+        # Ensure updateFilterDropdowns does not use kw to filter validRepos or validTeams
+        func_start = js_content.find('function updateFilterDropdowns()')
+        func_end = js_content.find('function applyFilters()')
+        dropdown_func = js_content[func_start:func_end]
+        self.assertNotIn('fullText.indexOf(kw)', dropdown_func)
+        self.assertNotIn('var kw = fileSearch', dropdown_func)
+
+    def test_sync_incremental_unanalyzed_counts_consistency(self):
+        sample_result = {
+            "summary": {"uncovered": 10, "unanalyzed": 10},
+            "details": [
+                {"repository": "ssf", "file_path": "a.c", "status": coverage_check.STATUS_UNCOVERED},
+                {"repository": "ssf", "file_path": "b.c", "status": coverage_check.STATUS_UNCOVERED},
+            ]
+        }
+        res = enhance_coverage.sync_incremental_unanalyzed_counts("test_project", sample_result)
+        self.assertEqual(sample_result["summary"]["unanalyzed"], 2)
 
 
 if __name__ == "__main__":
