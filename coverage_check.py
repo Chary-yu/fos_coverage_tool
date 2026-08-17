@@ -728,6 +728,8 @@ def write_result_excel(result, output_path):
     for label, key in ((STATUS_IGNORED, "ignored"), (STATUS_MISSING, "missing")):
         value = summary[key]
         summary_rows.append([label, value, "{:.2f}%".format(value * 100.0 / changed_total) if changed_total else "N/A"])
+    unanalyzed_val = summary.get("unanalyzed", summary.get("uncovered", 0))
+    summary_rows.append(["待分析", unanalyzed_val, "{:.2f}%".format(unanalyzed_val * 100.0 / changed_total) if changed_total else "N/A"])
     summary_rows.append([])
     rate = summary["coverage_rate"]
     summary_rows.append(["覆盖率(有效增量行)", "{}/{}".format(summary["covered"], total),

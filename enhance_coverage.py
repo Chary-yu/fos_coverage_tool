@@ -57,7 +57,7 @@ PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "visible-progress-20260817_v9_cascade_filter"
+ASSET_VERSION = "visible-progress-20260817_v9_2_filter_fix"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 
 
@@ -4626,8 +4626,8 @@ def sync_incremental_unanalyzed_counts(project_name, result, config=None):
                         count = row[1]
                     if fpath:
                         unanalyzed_by_file[_normalize_ownership_path(fpath)] = int(count or 0)
-    except Exception:
-        pass
+    except Exception as err:
+        print("[Warning] Failed to query incremental unanalyzed counts from database: {}".format(err))
 
     total_unanalyzed = 0
     for repository_name, review_file_path in sorted(details_by_file):
@@ -4640,7 +4640,7 @@ def sync_incremental_unanalyzed_counts(project_name, result, config=None):
     return unanalyzed_by_file
 
 
-def write_incremental_summary_page(output_html_dir, project_name, result, config=None):
+def write_incremental_summary_page(output_html_dir, project_name, result, config=None, unanalyzed_by_file=None):
     """Create an auditable landing page for the generated incremental review site."""
     summary = result["summary"]
     target_files = list(result.get("uncovered_lines_by_file", {}).keys()) + list(result.get("review_lines_by_file", {}).keys())
@@ -4660,7 +4660,8 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
     def escaped(value):
         return html.escape(str(value), quote=True)
 
-    unanalyzed_by_file = sync_incremental_unanalyzed_counts(project_name, result, config)
+    if unanalyzed_by_file is None:
+        unanalyzed_by_file = sync_incremental_unanalyzed_counts(project_name, result, config)
 
     file_rows = []
     for repository_name, review_file_path in sorted(details_by_file):
@@ -5052,7 +5053,10 @@ def build_incremental_review_site(result, input_dir, output_dir, project_name,
         os.path.join(output_dir, "html")
         if os.path.isdir(os.path.join(input_dir, "html")) else output_dir
     )
-    sync_incremental_unanalyzed_counts(project_name, result, load_config())
+    if not os.path.isdir(real_output_html):
+        raise RuntimeError("增量审查网页输出失败: {}".format(real_output_html))
+
+    unanalyzed_by_file = sync_incremental_unanalyzed_counts(project_name, result, load_config())
 
     result["project_name"] = project_name
     result["review_scope"] = "incremental"
@@ -5071,7 +5075,7 @@ def build_incremental_review_site(result, input_dir, output_dir, project_name,
     if os.path.abspath(excel_path) != os.path.abspath(html_excel_path):
         shutil.copy2(excel_path, html_excel_path)
 
-    write_incremental_summary_page(real_output_html, project_name, result)
+    write_incremental_summary_page(real_output_html, project_name, result, unanalyzed_by_file=unanalyzed_by_file)
     write_incremental_developer_tasks_page(real_output_html, project_name, result)
     timer.mark("write_summary_pages")
     print("[Incremental] Review home page: {}".format(
