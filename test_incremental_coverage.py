@@ -487,12 +487,14 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         with open(os.path.join(self.output_dir, "incremental_coverage.html"), "r", encoding="utf-8") as summary_page:
             summary_html = summary_page.read()
         self.assertIn("网络平台组 / 王工", summary_html)
-        self.assertIn('data-sort-key="ownership"', summary_html)
+        self.assertIn('data-sort-key="module"', summary_html)
+        self.assertIn('data-sort-key="team"', summary_html)
+        self.assertIn('data-sort-key="leader"', summary_html)
         repository_header = summary_html.index('data-sort-key="repository"')
-        ownership_header = summary_html.index('data-sort-key="ownership"')
+        module_header = summary_html.index('data-sort-key="module"')
         file_header = summary_html.index('data-sort-key="file"')
-        self.assertLess(repository_header, ownership_header)
-        self.assertLess(ownership_header, file_header)
+        self.assertLess(repository_header, module_header)
+        self.assertLess(module_header, file_header)
 
     def test_developer_task_page_lists_files_and_pending_fill(self):
         os.makedirs(self.output_dir)

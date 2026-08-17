@@ -4,6 +4,7 @@
     var body = table.tBodies[0];
 
     var repoFilter = document.getElementById("repo-filter");
+    var moduleFilter = document.getElementById("module-filter");
     var teamFilter = document.getElementById("team-filter");
     var leaderFilter = document.getElementById("leader-filter");
     var fileSearch = document.getElementById("file-search");
@@ -11,6 +12,7 @@
     var filterCount = document.getElementById("filter-count");
 
     var repos = [];
+    var modules = [];
     var teams = [];
     var leaders = [];
 
@@ -25,6 +27,7 @@
     for (var i = 0; i < allRows.length; i++) {
         var r = allRows[i];
         addUnique(repos, r.getAttribute("data-repo"));
+        addUnique(modules, r.getAttribute("data-module"));
         addUnique(teams, r.getAttribute("data-team"));
         addUnique(leaders, r.getAttribute("data-leader"));
     }
@@ -41,18 +44,22 @@
     }
 
     populateSelect(repoFilter, repos);
+    populateSelect(moduleFilter, modules);
     populateSelect(teamFilter, teams);
     populateSelect(leaderFilter, leaders);
 
     var keyToColumn = {
         repository: 0,
+        module: 1,
+        team: 2,
+        leader: 3,
         ownership: 1,
-        file: 2,
-        changed: 3,
-        covered: 4,
-        uncovered: 5,
-        ignored: 6,
-        missing: 7
+        file: 4,
+        changed: 5,
+        covered: 6,
+        uncovered: 7,
+        ignored: 8,
+        missing: 9
     };
 
     var currentKey = "uncovered";
@@ -60,6 +67,7 @@
 
     function applyFilters() {
         var selRepo = repoFilter ? repoFilter.value : "";
+        var selModule = moduleFilter ? moduleFilter.value : "";
         var selTeam = teamFilter ? teamFilter.value : "";
         var selLeader = leaderFilter ? leaderFilter.value : "";
         var kw = fileSearch ? fileSearch.value.trim().toLowerCase() : "";
@@ -70,18 +78,20 @@
         for (var i = 0; i < total; i++) {
             var row = allRows[i];
             var rRepo = row.getAttribute("data-repo") || "";
+            var rModule = row.getAttribute("data-module") || "";
             var rTeam = row.getAttribute("data-team") || "";
             var rLeader = row.getAttribute("data-leader") || "";
             var rOwnership = row.getAttribute("data-ownership") || "";
-            var rFile = (row.cells[2] ? row.cells[2].getAttribute("data-sort-value") || row.cells[2].textContent || "" : "");
-            var fullSearchText = (rRepo + " " + rTeam + " " + rLeader + " " + rOwnership + " " + rFile).toLowerCase();
+            var rFile = (row.cells[4] ? row.cells[4].getAttribute("data-sort-value") || row.cells[4].textContent || "" : "");
+            var fullSearchText = (rRepo + " " + rModule + " " + rTeam + " " + rLeader + " " + rOwnership + " " + rFile).toLowerCase();
 
             var mRepo = !selRepo || rRepo === selRepo;
+            var mModule = !selModule || rModule === selModule;
             var mTeam = !selTeam || rTeam === selTeam;
             var mLeader = !selLeader || rLeader === selLeader;
             var mKw = !kw || fullSearchText.indexOf(kw) !== -1;
 
-            if (mRepo && mTeam && mLeader && mKw) {
+            if (mRepo && mModule && mTeam && mLeader && mKw) {
                 row.style.display = "";
                 visible++;
             } else {
@@ -90,7 +100,7 @@
         }
 
         if (filterCount) {
-            if (selRepo || selTeam || selLeader || kw) {
+            if (selRepo || selModule || selTeam || selLeader || kw) {
                 filterCount.textContent = "筛选匹配 " + visible + " / " + total + " 个文件";
             } else {
                 filterCount.textContent = "共 " + total + " 个文件";
@@ -151,12 +161,14 @@
     }
 
     if (repoFilter) repoFilter.addEventListener("change", applyFilters);
+    if (moduleFilter) moduleFilter.addEventListener("change", applyFilters);
     if (teamFilter) teamFilter.addEventListener("change", applyFilters);
     if (leaderFilter) leaderFilter.addEventListener("change", applyFilters);
     if (fileSearch) fileSearch.addEventListener("input", applyFilters);
     if (resetBtn) {
         resetBtn.addEventListener("click", function() {
             if (repoFilter) repoFilter.value = "";
+            if (moduleFilter) moduleFilter.value = "";
             if (teamFilter) teamFilter.value = "";
             if (leaderFilter) leaderFilter.value = "";
             if (fileSearch) fileSearch.value = "";

@@ -57,7 +57,7 @@ PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "visible-progress-20260814_v7_syntax_fix"
+ASSET_VERSION = "visible-progress-20260817_module_unanalyzed"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 
 
@@ -4609,6 +4609,36 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
     def escaped(value):
         return html.escape(str(value), quote=True)
 
+    unanalyzed_by_file = {}
+    try:
+        db_mgr = get_thread_db_manager(config)
+        if db_mgr and db_mgr.is_available():
+            with db_mgr.get_connection() as conn:
+                cursor = conn.cursor()
+                sql = """
+                    SELECT MAX(i.file_path) AS file_path,
+                           SUM(CASE WHEN a.id IS NULL OR COALESCE(a.is_draft, 0) = 1 OR a.status = %s THEN 1 ELSE 0 END) AS unanalyzed_total
+                    FROM coverage_line_index i
+                    LEFT JOIN coverage_analysis a
+                      ON i.project_name = a.project_name
+                     AND i.file_path_hash = a.file_path_hash
+                     AND i.line_number = a.line_number
+                    WHERE i.project_name = %s
+                    GROUP BY i.project_name, i.file_path_hash
+                """
+                cursor.execute(sql, ("未确认", project_name))
+                for row in cursor.fetchall():
+                    if isinstance(row, dict):
+                        fpath = row.get("file_path", "")
+                        count = row.get("unanalyzed_total", 0)
+                    else:
+                        fpath = row[0]
+                        count = row[1]
+                    if fpath:
+                        unanalyzed_by_file[_normalize_ownership_path(fpath)] = int(count or 0)
+    except Exception as err:
+        pass
+
     file_rows = []
     for repository_name, review_file_path in sorted(details_by_file):
         items = details_by_file[(repository_name, review_file_path)]
@@ -4629,8 +4659,11 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
                 "leader": OWNERSHIP_UNMATCHED_LEADER,
                 "ownership_status": "归属表不可用",
             }
+        file_key = _normalize_ownership_path(review_file_path)
+        unanalyzed_count = unanalyzed_by_file.get(file_key, counts[coverage_check.STATUS_UNCOVERED])
         file_rows.append({
             "repository": repository_name or "",
+            "module": ownership["module"],
             "team": ownership["team"],
             "leader": ownership["leader"],
             "ownership_status": ownership["ownership_status"],
@@ -4641,13 +4674,14 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
             "uncovered": counts[coverage_check.STATUS_UNCOVERED],
             "ignored": counts[coverage_check.STATUS_IGNORED],
             "missing": counts[coverage_check.STATUS_MISSING],
+            "unanalyzed": unanalyzed_count,
         })
 
     # The first render already prioritizes files that need the most review; the
     # browser-side table controls below let reviewers switch to any other metric.
     file_rows.sort(key=lambda item: (
         -item["uncovered"], -item["changed"], item["repository"],
-        item["team"], item["leader"], item["file_path"]
+        item["module"], item["team"], item["leader"], item["file_path"]
     ))
     rows = []
     for item in file_rows:
@@ -4659,34 +4693,46 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
             source_cell = '<a href="{}">{}</a>'.format(
                 escaped(urllib.parse.quote(page_link, safe="/%#?=&-_.~")), source_cell
             )
-        ownership_text = "{} / {}".format(item["team"], item["leader"])
-        ownership_cell = escaped(ownership_text)
+        ownership_text = "{} / {} / {}".format(item["module"] or "-", item["team"], item["leader"])
+        module_cell = escaped(item["module"] or "-")
+        team_cell = escaped(item["team"] or "-")
+        leader_cell = escaped(item["leader"] or "-")
         if item["ownership_status"] != "已匹配":
-            ownership_cell = '<span class="badge-unmatched-pill" title="{}">{}</span>'.format(
-                escaped(item["ownership_status"]), ownership_cell
+            module_cell = '<span class="badge-unmatched-pill" title="{}">{}</span>'.format(
+                escaped(item["ownership_status"]), module_cell
             )
         rows.append(
-            "<tr data-repo=\"{}\" data-team=\"{}\" data-leader=\"{}\" data-ownership=\"{}\">"
-            "<td data-sort-value=\"{}\">{}</td><td data-sort-value=\"{}\">{}</td>"
+            "<tr data-repo=\"{}\" data-module=\"{}\" data-team=\"{}\" data-leader=\"{}\" data-ownership=\"{}\">"
             "<td data-sort-value=\"{}\">{}</td>"
-            "<td data-sort-value=\"{}\">{}</td><td data-sort-value=\"{}\">{}</td>"
-            "<td data-sort-value=\"{}\">{}</td><td data-sort-value=\"{}\">{}</td>"
+            "<td data-sort-value=\"{}\">{}</td>"
+            "<td data-sort-value=\"{}\">{}</td>"
+            "<td data-sort-value=\"{}\">{}</td>"
+            "<td data-sort-value=\"{}\">{}</td>"
+            "<td data-sort-value=\"{}\">{}</td>"
+            "<td data-sort-value=\"{}\">{}</td>"
+            "<td data-sort-value=\"{}\">{}</td>"
+            "<td data-sort-value=\"{}\">{}</td>"
             "<td data-sort-value=\"{}\">{}</td></tr>".format(
                 escaped(repository_name),
+                escaped(item["module"]),
                 escaped(item["team"]),
                 escaped(item["leader"]),
                 escaped(ownership_text),
                 escaped(repository_name),
                 escaped(repository_name or "-"),
-                escaped(ownership_text),
-                ownership_cell,
+                escaped(item["module"]),
+                module_cell,
+                escaped(item["team"]),
+                team_cell,
+                escaped(item["leader"]),
+                leader_cell,
                 escaped(item["file_path"]),
                 source_cell,
                 item["changed"], item["changed"],
                 item["covered"], item["covered"],
                 item["uncovered"], item["uncovered"],
                 item["ignored"], item["ignored"],
-                item["missing"], item["missing"],
+                item["unanalyzed"], item["unanalyzed"],
             )
         )
 
@@ -4698,7 +4744,7 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
 
     rate = summary["coverage_rate"]
     rate_text = "N/A" if rate is None else "{:.2f}%".format(rate)
-    table_rows = "".join(rows) or '<tr><td colspan="8">本次 Git diff 没有新增代码行。</td></tr>'
+    table_rows = "".join(rows) or '<tr><td colspan="10">本次 Git diff 没有新增代码行。</td></tr>'
     repositories = result.get("repositories") or []
     if repositories:
         git_range_text = "{} 个仓库的 Git 范围".format(len(repositories))
@@ -4778,13 +4824,14 @@ td a:hover{{text-decoration:underline}}
 <section><h2>文件明细（点击表头可排序；默认未覆盖新增行从多到少）</h2>
 <div class="filters">
   <div class="filter-group"><label for="repo-filter">仓库：</label><select id="repo-filter"><option value="">全部仓库</option></select></div>
+  <div class="filter-group"><label for="module-filter">组件：</label><select id="module-filter"><option value="">全部组件</option></select></div>
   <div class="filter-group"><label for="team-filter">小组：</label><select id="team-filter"><option value="">全部小组</option></select></div>
   <div class="filter-group"><label for="leader-filter">组长：</label><select id="leader-filter"><option value="">全部组长</option></select></div>
   <div class="filter-group"><label for="file-search">文件搜索：</label><input type="text" id="file-search" placeholder="输入文件路径关键字..."></div>
   <button type="button" id="reset-filters-btn" class="reset-btn">重置筛选</button>
   <span id="filter-count" class="filter-count"></span>
 </div>
-<table id="incremental-file-table"><thead><tr><th data-sort-key="repository" aria-sort="none"><button type="button" class="sort-button" data-sort-key="repository" data-sort-type="text">仓库 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ownership" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ownership" data-sort-type="text">小组 / 组长 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="file" aria-sort="none"><button type="button" class="sort-button" data-sort-key="file" data-sort-type="text">文件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="changed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="changed" data-sort-type="number">新增行 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="covered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="covered" data-sort-type="number">已覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="uncovered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="uncovered" data-sort-type="number">未覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ignored" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ignored" data-sort-type="number">无需覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="missing" aria-sort="none"><button type="button" class="sort-button" data-sort-key="missing" data-sort-type="number">覆盖信息缺失 <span class="sort-indicator" aria-hidden="true">↕</span></button></th></tr></thead><tbody>{table_rows}</tbody></table></section>
+<table id="incremental-file-table"><thead><tr><th data-sort-key="repository" aria-sort="none"><button type="button" class="sort-button" data-sort-key="repository" data-sort-type="text">仓库 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="module" aria-sort="none"><button type="button" class="sort-button" data-sort-key="module" data-sort-type="text">组件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="team" aria-sort="none"><button type="button" class="sort-button" data-sort-key="team" data-sort-type="text">小组 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="leader" aria-sort="none"><button type="button" class="sort-button" data-sort-key="leader" data-sort-type="text">组长 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="file" aria-sort="none"><button type="button" class="sort-button" data-sort-key="file" data-sort-type="text">文件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="changed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="changed" data-sort-type="number">新增行 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="covered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="covered" data-sort-type="number">已覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="uncovered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="uncovered" data-sort-type="number">未覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ignored" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ignored" data-sort-type="number">无需覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="missing" aria-sort="none"><button type="button" class="sort-button" data-sort-key="missing" data-sort-type="number">待分析行数 <span class="sort-indicator" aria-hidden="true">↕</span></button></th></tr></thead><tbody>{table_rows}</tbody></table></section>
 </main><script src="incremental_coverage.js?v={asset_version}"></script></body></html>""".format(
         asset_version=ASSET_VERSION,
         project=escaped(project_name),

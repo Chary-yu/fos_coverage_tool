@@ -846,9 +846,11 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
                 js_content = f_js.read()
 
             self.assertIn('id="repo-filter"', content)
+            self.assertIn('id="module-filter"', content)
             self.assertIn('id="team-filter"', content)
             self.assertIn('id="leader-filter"', content)
             self.assertIn('id="file-search"', content)
+            self.assertIn('待分析行数', content)
             self.assertIn('data-repo="repo_alpha"', content)
             self.assertIn('<script src="incremental_coverage.js?v=', content)
             self.assertIn('addUnique(repos,', js_content)
