@@ -65,9 +65,9 @@
 
     var keyToColumn = {
         repository: 0,
-        module: 1,
-        team: 2,
-        leader: 3,
+        team: 1,
+        leader: 2,
+        module: 3,
         ownership: 1,
         file: 4,
         changed: 5,

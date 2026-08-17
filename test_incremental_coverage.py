@@ -491,9 +491,13 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         self.assertIn('data-sort-key="team"', summary_html)
         self.assertIn('data-sort-key="leader"', summary_html)
         repository_header = summary_html.index('data-sort-key="repository"')
+        team_header = summary_html.index('data-sort-key="team"')
+        leader_header = summary_html.index('data-sort-key="leader"')
         module_header = summary_html.index('data-sort-key="module"')
         file_header = summary_html.index('data-sort-key="file"')
-        self.assertLess(repository_header, module_header)
+        self.assertLess(repository_header, team_header)
+        self.assertLess(team_header, leader_header)
+        self.assertLess(leader_header, module_header)
         self.assertLess(module_header, file_header)
 
     def test_developer_task_page_lists_files_and_pending_fill(self):
