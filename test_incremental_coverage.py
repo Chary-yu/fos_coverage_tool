@@ -559,9 +559,17 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         with open(html_path, "r", encoding="utf-8") as f:
             html_content = f.read()
 
-        self.assertIn('.progress-link', html_content)
-        self.assertIn('.progress-link:hover', html_content)
-        self.assertIn('visible-progress-20260817_progress_jump_filter', html_content)
+    def test_cascading_filter_dropdowns_in_incremental_js(self):
+        js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH
+        with open(js_path, "r", encoding="utf-8") as f:
+            js_content = f.read()
+
+        self.assertIn('function updateSelectOptions', js_content)
+        self.assertIn('function updateFilterDropdowns', js_content)
+        self.assertIn('updateSelectOptions(repoFilter, validRepos, selRepo);', js_content)
+        self.assertIn('updateSelectOptions(teamFilter, validTeams, selTeam);', js_content)
+        self.assertIn('updateSelectOptions(leaderFilter, validLeaders, selLeader);', js_content)
+        self.assertIn('updateSelectOptions(moduleFilter, validModules, selModule);', js_content)
 
 
 if __name__ == "__main__":

@@ -80,11 +80,84 @@
     var currentKey = "uncovered";
     var currentDirection = -1;
 
-    function applyFilters() {
+    function updateSelectOptions(selectEl, validList, currentVal) {
+        if (!selectEl) return;
+        validList.sort(function(a, b) { return a.localeCompare(b, "zh-CN"); });
+
+        while (selectEl.options.length > 1) {
+            selectEl.remove(1);
+        }
+
+        for (var j = 0; j < validList.length; j++) {
+            var val = validList[j];
+            var opt = document.createElement("option");
+            opt.value = val;
+            opt.textContent = val;
+            selectEl.appendChild(opt);
+        }
+
+        if (currentVal && validList.indexOf(currentVal) !== -1) {
+            selectEl.value = currentVal;
+        } else {
+            selectEl.value = "";
+        }
+    }
+
+    function updateFilterDropdowns() {
         var selRepo = repoFilter ? repoFilter.value : "";
-        var selModule = moduleFilter ? moduleFilter.value : "";
         var selTeam = teamFilter ? teamFilter.value : "";
         var selLeader = leaderFilter ? leaderFilter.value : "";
+        var selModule = moduleFilter ? moduleFilter.value : "";
+        var kw = fileSearch ? fileSearch.value.trim().toLowerCase() : "";
+
+        var validRepos = [];
+        var validTeams = [];
+        var validLeaders = [];
+        var validModules = [];
+
+        for (var i = 0; i < allRows.length; i++) {
+            var row = allRows[i];
+            var rRepo = row.getAttribute("data-repo") || "";
+            var rTeam = row.getAttribute("data-team") || "";
+            var rLeader = row.getAttribute("data-leader") || "";
+            var rModule = row.getAttribute("data-module") || "";
+            var rOwnership = row.getAttribute("data-ownership") || "";
+            var rFile = (row.cells[4] ? row.cells[4].getAttribute("data-sort-value") || row.cells[4].textContent || "" : "");
+            var fullSearchText = (rRepo + " " + rModule + " " + rTeam + " " + rLeader + " " + rOwnership + " " + rFile).toLowerCase();
+
+            var mRepo = !selRepo || rRepo === selRepo;
+            var mTeam = !selTeam || rTeam === selTeam;
+            var mLeader = !selLeader || rLeader === selLeader;
+            var mModule = !selModule || rModule === selModule;
+            var mKw = !kw || fullSearchText.indexOf(kw) !== -1;
+
+            if (mTeam && mLeader && mModule && mKw) {
+                addUnique(validRepos, rRepo);
+            }
+            if (mRepo && mLeader && mModule && mKw) {
+                addUnique(validTeams, rTeam);
+            }
+            if (mRepo && mTeam && mModule && mKw) {
+                addUnique(validLeaders, rLeader);
+            }
+            if (mRepo && mTeam && mLeader && mKw) {
+                addUnique(validModules, rModule);
+            }
+        }
+
+        updateSelectOptions(repoFilter, validRepos, selRepo);
+        updateSelectOptions(teamFilter, validTeams, selTeam);
+        updateSelectOptions(leaderFilter, validLeaders, selLeader);
+        updateSelectOptions(moduleFilter, validModules, selModule);
+    }
+
+    function applyFilters() {
+        updateFilterDropdowns();
+
+        var selRepo = repoFilter ? repoFilter.value : "";
+        var selTeam = teamFilter ? teamFilter.value : "";
+        var selLeader = leaderFilter ? leaderFilter.value : "";
+        var selModule = moduleFilter ? moduleFilter.value : "";
         var kw = fileSearch ? fileSearch.value.trim().toLowerCase() : "";
 
         var total = allRows.length;
@@ -93,20 +166,20 @@
         for (var i = 0; i < total; i++) {
             var row = allRows[i];
             var rRepo = row.getAttribute("data-repo") || "";
-            var rModule = row.getAttribute("data-module") || "";
             var rTeam = row.getAttribute("data-team") || "";
             var rLeader = row.getAttribute("data-leader") || "";
+            var rModule = row.getAttribute("data-module") || "";
             var rOwnership = row.getAttribute("data-ownership") || "";
             var rFile = (row.cells[4] ? row.cells[4].getAttribute("data-sort-value") || row.cells[4].textContent || "" : "");
             var fullSearchText = (rRepo + " " + rModule + " " + rTeam + " " + rLeader + " " + rOwnership + " " + rFile).toLowerCase();
 
             var mRepo = !selRepo || rRepo === selRepo;
-            var mModule = !selModule || rModule === selModule;
             var mTeam = !selTeam || rTeam === selTeam;
             var mLeader = !selLeader || rLeader === selLeader;
+            var mModule = !selModule || rModule === selModule;
             var mKw = !kw || fullSearchText.indexOf(kw) !== -1;
 
-            if (mRepo && mModule && mTeam && mLeader && mKw) {
+            if (mRepo && mTeam && mLeader && mModule && mKw) {
                 row.style.display = "";
                 visible++;
             } else {
@@ -115,7 +188,7 @@
         }
 
         if (filterCount) {
-            if (selRepo || selModule || selTeam || selLeader || kw) {
+            if (selRepo || selTeam || selLeader || selModule || kw) {
                 filterCount.textContent = "筛选匹配 " + visible + " / " + total + " 个文件";
             } else {
                 filterCount.textContent = "共 " + total + " 个文件";
