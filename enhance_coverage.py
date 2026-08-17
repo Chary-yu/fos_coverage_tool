@@ -4763,7 +4763,7 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
     page = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>增量覆盖率审查</title><style>
-body{{margin:0;background:#f2f2f7;color:#1c1c1e;font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}}
+body{{margin:0;background:#f2f2f7;color:#1c1c1e;font:14px/1.5 "Microsoft YaHei","微软雅黑",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;-webkit-font-smoothing:antialiased}}
 main{{max-width:1280px;margin:0 auto;padding:24px 24px 48px}}
 .hero-card{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:18px;padding:24px 28px;box-shadow:0 4px 20px -2px rgba(0,0,0,0.04);text-align:center;margin-bottom:20px}}
 h1{{margin:0 0 8px;font-size:26px;font-weight:800;letter-spacing:-0.6px;color:#1c1c1e}}
@@ -4948,7 +4948,7 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
     page = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>开发人员待填写清单</title><style>
-body{{margin:0;background:#f2f2f7;color:#1c1c1e;font:14px/1.5 -apple-system,BlinkMacSystemFont,"SF Pro Text","SF Pro Display","Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased}}
+body{{margin:0;background:#f2f2f7;color:#1c1c1e;font:14px/1.5 "Microsoft YaHei","微软雅黑",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;-webkit-font-smoothing:antialiased}}
 main{{max-width:1320px;margin:0 auto;padding:24px 24px 48px}}
 .hero-card{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:18px;padding:24px 28px;box-shadow:0 4px 20px -2px rgba(0,0,0,0.04);margin-bottom:20px}}
 h1{{margin:0 0 8px;font-size:26px;font-weight:800;letter-spacing:-0.6px;color:#1c1c1e}}

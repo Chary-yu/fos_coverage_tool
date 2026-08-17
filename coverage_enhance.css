@@ -35,7 +35,7 @@ pre.source::after {
     display: inline-flex;
     align-items: flex-start;
     gap: 6px;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+    font-family: "Microsoft YaHei", "微软雅黑", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
     font-size: 12px;
     vertical-align: middle;
     user-select: none;
@@ -285,7 +285,7 @@ textarea.coverage-analysis-input.multiline {
 
 /* 连续未覆盖区间 (基本块) 标识徽章样式 */
 .coverage-block-badge {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-family: "Microsoft YaHei", "微软雅黑", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
     font-size: 9px;
     font-weight: bold;
     color: #ff3b30;
@@ -524,7 +524,7 @@ textarea.coverage-analysis-input.multiline {
     border-radius: 16px !important;
     padding: 6px 14px !important;
     box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.08) !important;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif !important;
+    font-family: "Microsoft YaHei", "微软雅黑", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif !important;
     font-size: 12px !important;
     color: #000000 !important;
     user-select: none !important;
@@ -604,7 +604,7 @@ textarea.coverage-analysis-input.multiline {
     padding: 0 12px !important;
     font-size: 12px !important;
     font-weight: 600 !important;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif !important;
+    font-family: "Microsoft YaHei", "微软雅黑", -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif !important;
     color: #1c1c1e !important;
     background: #ffffff !important;
     border: 1px solid rgba(0, 0, 0, 0.08) !important;
