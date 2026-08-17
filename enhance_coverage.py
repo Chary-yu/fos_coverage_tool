@@ -57,7 +57,7 @@ PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "visible-progress-20260817_v9_2_filter_fix"
+ASSET_VERSION = "visible-progress-20260817_v9_3"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 
 
@@ -475,6 +475,19 @@ def resolve_ownership_xlsx_path(config=None):
     configured_path = os.path.expanduser(str(configured_path))
     if not os.path.isabs(configured_path):
         configured_path = os.path.join(SCRIPT_DIR, configured_path)
+    if os.path.isfile(configured_path):
+        return os.path.abspath(configured_path)
+
+    try:
+        if os.path.isdir(SCRIPT_DIR):
+            for fname in os.listdir(SCRIPT_DIR):
+                if fname.endswith(".xlsx") and ("目录归属" in fname or "#U4ee3#U7801" in fname or "归属模块" in fname or "模块统计" in fname):
+                    candidate = os.path.join(SCRIPT_DIR, fname)
+                    if os.path.isfile(candidate):
+                        return os.path.abspath(candidate)
+    except Exception:
+        pass
+
     return os.path.abspath(configured_path)
 
 
@@ -1062,8 +1075,8 @@ def save_job_to_db(job):
             ))
             db_manager.conn.commit()
             cursor.close()
-    except Exception:
-        pass
+    except Exception as err:
+        print("[Warning] Failed to save background job {} to database: {}".format(job.get("id") if job else None, err))
 
 
 def _cleanup_background_jobs_locked(now):
@@ -4604,7 +4617,8 @@ def sync_incremental_unanalyzed_counts(project_name, result, config=None):
         db_mgr = get_thread_db_manager(config)
         if db_mgr and db_mgr.is_available():
             with db_mgr.get_connection() as conn:
-                cursor = conn.cursor()
+                if conn is not None:
+                    cursor = conn.cursor()
                 sql = """
                     SELECT MAX(i.file_path) AS file_path,
                            SUM(CASE WHEN a.id IS NULL OR COALESCE(a.is_draft, 0) = 1 OR a.status = %s THEN 1 ELSE 0 END) AS unanalyzed_total

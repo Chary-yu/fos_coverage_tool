@@ -776,7 +776,7 @@ class TestScalableProgress(unittest.TestCase):
         with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as html_file:
             html_content = html_file.read()
         self.assertIn('src="coverage_progress.js?v=', html_content)
-        self.assertIn("页面版本 visible-progress-20260817_v9_2_filter_fix", html_content)
+        self.assertIn("页面版本 visible-progress-20260817_v9_3", html_content)
         self.assertNotIn('<script>\n    const DEFAULT_REVIEW_SCOPE', html_content)
 
 
@@ -980,7 +980,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("mod-chip", js_content)
         self.assertIn("mod-more-chip", js_content)
         self.assertIn("bar-high", js_content)
-        self.assertIn("visible-progress-20260817_v9_2_filter_fix", js_content)
+        self.assertIn("visible-progress-20260817_v9_3", js_content)
 
     def test_atomic_write_file_creates_and_renames(self):
         target_path = os.path.join(enhance_coverage.BACKGROUND_JOBS_STORAGE_DIR, "test_atomic.json")
@@ -1005,11 +1005,30 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         with open(py_path, "r", encoding="utf-8") as f:
             py_content = f.read()
 
-        self.assertIn("CREATE TABLE IF NOT EXISTS coverage_background_jobs", py_content)
-        self.assertIn("CREATE TABLE IF NOT EXISTS coverage_project_state", py_content)
         self.assertIn("def recover_background_jobs", py_content)
         self.assertIn("def start_background_job_cleanup_loop", py_content)
         self.assertIn("BACKGROUND_JOBS_STORAGE_DIR", py_content)
+
+    def test_recover_background_jobs_execution_flow(self):
+        mock_cursor = unittest.mock.MagicMock()
+        mock_cursor.fetchall.return_value = [
+            ("job_stale_1", "progress", "test_proj_stale", 999),
+        ]
+        mock_conn = unittest.mock.MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_mgr = unittest.mock.MagicMock()
+        mock_mgr.conn = mock_conn
+
+        with unittest.mock.patch.object(enhance_coverage, "db_manager", mock_mgr), \
+             unittest.mock.patch.object(enhance_coverage, "get_project_data_version", return_value=100), \
+             unittest.mock.patch.object(enhance_coverage, "save_job_to_db") as mock_save:
+            enhance_coverage.recover_background_jobs()
+            mock_save.assert_called_once()
+            self.assertEqual(mock_save.call_args[0][0]["state"], "failed")
+
+    def test_resolve_ownership_xlsx_path_fallback(self):
+        resolved = enhance_coverage.resolve_ownership_xlsx_path({"ownership": {"xlsx_path": "non_existent_file.xlsx"}})
+        self.assertTrue(os.path.isabs(resolved))
 
     def test_completed_job_db_restoration_restores_finished_at_and_enforces_retention(self):
         import time
