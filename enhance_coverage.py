@@ -57,7 +57,7 @@ PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "visible-progress-20260817_v9_4"
+ASSET_VERSION = "visible-progress-20260817_v9_5"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 
 
@@ -1179,11 +1179,20 @@ def _update_background_job(job_id, percent, stage, message):
             raise JobCancelledError("Job '{}' has been cancelled or expired.".format(job_id))
         pname = job.get("project_name")
         initial_ver = job.get("version")
-        if pname and initial_ver is not None:
-            if get_project_data_version(pname) != initial_ver:
-                job["state"] = "cancelled"
-                job["message"] = "数据版本已更新，任务已作废"
-                raise JobCancelledError("Job '{}' invalidated by project data version change.".format(job_id))
+
+    current_ver = None
+    if pname and initial_ver is not None:
+        current_ver = get_project_data_version(pname)
+
+    with _background_jobs_lock:
+        job = _background_jobs.get(job_id)
+        if not job or job.get("state") in ("cancelled", "failed", "expired"):
+            raise JobCancelledError("Job '{}' has been cancelled or expired.".format(job_id))
+        if pname and initial_ver is not None and current_ver is not None and current_ver != initial_ver:
+            job["state"] = "cancelled"
+            job["message"] = "数据版本已更新，任务已作废"
+            raise JobCancelledError("Job '{}' invalidated by project data version change.".format(job_id))
+
         job["percent"] = max(job.get("percent", 0), min(99, int(percent)))
         job["stage"] = stage
         job["message"] = message
@@ -1227,6 +1236,15 @@ def _finish_background_job(job_id, **values):
     cleanup_timer.start()
 
 
+def _cancel_background_job(job_id, reason="数据版本已更新，任务已作废"):
+    _finish_background_job(
+        job_id,
+        state="cancelled",
+        stage="cancelled",
+        message=reason,
+    )
+
+
 def _run_progress_background_job(job_id, project_name):
     try:
         data = compute_progress_data(
@@ -1245,7 +1263,9 @@ def _run_progress_background_job(job_id, project_name):
             message="文件级填写进展计算完成",
             data=data,
         )
-    except Exception as error:
+    except JobCancelledError as e:
+        print("[Progress Job] Job '{}' cancelled cleanly: {}".format(job_id, e), flush=True)
+        _cancel_background_job(job_id, str(e))
         print("[Progress Job] Failed for project '{}': {}".format(project_name, error), flush=True)
         _finish_background_job(
             job_id,
@@ -1330,6 +1350,7 @@ def _run_detail_export_background_job(job_id, project_name):
         )
     except JobCancelledError as e:
         print("[Export Job] Job '{}' cancelled cleanly: {}".format(job_id, e), flush=True)
+        _cancel_background_job(job_id, str(e))
         if temp_export_path and os.path.exists(temp_export_path):
             try:
                 os.remove(temp_export_path)
