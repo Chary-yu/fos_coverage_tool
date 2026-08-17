@@ -553,7 +553,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
 
         self.assertIn('const isIncremental = reviewScope === \'incremental\';', js_content)
         self.assertIn('<span class="mod-chip">', js_content)
-        self.assertIn('PROGRESS_PAGE_VERSION = \'visible-progress-20260817_v9_3\'', js_content)
+        self.assertIn('PROGRESS_PAGE_VERSION = \'visible-progress-20260817_v9_4\'', js_content)
 
         html_path = enhance_coverage.PROGRESS_PAGE_SOURCE_PATH
         with open(html_path, "r", encoding="utf-8") as f:
@@ -561,7 +561,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
 
         self.assertIn('.progress-link', html_content)
         self.assertIn('.progress-link:hover', html_content)
-        self.assertIn('页面版本 visible-progress-20260817_v9_3', html_content)
+        self.assertIn('页面版本 visible-progress-20260817_v9_4', html_content)
 
     def test_cascading_filter_dropdowns_in_incremental_js(self):
         js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH

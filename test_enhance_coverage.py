@@ -776,7 +776,7 @@ class TestScalableProgress(unittest.TestCase):
         with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as html_file:
             html_content = html_file.read()
         self.assertIn('src="coverage_progress.js?v=', html_content)
-        self.assertIn("页面版本 visible-progress-20260817_v9_3", html_content)
+        self.assertIn("页面版本 visible-progress-20260817_v9_4", html_content)
         self.assertNotIn('<script>\n    const DEFAULT_REVIEW_SCOPE', html_content)
 
 
@@ -980,7 +980,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("mod-chip", js_content)
         self.assertIn("mod-more-chip", js_content)
         self.assertIn("bar-high", js_content)
-        self.assertIn("visible-progress-20260817_v9_3", js_content)
+        self.assertIn("visible-progress-20260817_v9_4", js_content)
 
     def test_atomic_write_file_creates_and_renames(self):
         target_path = os.path.join(enhance_coverage.BACKGROUND_JOBS_STORAGE_DIR, "test_atomic.json")
@@ -1029,6 +1029,23 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
     def test_resolve_ownership_xlsx_path_fallback(self):
         resolved = enhance_coverage.resolve_ownership_xlsx_path({"ownership": {"xlsx_path": "non_existent_file.xlsx"}})
         self.assertTrue(os.path.isabs(resolved))
+
+    def test_worker_thread_cooperative_cancellation_on_data_version_change(self):
+        job_id = "test_cancel_job_123"
+        project_name = "cancel_test_proj"
+        with enhance_coverage._background_jobs_lock:
+            enhance_coverage._background_jobs[job_id] = {
+                "id": job_id,
+                "project_name": project_name,
+                "version": 1,
+                "state": "running",
+            }
+        # When data_version increments to 2, update should raise JobCancelledError
+        with unittest.mock.patch.object(enhance_coverage, "get_project_data_version", return_value=2):
+            with self.assertRaises(enhance_coverage.JobCancelledError):
+                enhance_coverage._update_background_job(job_id, 10, "exporting", "test")
+        with enhance_coverage._background_jobs_lock:
+            enhance_coverage._background_jobs.pop(job_id, None)
 
     def test_completed_job_db_restoration_restores_finished_at_and_enforces_retention(self):
         import time

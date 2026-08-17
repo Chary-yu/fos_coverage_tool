@@ -57,8 +57,13 @@ PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "visible-progress-20260817_v9_3"
+ASSET_VERSION = "visible-progress-20260817_v9_4"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
+
+
+class JobCancelledError(Exception):
+    """Raised when a background job has been cancelled or invalidated by data version change."""
+    pass
 
 
 class PerfTimer(object):
@@ -1170,8 +1175,15 @@ def _expire_background_job(job_id, expected_finished_at=None):
 def _update_background_job(job_id, percent, stage, message):
     with _background_jobs_lock:
         job = _background_jobs.get(job_id)
-        if not job or job.get("state") != "running":
-            return
+        if not job or job.get("state") in ("cancelled", "failed", "expired"):
+            raise JobCancelledError("Job '{}' has been cancelled or expired.".format(job_id))
+        pname = job.get("project_name")
+        initial_ver = job.get("version")
+        if pname and initial_ver is not None:
+            if get_project_data_version(pname) != initial_ver:
+                job["state"] = "cancelled"
+                job["message"] = "数据版本已更新，任务已作废"
+                raise JobCancelledError("Job '{}' invalidated by project data version change.".format(job_id))
         job["percent"] = max(job.get("percent", 0), min(99, int(percent)))
         job["stage"] = stage
         job["message"] = message
@@ -1283,10 +1295,9 @@ def write_full_detail_csv(manager, project_name, output_path, progress_callback=
     if progress_callback:
         progress_callback(98, "finalizing", "正在完成 CSV 文件")
     return written
-
-
 def _run_detail_export_background_job(job_id, project_name):
     output_path = None
+    temp_export_path = None
     try:
         _ensure_background_jobs_storage_dir()
         filename = "coverage_full_detail_{}_{}.csv".format(
@@ -1317,10 +1328,22 @@ def _run_detail_export_background_job(job_id, project_name):
             filename=filename,
             row_count=row_count,
         )
-    except Exception as error:
-        if output_path and os.path.exists(output_path + ".part"):
+    except JobCancelledError as e:
+        print("[Export Job] Job '{}' cancelled cleanly: {}".format(job_id, e), flush=True)
+        if temp_export_path and os.path.exists(temp_export_path):
             try:
-                os.remove(output_path + ".part")
+                os.remove(temp_export_path)
+            except OSError:
+                pass
+        if output_path and os.path.exists(output_path):
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+    except Exception as error:
+        if temp_export_path and os.path.exists(temp_export_path):
+            try:
+                os.remove(temp_export_path)
             except OSError:
                 pass
         print("[Export Job] Failed for project '{}': {}".format(project_name, error), flush=True)
@@ -1996,7 +2019,7 @@ def write_progress_page_targets(output_dir, real_output_html, review_scope="full
 class DatabaseManager:
     """MySQL 数据库管理层，处理连接、建库、建表以及存取操作"""
     def __init__(self, config, exit_on_error=True, init_schema=True):
-        self.config = config["mysql"]
+        self.config = (config or {}).get("mysql") or {}
         self.exit_on_error = exit_on_error
         self._local = threading.local()
         self._default_conn = None
@@ -2044,8 +2067,14 @@ class DatabaseManager:
                     pass
                 _local.conn = None
 
+    def is_available(self):
+        """Return True if MySQL driver (PyMySQL or mysql.connector) is available."""
+        return db_module is not None
+
     def get_connection(self, select_db=True):
         """建立并返回 MySQL 连接"""
+        if db_module is None:
+            return None
         params = {
             "host": self.config["host"],
             "port": int(self.config["port"]),
@@ -4284,15 +4313,16 @@ def get_thread_db_manager(config):
         manager = DatabaseManager(config, exit_on_error=False, init_schema=False)
         _thread_local.db_manager = manager
     else:
-        try:
-            manager.conn.ping(reconnect=True)
-        except Exception:
+        if getattr(manager, "conn", None) is not None:
             try:
-                manager.conn.close()
+                manager.conn.ping(reconnect=True)
             except Exception:
-                pass
-            manager = DatabaseManager(config, exit_on_error=False, init_schema=False)
-            _thread_local.db_manager = manager
+                try:
+                    manager.conn.close()
+                except Exception:
+                    pass
+                manager = DatabaseManager(config, exit_on_error=False, init_schema=False)
+                _thread_local.db_manager = manager
     return manager
 
 
@@ -4615,31 +4645,37 @@ def sync_incremental_unanalyzed_counts(project_name, result, config=None):
     unanalyzed_by_file = {}
     try:
         db_mgr = get_thread_db_manager(config)
-        if db_mgr and db_mgr.is_available():
-            with db_mgr.get_connection() as conn:
-                if conn is not None:
-                    cursor = conn.cursor()
-                sql = """
-                    SELECT MAX(i.file_path) AS file_path,
-                           SUM(CASE WHEN a.id IS NULL OR COALESCE(a.is_draft, 0) = 1 OR a.status = %s THEN 1 ELSE 0 END) AS unanalyzed_total
-                    FROM coverage_line_index i
-                    LEFT JOIN coverage_analysis a
-                      ON i.project_name = a.project_name
-                     AND i.file_path_hash = a.file_path_hash
-                     AND i.line_number = a.line_number
-                    WHERE i.project_name = %s
-                    GROUP BY i.project_name, i.file_path_hash
-                """
-                cursor.execute(sql, ("未确认", project_name))
-                for row in cursor.fetchall():
-                    if isinstance(row, dict):
-                        fpath = row.get("file_path", "")
-                        count = row.get("unanalyzed_total", 0)
-                    else:
-                        fpath = row[0]
-                        count = row[1]
-                    if fpath:
-                        unanalyzed_by_file[_normalize_ownership_path(fpath)] = int(count or 0)
+        if db_mgr and db_module is not None and getattr(db_mgr, "conn", None) is not None:
+            conn_ctx = db_mgr.get_connection()
+            if conn_ctx is not None:
+                with conn_ctx as conn:
+                    if conn is not None and hasattr(conn, "cursor"):
+                        cursor = conn.cursor()
+                        sql = """
+                            SELECT MAX(i.file_path) AS file_path,
+                                   SUM(CASE WHEN a.id IS NULL OR COALESCE(a.is_draft, 0) = 1 OR a.status = %s THEN 1 ELSE 0 END) AS unanalyzed_total
+                            FROM coverage_line_index i
+                            LEFT JOIN coverage_analysis a
+                              ON i.project_name = a.project_name
+                             AND i.file_path_hash = a.file_path_hash
+                             AND i.line_number = a.line_number
+                            WHERE i.project_name = %s
+                            GROUP BY i.project_name, i.file_path_hash
+                        """
+                        cursor.execute(sql, ("未确认", project_name))
+                        for row in cursor.fetchall() or []:
+                            if not row:
+                                continue
+                            if isinstance(row, dict):
+                                fpath = row.get("file_path", "")
+                                count = row.get("unanalyzed_total", 0)
+                            elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                                fpath = row[0]
+                                count = row[1]
+                            else:
+                                continue
+                            if fpath:
+                                unanalyzed_by_file[_normalize_ownership_path(fpath)] = int(count or 0)
     except Exception as err:
         print("[Warning] Failed to query incremental unanalyzed counts from database: {}".format(err))
 
