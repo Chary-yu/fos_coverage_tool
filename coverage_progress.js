@@ -2,16 +2,23 @@
 (function () {
   'use strict';
 
-  const PROGRESS_PAGE_VERSION = 'visible-progress-20260814_ios_ui';
+  const PROGRESS_PAGE_VERSION = 'visible-progress-20260817_progress_jump_filter';
   const DEFAULT_REVIEW_SCOPE = 'full';
   const params = new URLSearchParams(window.location.search);
   const configuredScope = document.body.getAttribute('data-review-scope') || DEFAULT_REVIEW_SCOPE;
   const reviewScope = params.get('scope') === 'incremental' ? 'incremental' : configuredScope;
+
+  function getReviewHomeUrl(queryParams) {
+    const targetPage = reviewScope === 'full' ? 'index.html' : 'incremental_coverage.html';
+    return queryParams ? `${targetPage}?${queryParams}` : targetPage;
+  }
+
   const projectInput = document.getElementById('projectInput');
   const projectOptions = document.getElementById('projectOptions');
   const statusEl = document.getElementById('status');
   const csvLink = document.getElementById('csvLink');
   const excelLink = document.getElementById('excelLink');
+  const returnSummaryLink = document.getElementById('returnSummaryLink');
   const detailExportBtn = document.getElementById('detailExportBtn');
   const detailDownloadLink = document.getElementById('detailDownloadLink');
   const jobProgress = document.getElementById('jobProgress');
@@ -27,6 +34,10 @@
   let currentDetailPage = 1;
 
   document.documentElement.setAttribute('data-progress-version', PROGRESS_PAGE_VERSION);
+  if (returnSummaryLink) {
+    returnSummaryLink.href = getReviewHomeUrl();
+    returnSummaryLink.textContent = reviewScope === 'full' ? '↩ 返回全量审查汇总' : '↩ 返回增量审查汇总';
+  }
   if (reviewScope === 'incremental') {
     document.title = 'Incremental Coverage Analysis Progress';
     document.getElementById('pageTitle').innerText = '增量覆盖率分析进度';
@@ -107,17 +118,17 @@
       let moduleCellHtml = '';
       const teamQuery = encodeURIComponent(row.team || '');
       const teamLinkHtml = row.team
-        ? `<a href="incremental_coverage.html?team=${teamQuery}" class="progress-link" title="点击查看 [${escapeHtml(row.team)}] 文件审查明细"><strong>${escapeHtml(row.team)}</strong></a>`
+        ? `<a href="${getReviewHomeUrl(`team=${teamQuery}`)}" class="progress-link" title="点击查看 [${escapeHtml(row.team)}] 文件审查明细"><strong>${escapeHtml(row.team)}</strong></a>`
         : '';
       const leaderLinkHtml = row.leader
-        ? `<a href="incremental_coverage.html?leader=${encodeURIComponent(row.leader)}" class="progress-link" title="点击查看 [${escapeHtml(row.leader)}] 文件审查明细">${escapeHtml(row.leader)}</a>`
+        ? `<a href="${getReviewHomeUrl(`leader=${encodeURIComponent(row.leader)}`)}" class="progress-link" title="点击查看 [${escapeHtml(row.leader)}] 文件审查明细">${escapeHtml(row.leader)}</a>`
         : '-';
 
       if (hasModules) {
         const visibleMods = modules.slice(0, 2);
         const modChips = visibleMods.map(m => {
           const modQuery = encodeURIComponent(m.module || '');
-          return `<a href="incremental_coverage.html?module=${modQuery}&team=${teamQuery}" class="mod-chip progress-link" title="点击查看 [${escapeHtml(m.module || '')}] 文件审查明细">${escapeHtml(m.module || '')}</a>`;
+          return `<a href="${getReviewHomeUrl(`module=${modQuery}&team=${teamQuery}`)}" class="mod-chip progress-link" title="点击查看 [${escapeHtml(m.module || '')}] 文件审查明细">${escapeHtml(m.module || '')}</a>`;
         }).join('');
         const moreCount = modules.length - visibleMods.length;
         const moreChip = moreCount > 0 ? `<span class="mod-more-chip">+${moreCount}</span>` : '';
@@ -147,7 +158,7 @@
 
       modules.forEach(mod => {
         const modQuery = encodeURIComponent(mod.module || '');
-        const subModLinkHtml = `<a href="incremental_coverage.html?module=${modQuery}&team=${teamQuery}" class="progress-link" title="点击查看 [${escapeHtml(mod.module || '')}] 文件审查明细">└─ ${escapeHtml(mod.module || '')}</a>`;
+        const subModLinkHtml = `<a href="${getReviewHomeUrl(`module=${modQuery}&team=${teamQuery}`)}" class="progress-link" title="点击查看 [${escapeHtml(mod.module || '')}] 文件审查明细">└─ ${escapeHtml(mod.module || '')}</a>`;
         const subTr = `
           <tr class="module-subrow team-subrow-${teamIdx}" style="display:none; background-color: #f8fafc;">
             <td style="padding-left: 28px; font-weight: 600; color: #334155;">${subModLinkHtml}</td>

@@ -534,6 +534,35 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         self.assertIn("待填写 2 行", page_html)
         self.assertIn("多人提交同一文件", page_html)
 
+    def test_url_search_param_parsing_and_history_replace_state_in_incremental_js(self):
+        js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH
+        with open(js_path, "r", encoding="utf-8") as f:
+            js_content = f.read()
+
+        self.assertIn('URLSearchParams(window.location.search)', js_content)
+        self.assertIn('params.get("repo")', js_content)
+        self.assertIn('params.get("module")', js_content)
+        self.assertIn('params.get("team")', js_content)
+        self.assertIn('params.get("leader")', js_content)
+        self.assertIn('window.history.replaceState', js_content)
+
+    def test_coverage_progress_js_dynamic_review_scope_urls_and_styles(self):
+        js_path = enhance_coverage.PROGRESS_JS_SOURCE_PATH
+        with open(js_path, "r", encoding="utf-8") as f:
+            js_content = f.read()
+
+        self.assertIn('getReviewHomeUrl', js_content)
+        self.assertIn("reviewScope === 'full' ? 'index.html'", js_content)
+        self.assertIn('PROGRESS_PAGE_VERSION = \'visible-progress-20260817_progress_jump_filter\'', js_content)
+
+        html_path = enhance_coverage.PROGRESS_PAGE_SOURCE_PATH
+        with open(html_path, "r", encoding="utf-8") as f:
+            html_content = f.read()
+
+        self.assertIn('.progress-link', html_content)
+        self.assertIn('.progress-link:hover', html_content)
+        self.assertIn('visible-progress-20260817_progress_jump_filter', html_content)
+
 
 if __name__ == "__main__":
     unittest.main()

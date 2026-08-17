@@ -253,6 +253,17 @@
       box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
       transform: none;
     }
+    .progress-link {
+      color: #007aff !important;
+      text-decoration: none !important;
+      font-weight: 600 !important;
+      cursor: pointer !important;
+      transition: color 0.15s ease !important;
+    }
+    .progress-link:hover {
+      text-decoration: underline !important;
+      color: #0051a8 !important;
+    }
     @media (max-width: 900px) { .cards { grid-template-columns: repeat(2, minmax(150px, 1fr)); } }
   </style>
 </head>
@@ -265,14 +276,14 @@
         <datalist id="projectOptions"></datalist>
         <button id="loadBtn" type="button">查看进度</button>
         <div class="segmented-group">
-          <a id="returnSummaryLink" class="button" href="incremental_coverage.html">↩ 返回增量审查汇总</a>
+          <a id="returnSummaryLink" class="button" href="index.html">↩ 返回全量审查汇总</a>
           <a id="csvLink" class="button" href="#" target="_blank">导出进度 Excel</a>
           <a id="excelLink" class="button" href="#" target="_blank">导出目录 Excel ZIP</a>
           <button id="detailExportBtn" type="button">后台导出详细 CSV</button>
         </div>
         <a id="detailDownloadLink" class="button" href="#" hidden>下载详细 CSV</a>
       </div>
-      <div class="page-version">页面版本 visible-progress-20260814_ios_ui · 点击后应立即显示进度条</div>
+      <div class="page-version">页面版本 visible-progress-20260817_progress_jump_filter · 点击后应立即显示进度条</div>
       <div id="status" class="status"></div>
       <div id="jobProgress" class="job-progress" role="status" aria-live="polite">
         <div class="job-progress-head"><span id="jobStage">准备中</span><span id="jobPercent">0%</span></div>
@@ -315,6 +326,6 @@
       <div class="table-wrap"><table id="detailTable"></table></div>
     </section>
   </main>
-  <script src="coverage_progress.js?v=visible-progress-20260814_ios_ui"></script>
+  <script src="coverage_progress.js?v=visible-progress-20260817_progress_jump_filter"></script>
 </body>
 </html>

@@ -187,6 +187,10 @@
             if (teamFilter) teamFilter.value = "";
             if (leaderFilter) leaderFilter.value = "";
             if (fileSearch) fileSearch.value = "";
+            if (window.history && window.history.replaceState) {
+                var cleanUrl = window.location.protocol + "//" + window.location.host + window.location.pathname;
+                window.history.replaceState({ path: cleanUrl }, "", cleanUrl);
+            }
             applyFilters();
         });
     }

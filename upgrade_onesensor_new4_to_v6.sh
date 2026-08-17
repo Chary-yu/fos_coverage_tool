@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# OneSensor Coverage Tool: Production Smooth Upgrade Script (new4 -> v6.3)
+# OneSensor Coverage Tool: Production Smooth Upgrade Script (new4 -> v8.0)
 # Features: Additive Schema Migration (Step 17 Allowlist), Pre-flight Check,
 #           Zero-downtime Asset Refresh & Verification.
 # ==============================================================================
@@ -19,7 +19,7 @@ error() {
     exit 1
 }
 
-log "Starting OneSensor smooth upgrade from new4 -> v6.3..."
+log "Starting OneSensor smooth upgrade from new4 -> v8.0..."
 
 # Step 1: Pre-flight Verification
 log "Step 1/6: Verifying Python environment & PyMySQL driver..."
@@ -63,7 +63,7 @@ print('[Step 17 Schema Check] PASSED cleanly! Core tables present, additive tabl
 " || error "Step 17 Schema Validation failed."
 
 # Step 4: Asset Cache-Busting & Resource Sync
-log "Step 4/6: Syncing static assets (v=visible-progress-20260814_ios_ui)..."
+log "Step 4/6: Syncing static assets (v=visible-progress-20260817_progress_jump_filter)..."
 if [ -d "${SCRIPT_DIR}/background_jobs" ]; then
     log "Background jobs storage directory verified: ${SCRIPT_DIR}/background_jobs"
 else
@@ -75,5 +75,5 @@ log "Step 5/6: Running self-test suite..."
 $SHELL -c 'export HTTP_PROXY=""; export HTTPS_PROXY=""; python3 -m unittest discover -s . -p "test_*.py"' || error "Unit test verification failed."
 
 # Step 6: Completion
-log "Step 6/6: Upgrade to OneSensor v6.3 completed successfully!"
+log "Step 6/6: Upgrade to OneSensor v8.0 completed successfully!"
 log "Log file saved to: ${LOG_FILE}"

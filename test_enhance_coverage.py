@@ -486,7 +486,7 @@ class TestIntegration(unittest.TestCase):
         self.assertIn('id="teamTable"', progress_content)
         self.assertIn('小组 / 组长填写进度', progress_content)
         self.assertIn('returnSummaryLink', progress_content)
-        self.assertIn('↩ 返回增量审查汇总', progress_content)
+        self.assertIn('返回全量审查汇总', progress_content)
         progress_js = os.path.join(self.output_dir, "coverage_progress.js")
         self.assertTrue(os.path.exists(progress_js))
         with open(progress_js, "r", encoding="utf-8") as f:
@@ -564,8 +564,9 @@ class TestInheritAnalysis(unittest.TestCase):
             }
         }
 
-        manager = enhance_coverage.DatabaseManager(config, exit_on_error=False, init_schema=False)
-        manager.conn = mock_conn
+        with unittest.mock.patch.object(enhance_coverage.DatabaseManager, 'get_connection', return_value=mock_conn):
+            manager = enhance_coverage.DatabaseManager(config, exit_on_error=False, init_schema=False)
+            manager.conn = mock_conn
 
         # Execute inheritance
         result = manager.inherit_analysis("v1", "v2")
@@ -628,8 +629,9 @@ class TestInheritAnalysis(unittest.TestCase):
             }
         }
 
-        manager = enhance_coverage.DatabaseManager(config, exit_on_error=False, init_schema=False)
-        manager.conn = mock_conn
+        with unittest.mock.patch.object(enhance_coverage.DatabaseManager, 'get_connection', return_value=mock_conn):
+            manager = enhance_coverage.DatabaseManager(config, exit_on_error=False, init_schema=False)
+            manager.conn = mock_conn
 
         # Execute inheritance
         result = manager.inherit_analysis("v1", "v2")
@@ -774,7 +776,7 @@ class TestScalableProgress(unittest.TestCase):
         with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as html_file:
             html_content = html_file.read()
         self.assertIn('src="coverage_progress.js?v=', html_content)
-        self.assertIn("页面版本 visible-progress-20260814_ios_ui", html_content)
+        self.assertIn("页面版本 visible-progress-20260817_progress_jump_filter", html_content)
         self.assertNotIn('<script>\n    const DEFAULT_REVIEW_SCOPE', html_content)
 
 
@@ -950,9 +952,10 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
 
     def test_thread_local_database_connection_cleanup(self):
         config = {"mysql": {"host": "127.0.0.1", "port": 3306, "user": "root", "password": "", "database": "cov"}}
-        manager = enhance_coverage.DatabaseManager(config, exit_on_error=False, init_schema=False)
         mock_conn = unittest.mock.MagicMock()
-        manager.conn = mock_conn
+        with unittest.mock.patch.object(enhance_coverage.DatabaseManager, 'get_connection', return_value=mock_conn):
+            manager = enhance_coverage.DatabaseManager(config, exit_on_error=False, init_schema=False)
+            manager.conn = mock_conn
 
         self.assertEqual(manager.conn, mock_conn)
         manager.close_thread_connection()
@@ -977,7 +980,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("mod-chip", js_content)
         self.assertIn("mod-more-chip", js_content)
         self.assertIn("bar-high", js_content)
-        self.assertIn("visible-progress-20260814_ios_ui", js_content)
+        self.assertIn("visible-progress-20260817_progress_jump_filter", js_content)
 
     def test_atomic_write_file_creates_and_renames(self):
         target_path = os.path.join(enhance_coverage.BACKGROUND_JOBS_STORAGE_DIR, "test_atomic.json")
