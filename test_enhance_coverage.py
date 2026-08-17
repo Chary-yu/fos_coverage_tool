@@ -485,6 +485,8 @@ class TestIntegration(unittest.TestCase):
         self.assertNotIn('<script>\n', progress_content)
         self.assertIn('id="teamTable"', progress_content)
         self.assertIn('小组 / 组长填写进度', progress_content)
+        self.assertIn('returnSummaryLink', progress_content)
+        self.assertIn('↩ 返回增量审查汇总', progress_content)
         progress_js = os.path.join(self.output_dir, "coverage_progress.js")
         self.assertTrue(os.path.exists(progress_js))
         with open(progress_js, "r", encoding="utf-8") as f:
