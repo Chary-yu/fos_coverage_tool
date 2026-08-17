@@ -553,11 +553,15 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
 
         self.assertIn('const isIncremental = reviewScope === \'incremental\';', js_content)
         self.assertIn('<span class="mod-chip">', js_content)
-        self.assertIn('PROGRESS_PAGE_VERSION = \'visible-progress-20260817_progress_jump_filter\'', js_content)
+        self.assertIn('PROGRESS_PAGE_VERSION = \'visible-progress-20260817_v9_cascade_filter\'', js_content)
 
         html_path = enhance_coverage.PROGRESS_PAGE_SOURCE_PATH
         with open(html_path, "r", encoding="utf-8") as f:
             html_content = f.read()
+
+        self.assertIn('.progress-link', html_content)
+        self.assertIn('.progress-link:hover', html_content)
+        self.assertIn('页面版本 visible-progress-20260817_v9_cascade_filter', html_content)
 
     def test_cascading_filter_dropdowns_in_incremental_js(self):
         js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH
@@ -566,10 +570,10 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
 
         self.assertIn('function updateSelectOptions', js_content)
         self.assertIn('function updateFilterDropdowns', js_content)
-        self.assertIn('updateSelectOptions(repoFilter, validRepos, selRepo);', js_content)
-        self.assertIn('updateSelectOptions(teamFilter, validTeams, selTeam);', js_content)
-        self.assertIn('updateSelectOptions(leaderFilter, validLeaders, selLeader);', js_content)
-        self.assertIn('updateSelectOptions(moduleFilter, validModules, selModule);', js_content)
+        self.assertIn('updateSelectOptions(repoFilter, validRepos, curRepo);', js_content)
+        self.assertIn('updateSelectOptions(teamFilter, validTeams, curTeam);', js_content)
+        self.assertIn('updateSelectOptions(leaderFilter, validLeaders, curLeader);', js_content)
+        self.assertIn('updateSelectOptions(moduleFilter, validModules, curModule);', js_content)
 
 
 if __name__ == "__main__":

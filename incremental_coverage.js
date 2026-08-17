@@ -84,16 +84,33 @@
         if (!selectEl) return;
         validList.sort(function(a, b) { return a.localeCompare(b, "zh-CN"); });
 
-        while (selectEl.options.length > 1) {
-            selectEl.remove(1);
+        var existingOptions = [];
+        for (var k = 1; k < selectEl.options.length; k++) {
+            existingOptions.push(selectEl.options[k].value);
         }
 
-        for (var j = 0; j < validList.length; j++) {
-            var val = validList[j];
-            var opt = document.createElement("option");
-            opt.value = val;
-            opt.textContent = val;
-            selectEl.appendChild(opt);
+        var isSameOptions = existingOptions.length === validList.length;
+        if (isSameOptions) {
+            for (var m = 0; m < validList.length; m++) {
+                if (existingOptions[m] !== validList[m]) {
+                    isSameOptions = false;
+                    break;
+                }
+            }
+        }
+
+        if (!isSameOptions) {
+            while (selectEl.options.length > 1) {
+                selectEl.remove(1);
+            }
+
+            for (var j = 0; j < validList.length; j++) {
+                var val = validList[j];
+                var opt = document.createElement("option");
+                opt.value = val;
+                opt.textContent = val;
+                selectEl.appendChild(opt);
+            }
         }
 
         if (currentVal && validList.indexOf(currentVal) !== -1) {
@@ -104,51 +121,87 @@
     }
 
     function updateFilterDropdowns() {
-        var selRepo = repoFilter ? repoFilter.value : "";
-        var selTeam = teamFilter ? teamFilter.value : "";
-        var selLeader = leaderFilter ? leaderFilter.value : "";
-        var selModule = moduleFilter ? moduleFilter.value : "";
         var kw = fileSearch ? fileSearch.value.trim().toLowerCase() : "";
 
         var validRepos = [];
-        var validTeams = [];
-        var validLeaders = [];
-        var validModules = [];
-
         for (var i = 0; i < allRows.length; i++) {
-            var row = allRows[i];
-            var rRepo = row.getAttribute("data-repo") || "";
-            var rTeam = row.getAttribute("data-team") || "";
-            var rLeader = row.getAttribute("data-leader") || "";
-            var rModule = row.getAttribute("data-module") || "";
-            var rOwnership = row.getAttribute("data-ownership") || "";
-            var rFile = (row.cells[4] ? row.cells[4].getAttribute("data-sort-value") || row.cells[4].textContent || "" : "");
-            var fullSearchText = (rRepo + " " + rModule + " " + rTeam + " " + rLeader + " " + rOwnership + " " + rFile).toLowerCase();
+            var rRepo = allRows[i].getAttribute("data-repo") || "";
+            var rTeam = allRows[i].getAttribute("data-team") || "";
+            var rLeader = allRows[i].getAttribute("data-leader") || "";
+            var rModule = allRows[i].getAttribute("data-module") || "";
+            var rOwnership = allRows[i].getAttribute("data-ownership") || "";
+            var rFile = (allRows[i].cells[4] ? allRows[i].cells[4].getAttribute("data-sort-value") || allRows[i].cells[4].textContent || "" : "");
+            var fullText = (rRepo + " " + rModule + " " + rTeam + " " + rLeader + " " + rOwnership + " " + rFile).toLowerCase();
 
-            var mRepo = !selRepo || rRepo === selRepo;
-            var mTeam = !selTeam || rTeam === selTeam;
-            var mLeader = !selLeader || rLeader === selLeader;
-            var mModule = !selModule || rModule === selModule;
-            var mKw = !kw || fullSearchText.indexOf(kw) !== -1;
-
-            if (mTeam && mLeader && mModule && mKw) {
+            if (!kw || fullText.indexOf(kw) !== -1) {
                 addUnique(validRepos, rRepo);
             }
-            if (mRepo && mLeader && mModule && mKw) {
+        }
+        var curRepo = repoFilter ? repoFilter.value : "";
+        updateSelectOptions(repoFilter, validRepos, curRepo);
+        var activeRepo = repoFilter ? repoFilter.value : "";
+
+        var validTeams = [];
+        for (var i = 0; i < allRows.length; i++) {
+            var rRepo = allRows[i].getAttribute("data-repo") || "";
+            var rTeam = allRows[i].getAttribute("data-team") || "";
+            var rLeader = allRows[i].getAttribute("data-leader") || "";
+            var rModule = allRows[i].getAttribute("data-module") || "";
+            var rOwnership = allRows[i].getAttribute("data-ownership") || "";
+            var rFile = (allRows[i].cells[4] ? allRows[i].cells[4].getAttribute("data-sort-value") || allRows[i].cells[4].textContent || "" : "");
+            var fullText = (rRepo + " " + rModule + " " + rTeam + " " + rLeader + " " + rOwnership + " " + rFile).toLowerCase();
+
+            var mRepo = !activeRepo || rRepo === activeRepo;
+            var mKw = !kw || fullText.indexOf(kw) !== -1;
+            if (mRepo && mKw) {
                 addUnique(validTeams, rTeam);
             }
-            if (mRepo && mTeam && mModule && mKw) {
+        }
+        var curTeam = teamFilter ? teamFilter.value : "";
+        updateSelectOptions(teamFilter, validTeams, curTeam);
+        var activeTeam = teamFilter ? teamFilter.value : "";
+
+        var validLeaders = [];
+        for (var i = 0; i < allRows.length; i++) {
+            var rRepo = allRows[i].getAttribute("data-repo") || "";
+            var rTeam = allRows[i].getAttribute("data-team") || "";
+            var rLeader = allRows[i].getAttribute("data-leader") || "";
+            var rModule = allRows[i].getAttribute("data-module") || "";
+            var rOwnership = allRows[i].getAttribute("data-ownership") || "";
+            var rFile = (allRows[i].cells[4] ? allRows[i].cells[4].getAttribute("data-sort-value") || allRows[i].cells[4].textContent || "" : "");
+            var fullText = (rRepo + " " + rModule + " " + rTeam + " " + rLeader + " " + rOwnership + " " + rFile).toLowerCase();
+
+            var mRepo = !activeRepo || rRepo === activeRepo;
+            var mTeam = !activeTeam || rTeam === activeTeam;
+            var mKw = !kw || fullText.indexOf(kw) !== -1;
+            if (mRepo && mTeam && mKw) {
                 addUnique(validLeaders, rLeader);
             }
+        }
+        var curLeader = leaderFilter ? leaderFilter.value : "";
+        updateSelectOptions(leaderFilter, validLeaders, curLeader);
+        var activeLeader = leaderFilter ? leaderFilter.value : "";
+
+        var validModules = [];
+        for (var i = 0; i < allRows.length; i++) {
+            var rRepo = allRows[i].getAttribute("data-repo") || "";
+            var rTeam = allRows[i].getAttribute("data-team") || "";
+            var rLeader = allRows[i].getAttribute("data-leader") || "";
+            var rModule = allRows[i].getAttribute("data-module") || "";
+            var rOwnership = allRows[i].getAttribute("data-ownership") || "";
+            var rFile = (allRows[i].cells[4] ? allRows[i].cells[4].getAttribute("data-sort-value") || allRows[i].cells[4].textContent || "" : "");
+            var fullText = (rRepo + " " + rModule + " " + rTeam + " " + rLeader + " " + rOwnership + " " + rFile).toLowerCase();
+
+            var mRepo = !activeRepo || rRepo === activeRepo;
+            var mTeam = !activeTeam || rTeam === activeTeam;
+            var mLeader = !activeLeader || rLeader === activeLeader;
+            var mKw = !kw || fullText.indexOf(kw) !== -1;
             if (mRepo && mTeam && mLeader && mKw) {
                 addUnique(validModules, rModule);
             }
         }
-
-        updateSelectOptions(repoFilter, validRepos, selRepo);
-        updateSelectOptions(teamFilter, validTeams, selTeam);
-        updateSelectOptions(leaderFilter, validLeaders, selLeader);
-        updateSelectOptions(moduleFilter, validModules, selModule);
+        var curModule = moduleFilter ? moduleFilter.value : "";
+        updateSelectOptions(moduleFilter, validModules, curModule);
     }
 
     function applyFilters() {
@@ -188,12 +241,16 @@
         }
 
         if (filterCount) {
-            if (selRepo || selTeam || selLeader || selModule || kw) {
-                filterCount.textContent = "筛选匹配 " + visible + " / " + total + " 个文件";
-            } else {
-                filterCount.textContent = "共 " + total + " 个文件";
-            }
+            filterCount.textContent = "已筛选出 " + visible + " / " + total + " 个文件";
         }
+    }
+
+    var searchTimer = null;
+    function debouncedApplyFilters() {
+        if (searchTimer) clearTimeout(searchTimer);
+        searchTimer = setTimeout(function() {
+            applyFilters();
+        }, 120);
     }
 
     function updateIndicators() {

@@ -2,7 +2,7 @@
 (function () {
   'use strict';
 
-  const PROGRESS_PAGE_VERSION = 'visible-progress-20260817_progress_jump_filter';
+  const PROGRESS_PAGE_VERSION = 'visible-progress-20260817_v9_cascade_filter';
   const DEFAULT_REVIEW_SCOPE = 'full';
   const params = new URLSearchParams(window.location.search);
   const configuredScope = document.body.getAttribute('data-review-scope') || DEFAULT_REVIEW_SCOPE;

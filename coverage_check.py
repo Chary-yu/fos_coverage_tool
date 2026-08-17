@@ -330,6 +330,7 @@ def build_summary(counters):
         "uncovered": uncovered,
         "ignored": ignored,
         "missing": missing,
+        "unanalyzed": uncovered,
         "coverable_total": coverable_total,
         "coverage_rate": covered * 100.0 / coverable_total if coverable_total else None,
     }

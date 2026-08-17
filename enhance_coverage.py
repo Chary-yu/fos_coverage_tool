@@ -57,7 +57,7 @@ PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "visible-progress-20260817_progress_jump_filter"
+ASSET_VERSION = "visible-progress-20260817_v9_cascade_filter"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 
 
@@ -4673,11 +4673,12 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
             "covered": counts[coverage_check.STATUS_COVERED],
             "uncovered": counts[coverage_check.STATUS_UNCOVERED],
             "ignored": counts[coverage_check.STATUS_IGNORED],
-            "missing": unanalyzed_count,
+            "missing": counts[coverage_check.STATUS_MISSING],
             "unanalyzed": unanalyzed_count,
         })
 
     summary["missing"] = sum(item["missing"] for item in file_rows)
+    summary["unanalyzed"] = sum(item["unanalyzed"] for item in file_rows)
 
     # The first render already prioritizes files that need the most review; the
     # browser-side table controls below let reviewers switch to any other metric.
@@ -4821,7 +4822,7 @@ td a:hover{{text-decoration:underline}}
   <div class="card"><div class="label">已覆盖</div><div class="value val-covered">{covered}</div></div>
   <div class="card"><div class="label">增量未覆盖（可填写）</div><div class="value val-uncovered">{uncovered}</div></div>
   <div class="card"><div class="label">有效增量覆盖率</div><div class="value val-rate">{rate}</div></div>
-  <div class="card"><div class="label">覆盖信息缺失</div><div class="value val-missing">{missing}</div></div>
+  <div class="card"><div class="label">待分析</div><div class="value val-missing">{unanalyzed}</div></div>
 </div>
 <section><h2>文件明细（点击表头可排序；默认未覆盖新增行从多到少）</h2>
 <div class="filters">
@@ -4845,7 +4846,7 @@ td a:hover{{text-decoration:underline}}
         covered=summary["covered"],
         uncovered=summary["uncovered"],
         rate=rate_text,
-        missing=summary["missing"],
+        unanalyzed=summary["unanalyzed"],
         table_rows=table_rows,
     )
     with open(os.path.join(output_html_dir, "incremental_coverage.html"), "w", encoding="utf-8") as page_file:
