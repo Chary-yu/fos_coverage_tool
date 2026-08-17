@@ -105,9 +105,20 @@
         : '<span class="toggle-team-spacer"></span>';
 
       let moduleCellHtml = '';
+      const teamQuery = encodeURIComponent(row.team || '');
+      const teamLinkHtml = row.team
+        ? `<a href="incremental_coverage.html?team=${teamQuery}" class="progress-link" title="点击查看 [${escapeHtml(row.team)}] 文件审查明细"><strong>${escapeHtml(row.team)}</strong></a>`
+        : '';
+      const leaderLinkHtml = row.leader
+        ? `<a href="incremental_coverage.html?leader=${encodeURIComponent(row.leader)}" class="progress-link" title="点击查看 [${escapeHtml(row.leader)}] 文件审查明细">${escapeHtml(row.leader)}</a>`
+        : '-';
+
       if (hasModules) {
         const visibleMods = modules.slice(0, 2);
-        const modChips = visibleMods.map(m => `<span class="mod-chip">${escapeHtml(m.module || '')}</span>`).join('');
+        const modChips = visibleMods.map(m => {
+          const modQuery = encodeURIComponent(m.module || '');
+          return `<a href="incremental_coverage.html?module=${modQuery}&team=${teamQuery}" class="mod-chip progress-link" title="点击查看 [${escapeHtml(m.module || '')}] 文件审查明细">${escapeHtml(m.module || '')}</a>`;
+        }).join('');
         const moreCount = modules.length - visibleMods.length;
         const moreChip = moreCount > 0 ? `<span class="mod-more-chip">+${moreCount}</span>` : '';
         moduleCellHtml = `${modChips}${moreChip}`;
@@ -117,8 +128,8 @@
 
       const parentTr = `
         <tr class="team-parent-row" data-team-index="${teamIdx}">
-          <td>${toggleBtn} <strong>${escapeHtml(row.team || '')}</strong></td>
-          <td>${escapeHtml(row.leader || '')}</td>
+          <td>${toggleBtn} ${teamLinkHtml}</td>
+          <td>${leaderLinkHtml}</td>
           <td class="path">${moduleCellHtml}</td>
           <td>${asNumber(row.file_total)}</td>
           <td>${asNumber(row.total_uncovered)}</td>
@@ -135,9 +146,11 @@
       htmlParts.push(parentTr);
 
       modules.forEach(mod => {
+        const modQuery = encodeURIComponent(mod.module || '');
+        const subModLinkHtml = `<a href="incremental_coverage.html?module=${modQuery}&team=${teamQuery}" class="progress-link" title="点击查看 [${escapeHtml(mod.module || '')}] 文件审查明细">└─ ${escapeHtml(mod.module || '')}</a>`;
         const subTr = `
           <tr class="module-subrow team-subrow-${teamIdx}" style="display:none; background-color: #f8fafc;">
-            <td style="padding-left: 28px; font-weight: 600; color: #334155;">└─ ${escapeHtml(mod.module || '')}</td>
+            <td style="padding-left: 28px; font-weight: 600; color: #334155;">${subModLinkHtml}</td>
             <td class="muted">-</td>
             <td class="path muted">${escapeHtml(mod.module || '')}</td>
             <td>${asNumber(mod.file_total)}</td>

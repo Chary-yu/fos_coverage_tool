@@ -48,6 +48,21 @@
     populateSelect(teamFilter, teams);
     populateSelect(leaderFilter, leaders);
 
+    if (window.location && window.location.search) {
+        try {
+            var params = new URLSearchParams(window.location.search);
+            var qRepo = params.get("repo");
+            var qModule = params.get("module");
+            var qTeam = params.get("team");
+            var qLeader = params.get("leader");
+
+            if (qRepo && repoFilter) repoFilter.value = qRepo;
+            if (qModule && moduleFilter) moduleFilter.value = qModule;
+            if (qTeam && teamFilter) teamFilter.value = qTeam;
+            if (qLeader && leaderFilter) leaderFilter.value = qLeader;
+        } catch (e) {}
+    }
+
     var keyToColumn = {
         repository: 0,
         module: 1,

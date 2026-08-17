@@ -649,6 +649,19 @@ textarea.coverage-analysis-input.multiline {
     background-color: rgba(0, 122, 255, 0.2) !important;
 }
 
+.progress-link {
+    color: #007aff !important;
+    text-decoration: none !important;
+    font-weight: 600 !important;
+    cursor: pointer !important;
+    transition: color 0.15s ease !important;
+}
+
+.progress-link:hover {
+    text-decoration: underline !important;
+    color: #0051a8 !important;
+}
+
 /* Ensure fixed bottom toolbar never obscures the last lines of source code */
 body.coverage-enhanced-body,
 body,
