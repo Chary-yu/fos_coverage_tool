@@ -32,7 +32,8 @@ class TestCodeDetailApi(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
-        self.mock_file_path = os.path.join(self.temp_dir, "calc.c.gcov.html")
+        os.makedirs(os.path.join(self.temp_dir, "src"), exist_ok=True)
+        self.mock_file_path = os.path.join(self.temp_dir, "src", "calc.c.gcov.html")
         self.sample_html = """
         <!DOCTYPE html>
         <html>
@@ -174,7 +175,7 @@ class TestCodeDetailApi(unittest.TestCase):
         payload = {
             "project_name": "TestProj",
             "file_path": "src/calc.c",
-            "ranges": [{"start_line": 1, "end_line": 1} for _ in range(101)],
+            "ranges": [{"start_line": 1, "end_line": 1} for _ in range(1001)],
         }
         handler = self._execute_handler_post("/api/coverage/code-lines/batch", payload)
         mock_resp.assert_called_with(400)

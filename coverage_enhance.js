@@ -1,16 +1,18 @@
 /**
- * 覆盖率 HTML 报告增强脚本 (ES6) - 待分析函数优先 + 懒加载折叠架构
+ * 覆盖率 HTML 报告增强脚本 (ES6) - 待分析函数优先 + 懒加载折叠架构 v11
  * 
  * 核心架构：
- * 1. CodeRegionStore: 区域状态与行缓存管理
- * 2. CodeRegionLoader: 区间/Chunk/Batch 数据加载与去重
- * 3. CodeLineRenderer: 统一代码行与分析面板渲染器 (唯一事实来源)
- * 4. CodeRegionController: 区域交互、分批 DOM 渲染调度与展开/折叠控制
+ * 1. ReviewDraftStore: 用户未保存编辑状态持久存储 (防止收起/重绘丢失数据)
+ * 2. CodeRegionStore: 区域状态与行缓存管理
+ * 3. CodeRegionLoader: 区间/Chunk/Batch 数据加载、去重与流式加载
+ * 4. CodeLineRenderer: 统一代码行与分析面板渲染器 (唯一事实来源)
+ * 5. CodeRegionController: 区域交互、分批 DOM 渲染调度与展开/折叠控制
  */
 (function() {
-    const ENHANCE_VERSION = 'lazy-collapse-20260818_v10_0';
+    const ENHANCE_VERSION = 'lazy-collapse-20260818_v11_0';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
+    const DEFAULT_REPORT_ID = '';
     const RENDER_MODE = 'lazy_collapse'; // 'lazy_collapse', 'lazy', 'immediate'
     const REVIEW_SCOPE = 'full'; // 'full' or 'incremental'
     const ENHANCE_SCRIPT_URL = document.currentScript && document.currentScript.src
@@ -37,18 +39,57 @@
     const MIN_FOLD_GAP = 15;
 
     let resolvedServerUrl = '';
+    let currentReportId = DEFAULT_REPORT_ID || '';
+    let currentFilePath = '';
     let dirtyPanelStartLines = new Set();
     let panelsMap = new Map(); // startLine -> panelState
     let batchToolbarState = null;
     let reviewControlsReady = false;
     let totalUncovered = 0;
     let blocks = [];
-    let blockRanges = [];
     let foldBars = [];
     let isFoldedModeActive = false;
-    let legacyPanelSyncers = [];
-    let legacyRefreshRequested = false;
-    let requestLegacyPanelRefresh = function() {};
+
+    // =========================================================================
+    // 1. ReviewDraftStore: 独立编辑状态存储 (保证收起/展开不丢失未保存编辑)
+    // =========================================================================
+    const ReviewDraftStore = {
+        _drafts: new Map(), // blockStartLine -> { reviewer, status, coverage_method, uncovered_reason, isDirty }
+
+        setDraft(blockStartLine, data) {
+            const line = Number(blockStartLine);
+            const existing = this._drafts.get(line) || {};
+            this._drafts.set(line, {
+                reviewer: data.reviewer !== undefined ? data.reviewer : (existing.reviewer || ''),
+                status: data.status !== undefined ? data.status : (existing.status || '未确认'),
+                coverage_method: data.coverage_method !== undefined ? data.coverage_method : (existing.coverage_method || ''),
+                uncovered_reason: data.uncovered_reason !== undefined ? data.uncovered_reason : (existing.uncovered_reason || ''),
+                isDirty: data.isDirty !== undefined ? Boolean(data.isDirty) : true,
+            });
+        },
+
+        getDraft(blockStartLine) {
+            return this._drafts.get(Number(blockStartLine)) || null;
+        },
+
+        clearDraft(blockStartLine) {
+            this._drafts.delete(Number(blockStartLine));
+        },
+
+        hasDirty(blockStartLine) {
+            const d = this._drafts.get(Number(blockStartLine));
+            return !!(d && d.isDirty);
+        },
+
+        hasAnyDirtyInRegion(startLine, endLine) {
+            for (const [line, draft] of this._drafts.entries()) {
+                if (line >= startLine && line <= endLine && draft.isDirty) {
+                    return true;
+                }
+            }
+            return false;
+        }
+    };
 
     function normalizeApiBase(value) {
         return String(value || '').replace(/\/+$/, '');
@@ -149,250 +190,253 @@
         if (key === 'status' && panel.select && typeof panel.select.value === 'string') {
             return panel.select.value;
         }
-        if (panel[key] && typeof panel[key].value === 'string') {
-            return panel[key].value;
+        if (panel.values && typeof panel.values[key] === 'string') {
+            return panel.values[key];
         }
-        return panel.values && typeof panel.values[key] === 'string' ? panel.values[key] : '';
+        return '';
     }
 
     function setStoredPanelValues(panel, values) {
-        if (!panel) return;
-        panel.values = Object.assign({
-            status: '未确认',
-            isDraft: false,
-            reviewerInput: '',
-            methodInput: '',
-            reasonInput: ''
-        }, panel.values || {}, values || {});
-
-        if (panel.select) {
-            panel.select.value = panel.values.status || '未确认';
+        if (!panel || !values) return;
+        panel.values = Object.assign({}, panel.values || {}, values);
+        if (panel.select && values.status !== undefined) {
+            panel.select.value = values.status;
         }
-        if (panel.reviewerInput) {
-            panel.reviewerInput.value = panel.values.reviewerInput || '';
+        if (panel.reviewerInput && values.reviewerInput !== undefined) {
+            panel.reviewerInput.value = values.reviewerInput;
         }
-        if (panel.methodInput) {
-            panel.methodInput.value = panel.values.methodInput || '';
+        if (panel.methodInput && values.methodInput !== undefined) {
+            panel.methodInput.value = values.methodInput;
         }
-        if (panel.reasonInput) {
-            panel.reasonInput.value = panel.values.reasonInput || '';
+        if (panel.reasonInput && values.reasonInput !== undefined) {
+            panel.reasonInput.value = values.reasonInput;
+        }
+        if (panel.lineNum !== undefined) {
+            ReviewDraftStore.setDraft(panel.lineNum, {
+                reviewer: values.reviewerInput,
+                status: values.status,
+                coverage_method: values.methodInput,
+                uncovered_reason: values.reasonInput,
+                isDirty: values.isDirty !== undefined ? values.isDirty : true
+            });
         }
     }
 
-    function setPanelPersistedState(panel) {
-        if (!panel || !panel.saveBtn) return;
-        const status = getStoredPanelValue(panel, 'status');
-        panel.saveBtn.className = 'coverage-analysis-btn saved';
-        panel.saveBtn.innerText = panel.values && panel.values.isDraft ? '已暂存' : (status === '未确认' ? '已保存' : '已确认');
+    function markPanelDirty(startLineNum) {
+        dirtyPanelStartLines.add(Number(startLineNum));
+        const panel = panelsMap.get(Number(startLineNum));
+        if (panel && panel.saveBtn) {
+            panel.saveBtn.innerText = 'Save';
+            panel.saveBtn.className = 'coverage-analysis-btn';
+        }
+        updateBatchToolbar();
+    }
+
+    function clearPanelDirty(startLineNum, resetSaved = true) {
+        dirtyPanelStartLines.delete(Number(startLineNum));
+        const panel = panelsMap.get(Number(startLineNum));
+        if (panel && resetSaved && panel.saveBtn) {
+            const isDraft = panel.values && panel.values.isDraft;
+            const status = panel.values ? panel.values.status : '';
+            panel.saveBtn.innerText = isDraft ? '已暂存' : (CONFIRMED_STATUS_SET.has(status) ? '已确认' : 'Save');
+            if (isDraft || CONFIRMED_STATUS_SET.has(status)) {
+                panel.saveBtn.className = 'coverage-analysis-btn saved';
+            }
+        }
+        updateBatchToolbar();
     }
 
     function updateBatchToolbar() {
         if (!batchToolbarState) return;
-        const count = dirtyPanelStartLines.size;
-        const submitting = batchToolbarState.submitting === true;
-        batchToolbarState.count.innerText = `待暂存 ${count} 项`;
-        batchToolbarState.locateBtn.disabled = !reviewControlsReady || submitting;
-        batchToolbarState.draftBtn.innerText = submitting ? '保存中...' : `暂存草稿 (${count})`;
-        batchToolbarState.confirmBtn.innerText = submitting ? '保存中...' : `确认提交 (${count})`;
-        batchToolbarState.draftBtn.disabled = count === 0 || submitting;
-        batchToolbarState.confirmBtn.disabled = count === 0 || submitting;
-        batchToolbarState.container.classList.toggle('has-pending', count > 0);
-    }
-
-    function markPanelDirty(startLineNum) {
-        const panel = panelsMap.get(startLineNum);
-        if (!panel) return;
-        dirtyPanelStartLines.add(startLineNum);
-        if (panel.saveBtn) {
-            panel.saveBtn.className = 'coverage-analysis-btn pending';
-            panel.saveBtn.innerText = '待暂存';
-        }
-        updateBatchToolbar();
+        const dirtyCount = dirtyPanelStartLines.size;
+        batchToolbarState.count.innerText = `未提交修改: ${dirtyCount} 项`;
+        batchToolbarState.draftBtn.innerText = `暂存草稿 (${dirtyCount})`;
+        batchToolbarState.confirmBtn.innerText = `确认提交 (${dirtyCount})`;
+        batchToolbarState.draftBtn.disabled = dirtyCount === 0 || batchToolbarState.submitting;
+        batchToolbarState.confirmBtn.disabled = dirtyCount === 0 || batchToolbarState.submitting;
     }
 
     function isPanelAwaitingReview(panel) {
         if (!panel) return false;
+        const status = getStoredPanelValue(panel, 'status');
         const isDraft = panel.values && panel.values.isDraft === true;
-        return isDraft || getStoredPanelValue(panel, 'status') === '未确认';
-    }
-
-    function clearPanelDirty(startLineNum, isDraft) {
-        const panel = panelsMap.get(startLineNum);
-        dirtyPanelStartLines.delete(startLineNum);
-        if (panel) {
-            setStoredPanelValues(panel, { isDraft: isDraft === true });
-        }
-        setPanelPersistedState(panel);
-        updateBatchToolbar();
-    }
-
-    function getPanelBatchPayload(panel) {
-        const block = panel.block || {};
-        const lineNums = block.lineNums || (block.startLine ? [block.startLine] : [panel.lineNum]);
-        return {
-            line_numbers: lineNums,
-            reviewer: getStoredPanelValue(panel, 'reviewerInput').trim(),
-            status: getStoredPanelValue(panel, 'status') || '未确认',
-            coverage_method: getStoredPanelValue(panel, 'methodInput').trim(),
-            uncovered_reason: getStoredPanelValue(panel, 'reasonInput').trim()
-        };
-    }
-
-    function saveReviewBlocksBatch(filePath, blocks, mode) {
-        return requestCoverageApi('/batch', {
-            method: 'POST',
-            mode: 'cors',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                project_name: DEFAULT_PROJECT,
-                file_path: filePath,
-                mode: mode,
-                blocks: blocks
-            })
-        });
-    }
-
-    function getReviewPanelLineNumbers() {
-        return Array.from(panelsMap.keys()).sort((left, right) => left - right);
+        return !status || status === '未确认' || isDraft;
     }
 
     function updateReviewNavigation() {
-        const lineNumbers = getReviewPanelLineNumbers();
-        panelsMap.forEach((panel, lineNumber) => {
-            if (!panel.previousBtn || !panel.nextBtn) return;
-            const index = lineNumbers.indexOf(lineNumber);
-            const previousLine = index > 0 ? lineNumbers[index - 1] : null;
-            const nextLine = index >= 0 && index < lineNumbers.length - 1 ? lineNumbers[index + 1] : null;
-            panel.previousBtn.disabled = previousLine === null;
-            panel.nextBtn.disabled = nextLine === null;
-            panel.previousBtn.title = previousLine === null ? '已是当前文件第一处可填写控件' : `跳转到第 ${previousLine} 行的可填写控件`;
-            panel.nextBtn.title = nextLine === null ? '已是当前文件最后一处可填写控件' : `跳转到第 ${nextLine} 行的可填写控件`;
+        const sortedPanels = Array.from(panelsMap.entries()).sort((a, b) => a[0] - b[0]);
+        sortedPanels.forEach(([lineNum, panel], idx) => {
+            if (panel.previousBtn) {
+                panel.previousBtn.disabled = idx === 0;
+            }
+            if (panel.nextBtn) {
+                panel.nextBtn.disabled = idx === sortedPanels.length - 1;
+            }
         });
     }
 
     function focusReviewPanel(panel) {
-        const focusTarget = panel && (panel.select || panel.placeholder);
-        if (!focusTarget) return;
-        if (typeof focusTarget.scrollIntoView === 'function') {
-            try {
-                focusTarget.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
-            } catch (e) {
-                focusTarget.scrollIntoView(true);
-            }
+        if (!panel) return;
+        const targetEl = panel.select || (panel.block && document.getElementById(`L${panel.block.startLine}`));
+        if (targetEl) {
+            targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            if (panel.select) panel.select.focus();
         }
-        window.setTimeout(function() {
-            if (typeof focusTarget.focus === 'function') {
-                focusTarget.focus();
-            }
-        }, 350);
     }
 
     function navigateReviewPanel(currentLineNum, direction) {
-        const lineNumbers = getReviewPanelLineNumbers();
-        const currentIndex = lineNumbers.indexOf(currentLineNum);
+        const sortedLines = Array.from(panelsMap.keys()).sort((a, b) => a - b);
+        const currentIndex = sortedLines.indexOf(Number(currentLineNum));
+        if (currentIndex === -1) return;
         const targetIndex = currentIndex + direction;
-        if (currentIndex === -1 || targetIndex < 0 || targetIndex >= lineNumbers.length) return;
-        const targetLineNum = lineNumbers[targetIndex];
-        let targetPanel = panelsMap.get(targetLineNum);
-        if (targetPanel) {
-            updateReviewNavigation();
+        if (targetIndex >= 0 && targetIndex < sortedLines.length) {
+            const targetPanel = panelsMap.get(sortedLines[targetIndex]);
             focusReviewPanel(targetPanel);
         }
     }
 
-    function findPreviousFilledPanelEntry(currentLineNum) {
-        const candidates = Array.from(panelsMap.entries())
-            .filter(([lineNum, panel]) => {
-                const status = panel.select ? panel.select.value : (panel.values && panel.values.status);
-                return lineNum < currentLineNum && status !== '未确认';
-            })
+    function findPreviousFilledPanel(currentLineNum) {
+        const sorted = Array.from(panelsMap.entries())
+            .filter(([l]) => l < currentLineNum)
             .sort((a, b) => b[0] - a[0]);
+        for (const [, panel] of sorted) {
+            const status = getStoredPanelValue(panel, 'status');
+            const reviewer = getStoredPanelValue(panel, 'reviewerInput');
+            if ((status && status !== '未确认') || reviewer) {
+                return panel;
+            }
+        }
+        return null;
+    }
 
-        for (const entry of candidates) {
+    function findPreviousFilledPanelEntry(currentLineNum) {
+        const sorted = Array.from(panelsMap.entries())
+            .filter(([l]) => l < currentLineNum)
+            .sort((a, b) => b[0] - a[0]);
+        for (const entry of sorted) {
             const panel = entry[1];
-            const reviewer = panel.reviewerInput ? panel.reviewerInput.value : (panel.values && panel.values.reviewerInput);
-            const method = panel.methodInput ? panel.methodInput.value : (panel.values && panel.values.methodInput);
-            const reason = panel.reasonInput ? panel.reasonInput.value : (panel.values && panel.values.reasonInput);
-            const hasContent = (reviewer || '').trim() || (method || '').trim() || (reason || '').trim();
-            if (hasContent) {
+            const status = getStoredPanelValue(panel, 'status');
+            const reviewer = getStoredPanelValue(panel, 'reviewerInput');
+            if ((status && status !== '未确认') || reviewer) {
                 return entry;
             }
         }
         return null;
     }
 
-    function findPreviousFilledPanel(currentLineNum) {
-        const entry = findPreviousFilledPanelEntry(currentLineNum);
-        return entry ? entry[1] : null;
-    }
-
-    function validatePanelForConfirm(startLineNum, panel) {
-        const values = getPanelBatchPayload(panel);
-        if (!CONFIRMED_STATUS_SET.has(values.status)) {
-            return `第 ${startLineNum} 行：请选择“可覆盖”、“无法覆盖”或“冗余代码”。`;
-        }
-        if (!values.reviewer) {
-            return `第 ${startLineNum} 行：请输入确认人。`;
-        }
-        if (!values.coverage_method && !values.uncovered_reason) {
-            return `第 ${startLineNum} 行：请填写条件覆盖方法或无条件覆盖原因。`;
-        }
-        return '';
-    }
-
-    function submitDirtyPanels(filePath, mode) {
-        const startLineNumbers = Array.from(dirtyPanelStartLines)
-            .filter(startLineNum => panelsMap.has(startLineNum))
-            .sort((left, right) => left - right);
-        if (!startLineNumbers.length || !batchToolbarState || batchToolbarState.submitting) return;
-
-        const panels = startLineNumbers.map(startLineNum => ({
-            startLineNum,
-            panel: panelsMap.get(startLineNum)
+    async function saveReviewBlocksBatch(filePath, payloadBlocks, actionType = 'confirm') {
+        const isDraft = actionType === 'draft';
+        const records = payloadBlocks.map(b => ({
+            line_numbers: b.line_numbers,
+            reviewer: b.reviewer || '',
+            status: b.status || '未确认',
+            coverage_method: b.coverage_method || '',
+            uncovered_reason: b.uncovered_reason || '',
+            is_draft: isDraft
         }));
-        if (mode === 'confirm') {
-            for (const item of panels) {
-                const message = validatePanelForConfirm(item.startLineNum, item.panel);
-                if (message) {
-                    alert(`[校验失败] ${message}`);
-                    focusReviewPanel(item.panel);
+
+        const result = await requestCoverageApi('/batch', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                project_name: DEFAULT_PROJECT,
+                file_path: filePath,
+                records: records
+            })
+        });
+
+        // Update ReviewDraftStore and clear dirty
+        payloadBlocks.forEach(b => {
+            const sLine = b.line_numbers[0];
+            ReviewDraftStore.setDraft(sLine, {
+                reviewer: b.reviewer,
+                status: b.status,
+                coverage_method: b.coverage_method,
+                uncovered_reason: b.uncovered_reason,
+                isDirty: false
+            });
+        });
+
+        return result;
+    }
+
+    async function submitDirtyPanels(filePath, actionType = 'confirm') {
+        if (!dirtyPanelStartLines.size) {
+            alert('没有未保存的修改。');
+            return;
+        }
+
+        const isDraft = actionType === 'draft';
+        const dirtyLines = Array.from(dirtyPanelStartLines).sort((a, b) => a - b);
+        const payloadBlocks = [];
+
+        for (const lineNum of dirtyLines) {
+            const panel = panelsMap.get(lineNum);
+            if (!panel) continue;
+            const reviewerVal = getStoredPanelValue(panel, 'reviewerInput').trim();
+            const statusVal = getStoredPanelValue(panel, 'status') || '未确认';
+            const methodVal = getStoredPanelValue(panel, 'methodInput').trim();
+            const reasonVal = getStoredPanelValue(panel, 'reasonInput').trim();
+
+            if (!isDraft) {
+                if (statusVal === '未确认') {
+                    alert(`第 ${lineNum} 行：请将状态变更为“可覆盖”或“无法覆盖”！`);
+                    focusReviewPanel(panel);
+                    return;
+                }
+                if (!reviewerVal) {
+                    alert(`第 ${lineNum} 行：请输入确认人！`);
+                    focusReviewPanel(panel);
+                    return;
+                }
+                if (!methodVal && !reasonVal) {
+                    alert(`第 ${lineNum} 行：“条件覆盖方法”与“无条件覆盖原因”必须填写其中之一！`);
+                    focusReviewPanel(panel);
                     return;
                 }
             }
+
+            const blockLineNums = panel.block ? panel.block.lineNums : [lineNum];
+            payloadBlocks.push({
+                line_numbers: blockLineNums,
+                reviewer: reviewerVal,
+                status: statusVal,
+                coverage_method: methodVal,
+                uncovered_reason: reasonVal
+            });
         }
 
         batchToolbarState.submitting = true;
         updateBatchToolbar();
-        saveReviewBlocksBatch(
-            filePath,
-            panels.map(item => getPanelBatchPayload(item.panel)),
-            mode
-        ).then(result => {
-            panels.forEach(item => clearPanelDirty(item.startLineNum, mode === 'draft'));
+
+        try {
+            await saveReviewBlocksBatch(filePath, payloadBlocks, actionType);
+            dirtyLines.forEach(l => {
+                const p = panelsMap.get(l);
+                if (p) {
+                    p.values.isDraft = isDraft;
+                    clearPanelDirty(l, true);
+                }
+            });
             notifyProgressChanged();
             updateHeaderStatistics();
-            requestLegacyPanelRefresh(3);
-            showToast(`批量${mode === 'confirm' ? '确认提交' : '暂存'}成功：${result.saved_blocks} 处，${result.saved_lines} 行`);
-        }).catch(error => {
-            console.error('[CoverageEnhance] Batch save failed:', error);
-            alert(`批量${mode === 'confirm' ? '确认提交' : '暂存'}失败：${error.message}`);
-        }).then(() => {
+            showToast(isDraft ? `已暂存 ${dirtyLines.length} 个分析草稿` : `已确认提交 ${dirtyLines.length} 项覆盖分析`);
+        } catch (err) {
+            alert(`批量保存失败: ${err.message}`);
+        } finally {
             batchToolbarState.submitting = false;
             updateBatchToolbar();
-        });
+        }
     }
 
     function createResizeGrip(textarea, onResize) {
         const grip = document.createElement('span');
         grip.className = 'coverage-resize-grip';
-        grip.title = '拖拽调整输入框大小';
+        grip.title = '拖拽调节输入框大小';
 
         grip.addEventListener('mousedown', function(e) {
             e.preventDefault();
             e.stopPropagation();
-
             const startX = e.clientX;
             const startY = e.clientY;
             const startWidth = textarea.offsetWidth;
@@ -451,6 +495,9 @@
             progressUrl.searchParams.set('project', DEFAULT_PROJECT);
             progressUrl.searchParams.set('scope', REVIEW_SCOPE);
             progressUrl.searchParams.set('v', ENHANCE_VERSION);
+            if (currentReportId) {
+                progressUrl.searchParams.set('report_id', currentReportId);
+            }
             const apiUrl = resolvedServerUrl || EXPLICIT_API_URL;
             if (apiUrl) {
                 progressUrl.searchParams.set('api', apiUrl);
@@ -475,7 +522,7 @@
                 .sort((left, right) => left[0] - right[0])
                 .find(entry => isPanelAwaitingReview(entry[1]));
             if (!pendingEntry) {
-                alert('当前文件没有待填写的控件。');
+                alert('当前已展开区域没有待填写的控件。');
                 return;
             }
             updateReviewNavigation();
@@ -498,83 +545,105 @@
         updateBatchToolbar();
 
         window.addEventListener('beforeunload', function(event) {
-            if (!dirtyPanelStartLines.size) return undefined;
-            const message = '当前页面有未暂存的填写内容。';
-            event.preventDefault();
-            event.returnValue = message;
-            return message;
+            if (dirtyPanelStartLines.size > 0) {
+                const message = `当前页面有 ${dirtyPanelStartLines.size} 项覆盖分析尚未暂存或提交！`;
+                event.preventDefault();
+                event.returnValue = message;
+                return message;
+            }
         });
     }
 
-    function createModeToggler(currentMode) {
+    function createModeToggler() {
         const container = document.createElement('div');
-        container.className = 'coverage-mode-toggler-container';
+        container.className = 'coverage-mode-toggler';
         container.setAttribute('contenteditable', 'false');
 
         const label = document.createElement('span');
-        label.className = 'coverage-mode-toggler-label';
-        label.innerText = '显示模式: ';
+        label.innerText = '模式: ';
 
         const select = document.createElement('select');
-        select.className = 'coverage-mode-toggler-select';
-
-        const optLazyCollapse = document.createElement('option');
-        optLazyCollapse.value = 'lazy_collapse';
-        optLazyCollapse.innerText = '待分析函数优先 (懒加载折叠)';
-        if (currentMode === 'lazy_collapse') optLazyCollapse.selected = true;
-
-        const optLazy = document.createElement('option');
-        optLazy.value = 'lazy';
-        optLazy.innerText = '轻量占位 (懒加载)';
-        if (currentMode === 'lazy') optLazy.selected = true;
-
-        const optImmediate = document.createElement('option');
-        optImmediate.value = 'immediate';
-        optImmediate.innerText = '完整显示 (立即生成)';
-        if (currentMode === 'immediate') optImmediate.selected = true;
-
-        select.appendChild(optLazyCollapse);
-        select.appendChild(optLazy);
-        select.appendChild(optImmediate);
-
-        select.addEventListener('change', function() {
-            const newMode = select.value;
-            const url = new URL(window.location.href);
-            url.searchParams.set('mode', newMode);
-            window.location.href = url.toString();
+        select.className = 'coverage-mode-select';
+        [
+            { value: 'lazy_collapse', text: '待分析折叠 (默认)' },
+            { value: 'lazy', text: '按需渲染 (Lazy)' },
+            { value: 'immediate', text: '即时全量 (Immediate)' }
+        ].forEach(opt => {
+            const option = document.createElement('option');
+            option.value = opt.value;
+            option.text = opt.text;
+            if (opt.value === ACTIVE_MODE) option.selected = true;
+            select.appendChild(option);
         });
 
-        const foldToggleBtn = document.createElement('button');
-        foldToggleBtn.type = 'button';
-        foldToggleBtn.className = 'coverage-fold-toggle-btn';
-        foldToggleBtn.id = 'coverage-fold-toggle-btn';
-        foldToggleBtn.innerText = isFoldedModeActive ? '👁️ 展开全部源码' : '🔍 上下文折叠';
-        foldToggleBtn.onclick = function() {
-            if (isFoldedModeActive) {
-                unfoldAllLines();
-            } else {
-                applyFrontendFolding(false);
-            }
-        };
+        select.addEventListener('change', function() {
+            const newUrl = new URL(window.location.href);
+            newUrl.searchParams.set('mode', select.value);
+            window.location.href = newUrl.toString();
+        });
 
         container.appendChild(label);
         container.appendChild(select);
-        container.appendChild(foldToggleBtn);
+
+        // Only show legacy fold toggle button in non-lazy_collapse modes
+        if (ACTIVE_MODE !== 'lazy_collapse') {
+            const foldToggleBtn = document.createElement('button');
+            foldToggleBtn.type = 'button';
+            foldToggleBtn.className = 'coverage-fold-toggle-btn';
+            foldToggleBtn.innerText = isFoldedModeActive ? '展开全部源码' : '上下文折叠';
+            foldToggleBtn.title = '折叠非待分析上下文代码';
+            foldToggleBtn.addEventListener('click', function() {
+                if (isFoldedModeActive) {
+                    applyFrontendFolding(true);
+                    foldToggleBtn.innerText = '上下文折叠';
+                } else {
+                    applyFrontendFolding(false);
+                    foldToggleBtn.innerText = '展开全部源码';
+                }
+            });
+            container.appendChild(foldToggleBtn);
+        }
+
         document.body.appendChild(container);
     }
 
     function updateHeaderStatistics() {
+        let totalUncov = totalUncovered;
         let confirmedCount = 0;
-        panelsMap.forEach((panel) => {
-            const status = panel.select ? panel.select.value : (panel.values && panel.values.status);
-            const isDraft = panel.values && panel.values.isDraft === true;
-            if (!isDraft && CONFIRMED_STATUS_SET.has(status)) {
-                const bLen = panel.block ? (panel.block.length || (panel.block.lineNums ? panel.block.lineNums.length : 1)) : 1;
-                confirmedCount += bLen;
-            }
-        });
 
-        const confirmedRatio = totalUncovered > 0 ? ((confirmedCount / totalUncovered) * 100).toFixed(1) : '0.0';
+        if (ACTIVE_MODE === 'lazy_collapse' && CodeRegionStore._layoutMeta) {
+            totalUncov = CodeRegionStore._layoutMeta.total_uncovered_count;
+            confirmedCount = CodeRegionStore._layoutMeta.confirmed_count || 0;
+
+            // Adjust by local live panel states
+            panelsMap.forEach((panel) => {
+                const status = panel.select ? panel.select.value : (panel.values && panel.values.status);
+                const isDraft = panel.values && panel.values.isDraft === true;
+                const origSaved = panel.values && panel.values._origSavedConfirmed;
+                const nowConfirmed = !isDraft && CONFIRMED_STATUS_SET.has(status);
+                const bLen = panel.block ? (panel.block.length || (panel.block.lineNums ? panel.block.lineNums.length : 1)) : 1;
+
+                if (nowConfirmed && !origSaved) {
+                    confirmedCount += bLen;
+                } else if (!nowConfirmed && origSaved) {
+                    confirmedCount -= bLen;
+                }
+            });
+            confirmedCount = Math.max(0, Math.min(totalUncov, confirmedCount));
+        } else {
+            panelsMap.forEach((panel) => {
+                const status = panel.select ? panel.select.value : (panel.values && panel.values.status);
+                const isDraft = panel.values && panel.values.isDraft === true;
+                if (!isDraft && CONFIRMED_STATUS_SET.has(status)) {
+                    const bLen = panel.block ? (panel.block.length || (panel.block.lineNums ? panel.block.lineNums.length : 1)) : 1;
+                    confirmedCount += bLen;
+                }
+            });
+        }
+
+        const confirmedRatio = totalUncov > 0
+            ? ((confirmedCount / totalUncov) * 100).toFixed(1)
+            : (totalUncov === 0 ? '100.0' : '0.0');
 
         const linesTd = Array.from(document.querySelectorAll('td.headerItem')).find(td => td.innerText.startsWith('Lines:'));
         if (!linesTd) return;
@@ -613,23 +682,16 @@
         const ratioFloat = parseFloat(confirmedRatio);
         if (ratioFloat === 0.0) {
             td4.className = 'coverage-ratio-low';
-        } else if (ratioFloat === 100.0) {
+        } else if (ratioFloat >= 90.0) {
             td4.className = 'coverage-ratio-hi';
         } else {
             td4.className = 'coverage-ratio-med';
         }
 
         const td5 = document.createElement('td');
-        td5.className = 'headerCovTableEntry';
-        td5.style.textAlign = 'right';
-        td5.style.fontWeight = 'bold';
-        td5.innerText = totalUncovered;
-
-        const td6 = document.createElement('td');
-        td6.className = 'headerCovTableEntry';
-        td6.style.textAlign = 'right';
-        td6.style.fontWeight = 'bold';
-        td6.innerText = confirmedCount;
+        td5.className = 'headerValue';
+        td5.style.paddingLeft = '4px';
+        td5.innerText = `${confirmedCount} / ${totalUncov}`;
 
         reviewTr.appendChild(td0);
         reviewTr.appendChild(td1);
@@ -637,71 +699,25 @@
         reviewTr.appendChild(td3);
         reviewTr.appendChild(td4);
         reviewTr.appendChild(td5);
-        reviewTr.appendChild(td6);
     }
 
-    // =========================================================================
-    // Legacy Helpers for Backward Compatibility and Test Integrity
-    // =========================================================================
-    function expandBlockPanel(startLineNum) {
-        const current = panelsMap.get(startLineNum);
-        if (!current || current.expanded) {
-            return current;
+    function setPanelPersistedState(panel) {
+        if (!panel || !panel.saveBtn) return;
+        const isDraft = panel.values && panel.values.isDraft === true;
+        const status = panel.values ? panel.values.status : '';
+        panel.saveBtn.innerText = isDraft ? '已暂存' : (CONFIRMED_STATUS_SET.has(status) ? '已确认' : 'Save');
+        if (isDraft || CONFIRMED_STATUS_SET.has(status)) {
+            panel.saveBtn.className = 'coverage-analysis-btn saved';
         }
-        const placeholder = current.placeholder;
-        const block = current.block;
-        const values = Object.assign({}, current.values || {});
-        renderBlockPanel(block);
+    }
+
+    function expandBlockPanel(startLineNum) {
         const panelState = panelsMap.get(startLineNum);
         if (panelState) {
+            const values = panelState.values || {};
             setStoredPanelValues(panelState, values);
-            if ((values.isDraft || (values.status && values.status !== '未确认')) && panelState.saveBtn) {
-                setPanelPersistedState(panelState);
-            }
-        }
-        if (placeholder) {
-            if (current.placeholderIsAnchor) {
-                placeholder.classList.remove(
-                    'coverage-analysis-placeholder-anchor',
-                    'coverage-analysis-placeholder-saved',
-                    'saved',
-                    'error',
-                    'legacy-inline-fast'
-                );
-                placeholder.removeAttribute('data-start-line');
-                placeholder.removeAttribute('data-coverage-label');
-                placeholder.style.removeProperty('--coverage-placeholder-margin');
-                placeholder.style.removeProperty('--coverage-placeholder-left');
-                placeholder.removeAttribute('title');
-            } else if (placeholder._coverageAlignSpacer) {
-                placeholder._coverageAlignSpacer.remove();
-                placeholder.remove();
-            } else {
-                placeholder.remove();
-            }
         }
         return panelState;
-    }
-
-    function renderBlockPanel(block) {
-        const startItem = block.startItem || block[0] || {};
-        const endLineNum = block.endLineNum || (block[block.length - 1] ? block[block.length - 1].lineNum : startItem.lineNum);
-        const lineDto = {
-            line_no: startItem.lineNum,
-            source: startItem.lineText || (startItem.span ? startItem.span.textContent : '') || '',
-            coverage_state: 'uncovered',
-            analysis_state: '未确认',
-            is_pending_analysis: true,
-            is_block_entry: true,
-            block_start_line: startItem.lineNum,
-            block_end_line: endLineNum,
-            block_type: 'single'
-        };
-        const panel = CodeLineRenderer.createReviewPanel(lineDto, '');
-        if (startItem.span) {
-            startItem.span.appendChild(panel);
-        }
-        return panelsMap.get(startItem.lineNum);
     }
 
     function ensureBlockLinesVisible(block) {
@@ -744,14 +760,16 @@
     }
 
     // =========================================================================
-    // 1. CodeRegionStore: 区域状态与行缓存存储
+    // 2. CodeRegionStore: 区域状态与行缓存存储
     // =========================================================================
     const CodeRegionStore = {
         _regions: new Map(), // regionId -> regionState
         _fileMeta: { totalLines: 0, filePath: '', projectName: '' },
+        _layoutMeta: null,
 
         init(layoutData) {
             this._regions.clear();
+            this._layoutMeta = layoutData;
             this._fileMeta.totalLines = layoutData.total_lines || 0;
             this._fileMeta.filePath = layoutData.file_path || '';
             this._fileMeta.projectName = layoutData.project_name || DEFAULT_PROJECT;
@@ -845,11 +863,17 @@
     };
 
     // =========================================================================
-    // 2. CodeRegionLoader: 区间/Chunk/Batch 数据请求与缓存写入
+    // 3. CodeRegionLoader: 区间/Chunk/Batch 数据请求与流式加载
     // =========================================================================
     const CodeRegionLoader = {
+        _inflightPromises: new Map(), // regionId or 'batch' -> Promise
+
         async loadInitialBatch(filePath, expandedRegions) {
             if (!expandedRegions.length) return [];
+            
+            // Mark all target regions as loading immediately to prevent duplicate triggers
+            expandedRegions.forEach(r => CodeRegionStore.setLoading(r.id, '正在加载…'));
+
             const ranges = expandedRegions.map(r => ({
                 start_line: r.startLine,
                 end_line: r.endLine
@@ -861,6 +885,8 @@
                 body: JSON.stringify({
                     project_name: DEFAULT_PROJECT,
                     file_path: filePath,
+                    report_id: currentReportId,
+                    scope: REVIEW_SCOPE,
                     ranges: ranges
                 })
             });
@@ -876,45 +902,74 @@
             return expandedRegions;
         },
 
-        async loadRegion(filePath, region, onProgress) {
+        async loadRegion(filePath, region, onChunkProgress) {
             if (region.loaded) {
                 return region.lines;
             }
 
-            CodeRegionStore.setLoading(region.id, '正在加载…');
-            const totalLinesToLoad = region.endLine - region.startLine + 1;
+            if (this._inflightPromises.has(region.id)) {
+                return this._inflightPromises.get(region.id);
+            }
 
-            if (totalLinesToLoad > LOAD_CHUNK_SIZE) {
-                // Chunked loading for large regions
-                const allLines = [];
-                for (let start = region.startLine; start <= region.endLine; start += LOAD_CHUNK_SIZE) {
-                    const end = Math.min(start + LOAD_CHUNK_SIZE - 1, region.endLine);
-                    if (typeof onProgress === 'function') {
-                        onProgress(allLines.length, totalLinesToLoad);
+            const loadPromise = (async () => {
+                CodeRegionStore.setLoading(region.id, '正在加载…');
+                const totalLinesToLoad = region.endLine - region.startLine + 1;
+
+                if (totalLinesToLoad > LOAD_CHUNK_SIZE) {
+                    // Chunked streaming loading for large regions
+                    const allLines = [];
+                    region.lines = allLines;
+
+                    for (let start = region.startLine; start <= region.endLine; start += LOAD_CHUNK_SIZE) {
+                        const end = Math.min(start + LOAD_CHUNK_SIZE - 1, region.endLine);
+                        const query = new URLSearchParams({
+                            project: DEFAULT_PROJECT,
+                            file: filePath,
+                            start_line: start,
+                            end_line: end,
+                            scope: REVIEW_SCOPE
+                        });
+                        if (currentReportId) query.set('report_id', currentReportId);
+
+                        const chunkData = await requestCoverageApi(`/code-lines?${query.toString()}`, { method: 'GET' });
+                        const chunkLines = chunkData && chunkData.data && chunkData.data.lines ? chunkData.data.lines : [];
+                        allLines.push(...chunkLines);
+
+                        if (typeof onChunkProgress === 'function') {
+                            await onChunkProgress(chunkLines, start, end, allLines.length, totalLinesToLoad);
+                        }
                     }
-                    const chunkData = await requestCoverageApi(
-                        `/code-lines?project=${encodeURIComponent(DEFAULT_PROJECT)}&file=${encodeURIComponent(filePath)}&start_line=${start}&end_line=${end}`,
-                        { method: 'GET' }
-                    );
-                    const chunkLines = chunkData && chunkData.data && chunkData.data.lines ? chunkData.data.lines : [];
-                    allLines.push(...chunkLines);
+                    CodeRegionStore.setLoaded(region.id, allLines);
+                    return allLines;
+                } else {
+                    const query = new URLSearchParams({
+                        project: DEFAULT_PROJECT,
+                        file: filePath,
+                        start_line: region.startLine,
+                        end_line: region.endLine,
+                        scope: REVIEW_SCOPE
+                    });
+                    if (currentReportId) query.set('report_id', currentReportId);
+
+                    const data = await requestCoverageApi(`/code-lines?${query.toString()}`, { method: 'GET' });
+                    const lines = data && data.data && data.data.lines ? data.data.lines : [];
+                    CodeRegionStore.setLoaded(region.id, lines);
+                    return lines;
                 }
-                CodeRegionStore.setLoaded(region.id, allLines);
-                return allLines;
-            } else {
-                const data = await requestCoverageApi(
-                    `/code-lines?project=${encodeURIComponent(DEFAULT_PROJECT)}&file=${encodeURIComponent(filePath)}&start_line=${region.startLine}&end_line=${region.endLine}`,
-                    { method: 'GET' }
-                );
-                const lines = data && data.data && data.data.lines ? data.data.lines : [];
-                CodeRegionStore.setLoaded(region.id, lines);
-                return lines;
+            })();
+
+            this._inflightPromises.set(region.id, loadPromise);
+            try {
+                const res = await loadPromise;
+                return res;
+            } finally {
+                this._inflightPromises.delete(region.id);
             }
         }
     };
 
     // =========================================================================
-    // 3. CodeLineRenderer: 唯一 Line DTO -> DOM 渲染器
+    // 4. CodeLineRenderer: 唯一 Line DTO -> DOM 渲染器 (支持 Draft Store 状态融合)
     // =========================================================================
     const CodeLineRenderer = {
         renderCodeLine(lineData, filePath) {
@@ -970,6 +1025,15 @@
             const blockLength = endLineNum - startLineNum + 1;
             const isMultiLine = blockLength > 1;
 
+            // Merge draft store if user had unsaved edits
+            const draft = ReviewDraftStore.getDraft(startLineNum);
+            const initialStatus = draft ? draft.status : (lineData.analysis_state || '未确认');
+            const initialReviewer = draft ? draft.reviewer : (lineData.reviewer || '');
+            const initialMethod = draft ? draft.coverage_method : (lineData.coverage_method || '');
+            const initialReason = draft ? draft.uncovered_reason : (lineData.uncovered_reason || '');
+            const isDraftState = draft ? draft.isDirty : Boolean(lineData.is_draft);
+            const origSavedConfirmed = !lineData.is_draft && CONFIRMED_STATUS_SET.has(lineData.analysis_state);
+
             const panel = document.createElement('span');
             panel.className = 'coverage-analysis-panel' + (isMultiLine ? ' multiline' : '');
             panel.setAttribute('contenteditable', 'false');
@@ -990,7 +1054,7 @@
                 const option = document.createElement('option');
                 option.value = opt;
                 option.text = opt;
-                if (opt === lineData.analysis_state) option.selected = true;
+                if (opt === initialStatus) option.selected = true;
                 select.appendChild(option);
             });
 
@@ -1025,20 +1089,20 @@
             reviewerInput.type = 'text';
             reviewerInput.className = 'coverage-analysis-input reviewer-input';
             reviewerInput.placeholder = '确认人';
-            reviewerInput.value = lineData.reviewer || '';
+            reviewerInput.value = initialReviewer;
 
             // Method textarea
             const methodInput = document.createElement('textarea');
             methodInput.className = 'coverage-analysis-input' + (isMultiLine ? ' multiline' : '');
             methodInput.placeholder = '条件覆盖方法';
-            methodInput.value = lineData.coverage_method || '';
+            methodInput.value = initialMethod;
             const methodGrip = createResizeGrip(methodInput);
 
             // Reason textarea
             const reasonInput = document.createElement('textarea');
             reasonInput.className = 'coverage-analysis-input' + (isMultiLine ? ' multiline' : '');
             reasonInput.placeholder = '无条件覆盖原因';
-            reasonInput.value = lineData.uncovered_reason || '';
+            reasonInput.value = initialReason;
             const reasonGrip = createResizeGrip(reasonInput);
 
             // Multi-line Badge
@@ -1053,8 +1117,9 @@
             // Save button
             const saveBtn = document.createElement('button');
             saveBtn.className = 'coverage-analysis-btn';
-            saveBtn.innerText = lineData.is_draft ? '已暂存' : (CONFIRMED_STATUS_SET.has(lineData.analysis_state) ? '已确认' : 'Save');
-            if (lineData.is_draft || CONFIRMED_STATUS_SET.has(lineData.analysis_state)) {
+            const isConfirmed = CONFIRMED_STATUS_SET.has(initialStatus);
+            saveBtn.innerText = isDraftState ? 'Save' : (isConfirmed ? '已确认' : 'Save');
+            if (!isDraftState && (isConfirmed || lineData.is_draft)) {
                 saveBtn.classList.add('saved');
             }
 
@@ -1090,15 +1155,19 @@
                 lineNum: startLineNum,
                 expanded: true,
                 values: {
-                    status: select.value,
-                    reviewerInput: reviewerInput.value,
-                    methodInput: methodInput.value,
-                    reasonInput: reasonInput.value,
-                    isDraft: lineData.is_draft
+                    status: initialStatus,
+                    reviewerInput: initialReviewer,
+                    methodInput: initialMethod,
+                    reasonInput: initialReason,
+                    isDraft: isDraftState,
+                    _origSavedConfirmed: origSavedConfirmed
                 }
             };
 
             panelsMap.set(startLineNum, panelState);
+            if (draft && draft.isDirty) {
+                dirtyPanelStartLines.add(startLineNum);
+            }
 
             // Event Listeners
             saveBtn.addEventListener('click', function(e) {
@@ -1135,15 +1204,18 @@
                     status: statusVal,
                     coverage_method: methodVal,
                     uncovered_reason: reasonVal
-                }], 'confirm').then(result => {
+                }], 'confirm').then(() => {
                     setStoredPanelValues(panelState, {
                         status: statusVal,
                         reviewerInput: reviewerVal,
                         methodInput: methodVal,
                         reasonInput: reasonVal,
-                        isDraft: false
+                        isDraft: false,
+                        _origSavedConfirmed: true
                     });
                     clearPanelDirty(startLineNum, false);
+                    saveBtn.innerText = '已确认';
+                    saveBtn.className = 'coverage-analysis-btn saved';
                     notifyProgressChanged();
                     updateHeaderStatistics();
                     showToast(`第 ${startLineNum}-${endLineNum} 行分析已确认保存`);
@@ -1244,7 +1316,7 @@
     };
 
     // =========================================================================
-    // 4. CodeRegionController: 区域交互与分批 DOM 渲染调度
+    // 5. CodeRegionController: 区域交互与分批 DOM 渲染调度
     // =========================================================================
     const CodeRegionController = {
         filePath: '',
@@ -1256,8 +1328,8 @@
             this.container = preSource;
             CodeRegionStore.init(layoutData);
 
-            // Calculate initial physical total uncovered from layout
-            totalUncovered = layoutData.pending_line_count || 0;
+            // Calculate initial total uncovered from layout
+            totalUncovered = layoutData.total_uncovered_count || layoutData.pending_line_count || 0;
 
             // Clear original preSource DOM
             preSource.innerHTML = '';
@@ -1401,14 +1473,18 @@
                 return;
             }
 
-            // Load lines via Loader
+            // Load lines via Loader with chunk streaming
             this.updatePlaceholderState(region);
             try {
-                await CodeRegionLoader.loadRegion(this.filePath, region, (loaded, total) => {
+                this.prepareRegionLinesContainer(region);
+
+                await CodeRegionLoader.loadRegion(this.filePath, region, async (chunkLines, start, end, loaded, total) => {
                     region.progressText = `正在展开 ${loaded} / ${total} 行…`;
                     this.updatePlaceholderState(region);
+                    await this.appendChunkLines(region, chunkLines);
                 });
-                await this.renderRegionLines(region);
+
+                await this.finalizeRegionLoaded(region);
             } catch (err) {
                 console.error(`[CodeRegionController] Failed to expand region ${regionId}:`, err);
                 CodeRegionStore.setError(regionId, err.message || String(err));
@@ -1416,11 +1492,66 @@
             }
         },
 
+        prepareRegionLinesContainer(region) {
+            const container = region.domContainer;
+            if (!container) return;
+
+            if (!region.headerEl && (region.kind === 'analysis' || region.defaultState === 'expanded')) {
+                const header = document.createElement('div');
+                header.className = 'coverage-region-header';
+                const labelText = region.label ? `${region.label} · ` : '';
+                header.innerHTML = `
+                    <div class="region-title">
+                        <span>▾ ${labelText}分析区域</span>
+                        <span class="badge">第 ${region.startLine} - ${region.endLine} 行 (${region.lineCount} 行)</span>
+                    </div>
+                    <div class="region-actions">
+                        <button type="button" class="coverage-region-collapse-btn">收起区域</button>
+                    </div>
+                `;
+                header.querySelector('.coverage-region-collapse-btn').addEventListener('click', (e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    this.collapseRegion(region.id);
+                });
+                region.headerEl = header;
+                container.appendChild(header);
+            }
+
+            if (!region.linesEl) {
+                const linesContainer = document.createElement('div');
+                linesContainer.className = 'coverage-region-lines';
+                region.linesEl = linesContainer;
+                container.appendChild(linesContainer);
+            } else {
+                region.linesEl.innerHTML = '';
+            }
+        },
+
+        async appendChunkLines(region, chunkLines) {
+            if (!region.linesEl || !chunkLines || !chunkLines.length) return;
+            const fragment = document.createDocumentFragment();
+            for (const line of chunkLines) {
+                fragment.appendChild(CodeLineRenderer.renderCodeLine(line, this.filePath));
+            }
+            region.linesEl.appendChild(fragment);
+            await yieldToBrowser();
+        },
+
+        async finalizeRegionLoaded(region) {
+            if (region.placeholderEl) {
+                region.placeholderEl.style.display = 'none';
+            }
+            CodeRegionStore.setExpanded(region.id);
+            updateReviewNavigation();
+            updateHeaderStatistics();
+        },
+
         collapseRegion(regionId) {
             const region = CodeRegionStore.get(regionId);
             if (!region || !region.domContainer) return;
 
-            // Remove lines DOM to free browser memory
+            // Free DOM memory while preserving DraftStore edits
             if (region.linesEl) {
                 region.linesEl.remove();
                 region.linesEl = null;
@@ -1448,51 +1579,13 @@
             const container = region.domContainer;
             if (!container) return;
 
-            // Hide placeholder
             if (region.placeholderEl) {
                 region.placeholderEl.style.display = 'none';
             }
 
-            // Create region header bar if analysis region or large region
-            if (!region.headerEl && (region.kind === 'analysis' || region.defaultState === 'expanded')) {
-                const header = document.createElement('div');
-                header.className = 'coverage-region-header';
-                const labelText = region.label ? `${region.label} · ` : '';
-                header.innerHTML = `
-                    <div class="region-title">
-                        <span>▾ ${labelText}分析区域</span>
-                        <span class="badge">第 ${region.startLine} - ${region.endLine} 行 (${region.lineCount} 行)</span>
-                    </div>
-                    <div class="region-actions">
-                        <button type="button" class="coverage-region-collapse-btn">收起区域</button>
-                    </div>
-                `;
-                header.querySelector('.coverage-region-collapse-btn').addEventListener('click', (e) => {
-                    e.preventDefault();
-                    e.stopPropagation();
-                    this.collapseRegion(region.id);
-                });
-                region.headerEl = header;
-                container.appendChild(header);
-            }
-
-            // Lines container
-            let linesContainer = region.linesEl;
-            if (!linesContainer) {
-                linesContainer = document.createElement('div');
-                linesContainer.className = 'coverage-region-lines';
-                region.linesEl = linesContainer;
-                container.appendChild(linesContainer);
-            } else {
-                linesContainer.innerHTML = '';
-            }
-
-            // Batch render lines
-            await this.renderLinesInBatches(region.lines, linesContainer);
-            CodeRegionStore.setExpanded(region.id);
-
-            updateReviewNavigation();
-            updateHeaderStatistics();
+            this.prepareRegionLinesContainer(region);
+            await this.renderLinesInBatches(region.lines, region.linesEl);
+            await this.finalizeRegionLoaded(region);
         },
 
         async renderLinesInBatches(lines, container, batchSize = RENDER_BATCH_SIZE) {
@@ -1563,6 +1656,10 @@
                 const reg = allRegions[i];
                 statusEl.innerText = `正在展开 ${loadedLinesCount} / ${totalLines} 行 (${i + 1}/${allRegions.length})…`;
                 try {
+                    if (reg.currentState === 'expanded-loaded' && reg.linesEl) {
+                        loadedLinesCount += reg.lineCount;
+                        continue;
+                    }
                     if (!reg.loaded) {
                         await CodeRegionLoader.loadRegion(this.filePath, reg);
                     }
@@ -1626,14 +1723,26 @@
     // Entry Point: DOMContentLoaded Bootstrap
     // =========================================================================
     document.addEventListener('DOMContentLoaded', async function() {
-        // 1. Extract relative file path
-        let filePath = '';
-        const titleElement = document.querySelector('title');
-        if (titleElement) {
-            const titleText = titleElement.innerText;
-            const match = titleText.match(/LCOV\s+-\s+.*?\s+-\s+(.+)/);
-            if (match && match[1]) {
-                filePath = match[1].trim();
+        // Extract meta tag parameters
+        const metaReportId = document.querySelector('meta[name="coverage-report-id"]');
+        const metaFilePath = document.querySelector('meta[name="coverage-file-path"]');
+
+        currentReportId = (metaReportId && metaReportId.content)
+            || URL_PARAMS.get('report_id')
+            || URL_PARAMS.get('report')
+            || DEFAULT_REPORT_ID
+            || '';
+
+        let filePath = (metaFilePath && metaFilePath.content) || '';
+
+        if (!filePath) {
+            const titleElement = document.querySelector('title');
+            if (titleElement) {
+                const titleText = titleElement.innerText;
+                const match = titleText.match(/LCOV\s+-\s+.*?\s+-\s+(.+)/);
+                if (match && match[1]) {
+                    filePath = match[1].trim();
+                }
             }
         }
         if (!filePath) {
@@ -1645,8 +1754,10 @@
                 filePath = window.location.pathname;
             }
         }
+        currentFilePath = filePath;
 
         console.log('[CoverageEnhance] Current file path:', filePath);
+        console.log('[CoverageEnhance] Report ID:', currentReportId);
         console.log('[CoverageEnhance] Active mode:', ACTIVE_MODE);
         console.log('[CoverageEnhance] Version:', ENHANCE_VERSION);
 
@@ -1663,23 +1774,39 @@
             preSource.parentNode.insertBefore(scopeNotice, preSource);
         }
 
-        createModeToggler(ACTIVE_MODE);
+        createModeToggler();
         createBatchToolbar(filePath);
 
         // Branch by ACTIVE_MODE
         if (ACTIVE_MODE === 'lazy_collapse') {
-            // New Lazy Collapse Architecture
             try {
-                const layoutResp = await requestCoverageApi(
-                    `/code-layout?project=${encodeURIComponent(DEFAULT_PROJECT)}&file=${encodeURIComponent(filePath)}`,
-                    { method: 'GET' }
-                );
+                const query = new URLSearchParams({
+                    project: DEFAULT_PROJECT,
+                    file: filePath,
+                    scope: REVIEW_SCOPE
+                });
+                if (currentReportId) query.set('report_id', currentReportId);
+
+                const layoutResp = await requestCoverageApi(`/code-layout?${query.toString()}`, { method: 'GET' });
                 if (layoutResp && layoutResp.data) {
                     await CodeRegionController.init(layoutResp.data, preSource);
                     return;
                 }
             } catch (err) {
-                console.warn('[CoverageEnhance] Failed to initialize via backend layout, falling back to client DOM parsing:', err.message);
+                console.warn('[CoverageEnhance] Failed to initialize via backend layout:', err.message);
+                // If the source was already stripped, display clear error message
+                if (preSource.children.length === 0 && preSource.textContent.trim() === '') {
+                    const errBanner = document.createElement('div');
+                    errBanner.className = 'coverage-region-placeholder error';
+                    errBanner.innerHTML = `
+                        <div class="placeholder-left">
+                            <span class="placeholder-icon">⚠️</span>
+                            <span class="placeholder-text">无法加载代码布局与源码数据：${err.message}</span>
+                        </div>
+                    `;
+                    preSource.appendChild(errBanner);
+                    return;
+                }
             }
         }
 
@@ -1885,7 +2012,13 @@
         });
 
         // Pull existing database records
-        requestCoverageApi(`?project=${encodeURIComponent(DEFAULT_PROJECT)}&file=${encodeURIComponent(filePath)}`, { method: 'GET' })
+        const query = new URLSearchParams({
+            project: DEFAULT_PROJECT,
+            file: filePath
+        });
+        if (currentReportId) query.set('report_id', currentReportId);
+
+        requestCoverageApi(`?${query.toString()}`, { method: 'GET' })
             .then(data => {
                 if (data && data.records) {
                     const dbMap = new Map();
@@ -1898,7 +2031,8 @@
                                 isDraft: rec.is_draft === true || rec.is_draft === 1,
                                 reviewerInput: rec.reviewer || '',
                                 methodInput: rec.coverage_method || '',
-                                reasonInput: rec.uncovered_reason || ''
+                                reasonInput: rec.uncovered_reason || '',
+                                _origSavedConfirmed: !rec.is_draft && CONFIRMED_STATUS_SET.has(rec.status)
                             });
                             setPanelPersistedState(pState);
                         }

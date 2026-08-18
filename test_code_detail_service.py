@@ -239,24 +239,24 @@ class TestSourceReaderAndService(unittest.TestCase):
         self.assertIn("perf", layout)
         self.assertIn("layout_build_ms", layout["perf"])
 
-        # divide function (7..13) should be expanded
+        # divide function (7..12) should be expanded
         expanded_regions = [r for r in layout["regions"] if r["default_state"] == "expanded"]
         self.assertEqual(len(expanded_regions), 1)
         self.assertEqual(expanded_regions[0]["start_line"], 7)
-        self.assertEqual(expanded_regions[0]["end_line"], 13)
+        self.assertEqual(expanded_regions[0]["end_line"], 12)
         self.assertEqual(expanded_regions[0]["label"], "divide")
 
         # Batch lines loading
         batch = service.get_code_lines_batch(
             project_name="TestProj",
             file_path="src/calculator.c",
-            ranges=[{"start_line": 7, "end_line": 13}],
+            ranges=[{"start_line": 7, "end_line": 12}],
             content_override=self.mock_legacy_html,
         )
         self.assertEqual(len(batch["ranges"]), 1)
-        self.assertEqual(len(batch["ranges"][0]["lines"]), 7)
+        self.assertEqual(len(batch["ranges"][0]["lines"]), 6)
         self.assertEqual(batch["ranges"][0]["lines"][0]["line_no"], 7)
-        self.assertEqual(batch["ranges"][0]["lines"][-1]["line_no"], 13)
+        self.assertEqual(batch["ranges"][0]["lines"][-1]["line_no"], 12)
         self.assertIn("batch_load_ms", batch["perf"])
 
         # Single range loading

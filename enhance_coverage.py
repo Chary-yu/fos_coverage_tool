@@ -35,11 +35,16 @@ from code_region import CodeRegion, FunctionRange, build_code_regions
 from source_reader import (
     SourceContext,
     SourceLineDTO,
+    is_line_pending_analysis,
+    load_source_sidecar,
     parse_source_lines_from_gcov_html,
     read_source_lines,
     read_source_ranges,
+    save_source_sidecar,
 )
-from code_detail_service import CodeDetailService, is_safe_relative_path
+from code_detail_service import CodeDetailService, compute_file_path_hash, is_safe_relative_path
+
+VALID_RENDER_MODES = ("lazy_collapse", "lazy", "immediate")
 
 try:
     from http.server import ThreadingHTTPServer
@@ -1961,8 +1966,8 @@ def load_config():
     return default_config
 
 
-def write_configured_enhance_js(output_path, project_name, render_mode, review_scope="full"):
-    """Copy the frontend script and inject project, render mode and review scope."""
+def write_configured_enhance_js(output_path, project_name, render_mode="lazy_collapse", review_scope="full", report_id=""):
+    """Copy the frontend script and inject project, render mode, review scope and report_id."""
     with open(JS_SOURCE_PATH, 'r', encoding='utf-8') as f:
         content = f.read()
 
@@ -1995,6 +2000,14 @@ def write_configured_enhance_js(output_path, project_name, render_mode, review_s
     )
     if replace_count != 1:
         raise RuntimeError("Failed to inject REVIEW_SCOPE into coverage_enhance.js")
+
+    report_id_literal = json.dumps(str(report_id or ""), ensure_ascii=False)
+    new_content, _ = re.subn(
+        r"const\s+DEFAULT_REPORT_ID\s*=\s*(['\"]).*?\1\s*;",
+        f"const DEFAULT_REPORT_ID = {report_id_literal};",
+        new_content,
+        count=1
+    )
 
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(new_content)
@@ -3887,6 +3900,8 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         elif parsed_url.path in ("/api/coverage/code-layout", "/api/coverage/layout"):
             project_name = query_params.get("project", query_params.get("project_name", [""]))[0].strip()
             file_path = query_params.get("file", query_params.get("file_path", [""]))[0].strip()
+            report_id = query_params.get("report_id", query_params.get("report", [""]))[0].strip()
+            review_scope = query_params.get("scope", query_params.get("review_scope", ["full"]))[0].strip()
             if not project_name or not file_path:
                 self.send_error_response(400, "Missing 'project' or 'file' parameter")
                 return
@@ -3895,8 +3910,19 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 service = get_code_detail_service()
-                data = service.get_code_layout(project_name, file_path)
+                data = service.get_code_layout(
+                    project_name=project_name,
+                    file_path=file_path,
+                    report_id=report_id,
+                    review_scope=review_scope,
+                )
                 self.send_json_response(200, {"status": "success", "data": data})
+            except FileNotFoundError as error:
+                self.send_error_response(404, str(error))
+                return
+            except ValueError as error:
+                self.send_error_response(400, str(error))
+                return
             except Exception as error:
                 print(f"[CodeLayout] Failed for {file_path}: {error}", flush=True)
                 self.send_error_response(500, f"Failed to get code layout: {error}")
@@ -3904,6 +3930,8 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         elif parsed_url.path == "/api/coverage/code-lines":
             project_name = query_params.get("project", query_params.get("project_name", [""]))[0].strip()
             file_path = query_params.get("file", query_params.get("file_path", [""]))[0].strip()
+            report_id = query_params.get("report_id", query_params.get("report", [""]))[0].strip()
+            review_scope = query_params.get("scope", query_params.get("review_scope", ["full"]))[0].strip()
             if not project_name or not file_path:
                 self.send_error_response(400, "Missing 'project' or 'file' parameter")
                 return
@@ -3921,8 +3949,21 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 service = get_code_detail_service()
-                data = service.get_code_lines_single(project_name, file_path, start_line, end_line)
+                data = service.get_code_lines_single(
+                    project_name=project_name,
+                    file_path=file_path,
+                    start_line=start_line,
+                    end_line=end_line,
+                    report_id=report_id,
+                    review_scope=review_scope,
+                )
                 self.send_json_response(200, {"status": "success", "data": data})
+            except FileNotFoundError as error:
+                self.send_error_response(404, str(error))
+                return
+            except ValueError as error:
+                self.send_error_response(400, str(error))
+                return
             except Exception as error:
                 print(f"[CodeLines] Failed for {file_path}: {error}", flush=True)
                 self.send_error_response(500, f"Failed to get code lines: {error}")
@@ -4270,6 +4311,8 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 return
             project_name = str(payload.get("project_name") or payload.get("project") or "").strip()
             file_path = str(payload.get("file_path") or payload.get("file") or "").strip()
+            report_id = str(payload.get("report_id") or payload.get("report") or "").strip()
+            review_scope = str(payload.get("scope") or payload.get("review_scope") or "full").strip()
             ranges = payload.get("ranges")
             if not project_name or not file_path:
                 self.send_error_response(400, "Missing required parameters (project_name, file_path)")
@@ -4280,13 +4323,25 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
             if not isinstance(ranges, list) or not ranges:
                 self.send_error_response(400, "ranges must be a non-empty array")
                 return
-            if len(ranges) > 100:
-                self.send_error_response(400, "Too many ranges requested (max 100)")
+            if len(ranges) > 1000:
+                self.send_error_response(400, "Too many ranges requested (max 1000)")
                 return
             try:
                 service = get_code_detail_service()
-                data = service.get_code_lines_batch(project_name, file_path, ranges)
+                data = service.get_code_lines_batch(
+                    project_name=project_name,
+                    file_path=file_path,
+                    ranges=ranges,
+                    report_id=report_id,
+                    review_scope=review_scope,
+                )
                 self.send_json_response(200, {"status": "success", "data": data})
+            except FileNotFoundError as error:
+                self.send_error_response(404, str(error))
+                return
+            except ValueError as error:
+                self.send_error_response(400, str(error))
+                return
             except Exception as error:
                 print(f"[CodeLinesBatch] Failed for {file_path}: {error}", flush=True)
                 self.send_error_response(500, f"Failed to batch load code lines: {error}")
@@ -4304,6 +4359,8 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 return
             project_name = str(payload.get("project_name") or payload.get("project") or "").strip()
             file_path = str(payload.get("file_path") or payload.get("file") or "").strip()
+            report_id = str(payload.get("report_id") or payload.get("report") or "").strip()
+            review_scope = str(payload.get("scope") or payload.get("review_scope") or "full").strip()
             try:
                 start_line = int(payload.get("start_line", 0))
                 end_line = int(payload.get("end_line", 0))
@@ -4321,8 +4378,21 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 service = get_code_detail_service()
-                data = service.get_code_lines_single(project_name, file_path, start_line, end_line)
+                data = service.get_code_lines_single(
+                    project_name=project_name,
+                    file_path=file_path,
+                    start_line=start_line,
+                    end_line=end_line,
+                    report_id=report_id,
+                    review_scope=review_scope,
+                )
                 self.send_json_response(200, {"status": "success", "data": data})
+            except FileNotFoundError as error:
+                self.send_error_response(404, str(error))
+                return
+            except ValueError as error:
+                self.send_error_response(400, str(error))
+                return
             except Exception as error:
                 print(f"[CodeLines] Failed for {file_path}: {error}", flush=True)
                 self.send_error_response(500, f"Failed to get code lines: {error}")
@@ -4570,7 +4640,8 @@ def close_thread_db_manager():
 
 
 def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync_index=True,
-                                 review_scope="full", incremental_lines_by_file=None):
+                                 review_scope="full", incremental_lines_by_file=None,
+                                 render_mode="lazy_collapse", report_id="", output_dir=""):
     depth = len(rel_path.split(os.sep)) - 1
     prefix = "../" * depth
 
@@ -4613,15 +4684,45 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
 
     injected = 0
     updated = 0
+
+    if render_mode == "lazy_collapse":
+        try:
+            source_ctx = parse_source_lines_from_gcov_html(
+                content=content,
+                project_name=project_name,
+                file_path=report_file_path,
+                review_scope=review_scope,
+                incremental_line_numbers=set(review_line_numbers) if review_line_numbers else None,
+                report_id=report_id,
+            )
+            sidecar_dir = output_dir or os.path.dirname(file_path)
+            save_source_sidecar(sidecar_dir, report_id, report_file_hash, source_ctx)
+        except Exception as err:
+            logger.warning(f"[Injector] Failed to save sidecar for {rel_path}: {err}")
+
+    meta_tags = (
+        f'<meta name="coverage-report-id" content="{html.escape(report_id)}">\n'
+        f'<meta name="coverage-file-path" content="{html.escape(report_file_path)}">\n'
+        f'<meta name="coverage-render-mode" content="{html.escape(render_mode)}">\n'
+    )
+
     if "coverage_enhance.js" in content:
         new_content = re.sub(r'(href="[^"]*coverage_enhance\.css)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', content)
         new_content = re.sub(r'(src="[^"]*coverage_enhance\.js)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', new_content)
+        if meta_tags.strip() not in new_content and "<head>" in new_content:
+            new_content = new_content.replace("<head>", f"<head>\n{meta_tags}", 1)
+        if render_mode == "lazy_collapse" and '<pre class="source">' in new_content:
+            new_content = re.sub(r'<pre class="source">.*?</pre>', r'<pre class="source"></pre>', new_content, flags=re.S)
         if new_content != content:
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(new_content)
             updated = 1
     elif "</head>" in content:
-        new_content = content.replace("</head>", inject_code, 1)
+        new_content = content.replace("</head>", f"{inject_code}", 1)
+        if "<head>" in new_content:
+            new_content = new_content.replace("<head>", f"<head>\n{meta_tags}", 1)
+        if render_mode == "lazy_collapse" and '<pre class="source">' in new_content:
+            new_content = re.sub(r'<pre class="source">.*?</pre>', r'<pre class="source"></pre>', new_content, flags=re.S)
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(new_content)
         injected = 1
@@ -4703,14 +4804,17 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
         return
 
     if render_mode is None:
-        render_mode = config.get("render_mode", "lazy")
-    if render_mode not in ("lazy", "immediate"):
-        render_mode = "lazy"
+        render_mode = config.get("render_mode", "lazy_collapse")
+    if render_mode not in VALID_RENDER_MODES:
+        render_mode = "lazy_collapse"
     if review_scope not in ("full", "incremental"):
         raise ValueError("review_scope must be 'full' or 'incremental'")
 
+    report_id = f"report_{calc_file_path_hash(os.path.abspath(real_output_html))[:16]}"
+    get_code_detail_service(search_dirs=[real_output_html, output_dir, os.path.join(real_output_html, ".source_cache")])
+
     write_configured_enhance_js(
-        os.path.join(real_output_html, "coverage_enhance.js"), project_name, render_mode, review_scope
+        os.path.join(real_output_html, "coverage_enhance.js"), project_name, render_mode, review_scope, report_id=report_id
     )
     shutil.copy2(CSS_SOURCE_PATH, os.path.join(real_output_html, "coverage_enhance.css"))
     write_progress_page_targets(output_dir, real_output_html, review_scope)
@@ -4718,6 +4822,7 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
     print(f"[Injector] Frontend project name: {project_name}")
     print(f"[Injector] Frontend render mode: {render_mode}")
     print(f"[Injector] Review scope: {review_scope}")
+    print(f"[Injector] Report ID: {report_id}")
     index_manager = None
     indexed_records = 0
     indexed_files = 0
@@ -4780,6 +4885,9 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
                 index_manager is not None,
                 review_scope,
                 incremental_lines_by_file,
+                render_mode,
+                report_id,
+                real_output_html,
             )
             for file_path, rel_path in gcov_files
         ]
@@ -5538,11 +5646,11 @@ def run_server():
 
 def print_help():
     print("Usage:")
-    print("  python scripts/enhance_coverage.py inject --project <project_name> --dir <input_dir> --out <output_dir> [--mode <lazy|immediate>]")
+    print("  python scripts/enhance_coverage.py inject --project <project_name> --dir <input_dir> --out <output_dir> [--mode <lazy_collapse|lazy|immediate>]")
     print("    - Scan and inject custom interactive forms into HTML reports.")
     print("    - --project is recommended and overrides coverage_config.json project_name.")
     print("    - --workers <N> controls parallel HTML parsing and line-index DB sync.")
-    print("    - --mode <lazy|immediate> specifies the display mode (placeholder vs immediate controls).")
+    print("    - --mode <lazy_collapse|lazy|immediate> specifies the display mode (default: lazy_collapse).")
     print("    - Use --use-config-project only if you intentionally want coverage_config.json project_name.")
     print("  python scripts/enhance_coverage.py server")
     print("    - Start local bridge server for MySQL persistence.")
@@ -5550,7 +5658,7 @@ def print_help():
     print("    - Reuse reviewed analysis for unchanged functions in a later project/version.")
     print("  python scripts/enhance_coverage.py incremental --project <project_name> --repo <git_repo> --oldgit <old_commit> --newgit <new_commit> --info <coverage.info|dir> --dir <lcov_html_dir> --out <output_dir>")
     print("    - Build an incremental review website; only Git-added, LCOV-uncovered lines are editable.")
-    print("    - Optional: --workers <N> --mode <lazy|immediate> --excel <result.xlsx>")
+    print("    - Optional: --workers <N> --mode <lazy_collapse|lazy|immediate> --excel <result.xlsx>")
     print("  python scripts/enhance_coverage.py incremental --project <project_name> --repos-config <repos.json> --info <coverage.info|dir> --dir <lcov_html_dir> --out <output_dir>")
     print("    - Build one incremental review website from several independent Git repositories.")
 

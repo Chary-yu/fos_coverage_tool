@@ -1,10 +1,12 @@
 """
 Source Reader module for OneSensor code coverage detail page.
-Reads and slices source code lines, extracts function ranges, basic blocks,
-and merges review/analysis state into unified Line DTOs.
+Reads and slices source code lines, extracts function ranges using token-aware brace depth tracking,
+detects basic blocks, and merges review/analysis state into unified Line DTOs.
+Supports source sidecar serialization and deserialization for true lazy loading.
 """
 
 import html
+import json
 import logging
 import os
 import re
@@ -96,6 +98,25 @@ def extract_report_file_path(content: str, fallback_path: str = "") -> str:
     return fallback_path.replace(os.sep, '/').replace('.gcov.html', '')
 
 
+def is_line_pending_analysis(
+    coverage_state: str,
+    analysis_state: str = "未确认",
+    is_draft: bool = False,
+    fill_status: str = "未填写",
+) -> bool:
+    """
+    Unified Single Source of Truth for whether a line requires coverage analysis.
+    A line is pending analysis if it is uncovered AND (not confirmed OR is still a draft).
+    """
+    if coverage_state != "uncovered":
+        return False
+    if is_draft:
+        return True
+    if fill_status == "未填写":
+        return True
+    return analysis_state not in CONFIRMED_STATUS_SET
+
+
 class SourceLineDTO:
     """Represents a unified Code Detail Line DTO."""
 
@@ -152,9 +173,29 @@ class SourceLineDTO:
             "is_block_entry": self.is_block_entry,
         }
 
+    @classmethod
+    def from_dict(cls, data: dict) -> "SourceLineDTO":
+        return cls(
+            line_no=data.get("line_no", 0),
+            source=data.get("source", ""),
+            raw_html=data.get("raw_html", ""),
+            coverage_state=data.get("coverage_state", "ignored"),
+            analysis_state=data.get("analysis_state", "未确认"),
+            is_pending_analysis=data.get("is_pending_analysis", False),
+            reviewer=data.get("reviewer", ""),
+            coverage_method=data.get("coverage_method", ""),
+            uncovered_reason=data.get("uncovered_reason", ""),
+            is_draft=data.get("is_draft", False),
+            block_start_line=data.get("block_start_line"),
+            block_end_line=data.get("block_end_line"),
+            block_type=data.get("block_type", "single"),
+            function_name=data.get("function_name", ""),
+            is_block_entry=data.get("is_block_entry", False),
+        )
+
 
 class SourceContext:
-    """Holds parsed source code information, function ranges, and line DTOs."""
+    """Represents the parsed source context of an entire file."""
 
     def __init__(
         self,
@@ -163,23 +204,181 @@ class SourceContext:
         lines: List[SourceLineDTO],
         function_ranges: Optional[List[FunctionRange]] = None,
         pending_lines: Optional[List[int]] = None,
+        total_uncovered_count: int = 0,
+        confirmed_count: int = 0,
+        report_id: str = "",
     ):
-        self.project_name = str(project_name)
-        self.file_path = str(file_path)
-        self.lines = lines or []
-        self.total_lines = len(self.lines)
+        self.project_name = project_name
+        self.file_path = file_path
+        self.lines = lines
         self.function_ranges = function_ranges or []
-        if pending_lines is not None:
-            self.pending_lines = sorted(set(pending_lines))
-        else:
-            self.pending_lines = [
-                line.line_no for line in self.lines if line.is_pending_analysis
-            ]
+        self.pending_lines = pending_lines or []
+        self.total_uncovered_count = total_uncovered_count or sum(
+            1 for line in lines if line.coverage_state == "uncovered"
+        )
+        self.confirmed_count = confirmed_count or sum(
+            1 for line in lines
+            if line.coverage_state == "uncovered"
+            and not line.is_draft
+            and line.analysis_state in CONFIRMED_STATUS_SET
+        )
+        self.report_id = report_id
+
+    @property
+    def total_lines(self) -> int:
+        return len(self.lines)
 
     def get_line(self, line_no: int) -> Optional[SourceLineDTO]:
         if 1 <= line_no <= len(self.lines):
             return self.lines[line_no - 1]
         return None
+
+    def to_dict(self) -> dict:
+        return {
+            "project_name": self.project_name,
+            "file_path": self.file_path,
+            "report_id": self.report_id,
+            "total_lines": self.total_lines,
+            "total_uncovered_count": self.total_uncovered_count,
+            "confirmed_count": self.confirmed_count,
+            "pending_lines": self.pending_lines,
+            "function_ranges": [f.to_dict() for f in self.function_ranges],
+            "lines": [l.to_dict() for l in self.lines],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SourceContext":
+        lines = [SourceLineDTO.from_dict(d) for d in data.get("lines", [])]
+        function_ranges = [
+            FunctionRange(f["start_line"], f["end_line"], f.get("name"))
+            for f in data.get("function_ranges", [])
+        ]
+        return cls(
+            project_name=data.get("project_name", ""),
+            file_path=data.get("file_path", ""),
+            lines=lines,
+            function_ranges=function_ranges,
+            pending_lines=data.get("pending_lines", []),
+            total_uncovered_count=data.get("total_uncovered_count", 0),
+            confirmed_count=data.get("confirmed_count", 0),
+            report_id=data.get("report_id", ""),
+        )
+
+
+def extract_c_function_ranges(raw_lines: List[dict]) -> List[FunctionRange]:
+    """
+    Extract accurate C/C++ function ranges using token-aware brace depth tracking.
+    Correctly ignores braces in comments, strings, char literals, and macros.
+    """
+    functions: List[FunctionRange] = []
+    in_block_comment = False
+    current_fn_name = None
+    current_fn_start_line = None
+    brace_depth = 0
+    entered_body = False
+
+    for idx, item in enumerate(raw_lines):
+        line_no = item["line_no"]
+        text = item["code_text"]
+
+        # Clean string, char literals and comments to count real code braces
+        i = 0
+        n = len(text)
+        line_cleaned = []
+
+        while i < n:
+            if in_block_comment:
+                if i + 1 < n and text[i:i+2] == '*/':
+                    in_block_comment = False
+                    i += 2
+                else:
+                    i += 1
+                continue
+
+            if i + 1 < n and text[i:i+2] == '/*':
+                in_block_comment = True
+                i += 2
+                continue
+
+            if i + 1 < n and text[i:i+2] == '//':
+                break
+
+            char = text[i]
+
+            if char == '"':
+                i += 1
+                while i < n:
+                    if text[i] == '\\':
+                        i += 2
+                    elif text[i] == '"':
+                        i += 1
+                        break
+                    else:
+                        i += 1
+                continue
+
+            if char == "'":
+                i += 1
+                while i < n:
+                    if text[i] == '\\':
+                        i += 2
+                    elif text[i] == "'":
+                        i += 1
+                        break
+                    else:
+                        i += 1
+                continue
+
+            line_cleaned.append(char)
+            i += 1
+
+        clean_text = "".join(line_cleaned).strip()
+
+        if current_fn_start_line is None:
+            if is_function_entry_text(text):
+                fn_name = extract_function_name(text)
+                current_fn_name = fn_name
+                current_fn_start_line = line_no
+                open_b = clean_text.count('{')
+                close_b = clean_text.count('}')
+                brace_depth = open_b - close_b
+                entered_body = (open_b > 0)
+                if entered_body and brace_depth <= 0:
+                    # Single-line function
+                    functions.append(FunctionRange(current_fn_start_line, line_no, current_fn_name))
+                    current_fn_name = None
+                    current_fn_start_line = None
+                    brace_depth = 0
+                    entered_body = False
+        else:
+            open_b = clean_text.count('{')
+            close_b = clean_text.count('}')
+            if not entered_body:
+                if open_b > 0:
+                    entered_body = True
+                    brace_depth = open_b - close_b
+                elif is_function_entry_text(text) and not clean_text.startswith('('):
+                    # Previous function signature had no body
+                    fn_name = extract_function_name(text)
+                    functions.append(FunctionRange(current_fn_start_line, raw_lines[idx - 1]["line_no"], current_fn_name))
+                    current_fn_name = fn_name
+                    current_fn_start_line = line_no
+                    brace_depth = open_b - close_b
+                    entered_body = (open_b > 0)
+            else:
+                brace_depth += (open_b - close_b)
+
+            if entered_body and brace_depth <= 0:
+                functions.append(FunctionRange(current_fn_start_line, line_no, current_fn_name))
+                current_fn_name = None
+                current_fn_start_line = None
+                brace_depth = 0
+                entered_body = False
+
+    if current_fn_start_line is not None and raw_lines:
+        functions.append(FunctionRange(current_fn_start_line, raw_lines[-1]["line_no"], current_fn_name))
+
+    return functions
 
 
 def parse_source_lines_from_gcov_html(
@@ -189,6 +388,7 @@ def parse_source_lines_from_gcov_html(
     analysis_records: Optional[List[Dict[str, Any]]] = None,
     review_scope: str = "full",
     incremental_line_numbers: Optional[Set[int]] = None,
+    report_id: str = "",
 ) -> SourceContext:
     r"""
     Parse an LCOV HTML report (.gcov.html) into a structured SourceContext.
@@ -206,7 +406,7 @@ def parse_source_lines_from_gcov_html(
 
     raw_lines = []
     # Fast pattern detection
-    if 'id="L' in content or 'id=\'L' in content:
+    if 'id="L' in content or "id='L" in content:
         # Modern genhtml pattern: <span id="L1" ...>
         modern_pattern = re.compile(r'<span\b[^>]*\bid=["\']L(\d+)["\'][^>]*>(.*?)</span>', re.S | re.I)
         for match in modern_pattern.finditer(content):
@@ -272,30 +472,8 @@ def parse_source_lines_from_gcov_html(
     # Ensure continuous 1..N
     raw_lines.sort(key=lambda item: item["line_no"])
 
-    # Extract function ranges
-    function_ranges: List[FunctionRange] = []
-    current_fn_start = None
-    for index, item in enumerate(raw_lines):
-        if is_function_entry_text(item["code_text"]):
-            if current_fn_start is not None:
-                fn_name = extract_function_name(raw_lines[current_fn_start]["code_text"])
-                function_ranges.append(
-                    FunctionRange(
-                        raw_lines[current_fn_start]["line_no"],
-                        raw_lines[index - 1]["line_no"],
-                        fn_name,
-                    )
-                )
-            current_fn_start = index
-    if current_fn_start is not None and raw_lines:
-        fn_name = extract_function_name(raw_lines[current_fn_start]["code_text"])
-        function_ranges.append(
-            FunctionRange(
-                raw_lines[current_fn_start]["line_no"],
-                raw_lines[-1]["line_no"],
-                fn_name,
-            )
-        )
+    # Extract accurate function ranges via brace-aware parser
+    function_ranges = extract_c_function_ranges(raw_lines)
 
     # Attach function_name to lines efficiently O(N)
     line_map = {item["line_no"]: item for item in raw_lines}
@@ -317,89 +495,105 @@ def parse_source_lines_from_gcov_html(
         if not is_uncov or line_no in counted:
             continue
 
-        block = [item]
-        b_type = (
-            "function_entry"
-            if is_function_entry_text(item["code_text"])
-            else "control_flow"
-            if is_control_flow_text(item["code_text"])
-            else "single"
-        )
+        if is_control_flow_text(item["code_text"]):
+            block_map[line_no] = (line_no, line_no, "control_flow", True)
+            counted.add(line_no)
+        else:
+            # Build semantic block
+            block_lines = [item]
+            start_is_fn = is_function_entry_text(item["code_text"])
+            consumed_until = index
 
-        if b_type != "control_flow":
-            if b_type == "single":
-                b_type = "straight_line"
-            for next_item in raw_lines[index + 1:]:
-                if is_control_flow_text(next_item["code_text"]) or is_function_entry_text(next_item["code_text"]):
+            for j in range(index + 1, len(raw_lines)):
+                next_item = raw_lines[j]
+                if next_item["coverage_state"] == "covered":
                     break
-                next_uncov = next_item["is_uncovered"]
-                if review_scope == "incremental" and not next_item["is_incremental"]:
-                    next_uncov = False
 
-                if next_uncov:
-                    if b_type == "function_entry" and not is_simple_auto_group_text(next_item["code_text"]):
+                next_is_uncov = next_item["is_uncovered"]
+                if review_scope == "incremental" and not next_item["is_incremental"]:
+                    next_is_uncov = False
+
+                if next_is_uncov:
+                    if is_control_flow_text(next_item["code_text"]) or is_function_entry_text(next_item["code_text"]):
                         break
-                    if b_type != "function_entry" and (
+                    if start_is_fn and not is_simple_auto_group_text(next_item["code_text"]):
+                        break
+                    if not start_is_fn and (
                         not is_simple_auto_group_text(item["code_text"])
                         or not is_simple_auto_group_text(next_item["code_text"])
                     ):
                         break
-                    block.append(next_item)
+                    block_lines.append(next_item)
+                    consumed_until = j
                     continue
-                if b_type != "function_entry":
+
+                if not start_is_fn:
                     break
+                if is_control_flow_text(next_item["code_text"]) or is_function_entry_text(next_item["code_text"]):
+                    break
+                if start_is_fn and not is_structural_text(next_item["code_text"]):
+                    continue
                 if not is_structural_text(next_item["code_text"]):
                     break
 
-        b_start = block[0]["line_no"]
-        b_end = block[-1]["line_no"]
-        for b_idx, b_item in enumerate(block):
-            b_lno = b_item["line_no"]
-            counted.add(b_lno)
-            block_map[b_lno] = (b_start, b_end, b_type, b_idx == 0)
+            start_l = block_lines[0]["line_no"]
+            end_l = block_lines[-1]["line_no"]
+            b_type = "function_body" if start_is_fn else "sequential"
+            for b_idx, bl in enumerate(block_lines):
+                bl_no = bl["line_no"]
+                block_map[bl_no] = (start_l, end_l, b_type, b_idx == 0)
+                counted.add(bl_no)
 
-    # Build final SourceLineDTO list
-    final_lines: List[SourceLineDTO] = []
+    # Build SourceLineDTO list
+    dto_lines: List[SourceLineDTO] = []
     pending_lines: List[int] = []
+    total_uncovered_count = 0
+    confirmed_count = 0
 
     for item in raw_lines:
         line_no = item["line_no"]
-        b_info = block_map.get(line_no, (line_no, line_no, "single", False))
-        b_start, b_end, b_type, is_entry = b_info
+        cov_state = item["coverage_state"]
+        if review_scope == "incremental" and not item["is_incremental"] and cov_state == "uncovered":
+            cov_state = "ignored"
 
-        # Check DB analysis record
-        db_rec = analysis_map.get(line_no, {})
-        status = db_rec.get("status") or "未确认"
-        reviewer = db_rec.get("reviewer") or ""
-        is_draft = bool(db_rec.get("is_draft", False))
-        cov_method = db_rec.get("coverage_method") or ""
-        uncov_reason = db_rec.get("uncovered_reason") or ""
+        if cov_state == "uncovered":
+            total_uncovered_count += 1
 
-        # Determine pending analysis:
-        # Line is uncovered (or incremental uncovered) AND not confirmed in DB
-        line_is_uncovered = item["is_uncovered"]
-        if review_scope == "incremental":
-            line_is_uncovered = line_is_uncovered and item["is_incremental"]
+        rec = analysis_map.get(line_no)
+        analysis_state = rec.get("status") if rec else "未确认"
+        is_draft = bool(rec.get("is_draft", False)) if rec else False
+        fill_status = rec.get("fill_status", "已填写" if rec and rec.get("status") else "未填写") if rec else "未填写"
+        reviewer = rec.get("reviewer", "") if rec else ""
+        coverage_method = rec.get("coverage_method", "") if rec else ""
+        uncovered_reason = rec.get("uncovered_reason", "") if rec else ""
 
-        is_pending = False
-        if line_is_uncovered:
-            if status not in CONFIRMED_STATUS_SET or is_draft:
-                is_pending = True
+        is_pending = is_line_pending_analysis(
+            coverage_state=cov_state,
+            analysis_state=analysis_state,
+            is_draft=is_draft,
+            fill_status=fill_status,
+        )
 
         if is_pending:
             pending_lines.append(line_no)
+        elif cov_state == "uncovered" and analysis_state in CONFIRMED_STATUS_SET and not is_draft:
+            confirmed_count += 1
 
-        final_lines.append(
+        b_start, b_end, b_type, is_entry = block_map.get(
+            line_no, (line_no, line_no, "single", cov_state == "uncovered")
+        )
+
+        dto_lines.append(
             SourceLineDTO(
                 line_no=line_no,
                 source=item["code_text"],
                 raw_html=item["raw_html"],
-                coverage_state=item["coverage_state"],
-                analysis_state=status,
+                coverage_state=cov_state,
+                analysis_state=analysis_state,
                 is_pending_analysis=is_pending,
                 reviewer=reviewer,
-                coverage_method=cov_method,
-                uncovered_reason=uncov_reason,
+                coverage_method=coverage_method,
+                uncovered_reason=uncovered_reason,
                 is_draft=is_draft,
                 block_start_line=b_start,
                 block_end_line=b_end,
@@ -412,64 +606,91 @@ def parse_source_lines_from_gcov_html(
     return SourceContext(
         project_name=project_name,
         file_path=file_path,
-        lines=final_lines,
+        lines=dto_lines,
         function_ranges=function_ranges,
         pending_lines=pending_lines,
+        total_uncovered_count=total_uncovered_count,
+        confirmed_count=confirmed_count,
+        report_id=report_id,
     )
 
 
 def read_source_lines(
-    source_context: SourceContext,
-    start_line: int,
-    end_line: int,
+    source_context: SourceContext, start_line: int, end_line: int
 ) -> List[Dict[str, Any]]:
     """
-    Read code lines in range [start_line, end_line] (1-indexed inclusive).
-    Validates range against total_lines.
+    Read line DTOs for a single contiguous range [start_line, end_line].
+    Validates boundary conditions and returns serialized line dictionaries.
     """
-    if not source_context:
-        raise ValueError("source_context is required")
-
     total = source_context.total_lines
     start_line = int(start_line)
     end_line = int(end_line)
 
     if start_line <= 0 or end_line <= 0:
-        raise ValueError(f"Invalid line range: start={start_line}, end={end_line} (must be > 0)")
+        raise ValueError(f"Line numbers must be positive: start={start_line}, end={end_line}")
     if start_line > end_line:
-        raise ValueError(f"Invalid line range: start={start_line} > end={end_line}")
+        raise ValueError(f"start_line ({start_line}) cannot be greater than end_line ({end_line})")
     if total > 0 and (start_line > total or end_line > total):
-        raise ValueError(f"Line range [{start_line}, {end_line}] exceeds total lines {total}")
+        raise ValueError(f"Requested range [{start_line}..{end_line}] exceeds total lines {total}")
 
-    # 1-indexed slice
-    sliced = source_context.lines[start_line - 1:end_line]
-    return [line.to_dict() for line in sliced]
+    sliced_dtos = source_context.lines[start_line - 1:end_line]
+    return [dto.to_dict() for dto in sliced_dtos]
 
 
 def read_source_ranges(
     source_context: SourceContext,
     ranges: List[Dict[str, int]],
-    max_ranges: int = 100,
+    max_ranges: int = 1000,
 ) -> List[Dict[str, Any]]:
     """
-    Read multiple code ranges in one operation.
-    Validates maximum range count and each individual range.
+    Read line DTOs for multiple ranges in a single batch.
+    Returns: [{'start_line': s, 'end_line': e, 'lines': [SourceLineDTO.to_dict(), ...]}, ...]
     """
-    if not isinstance(ranges, list):
-        raise ValueError("ranges must be a list")
+    if not ranges:
+        return []
     if len(ranges) > max_ranges:
-        raise ValueError(f"Too many ranges requested (max={max_ranges})")
+        raise ValueError(f"Requested ranges count {len(ranges)} exceeds maximum allowed {max_ranges}")
 
-    result = []
+    results = []
     for r in ranges:
-        if not isinstance(r, dict):
-            raise ValueError("Each range item must be an object with start_line and end_line")
         s_line = int(r.get("start_line", 0))
         e_line = int(r.get("end_line", 0))
-        lines = read_source_lines(source_context, s_line, e_line)
-        result.append({
+        lines_data = read_source_lines(source_context, s_line, e_line)
+        results.append({
             "start_line": s_line,
             "end_line": e_line,
-            "lines": lines,
+            "lines": lines_data,
         })
-    return result
+    return results
+
+
+def save_source_sidecar(
+    output_dir: str,
+    report_id: str,
+    file_path_hash: str,
+    source_context: SourceContext,
+) -> str:
+    """Serialize SourceContext to a server-side sidecar file in .source_cache directory."""
+    cache_dir = os.path.join(output_dir, ".source_cache", report_id)
+    os.makedirs(cache_dir, exist_ok=True)
+    sidecar_path = os.path.join(cache_dir, f"{file_path_hash}.source.json")
+    with open(sidecar_path, "w", encoding="utf-8") as f:
+        json.dump(source_context.to_dict(), f, ensure_ascii=False)
+    return sidecar_path
+
+
+def load_source_sidecar(
+    output_dir: str,
+    report_id: str,
+    file_path_hash: str,
+) -> Optional[SourceContext]:
+    """Load SourceContext from a server-side sidecar file if present."""
+    sidecar_path = os.path.join(output_dir, ".source_cache", report_id, f"{file_path_hash}.source.json")
+    if os.path.isfile(sidecar_path):
+        try:
+            with open(sidecar_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return SourceContext.from_dict(data)
+        except Exception as e:
+            logger.warning(f"[SourceReader] Failed to load sidecar {sidecar_path}: {e}")
+    return None

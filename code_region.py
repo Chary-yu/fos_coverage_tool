@@ -144,7 +144,9 @@ def sanitize_function_ranges(
 
 
 def find_function_containing_line(
-    line_number: int, sorted_function_ranges: List[FunctionRange]
+    line_number: int,
+    sorted_function_ranges: List[FunctionRange],
+    start_lines: Optional[List[int]] = None,
 ) -> Optional[FunctionRange]:
     """
     Find the function containing line_number in O(log F) time.
@@ -153,20 +155,23 @@ def find_function_containing_line(
     if not sorted_function_ranges:
         return None
 
-    start_lines = [fn.start_line for fn in sorted_function_ranges]
+    if start_lines is None:
+        start_lines = [fn.start_line for fn in sorted_function_ranges]
+
     idx = bisect_right(start_lines, line_number)
-
-    candidates = []
-    for i in range(idx - 1, -1, -1):
-        fn = sorted_function_ranges[i]
-        if fn.contains(line_number):
-            candidates.append(fn)
-
-    if not candidates:
+    if idx == 0:
         return None
 
-    candidates.sort(key=lambda fn: (fn.end_line - fn.start_line, -fn.start_line))
-    return candidates[0]
+    cand = sorted_function_ranges[idx - 1]
+    if cand.contains(line_number):
+        return cand
+
+    for i in range(idx - 2, -1, -1):
+        fn = sorted_function_ranges[i]
+        if fn.contains(line_number):
+            return fn
+
+    return None
 
 
 def build_code_regions(
@@ -208,88 +213,108 @@ def build_code_regions(
             )
         ]
 
-    sorted_functions = sanitize_function_ranges(function_ranges, total_lines=total_lines)
+    valid_functions = sanitize_function_ranges(function_ranges, total_lines)
+    start_lines = [fn.start_line for fn in valid_functions]
 
-    raw_expanded: List[Tuple[int, int, Optional[str]]] = []
+    # Map pending lines to expanded ranges via fast two-pointer sweep + O(log F) bisect fallback
+    raw_expanded_ranges: List[Tuple[int, int, str, Optional[str]]] = []
+    fn_idx = 0
+    num_fns = len(valid_functions)
+
     for line in valid_pending:
-        fn = find_function_containing_line(line, sorted_functions)
-        if fn:
-            raw_expanded.append((fn.start_line, fn.end_line, fn.name))
+        while fn_idx + 1 < num_fns and valid_functions[fn_idx + 1].start_line <= line:
+            fn_idx += 1
+
+        matched_fn = None
+        if num_fns > 0:
+            cand = valid_functions[fn_idx]
+            if cand.contains(line):
+                matched_fn = cand
+            else:
+                matched_fn = find_function_containing_line(line, valid_functions, start_lines)
+
+        if matched_fn is not None:
+            label = matched_fn.name if matched_fn.name else None
+            raw_expanded_ranges.append((matched_fn.start_line, matched_fn.end_line, "analysis", label))
         else:
-            start_l = max(1, line - fallback_context)
-            end_l = min(total_lines, line + fallback_context)
-            raw_expanded.append((start_l, end_l, None))
+            s_line = max(1, line - fallback_context)
+            e_line = min(total_lines, line + fallback_context)
+            raw_expanded_ranges.append((s_line, e_line, "analysis", None))
 
-    raw_expanded.sort(key=lambda item: (item[0], item[1]))
+    # Sort raw expanded ranges by start_line
+    raw_expanded_ranges.sort(key=lambda item: (item[0], item[1]))
 
-    merged_expanded: List[Tuple[int, int, Optional[str]]] = []
-    for cur_start, cur_end, cur_label in raw_expanded:
+    # Merge overlapping or close (gap <= max_merge_gap) expanded ranges
+    merged_expanded: List[Tuple[int, int, str, Optional[str]]] = []
+    for cur_start, cur_end, cur_kind, cur_label in raw_expanded_ranges:
         if not merged_expanded:
-            merged_expanded.append((cur_start, cur_end, cur_label))
+            merged_expanded.append((cur_start, cur_end, cur_kind, cur_label))
             continue
 
-        prev_start, prev_end, prev_label = merged_expanded[-1]
+        prev_start, prev_end, prev_kind, prev_label = merged_expanded[-1]
 
-        # gap between prev_end and cur_start:
-        # e.g. prev_end=180, cur_start=201 -> gap = 201 - 180 - 1 = 20
+        # Calculate gap: next_start - cur_end - 1
         gap = cur_start - prev_end - 1
-
         if gap <= max_merge_gap:
+            # Merge
             new_end = max(prev_end, cur_end)
-            labels = []
-            if prev_label:
-                labels.append(prev_label)
-            if cur_label and cur_label not in labels:
-                labels.append(cur_label)
-            new_label = ", ".join(labels) if labels else None
-
-            merged_expanded[-1] = (prev_start, new_end, new_label)
+            if prev_label and cur_label and prev_label != cur_label:
+                new_label = f"{prev_label}, {cur_label}" if not prev_label.endswith("等") else prev_label
+                if len(new_label) > 40:
+                    first_fn = prev_label.split(",")[0].strip()
+                    new_label = f"{first_fn} 等"
+            else:
+                new_label = prev_label or cur_label
+            merged_expanded[-1] = (prev_start, new_end, "analysis", new_label)
         else:
-            merged_expanded.append((cur_start, cur_end, cur_label))
+            merged_expanded.append((cur_start, cur_end, cur_kind, cur_label))
 
-    regions: List[CodeRegion] = []
-    cursor = 1
+    # Fill collapsed regions between expanded ranges to form continuous 1..total_lines coverage
+    final_regions: List[CodeRegion] = []
+    current_cursor = 1
 
-    for start_l, end_l, label in merged_expanded:
-        start_l = max(1, start_l)
-        end_l = min(total_lines, end_l)
-
-        if start_l > cursor:
-            collapsed_start = cursor
-            collapsed_end = start_l - 1
-            regions.append(
+    for exp_start, exp_end, exp_kind, exp_label in merged_expanded:
+        if exp_start > current_cursor:
+            # Collapsed region before current expanded region
+            col_start = current_cursor
+            col_end = exp_start - 1
+            final_regions.append(
                 CodeRegion(
-                    region_id=f"region-{collapsed_start}-{collapsed_end}",
-                    start_line=collapsed_start,
-                    end_line=collapsed_end,
+                    region_id=f"region-{col_start}-{col_end}",
+                    start_line=col_start,
+                    end_line=col_end,
                     default_state="collapsed",
                     kind="collapsed",
                     label=None,
                 )
             )
 
-        regions.append(
+        # Add expanded region
+        final_regions.append(
             CodeRegion(
-                region_id=f"region-{start_l}-{end_l}",
-                start_line=start_l,
-                end_line=end_l,
+                region_id=f"region-{exp_start}-{exp_end}",
+                start_line=exp_start,
+                end_line=exp_end,
                 default_state="expanded",
-                kind="analysis",
-                label=label,
+                kind=exp_kind,
+                label=exp_label,
             )
         )
-        cursor = end_l + 1
+        current_cursor = exp_end + 1
 
-    if cursor <= total_lines:
-        regions.append(
+    # Trailing collapsed region if needed
+    if current_cursor <= total_lines:
+        col_start = current_cursor
+        col_end = total_lines
+        final_regions.append(
             CodeRegion(
-                region_id=f"region-{cursor}-{total_lines}",
-                start_line=cursor,
-                end_line=total_lines,
+                region_id=f"region-{col_start}-{col_end}",
+                start_line=col_start,
+                end_line=col_end,
                 default_state="collapsed",
                 kind="collapsed",
                 label=None,
             )
         )
 
-    return regions
+    return final_regions

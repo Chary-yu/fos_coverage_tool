@@ -11,7 +11,9 @@
 }
 
 /* 强制使每一行代码容器成为独占整行的浮动块，确保控件完美在右侧本行对齐 */
-pre.source > span[id^="L"] {
+pre.source > span[id^="L"],
+.coverage-line-span {
+    display: block !important;
     float: left !important;
     width: 100% !important;
     box-sizing: border-box !important;
@@ -22,7 +24,8 @@ pre.source > span[id^="L"] {
 }
 
 /* 浮动元素会导致父容器高度塌陷，使用伪元素完美闭合清除浮动 */
-pre.source::after {
+pre.source::after,
+.coverage-region-lines::after {
     content: "" !important;
     display: table !important;
     clear: both !important;
