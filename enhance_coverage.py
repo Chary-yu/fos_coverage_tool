@@ -2054,6 +2054,20 @@ def write_progress_page_targets(output_dir, real_output_html, review_scope="full
         )
 
 
+def is_mysql_configured(config=None):
+    """Return True if MySQL database settings (host, etc.) are present in config and PyMySQL driver is loaded."""
+    if db_module is None:
+        return False
+    cfg = config
+    if cfg is None:
+        try:
+            cfg = load_config()
+        except Exception:
+            cfg = {}
+    mysql_cfg = (cfg or {}).get("mysql") or {}
+    return bool(str(mysql_cfg.get("host") or "").strip())
+
+
 class DatabaseManager:
     """MySQL 数据库管理层，处理连接、建库、建表以及存取操作"""
     def __init__(self, config, exit_on_error=True, init_schema=True):
@@ -4005,8 +4019,12 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
             if not project_name:
                 self.send_error_response(400, "Missing 'project' parameter")
                 return
+            cfg = load_config()
+            if not is_mysql_configured(cfg):
+                self.send_error_response(503, "Database is not configured for unanalyzed counts API")
+                return
             try:
-                counts_map, ver = get_incremental_unanalyzed_counts(project_name, config=load_config())
+                counts_map, ver = get_incremental_unanalyzed_counts(project_name, config=cfg)
                 file_list = [
                     {"file_path": fpath, "unanalyzed": count}
                     for fpath, count in counts_map.items()
@@ -4023,7 +4041,7 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 })
             except Exception as err:
                 print("[Incremental Unanalyzed API] Failed for project '{}': {}".format(project_name, err), flush=True)
-                self.send_error_response(500, "Failed to query incremental unanalyzed counts")
+                self.send_error_response(500, "Database query for unanalyzed counts failed: {}".format(err))
                 return
         elif parsed_url.path == "/api/coverage":
             project_name = query_params.get("project", [""])[0]
@@ -4702,22 +4720,29 @@ _incremental_unanalyzed_cache = {}
 _incremental_unanalyzed_cache_lock = threading.Lock()
 
 
-def query_incremental_unanalyzed_counts(db_mgr, project_name):
+def query_incremental_unanalyzed_counts(db_mgr, project_name, config=None):
     """Query DB for unanalyzed line counts per normalized file path.
     Does NOT rely on Connection context manager (__enter__) for legacy PyMySQL compatibility.
-    Raises exception on database failure.
+    Raises exception on database failure if MySQL is configured.
     """
-    if db_mgr is None or db_module is None or not getattr(db_mgr, "conn", None):
+    is_configured = is_mysql_configured(config)
+    conn = getattr(db_mgr, "conn", None) if db_mgr else None
+    if not conn:
+        if is_configured:
+            raise RuntimeError("Database connection to MySQL is configured but currently unavailable")
         return {}
 
-    conn = db_mgr.conn
     try:
         if hasattr(conn, "ping"):
             conn.ping(reconnect=True)
-    except Exception:
-        pass
+    except Exception as ping_err:
+        if is_configured:
+            raise RuntimeError("Database ping failed for configured MySQL database: {}".format(ping_err))
 
-    if not getattr(db_mgr, "conn", None):
+    conn = getattr(db_mgr, "conn", None) if db_mgr else None
+    if not conn:
+        if is_configured:
+            raise RuntimeError("Database connection to MySQL was lost during ping")
         return {}
 
     cursor = conn.cursor()
@@ -4754,13 +4779,20 @@ def query_incremental_unanalyzed_counts(db_mgr, project_name):
         err_msg = str(err).lower()
         if "doesn't exist" in err_msg or "does not exist" in err_msg or "no such table" in err_msg:
             return {}
+        if is_configured:
+            raise RuntimeError("Database query failed for configured MySQL database: {}".format(err))
         raise
     finally:
-        cursor.close()
+        try:
+            cursor.close()
+        except Exception:
+            pass
 
 
 def get_incremental_unanalyzed_counts(project_name, db_mgr=None, config=None):
-    """Fetch unanalyzed counts per file for project_name, utilizing data_version caching."""
+    """Fetch unanalyzed counts per file for project_name, utilizing data_version caching.
+    Guarantees failed database queries are NOT saved to cache.
+    """
     if db_mgr is None:
         db_mgr = get_thread_db_manager(config)
 
@@ -4771,7 +4803,7 @@ def get_incremental_unanalyzed_counts(project_name, db_mgr=None, config=None):
         if cached and cached.get("version") == current_ver:
             return cached["data"], current_ver
 
-    counts_map = query_incremental_unanalyzed_counts(db_mgr, project_name)
+    counts_map = query_incremental_unanalyzed_counts(db_mgr, project_name, config=config)
 
     with _incremental_unanalyzed_cache_lock:
         _incremental_unanalyzed_cache[project_name] = {
@@ -4792,25 +4824,41 @@ def sync_incremental_unanalyzed_counts(project_name, result, config=None):
         key = (item.get("repository", ""), item.get("review_file_path") or item["file_path"])
         details_by_file.setdefault(key, []).append(item)
 
-    db_mgr = get_thread_db_manager(config)
+    cfg = load_config() if config is None else config
+    is_configured = is_mysql_configured(cfg)
+    db_mgr = get_thread_db_manager(cfg)
     is_db_active = db_mgr and db_mgr.is_available()
 
-    if is_db_active:
+    if is_configured:
+        if not is_db_active:
+            raise RuntimeError("MySQL is configured for project '{}', but database connection is unavailable".format(project_name))
         try:
-            unanalyzed_by_file, _ = get_incremental_unanalyzed_counts(project_name, db_mgr=db_mgr, config=config)
+            unanalyzed_by_file, _ = get_incremental_unanalyzed_counts(project_name, db_mgr=db_mgr, config=cfg)
         except Exception as err:
-            print("[Error] Failed to query incremental unanalyzed counts from database: {}".format(err), flush=True)
+            print("[Error] Failed to query incremental unanalyzed counts for project '{}': {}".format(project_name, err), flush=True)
             raise RuntimeError("Database query for incremental unanalyzed counts failed: {}".format(err))
     else:
         # Standalone / Demo mode without DB
         unanalyzed_by_file = {}
 
     total_unanalyzed = 0
+    matched_count = 0
+    path_miss_count = 0
     for repository_name, review_file_path in sorted(details_by_file):
         items = details_by_file[(repository_name, review_file_path)]
         uncovered_count = sum(1 for item in items if item.get("status") == coverage_check.STATUS_UNCOVERED)
         file_key = _normalize_ownership_path(review_file_path)
-        total_unanalyzed += unanalyzed_by_file.get(file_key, uncovered_count)
+        if file_key in unanalyzed_by_file:
+            matched_count += 1
+            total_unanalyzed += unanalyzed_by_file[file_key]
+        else:
+            if is_configured and is_db_active and unanalyzed_by_file:
+                path_miss_count += 1
+                print("[WARNING] Path miss for unanalyzed counts: '{}' (repository: '{}'), defaulting to uncovered count ({})".format(file_key, repository_name, uncovered_count), flush=True)
+            total_unanalyzed += uncovered_count
+
+    if is_configured and is_db_active:
+        print("[Unanalyzed Sync] Project '{}': Matched {} file(s), missed {} file(s) against MySQL line index.".format(project_name, matched_count, path_miss_count), flush=True)
 
     summary["unanalyzed"] = total_unanalyzed
     return unanalyzed_by_file

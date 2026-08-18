@@ -678,15 +678,18 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         mock_mgr = unittest.mock.MagicMock()
         mock_mgr.is_available.return_value = True
 
-        with unittest.mock.patch.object(enhance_coverage, "get_thread_db_manager", return_value=mock_mgr), \
+        mock_config = {"mysql": {"host": "127.0.0.1", "port": 3306}}
+        with unittest.mock.patch.object(enhance_coverage, "db_module", object()), \
+             unittest.mock.patch.object(enhance_coverage, "get_thread_db_manager", return_value=mock_mgr), \
              unittest.mock.patch.object(enhance_coverage, "get_incremental_unanalyzed_counts", side_effect=RuntimeError("MySQL disconnected")):
             with self.assertRaises(RuntimeError):
-                enhance_coverage.sync_incremental_unanalyzed_counts("FOS_V6R2", sample_result)
+                enhance_coverage.sync_incremental_unanalyzed_counts("FOS_V6R2", sample_result, config=mock_config)
 
     def test_api_incremental_unanalyzed_success(self):
         """Test 6: Verify GET /api/coverage/incremental/unanalyzed returns success JSON."""
         counts = {"/src/a.c": 3, "/src/b.c": 0}
-        with unittest.mock.patch.object(enhance_coverage, "get_incremental_unanalyzed_counts", return_value=(counts, 42)):
+        with unittest.mock.patch.object(enhance_coverage, "is_mysql_configured", return_value=True), \
+             unittest.mock.patch.object(enhance_coverage, "get_incremental_unanalyzed_counts", return_value=(counts, 42)):
             handler = unittest.mock.MagicMock()
             handler.path = "/api/coverage/incremental/unanalyzed?project=FOS_V6R2"
             sent_data = {}
@@ -703,7 +706,8 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
 
     def test_api_incremental_unanalyzed_db_failure(self):
         """Test 7: Verify GET /api/coverage/incremental/unanalyzed returns 500 when DB query fails."""
-        with unittest.mock.patch.object(enhance_coverage, "get_incremental_unanalyzed_counts", side_effect=RuntimeError("DB Connection Lost")):
+        with unittest.mock.patch.object(enhance_coverage, "is_mysql_configured", return_value=True), \
+             unittest.mock.patch.object(enhance_coverage, "get_incremental_unanalyzed_counts", side_effect=RuntimeError("DB Connection Lost")):
             handler = unittest.mock.MagicMock()
             handler.path = "/api/coverage/incremental/unanalyzed?project=FOS_V6R2"
             sent_error = {}
@@ -762,6 +766,94 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
 
         self.assertIn('unanalyzed: 9', js_content)
 
+    def test_configured_mysql_connection_failure_raises_runtime_error(self):
+        """Test 11: Verify fail-closed behavior when MySQL is configured but connection fails."""
+        sample_result = {
+            "summary": {"uncovered": 10, "unanalyzed": 10},
+            "details": [
+                {"repository": "ssf", "file_path": "a.c", "status": coverage_check.STATUS_UNCOVERED},
+            ]
+        }
+        mock_config = {"mysql": {"host": "127.0.0.1", "port": 3306, "user": "root", "database": "coverage"}}
+        mock_mgr = unittest.mock.MagicMock()
+        mock_mgr.is_available.return_value = False  # Connection failed / missing
+
+        with unittest.mock.patch.object(enhance_coverage, "db_module", object()), \
+             unittest.mock.patch.object(enhance_coverage, "get_thread_db_manager", return_value=mock_mgr):
+            with self.assertRaises(RuntimeError) as cm:
+                enhance_coverage.sync_incremental_unanalyzed_counts("FOS_V6R2", sample_result, config=mock_config)
+            self.assertIn("MySQL is configured", str(cm.exception))
+
+    def test_failed_db_query_does_not_pollute_cache(self):
+        """Test 12: Verify failed DB query does NOT write empty failure dict to _incremental_unanalyzed_cache."""
+        mock_config = {"mysql": {"host": "127.0.0.1", "port": 3306}}
+        mock_mgr = unittest.mock.MagicMock()
+        mock_mgr.conn = None  # Connection lost
+
+        with unittest.mock.patch.object(enhance_coverage, "db_module", object()), \
+             unittest.mock.patch.object(enhance_coverage, "get_project_data_version", return_value=99):
+            # Ensure cache is clean for test project
+            with enhance_coverage._incremental_unanalyzed_cache_lock:
+                enhance_coverage._incremental_unanalyzed_cache.pop("TEST_CACHE_PROJ", None)
+
+            with self.assertRaises(RuntimeError):
+                enhance_coverage.get_incremental_unanalyzed_counts("TEST_CACHE_PROJ", db_mgr=mock_mgr, config=mock_config)
+
+            with enhance_coverage._incremental_unanalyzed_cache_lock:
+                self.assertNotIn("TEST_CACHE_PROJ", enhance_coverage._incremental_unanalyzed_cache)
+
+    def test_unconfigured_mysql_standalone_demo_mode_defaults_gracefully(self):
+        """Test 13: Verify standalone demo mode (empty mysql host) gracefully defaults unanalyzed to uncovered count."""
+        sample_result = {
+            "summary": {"uncovered": 5, "unanalyzed": 5},
+            "details": [
+                {"repository": "ssf", "file_path": "a.c", "status": coverage_check.STATUS_UNCOVERED},
+            ]
+        }
+        mock_config = {"mysql": {"host": "", "port": 3306}}  # Unconfigured host
+        mock_mgr = unittest.mock.MagicMock()
+        mock_mgr.is_available.return_value = False
+
+        with unittest.mock.patch.object(enhance_coverage, "get_thread_db_manager", return_value=mock_mgr):
+            unanalyzed_map = enhance_coverage.sync_incremental_unanalyzed_counts("DEMO_PROJ", sample_result, config=mock_config)
+            self.assertEqual(unanalyzed_map, {})
+            self.assertEqual(sample_result["summary"]["unanalyzed"], 1)
+
+    def test_path_miss_logs_warning_and_diagnostic_summary(self):
+        """Test 14: Verify single-file path miss logs explicit warning and summary diagnostic count."""
+        sample_result = {
+            "summary": {"uncovered": 5, "unanalyzed": 5},
+            "details": [
+                {"repository": "ssf", "file_path": "matched.c", "status": coverage_check.STATUS_UNCOVERED},
+                {"repository": "ssf", "file_path": "missed.c", "status": coverage_check.STATUS_UNCOVERED},
+            ]
+        }
+        mock_config = {"mysql": {"host": "127.0.0.1", "port": 3306}}
+        mock_mgr = unittest.mock.MagicMock()
+        mock_mgr.is_available.return_value = True
+
+        counts_map = {"matched.c": 3}  # matched.c is present, missed.c is absent
+        with unittest.mock.patch.object(enhance_coverage, "db_module", object()), \
+             unittest.mock.patch.object(enhance_coverage, "get_thread_db_manager", return_value=mock_mgr), \
+             unittest.mock.patch.object(enhance_coverage, "get_incremental_unanalyzed_counts", return_value=(counts_map, 10)), \
+             unittest.mock.patch("builtins.print") as mock_print:
+            unanalyzed_map = enhance_coverage.sync_incremental_unanalyzed_counts("WARN_PROJ", sample_result, config=mock_config)
+            self.assertEqual(sample_result["summary"]["unanalyzed"], 4)  # 3 + 1
+            printed_msgs = [call[0][0] for call in mock_print.call_args_list if call[0]]
+            self.assertTrue(any("[WARNING] Path miss for unanalyzed counts: 'missed.c'" in m for m in printed_msgs))
+            self.assertTrue(any("Matched 1 file(s), missed 1 file(s)" in m for m in printed_msgs))
+
+    def test_frontend_js_refresh_error_sets_tooltip(self):
+        """Test 15: Verify incremental_coverage.js sets tooltip notice and error class on API failure."""
+        js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH
+        with open(js_path, "r", encoding="utf-8") as f:
+            js_content = f.read()
+
+        self.assertIn('totalEl.setAttribute("title", "待分析动态刷新失败，正在显示当前快照数值 (" + (err.message || err) + ")");', js_content)
+        self.assertIn('totalEl.classList.add("refresh-failed")', js_content)
+        self.assertIn('totalEl.removeAttribute("title")', js_content)
+
 
 if __name__ == "__main__":
     unittest.main()
+

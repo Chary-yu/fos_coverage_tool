@@ -381,6 +381,8 @@
                 var totalEl = document.getElementById("incremental-unanalyzed-total");
                 if (totalEl) {
                     totalEl.textContent = total;
+                    totalEl.removeAttribute("title");
+                    if (totalEl.classList) totalEl.classList.remove("refresh-failed");
                 }
 
                 if (currentKey === "unanalyzed" || currentKey === "missing") {
@@ -389,6 +391,11 @@
             })
             .catch(function(err) {
                 isRefreshing = false;
+                var totalEl = document.getElementById("incremental-unanalyzed-total");
+                if (totalEl) {
+                    totalEl.setAttribute("title", "待分析动态刷新失败，正在显示当前快照数值 (" + (err.message || err) + ")");
+                    if (totalEl.classList) totalEl.classList.add("refresh-failed");
+                }
                 console.warn("[Unanalyzed Refresh] API failed:", err);
             });
     }
