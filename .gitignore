@@ -68,3 +68,5 @@ dop_review_test/
 review/
 *.log
 .coverage_demo/
+background_jobs/
+demo_ui_output/

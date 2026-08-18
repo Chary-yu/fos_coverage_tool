@@ -31,6 +31,15 @@ from xml.etree import ElementTree
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import coverage_check
+from code_region import CodeRegion, FunctionRange, build_code_regions
+from source_reader import (
+    SourceContext,
+    SourceLineDTO,
+    parse_source_lines_from_gcov_html,
+    read_source_lines,
+    read_source_ranges,
+)
+from code_detail_service import CodeDetailService, is_safe_relative_path
 
 try:
     from http.server import ThreadingHTTPServer
@@ -3803,6 +3812,31 @@ def build_review_excel_for_dir(project_name, current_dir, total_uncovered,
     }
 
 
+_global_code_detail_service = None
+
+
+def get_code_detail_service(db_mgr=None, search_dirs=None):
+    """Return a configured CodeDetailService instance."""
+    global _global_code_detail_service
+    manager = db_mgr or globals().get("db_manager")
+    dirs = [
+        SCRIPT_DIR,
+        os.path.join(SCRIPT_DIR, "html"),
+        os.path.join(SCRIPT_DIR, "demo_ui_output"),
+        os.path.join(SCRIPT_DIR, ".coverage_demo", "html"),
+        os.path.join(SCRIPT_DIR, "..", "build", "coverage"),
+        os.path.join(SCRIPT_DIR, "..", "build", "coverage_review"),
+    ]
+    if search_dirs:
+        dirs.extend(search_dirs)
+    if _global_code_detail_service is None or _global_code_detail_service.db_manager != manager:
+        _global_code_detail_service = CodeDetailService(db_manager=manager, search_dirs=dirs)
+    else:
+        for d in dirs:
+            _global_code_detail_service.add_search_dir(d)
+    return _global_code_detail_service
+
+
 class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
     """基于 BaseHTTPRequestHandler 的极轻量跨域 API 服务器"""
 
@@ -3850,6 +3884,49 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.send_error_response(404, "Background job not found or expired")
                 return
             self.send_json_response(200, {"status": "success", "job": job})
+        elif parsed_url.path in ("/api/coverage/code-layout", "/api/coverage/layout"):
+            project_name = query_params.get("project", query_params.get("project_name", [""]))[0].strip()
+            file_path = query_params.get("file", query_params.get("file_path", [""]))[0].strip()
+            if not project_name or not file_path:
+                self.send_error_response(400, "Missing 'project' or 'file' parameter")
+                return
+            if not is_safe_relative_path(file_path):
+                self.send_error_response(400, "Invalid or unsafe file path")
+                return
+            try:
+                service = get_code_detail_service()
+                data = service.get_code_layout(project_name, file_path)
+                self.send_json_response(200, {"status": "success", "data": data})
+            except Exception as error:
+                print(f"[CodeLayout] Failed for {file_path}: {error}", flush=True)
+                self.send_error_response(500, f"Failed to get code layout: {error}")
+                return
+        elif parsed_url.path == "/api/coverage/code-lines":
+            project_name = query_params.get("project", query_params.get("project_name", [""]))[0].strip()
+            file_path = query_params.get("file", query_params.get("file_path", [""]))[0].strip()
+            if not project_name or not file_path:
+                self.send_error_response(400, "Missing 'project' or 'file' parameter")
+                return
+            if not is_safe_relative_path(file_path):
+                self.send_error_response(400, "Invalid or unsafe file path")
+                return
+            try:
+                start_line = int(query_params.get("start_line", ["1"])[0])
+                end_line = int(query_params.get("end_line", ["1"])[0])
+            except (ValueError, TypeError):
+                self.send_error_response(400, "Invalid start_line or end_line parameter")
+                return
+            if start_line <= 0 or end_line <= 0 or start_line > end_line:
+                self.send_error_response(400, "Invalid start_line or end_line range")
+                return
+            try:
+                service = get_code_detail_service()
+                data = service.get_code_lines_single(project_name, file_path, start_line, end_line)
+                self.send_json_response(200, {"status": "success", "data": data})
+            except Exception as error:
+                print(f"[CodeLines] Failed for {file_path}: {error}", flush=True)
+                self.send_error_response(500, f"Failed to get code lines: {error}")
+                return
         elif parsed_url.path == "/api/coverage/details":
             project_name = query_params.get("project", [""])[0].strip()
             file_path = query_params.get("file", [""])[0]
@@ -4180,6 +4257,76 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.send_json_response(200, response)
             else:
                 self.send_error_response(500, "Failed to save batch records to database")
+        elif parsed_url.path == "/api/coverage/code-lines/batch":
+            content_length = int(self.headers.get("Content-Length", 0))
+            post_data = self.rfile.read(content_length)
+            try:
+                payload = json.loads(post_data.decode("utf-8"))
+            except ValueError:
+                self.send_error_response(400, "Invalid JSON data")
+                return
+            if not isinstance(payload, dict):
+                self.send_error_response(400, "JSON payload must be an object")
+                return
+            project_name = str(payload.get("project_name") or payload.get("project") or "").strip()
+            file_path = str(payload.get("file_path") or payload.get("file") or "").strip()
+            ranges = payload.get("ranges")
+            if not project_name or not file_path:
+                self.send_error_response(400, "Missing required parameters (project_name, file_path)")
+                return
+            if not is_safe_relative_path(file_path):
+                self.send_error_response(400, "Invalid or unsafe file path")
+                return
+            if not isinstance(ranges, list) or not ranges:
+                self.send_error_response(400, "ranges must be a non-empty array")
+                return
+            if len(ranges) > 100:
+                self.send_error_response(400, "Too many ranges requested (max 100)")
+                return
+            try:
+                service = get_code_detail_service()
+                data = service.get_code_lines_batch(project_name, file_path, ranges)
+                self.send_json_response(200, {"status": "success", "data": data})
+            except Exception as error:
+                print(f"[CodeLinesBatch] Failed for {file_path}: {error}", flush=True)
+                self.send_error_response(500, f"Failed to batch load code lines: {error}")
+                return
+        elif parsed_url.path == "/api/coverage/code-lines":
+            content_length = int(self.headers.get("Content-Length", 0))
+            post_data = self.rfile.read(content_length)
+            try:
+                payload = json.loads(post_data.decode("utf-8"))
+            except ValueError:
+                self.send_error_response(400, "Invalid JSON data")
+                return
+            if not isinstance(payload, dict):
+                self.send_error_response(400, "JSON payload must be an object")
+                return
+            project_name = str(payload.get("project_name") or payload.get("project") or "").strip()
+            file_path = str(payload.get("file_path") or payload.get("file") or "").strip()
+            try:
+                start_line = int(payload.get("start_line", 0))
+                end_line = int(payload.get("end_line", 0))
+            except (ValueError, TypeError):
+                self.send_error_response(400, "Invalid start_line or end_line parameter")
+                return
+            if not project_name or not file_path:
+                self.send_error_response(400, "Missing required parameters (project_name, file_path)")
+                return
+            if not is_safe_relative_path(file_path):
+                self.send_error_response(400, "Invalid or unsafe file path")
+                return
+            if start_line <= 0 or end_line <= 0 or start_line > end_line:
+                self.send_error_response(400, "Invalid start_line or end_line range")
+                return
+            try:
+                service = get_code_detail_service()
+                data = service.get_code_lines_single(project_name, file_path, start_line, end_line)
+                self.send_json_response(200, {"status": "success", "data": data})
+            except Exception as error:
+                print(f"[CodeLines] Failed for {file_path}: {error}", flush=True)
+                self.send_error_response(500, f"Failed to get code lines: {error}")
+                return
         else:
             self.send_error_response(404, "Not Found")
 
