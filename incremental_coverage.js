@@ -356,7 +356,7 @@
             if (window.location.pathname && window.location.pathname.indexOf("/coverage/") === 0) {
                 candidates.push(origin + "/coverage/api/coverage");
             }
-            if (window.location.port && window.location.port !== "9528") {
+            if (window.location.hostname && window.location.port !== "9528") {
                 candidates.push(window.location.protocol + "//" + window.location.hostname + ":9528/api/coverage");
             }
         }
@@ -394,7 +394,14 @@
         isRefreshing = true;
         lastRefreshTime = now;
 
-        var candidates = resolvedApiBase ? [resolvedApiBase].concat(getApiBaseCandidates()) : getApiBaseCandidates();
+        var rawCandidates = resolvedApiBase ? [resolvedApiBase].concat(getApiBaseCandidates()) : getApiBaseCandidates();
+        var candidates = [];
+        for (var k = 0; k < rawCandidates.length; k++) {
+            var candidateItem = rawCandidates[k];
+            if (candidateItem && candidates.indexOf(candidateItem) === -1) {
+                candidates.push(candidateItem);
+            }
+        }
         fetchUnanalyzedFromCandidates(candidates, 0)
             .then(function(resData) {
                 isRefreshing = false;

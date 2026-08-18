@@ -4775,6 +4775,12 @@ def query_incremental_unanalyzed_counts(db_mgr, project_name, config=None):
             elif isinstance(row, (list, tuple)) and len(row) >= 2:
                 fpath = row[0]
                 count = row[1]
+            elif hasattr(row, "__getitem__"):
+                try:
+                    fpath = row[0]
+                    count = row[1]
+                except Exception:
+                    continue
             else:
                 continue
             if fpath:

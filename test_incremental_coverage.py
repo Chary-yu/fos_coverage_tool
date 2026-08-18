@@ -894,8 +894,8 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         self.assertIn("function fetchUnanalyzedFromCandidates(", js_content)
         self.assertIn("resolvedApiBase", js_content)
 
-    def test_e2e_batch_save_decrements_unanalyzed_counts_and_invalidates_cache(self):
-        """Test 19: Full E2E flow testing initial unanalyzed count (10) -> confirm 3 lines -> data_version invalidates cache -> count updates to (7)."""
+    def test_unanalyzed_cache_refreshes_after_data_version_change(self):
+        """Test 19: Verify cache invalidation when data_version changes."""
         project_name = "E2E_REFRESH_TEST"
         mock_config = {"mysql": {"host": "127.0.0.1", "port": 3306}}
         mock_mgr = unittest.mock.MagicMock()
@@ -920,6 +920,122 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
             counts2, ver2 = enhance_coverage.get_incremental_unanalyzed_counts(project_name, db_mgr=mock_mgr, config=mock_config)
             self.assertEqual(ver2, 2)
             self.assertEqual(counts2.get("/src/main.c"), 7)
+
+    def test_true_integration_batch_save_decrements_unanalyzed_counts(self):
+        """Test 20: True integration test with real SQLite database table operations and zero mocked query functions."""
+        import sqlite3
+
+        project_name = "TRUE_INTEG_PROJ"
+        mock_config = {"mysql": {"host": "127.0.0.1", "port": 3306}}
+
+        sqlite_conn = sqlite3.connect(":memory:", check_same_thread=False)
+        sqlite_conn.row_factory = sqlite3.Row
+        cur = sqlite_conn.cursor()
+
+        # Create real database tables
+        cur.execute("""
+            CREATE TABLE coverage_line_index (
+                project_name TEXT, file_path TEXT, file_path_hash TEXT, line_number INTEGER
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE coverage_analysis (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_name TEXT, file_path TEXT, file_path_hash TEXT, source_file_name TEXT,
+                line_number INTEGER, reviewer TEXT, status TEXT, is_draft INTEGER,
+                coverage_method TEXT, uncovered_reason TEXT,
+                UNIQUE(project_name, file_path_hash, line_number)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE coverage_project_data_version (
+                project_name TEXT PRIMARY KEY, data_version INTEGER
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE coverage_project_state (
+                project_name TEXT PRIMARY KEY, data_version INTEGER, updated_at TEXT
+            )
+        """)
+        sqlite_conn.commit()
+
+        # Insert 10 uncovered line index rows for /src/main.c
+        fhash = enhance_coverage.calc_file_path_hash("/src/main.c")
+        for line in range(1, 11):
+            cur.execute(
+                "INSERT INTO coverage_line_index (project_name, file_path, file_path_hash, line_number) VALUES (?, ?, ?, ?)",
+                (project_name, "/src/main.c", fhash, line)
+            )
+        sqlite_conn.commit()
+
+        class SQLiteAdapter:
+            def __init__(self, conn):
+                self.conn = conn
+            def cursor(self):
+                return SQLiteCursorAdapter(self.conn.cursor())
+            def commit(self):
+                self.conn.commit()
+            def rollback(self):
+                self.conn.rollback()
+
+        class SQLiteCursorAdapter:
+            def __init__(self, cursor):
+                self.cursor = cursor
+            def execute(self, sql, params=()):
+                adapted_sql = sql.replace("%s", "?").replace("NOW(6)", "CURRENT_TIMESTAMP")
+                if "ON DUPLICATE KEY UPDATE" in adapted_sql:
+                    if "coverage_project_state" in adapted_sql:
+                        adapted_sql = adapted_sql.split("ON DUPLICATE KEY UPDATE")[0] + "ON CONFLICT(project_name) DO UPDATE SET data_version = coverage_project_state.data_version + 1, updated_at = CURRENT_TIMESTAMP"
+                    else:
+                        adapted_sql = adapted_sql.split("ON DUPLICATE KEY UPDATE")[0] + "ON CONFLICT(project_name, file_path_hash, line_number) DO UPDATE SET file_path=excluded.file_path, reviewer=excluded.reviewer, status=excluded.status, is_draft=excluded.is_draft"
+                self.cursor.execute(adapted_sql, params)
+            def executemany(self, sql, params_seq):
+                adapted_sql = sql.replace("%s", "?").replace("NOW(6)", "CURRENT_TIMESTAMP")
+                if "ON DUPLICATE KEY UPDATE" in adapted_sql:
+                    if "coverage_project_state" in adapted_sql:
+                        adapted_sql = adapted_sql.split("ON DUPLICATE KEY UPDATE")[0] + "ON CONFLICT(project_name) DO UPDATE SET data_version = coverage_project_state.data_version + 1, updated_at = CURRENT_TIMESTAMP"
+                    else:
+                        adapted_sql = adapted_sql.split("ON DUPLICATE KEY UPDATE")[0] + "ON CONFLICT(project_name, file_path_hash, line_number) DO UPDATE SET file_path=excluded.file_path, reviewer=excluded.reviewer, status=excluded.status, is_draft=excluded.is_draft"
+                self.cursor.executemany(adapted_sql, params_seq)
+            def fetchall(self):
+                return self.cursor.fetchall()
+            def fetchone(self):
+                return self.cursor.fetchone()
+            def close(self):
+                self.cursor.close()
+
+        adapter = SQLiteAdapter(sqlite_conn)
+        mock_mgr = enhance_coverage.DatabaseManager.__new__(enhance_coverage.DatabaseManager)
+        mock_mgr.config = mock_config["mysql"]
+        mock_mgr._default_conn = adapter
+        mock_mgr._local = unittest.mock.MagicMock()
+        mock_mgr._local.conn = adapter
+
+        with unittest.mock.patch.object(enhance_coverage, "db_module", object()):
+            # Step 1: Initial query returns 10 unanalyzed lines (version = 1)
+            counts1, ver1 = enhance_coverage.get_incremental_unanalyzed_counts(project_name, db_mgr=mock_mgr, config=mock_config)
+            self.assertEqual(ver1, 1)
+            self.assertEqual(counts1.get(enhance_coverage._normalize_ownership_path("/src/main.c")), 10)
+
+            # Step 2: Save 3 confirmed lines in coverage_analysis DB table
+            blocks = [{
+                "line_numbers": [1, 2, 3],
+                "reviewer": "Reviewer A",
+                "status": "可覆盖",
+                "coverage_method": "单元测试",
+                "uncovered_reason": ""
+            }]
+            save_res = mock_mgr.save_records_batch(project_name, "/src/main.c", blocks, is_draft=False)
+            self.assertIsNotNone(save_res)
+
+            # Step 3: Advance data_version in DB table
+            new_ver = enhance_coverage.increment_project_data_version(project_name, manager=mock_mgr)
+            self.assertEqual(new_ver, 2)
+
+            # Step 4: Query again -> DB tables executed, cache invalidated, returns 7 unanalyzed lines (version = 2)
+            counts2, ver2 = enhance_coverage.get_incremental_unanalyzed_counts(project_name, db_mgr=mock_mgr, config=mock_config)
+            self.assertEqual(ver2, 2)
+            self.assertEqual(counts2.get(enhance_coverage._normalize_ownership_path("/src/main.c")), 7)
 
 
 if __name__ == "__main__":
