@@ -57,7 +57,7 @@ PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "visible-progress-20260817_v9_6"
+ASSET_VERSION = "visible-progress-20260817_v9_7"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 
 
@@ -1565,6 +1565,21 @@ def start_background_job_cleanup_loop():
     t.start()
 
 
+def _cleanup_job_files(job_id):
+    """Clean up orphan CSV, JSON, and temporary .part files for a job_id."""
+    if not job_id:
+        return
+    _ensure_background_jobs_storage_dir()
+    for base in (f"export_{job_id}.csv", f"progress_{job_id}.json"):
+        fpath = os.path.join(BACKGROUND_JOBS_STORAGE_DIR, base)
+        for path in (fpath, fpath + ".part"):
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+
 def recover_background_jobs():
     """On server startup, recover or resubmit interrupted/stale background jobs from DB."""
     if not (db_manager and hasattr(db_manager, "conn") and db_manager.conn):
@@ -1594,6 +1609,7 @@ def recover_background_jobs():
             current_ver = get_project_data_version(project_name)
             if version != current_ver:
                 save_job_to_db({"id": job_id, "state": "failed", "message": "服务重启，前一个进程中的数据版本已更新，任务已作废"})
+                _cleanup_job_files(job_id)
                 continue
 
             key = (kind, project_name, version)
@@ -1607,7 +1623,7 @@ def recover_background_jobs():
                 "state": "running",
                 "percent": 1,
                 "stage": "queued",
-                "message": "服务重启，已自动恢复并开始重新计算",
+                "message": "服务重启，已从头重新计算/导出",
                 "created_at_epoch": now,
                 "updated_at_epoch": now,
             }

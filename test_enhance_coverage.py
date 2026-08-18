@@ -776,7 +776,7 @@ class TestScalableProgress(unittest.TestCase):
         with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as html_file:
             html_content = html_file.read()
         self.assertIn('src="coverage_progress.js?v=', html_content)
-        self.assertIn("页面版本 visible-progress-20260817_v9_6", html_content)
+        self.assertIn("页面版本 visible-progress-20260817_v9_7", html_content)
         self.assertNotIn('<script>\n    const DEFAULT_REVIEW_SCOPE', html_content)
 
 
@@ -980,7 +980,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("mod-chip", js_content)
         self.assertIn("mod-more-chip", js_content)
         self.assertIn("bar-high", js_content)
-        self.assertIn("visible-progress-20260817_v9_6", js_content)
+        self.assertIn("visible-progress-20260817_v9_7", js_content)
 
     def test_atomic_write_file_creates_and_renames(self):
         target_path = os.path.join(enhance_coverage.BACKGROUND_JOBS_STORAGE_DIR, "test_atomic.json")
@@ -1025,6 +1025,30 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
             enhance_coverage.recover_background_jobs()
             mock_save.assert_called_once()
             self.assertEqual(mock_save.call_args[0][0]["state"], "failed")
+
+    def test_recover_background_jobs_cleans_orphan_part_files(self):
+        job_id = "stale_orphan_999"
+        enhance_coverage._ensure_background_jobs_storage_dir()
+        orphan_part = os.path.join(enhance_coverage.BACKGROUND_JOBS_STORAGE_DIR, f"export_{job_id}.csv.part")
+        with open(orphan_part, "w", encoding="utf-8") as f:
+            f.write("orphan data")
+        self.assertTrue(os.path.exists(orphan_part))
+
+        mock_cursor = unittest.mock.MagicMock()
+        mock_cursor.fetchall.return_value = [
+            (job_id, "full_detail_export", "orphan_proj", 1),
+        ]
+        mock_conn = unittest.mock.MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_mgr = unittest.mock.MagicMock()
+        mock_mgr.conn = mock_conn
+
+        with unittest.mock.patch.object(enhance_coverage, "db_manager", mock_mgr), \
+             unittest.mock.patch.object(enhance_coverage, "get_project_data_version", return_value=2), \
+             unittest.mock.patch.object(enhance_coverage, "save_job_to_db"):
+            enhance_coverage.recover_background_jobs()
+
+        self.assertFalse(os.path.exists(orphan_part))
 
     def test_resolve_ownership_xlsx_path_fallback(self):
         resolved = enhance_coverage.resolve_ownership_xlsx_path({"ownership": {"xlsx_path": "non_existent_file.xlsx"}})

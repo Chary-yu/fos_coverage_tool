@@ -93,7 +93,6 @@ def main():
         for pname in known_projects:
             invalidate_project_background_jobs(pname, manager=manager)
 
-        cursor.execute("UPDATE coverage_project_state SET data_version = data_version + 1, updated_at = NOW(6)")
         cursor.execute("ALTER TABLE coverage_analysis AUTO_INCREMENT = 1")
         cursor.execute("ALTER TABLE coverage_line_index AUTO_INCREMENT = 1")
         if os.path.exists(BACKGROUND_JOBS_STORAGE_DIR):
@@ -129,7 +128,7 @@ def main():
 
     print(f"[ClearDB] coverage_analysis rows after: {analysis_after}")
     print(f"[ClearDB] coverage_line_index rows after: {index_after}")
-    print("[ClearDB] Background jobs and project state cleared.")
+    print("[ClearDB] Coverage analysis data, line index, and background jobs cleared (data versions incremented).")
     print("[ClearDB] Done.")
     return 0
 
