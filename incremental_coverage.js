@@ -74,7 +74,8 @@
         covered: 6,
         uncovered: 7,
         ignored: 8,
-        missing: 9
+        missing: 9,
+        unanalyzed: 9
     };
 
     var currentKey = "uncovered";
@@ -327,5 +328,83 @@
         });
     }
 
+    var mainEl = document.querySelector("main[data-project]");
+    var projectName = mainEl ? mainEl.getAttribute("data-project") : "";
+    if (!projectName && window.location && window.location.search) {
+        try {
+            var params = new URLSearchParams(window.location.search);
+            projectName = params.get("project") || "";
+        } catch (e) {}
+    }
+
+    var isRefreshing = false;
+    var lastRefreshTime = 0;
+
+    function refreshUnanalyzedCounts() {
+        if (!projectName || isRefreshing) return;
+        var now = Date.now();
+        if (now - lastRefreshTime < 2000) return;
+        isRefreshing = true;
+        lastRefreshTime = now;
+
+        var url = "/api/coverage/incremental/unanalyzed?project=" + encodeURIComponent(projectName);
+        fetch(url)
+            .then(function(res) {
+                if (!res.ok) throw new Error("HTTP " + res.status);
+                return res.json();
+            })
+            .then(function(resData) {
+                isRefreshing = false;
+                if (!resData || resData.status !== "success" || !resData.data) return;
+                var files = resData.data.files || [];
+                var map = {};
+                for (var i = 0; i < files.length; i++) {
+                    map[files[i].file_path] = files[i].unanalyzed;
+                }
+
+                var total = 0;
+                var rows = body.rows;
+                for (var j = 0; j < rows.length; j++) {
+                    var row = rows[j];
+                    var key = row.getAttribute("data-file-key");
+                    var cell = row.querySelector(".js-unanalyzed-count") || row.cells[9];
+                    if (cell) {
+                        var count = (key && key in map) ? map[key] : parseInt(cell.getAttribute("data-sort-value") || cell.textContent.trim() || "0", 10);
+                        if (key && key in map) {
+                            cell.textContent = count;
+                            cell.setAttribute("data-sort-value", count);
+                        }
+                        total += count;
+                    }
+                }
+
+                var totalEl = document.getElementById("incremental-unanalyzed-total");
+                if (totalEl) {
+                    totalEl.textContent = total;
+                }
+
+                if (currentKey === "unanalyzed" || currentKey === "missing") {
+                    sortRows(currentKey, currentDirection);
+                }
+            })
+            .catch(function(err) {
+                isRefreshing = false;
+                console.warn("[Unanalyzed Refresh] API failed:", err);
+            });
+    }
+
+    if (window.addEventListener) {
+        window.addEventListener("pageshow", function() { refreshUnanalyzedCounts(); });
+        window.addEventListener("focus", function() { refreshUnanalyzedCounts(); });
+    }
+    if (document.addEventListener) {
+        document.addEventListener("visibilitychange", function() {
+            if (document.visibilityState === "visible") {
+                refreshUnanalyzedCounts();
+            }
+        });
+    }
+
     sortRows("uncovered", -1);
+    refreshUnanalyzedCounts();
 })();

@@ -57,7 +57,7 @@ PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "visible-progress-20260817_v9_7"
+ASSET_VERSION = "visible-progress-20260817_v9_10"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 
 
@@ -2106,8 +2106,8 @@ class DatabaseManager:
                 _local.conn = None
 
     def is_available(self):
-        """Return True if MySQL driver (PyMySQL or mysql.connector) is available."""
-        return db_module is not None
+        """Return True if MySQL driver (PyMySQL or mysql.connector) is available and connection is established."""
+        return db_module is not None and getattr(self, "conn", None) is not None
 
     def get_connection(self, select_db=True):
         """建立并返回 MySQL 连接"""
@@ -2128,10 +2128,13 @@ class DatabaseManager:
         if select_db and db_module.__name__ == 'mysql.connector':
             params["database"] = self.config["database"]
 
-        conn = db_module.connect(**params)
-        if select_db and db_module.__name__ == 'pymysql':
-            conn.select_db(self.config["database"])
-        return conn
+        try:
+            conn = db_module.connect(**params)
+            if select_db and db_module.__name__ == 'pymysql':
+                conn.select_db(self.config["database"])
+            return conn
+        except Exception:
+            return None
 
     def ensure_index(self, cursor, table_name, index_name, create_sql):
         cursor.execute(f"SHOW INDEX FROM {table_name} WHERE Key_name = %s", (index_name,))
@@ -3997,6 +4000,31 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 return
 
             self.send_json_response(200, {"status": "success", "data": data})
+        elif parsed_url.path == "/api/coverage/incremental/unanalyzed":
+            project_name = query_params.get("project", [""])[0].strip()
+            if not project_name:
+                self.send_error_response(400, "Missing 'project' parameter")
+                return
+            try:
+                counts_map, ver = get_incremental_unanalyzed_counts(project_name, config=load_config())
+                file_list = [
+                    {"file_path": fpath, "unanalyzed": count}
+                    for fpath, count in counts_map.items()
+                ]
+                total = sum(counts_map.values())
+                self.send_json_response(200, {
+                    "status": "success",
+                    "data": {
+                        "project_name": project_name,
+                        "data_version": ver,
+                        "total_unanalyzed": total,
+                        "files": file_list,
+                    }
+                })
+            except Exception as err:
+                print("[Incremental Unanalyzed API] Failed for project '{}': {}".format(project_name, err), flush=True)
+                self.send_error_response(500, "Failed to query incremental unanalyzed counts")
+                return
         elif parsed_url.path == "/api/coverage":
             project_name = query_params.get("project", [""])[0]
             file_path = query_params.get("file", [""])[0]
@@ -4670,6 +4698,90 @@ def incremental_developer_anchor(developer):
     return "developer-{}".format(hashlib.sha1(identity.encode("utf-8")).hexdigest()[:12])
 
 
+_incremental_unanalyzed_cache = {}
+_incremental_unanalyzed_cache_lock = threading.Lock()
+
+
+def query_incremental_unanalyzed_counts(db_mgr, project_name):
+    """Query DB for unanalyzed line counts per normalized file path.
+    Does NOT rely on Connection context manager (__enter__) for legacy PyMySQL compatibility.
+    Raises exception on database failure.
+    """
+    if db_mgr is None or db_module is None or not getattr(db_mgr, "conn", None):
+        return {}
+
+    conn = db_mgr.conn
+    try:
+        if hasattr(conn, "ping"):
+            conn.ping(reconnect=True)
+    except Exception:
+        pass
+
+    if not getattr(db_mgr, "conn", None):
+        return {}
+
+    cursor = conn.cursor()
+    unanalyzed_by_file = {}
+    try:
+        sql = """
+            SELECT MAX(i.file_path) AS file_path,
+                   SUM(CASE WHEN a.id IS NULL OR COALESCE(a.is_draft, 0) = 1 OR a.status = %s THEN 1 ELSE 0 END) AS unanalyzed_total
+            FROM coverage_line_index i
+            LEFT JOIN coverage_analysis a
+              ON i.project_name = a.project_name
+             AND i.file_path_hash = a.file_path_hash
+             AND i.line_number = a.line_number
+            WHERE i.project_name = %s
+            GROUP BY i.project_name, i.file_path_hash
+        """
+        cursor.execute(sql, ("未确认", project_name))
+        rows = cursor.fetchall() or []
+        for row in rows:
+            if not row:
+                continue
+            if isinstance(row, dict):
+                fpath = row.get("file_path", "")
+                count = row.get("unanalyzed_total", 0)
+            elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                fpath = row[0]
+                count = row[1]
+            else:
+                continue
+            if fpath:
+                unanalyzed_by_file[_normalize_ownership_path(fpath)] = int(count or 0)
+        return unanalyzed_by_file
+    except Exception as err:
+        err_msg = str(err).lower()
+        if "doesn't exist" in err_msg or "does not exist" in err_msg or "no such table" in err_msg:
+            return {}
+        raise
+    finally:
+        cursor.close()
+
+
+def get_incremental_unanalyzed_counts(project_name, db_mgr=None, config=None):
+    """Fetch unanalyzed counts per file for project_name, utilizing data_version caching."""
+    if db_mgr is None:
+        db_mgr = get_thread_db_manager(config)
+
+    current_ver = get_project_data_version(project_name, manager=db_mgr)
+
+    with _incremental_unanalyzed_cache_lock:
+        cached = _incremental_unanalyzed_cache.get(project_name)
+        if cached and cached.get("version") == current_ver:
+            return cached["data"], current_ver
+
+    counts_map = query_incremental_unanalyzed_counts(db_mgr, project_name)
+
+    with _incremental_unanalyzed_cache_lock:
+        _incremental_unanalyzed_cache[project_name] = {
+            "version": current_ver,
+            "data": counts_map,
+        }
+
+    return counts_map, current_ver
+
+
 def sync_incremental_unanalyzed_counts(project_name, result, config=None):
     """Query DB for unanalyzed counts and update result['summary']['unanalyzed'] beforehand."""
     if not result or "details" not in result:
@@ -4680,42 +4792,18 @@ def sync_incremental_unanalyzed_counts(project_name, result, config=None):
         key = (item.get("repository", ""), item.get("review_file_path") or item["file_path"])
         details_by_file.setdefault(key, []).append(item)
 
-    unanalyzed_by_file = {}
-    try:
-        db_mgr = get_thread_db_manager(config)
-        if db_mgr and db_module is not None and getattr(db_mgr, "conn", None) is not None:
-            conn_ctx = db_mgr.get_connection()
-            if conn_ctx is not None:
-                with conn_ctx as conn:
-                    if conn is not None and hasattr(conn, "cursor"):
-                        cursor = conn.cursor()
-                        sql = """
-                            SELECT MAX(i.file_path) AS file_path,
-                                   SUM(CASE WHEN a.id IS NULL OR COALESCE(a.is_draft, 0) = 1 OR a.status = %s THEN 1 ELSE 0 END) AS unanalyzed_total
-                            FROM coverage_line_index i
-                            LEFT JOIN coverage_analysis a
-                              ON i.project_name = a.project_name
-                             AND i.file_path_hash = a.file_path_hash
-                             AND i.line_number = a.line_number
-                            WHERE i.project_name = %s
-                            GROUP BY i.project_name, i.file_path_hash
-                        """
-                        cursor.execute(sql, ("未确认", project_name))
-                        for row in cursor.fetchall() or []:
-                            if not row:
-                                continue
-                            if isinstance(row, dict):
-                                fpath = row.get("file_path", "")
-                                count = row.get("unanalyzed_total", 0)
-                            elif isinstance(row, (list, tuple)) and len(row) >= 2:
-                                fpath = row[0]
-                                count = row[1]
-                            else:
-                                continue
-                            if fpath:
-                                unanalyzed_by_file[_normalize_ownership_path(fpath)] = int(count or 0)
-    except Exception as err:
-        print("[Warning] Failed to query incremental unanalyzed counts from database: {}".format(err))
+    db_mgr = get_thread_db_manager(config)
+    is_db_active = db_mgr and db_mgr.is_available()
+
+    if is_db_active:
+        try:
+            unanalyzed_by_file, _ = get_incremental_unanalyzed_counts(project_name, db_mgr=db_mgr, config=config)
+        except Exception as err:
+            print("[Error] Failed to query incremental unanalyzed counts from database: {}".format(err), flush=True)
+            raise RuntimeError("Database query for incremental unanalyzed counts failed: {}".format(err))
+    else:
+        # Standalone / Demo mode without DB
+        unanalyzed_by_file = {}
 
     total_unanalyzed = 0
     for repository_name, review_file_path in sorted(details_by_file):
@@ -4802,6 +4890,7 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
     for item in file_rows:
         repository_name = item["repository"]
         review_file_path = item["review_file_path"]
+        file_key = _normalize_ownership_path(review_file_path)
         page_link = get_report_page_link(review_file_path, report_pages)
         source_cell = escaped(item["file_path"])
         if page_link:
@@ -4817,22 +4906,23 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
                 escaped(item["ownership_status"]), module_cell
             )
         rows.append(
-            "<tr data-repo=\"{}\" data-module=\"{}\" data-team=\"{}\" data-leader=\"{}\" data-ownership=\"{}\">"
-            "<td data-sort-value=\"{}\">{}</td>"
-            "<td data-sort-value=\"{}\">{}</td>"
-            "<td data-sort-value=\"{}\">{}</td>"
-            "<td data-sort-value=\"{}\">{}</td>"
-            "<td data-sort-value=\"{}\">{}</td>"
-            "<td data-sort-value=\"{}\">{}</td>"
-            "<td data-sort-value=\"{}\">{}</td>"
-            "<td data-sort-value=\"{}\">{}</td>"
-            "<td data-sort-value=\"{}\">{}</td>"
-            "<td data-sort-value=\"{}\">{}</td></tr>".format(
+            '<tr data-repo="{}" data-module="{}" data-team="{}" data-leader="{}" data-ownership="{}" data-file-key="{}">'
+            '<td data-sort-value="{}">{}</td>'
+            '<td data-sort-value="{}">{}</td>'
+            '<td data-sort-value="{}">{}</td>'
+            '<td data-sort-value="{}">{}</td>'
+            '<td data-sort-value="{}">{}</td>'
+            '<td data-sort-value="{}">{}</td>'
+            '<td data-sort-value="{}">{}</td>'
+            '<td data-sort-value="{}">{}</td>'
+            '<td data-sort-value="{}">{}</td>'
+            '<td class="js-unanalyzed-count" data-sort-value="{}">{}</td></tr>'.format(
                 escaped(repository_name),
                 escaped(item["module"]),
                 escaped(item["team"]),
                 escaped(item["leader"]),
                 escaped(ownership_text),
+                escaped(file_key),
                 escaped(repository_name),
                 escaped(repository_name or "-"),
                 escaped(item["team"]),
@@ -4918,7 +5008,7 @@ tr:hover td{{background:rgba(0,122,255,0.03)}}
 td a{{color:#007aff;text-decoration:none;font-weight:600}}
 td a:hover{{text-decoration:underline}}
 @media(max-width:850px){{.cards{{grid-template-columns:repeat(2,minmax(130px,1fr))}}main{{padding:16px 12px}}}}
-</style></head><body><main>
+</style></head><body><main data-project="{project}">
 <div class="hero-card">
   <h1>增量覆盖率审查</h1>
   <div class="muted">项目：{project}；Git 范围：{git_range_text}；生成时间：{generated_at}</div>{repository_ranges}
@@ -4934,7 +5024,7 @@ td a:hover{{text-decoration:underline}}
   <div class="card"><div class="label">已覆盖</div><div class="value val-covered">{covered}</div></div>
   <div class="card"><div class="label">增量未覆盖（可填写）</div><div class="value val-uncovered">{uncovered}</div></div>
   <div class="card"><div class="label">有效增量覆盖率</div><div class="value val-rate">{rate}</div></div>
-  <div class="card"><div class="label">待分析</div><div class="value val-missing">{unanalyzed}</div></div>
+  <div class="card"><div class="label">待分析</div><div id="incremental-unanalyzed-total" class="value val-missing">{unanalyzed}</div></div>
 </div>
 <section><h2>文件明细（点击表头可排序；默认未覆盖新增行从多到少）</h2>
 <div class="filters">
@@ -4946,7 +5036,7 @@ td a:hover{{text-decoration:underline}}
   <button type="button" id="reset-filters-btn" class="reset-btn">重置筛选</button>
   <span id="filter-count" class="filter-count"></span>
 </div>
-<table id="incremental-file-table"><thead><tr><th data-sort-key="repository" aria-sort="none"><button type="button" class="sort-button" data-sort-key="repository" data-sort-type="text">仓库 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="team" aria-sort="none"><button type="button" class="sort-button" data-sort-key="team" data-sort-type="text">小组 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="leader" aria-sort="none"><button type="button" class="sort-button" data-sort-key="leader" data-sort-type="text">组长 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="module" aria-sort="none"><button type="button" class="sort-button" data-sort-key="module" data-sort-type="text">组件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="file" aria-sort="none"><button type="button" class="sort-button" data-sort-key="file" data-sort-type="text">文件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="changed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="changed" data-sort-type="number">新增行 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="covered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="covered" data-sort-type="number">已覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="uncovered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="uncovered" data-sort-type="number">未覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ignored" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ignored" data-sort-type="number">无需覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="missing" aria-sort="none"><button type="button" class="sort-button" data-sort-key="missing" data-sort-type="number">待分析行数 <span class="sort-indicator" aria-hidden="true">↕</span></button></th></tr></thead><tbody>{table_rows}</tbody></table></section>
+<table id="incremental-file-table"><thead><tr><th data-sort-key="repository" aria-sort="none"><button type="button" class="sort-button" data-sort-key="repository" data-sort-type="text">仓库 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="team" aria-sort="none"><button type="button" class="sort-button" data-sort-key="team" data-sort-type="text">小组 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="leader" aria-sort="none"><button type="button" class="sort-button" data-sort-key="leader" data-sort-type="text">组长 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="module" aria-sort="none"><button type="button" class="sort-button" data-sort-key="module" data-sort-type="text">组件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="file" aria-sort="none"><button type="button" class="sort-button" data-sort-key="file" data-sort-type="text">文件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="changed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="changed" data-sort-type="number">新增行 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="covered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="covered" data-sort-type="number">已覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="uncovered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="uncovered" data-sort-type="number">未覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ignored" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ignored" data-sort-type="number">无需覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="unanalyzed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="unanalyzed" data-sort-type="number">待分析行数 <span class="sort-indicator" aria-hidden="true">↕</span></button></th></tr></thead><tbody>{table_rows}</tbody></table></section>
 </main><script src="incremental_coverage.js?v={asset_version}"></script></body></html>""".format(
         asset_version=ASSET_VERSION,
         project=escaped(project_name),

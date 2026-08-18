@@ -553,7 +553,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
 
         self.assertIn('const isIncremental = reviewScope === \'incremental\';', js_content)
         self.assertIn('<span class="mod-chip">', js_content)
-        self.assertIn('PROGRESS_PAGE_VERSION = \'visible-progress-20260817_v9_7\'', js_content)
+        self.assertIn('PROGRESS_PAGE_VERSION = \'visible-progress-20260817_v9_10\'', js_content)
 
         html_path = enhance_coverage.PROGRESS_PAGE_SOURCE_PATH
         with open(html_path, "r", encoding="utf-8") as f:
@@ -561,7 +561,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
 
         self.assertIn('.progress-link', html_content)
         self.assertIn('.progress-link:hover', html_content)
-        self.assertIn('页面版本 visible-progress-20260817_v9_7', html_content)
+        self.assertIn('页面版本 visible-progress-20260817_v9_10', html_content)
 
     def test_cascading_filter_dropdowns_in_incremental_js(self):
         js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH
@@ -598,6 +598,169 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         }
         res = enhance_coverage.sync_incremental_unanalyzed_counts("test_project", sample_result)
         self.assertEqual(sample_result["summary"]["unanalyzed"], 2)
+
+    def test_legacy_pymysql_connection_without_enter_context_manager(self):
+        """Test 1: Verify query_incremental_unanalyzed_counts works with legacy PyMySQL Connection lacking __enter__."""
+        class LegacyPyMySQLConnection:
+            def __init__(self):
+                self.ping_called = False
+            def ping(self, reconnect=True):
+                self.ping_called = True
+            def cursor(self):
+                mock_cursor = unittest.mock.MagicMock()
+                mock_cursor.fetchall.return_value = [
+                    {"file_path": "/home/user/src/a.c", "unanalyzed_total": 5}
+                ]
+                return mock_cursor
+            # Intentionally NO __enter__ or __exit__ methods!
+
+        mock_mgr = unittest.mock.MagicMock()
+        mock_mgr.conn = LegacyPyMySQLConnection()
+
+        with unittest.mock.patch.object(enhance_coverage, "db_module", object()):
+            res = enhance_coverage.query_incremental_unanalyzed_counts(mock_mgr, "FOS_V6R2")
+            self.assertEqual(res.get("/home/user/src/a.c"), 5)
+
+    def test_query_incremental_unanalyzed_counts_confirmed_deducted(self):
+        """Test 2: Verify confirmed analysis rows deduct from unanalyzed total."""
+        mock_cursor = unittest.mock.MagicMock()
+        # 10 uncovered lines in index, 8 confirmed in analysis -> SQL returns 2 unanalyzed
+        mock_cursor.fetchall.return_value = [
+            {"file_path": "/src/main.c", "unanalyzed_total": 2}
+        ]
+        mock_conn = unittest.mock.MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_mgr = unittest.mock.MagicMock()
+        mock_mgr.conn = mock_conn
+
+        with unittest.mock.patch.object(enhance_coverage, "db_module", object()):
+            res = enhance_coverage.query_incremental_unanalyzed_counts(mock_mgr, "FOS_V6R2")
+            self.assertEqual(res.get("/src/main.c"), 2)
+
+    def test_query_incremental_unanalyzed_counts_draft_included(self):
+        """Test 3: Verify draft analysis rows (is_draft=1) are included in unanalyzed total."""
+        mock_cursor = unittest.mock.MagicMock()
+        # 2 confirmed, 3 draft, 5 no record -> SQL returns 8 unanalyzed
+        mock_cursor.fetchall.return_value = [
+            {"file_path": "/src/draft.c", "unanalyzed_total": 8}
+        ]
+        mock_conn = unittest.mock.MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_mgr = unittest.mock.MagicMock()
+        mock_mgr.conn = mock_conn
+
+        with unittest.mock.patch.object(enhance_coverage, "db_module", object()):
+            res = enhance_coverage.query_incremental_unanalyzed_counts(mock_mgr, "FOS_V6R2")
+            self.assertEqual(res.get("/src/draft.c"), 8)
+
+    def test_query_incremental_unanalyzed_counts_cursor_closed_in_finally(self):
+        """Test 4: Verify cursor is closed in finally block whether SQL succeeds or fails."""
+        mock_cursor = unittest.mock.MagicMock()
+        mock_cursor.execute.side_effect = RuntimeError("SQL error")
+        mock_conn = unittest.mock.MagicMock()
+        mock_conn.cursor.return_value = mock_cursor
+        mock_mgr = unittest.mock.MagicMock()
+        mock_mgr.conn = mock_conn
+
+        with unittest.mock.patch.object(enhance_coverage, "db_module", object()):
+            with self.assertRaises(RuntimeError):
+                enhance_coverage.query_incremental_unanalyzed_counts(mock_mgr, "FOS_V6R2")
+            mock_cursor.close.assert_called_once()
+
+    def test_sync_incremental_unanalyzed_counts_raises_on_db_failure(self):
+        """Test 5: Verify sync_incremental_unanalyzed_counts raises RuntimeError and does NOT fake numbers when DB fails."""
+        sample_result = {
+            "summary": {"uncovered": 10, "unanalyzed": 10},
+            "details": [
+                {"repository": "ssf", "file_path": "a.c", "status": coverage_check.STATUS_UNCOVERED},
+            ]
+        }
+        mock_mgr = unittest.mock.MagicMock()
+        mock_mgr.is_available.return_value = True
+
+        with unittest.mock.patch.object(enhance_coverage, "get_thread_db_manager", return_value=mock_mgr), \
+             unittest.mock.patch.object(enhance_coverage, "get_incremental_unanalyzed_counts", side_effect=RuntimeError("MySQL disconnected")):
+            with self.assertRaises(RuntimeError):
+                enhance_coverage.sync_incremental_unanalyzed_counts("FOS_V6R2", sample_result)
+
+    def test_api_incremental_unanalyzed_success(self):
+        """Test 6: Verify GET /api/coverage/incremental/unanalyzed returns success JSON."""
+        counts = {"/src/a.c": 3, "/src/b.c": 0}
+        with unittest.mock.patch.object(enhance_coverage, "get_incremental_unanalyzed_counts", return_value=(counts, 42)):
+            handler = unittest.mock.MagicMock()
+            handler.path = "/api/coverage/incremental/unanalyzed?project=FOS_V6R2"
+            sent_data = {}
+            def send_json(status_code, data):
+                sent_data["code"] = status_code
+                sent_data["body"] = data
+            handler.send_json_response = send_json
+            enhance_coverage.CoverageHTTPRequestHandler.do_GET(handler)
+            self.assertEqual(sent_data.get("code"), 200)
+            self.assertEqual(sent_data["body"]["status"], "success")
+            self.assertEqual(sent_data["body"]["data"]["project_name"], "FOS_V6R2")
+            self.assertEqual(sent_data["body"]["data"]["data_version"], 42)
+            self.assertEqual(sent_data["body"]["data"]["total_unanalyzed"], 3)
+
+    def test_api_incremental_unanalyzed_db_failure(self):
+        """Test 7: Verify GET /api/coverage/incremental/unanalyzed returns 500 when DB query fails."""
+        with unittest.mock.patch.object(enhance_coverage, "get_incremental_unanalyzed_counts", side_effect=RuntimeError("DB Connection Lost")):
+            handler = unittest.mock.MagicMock()
+            handler.path = "/api/coverage/incremental/unanalyzed?project=FOS_V6R2"
+            sent_error = {}
+            def send_err(status_code, msg):
+                sent_error["code"] = status_code
+                sent_error["msg"] = msg
+            handler.send_error_response = send_err
+            enhance_coverage.CoverageHTTPRequestHandler.do_GET(handler)
+            self.assertEqual(sent_error.get("code"), 500)
+
+    def test_write_incremental_summary_page_contains_dom_refresh_markers(self):
+        """Test 8: Verify incremental_coverage.html contains DOM attributes for dynamic JS refresh."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            sample_result = {
+                "generated_at": "2026-08-18 10:00:00",
+                "oldgit": "111111",
+                "newgit": "222222",
+                "summary": {"changed_lines": 5, "covered": 2, "uncovered": 3, "coverage_rate": 40.0, "missing": 3, "unanalyzed": 3},
+                "uncovered_lines_by_file": {"/src/main.c": [10, 11, 12]},
+                "review_lines_by_file": {"/src/main.c": [10, 11, 12]},
+                "details": [
+                    {"repository": "repo_a", "file_path": "/src/main.c", "review_file_path": "/src/main.c", "status": coverage_check.STATUS_UNCOVERED},
+                ]
+            }
+            mock_mgr = unittest.mock.MagicMock()
+            mock_mgr.is_available.return_value = False
+            with unittest.mock.patch.object(enhance_coverage, "get_thread_db_manager", return_value=mock_mgr):
+                enhance_coverage.write_incremental_summary_page(tmp_dir, "FOS_V6R2", sample_result)
+            html_path = os.path.join(tmp_dir, "incremental_coverage.html")
+            with open(html_path, "r", encoding="utf-8") as f:
+                html_content = f.read()
+            self.assertIn('<main data-project="FOS_V6R2">', html_content)
+            self.assertIn('data-file-key="/src/main.c"', html_content)
+            self.assertIn('class="js-unanalyzed-count"', html_content)
+            self.assertIn('id="incremental-unanalyzed-total"', html_content)
+            self.assertIn('data-sort-key="unanalyzed"', html_content)
+
+    def test_incremental_coverage_js_contains_refresh_logic(self):
+        """Test 9: Verify incremental_coverage.js static script contains refreshUnanalyzedCounts and event listeners."""
+        js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH
+        with open(js_path, "r", encoding="utf-8") as f:
+            js_content = f.read()
+
+        self.assertIn('function refreshUnanalyzedCounts()', js_content)
+        self.assertIn('/api/coverage/incremental/unanalyzed', js_content)
+        self.assertIn('pageshow', js_content)
+        self.assertIn('visibilitychange', js_content)
+        self.assertIn('focus', js_content)
+
+    def test_unanalyzed_sorting_key_in_js(self):
+        """Test 10: Verify unanalyzed sorting key mapping exists in incremental_coverage.js."""
+        js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH
+        with open(js_path, "r", encoding="utf-8") as f:
+            js_content = f.read()
+
+        self.assertIn('unanalyzed: 9', js_content)
 
 
 if __name__ == "__main__":
