@@ -337,8 +337,55 @@
         } catch (e) {}
     }
 
+    var resolvedApiBase = "";
     var isRefreshing = false;
     var lastRefreshTime = 0;
+
+    function getApiBaseCandidates() {
+        var candidates = [];
+        if (window.location && window.location.search) {
+            try {
+                var p = new URLSearchParams(window.location.search);
+                var explicit = p.get("api");
+                if (explicit) candidates.push(explicit.replace(/\/+$/, ""));
+            } catch (e) {}
+        }
+        var origin = (window.location && window.location.origin && window.location.origin !== "null") ? window.location.origin : "";
+        if (origin) {
+            candidates.push(origin + "/api/coverage");
+            if (window.location.pathname && window.location.pathname.indexOf("/coverage/") === 0) {
+                candidates.push(origin + "/coverage/api/coverage");
+            }
+            if (window.location.port && window.location.port !== "9528") {
+                candidates.push(window.location.protocol + "//" + window.location.hostname + ":9528/api/coverage");
+            }
+        }
+        candidates.push("http://127.0.0.1:9528/api/coverage");
+        candidates.push("/api/coverage");
+        var result = [];
+        for (var c = 0; c < candidates.length; c++) {
+            var item = (candidates[c] || "").replace(/\/+$/, "");
+            if (item && result.indexOf(item) === -1) {
+                result.push(item);
+            }
+        }
+        return result;
+    }
+
+    function fetchUnanalyzedFromCandidates(candidates, index) {
+        if (index >= candidates.length) {
+            return Promise.reject(new Error("All API endpoints unavailable"));
+        }
+        var base = candidates[index];
+        var url = base + "/incremental/unanalyzed?project=" + encodeURIComponent(projectName);
+        return fetch(url).then(function(res) {
+            if (!res.ok) throw new Error("HTTP " + res.status);
+            resolvedApiBase = base;
+            return res.json();
+        }).catch(function(err) {
+            return fetchUnanalyzedFromCandidates(candidates, index + 1);
+        });
+    }
 
     function refreshUnanalyzedCounts() {
         if (!projectName || isRefreshing) return;
@@ -347,12 +394,8 @@
         isRefreshing = true;
         lastRefreshTime = now;
 
-        var url = "/api/coverage/incremental/unanalyzed?project=" + encodeURIComponent(projectName);
-        fetch(url)
-            .then(function(res) {
-                if (!res.ok) throw new Error("HTTP " + res.status);
-                return res.json();
-            })
+        var candidates = resolvedApiBase ? [resolvedApiBase].concat(getApiBaseCandidates()) : getApiBaseCandidates();
+        fetchUnanalyzedFromCandidates(candidates, 0)
             .then(function(resData) {
                 isRefreshing = false;
                 if (!resData || resData.status !== "success" || !resData.data) return;

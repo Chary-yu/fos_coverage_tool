@@ -776,7 +776,7 @@ class TestScalableProgress(unittest.TestCase):
         with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as html_file:
             html_content = html_file.read()
         self.assertIn('src="coverage_progress.js?v=', html_content)
-        self.assertIn("页面版本 visible-progress-20260817_v9_11", html_content)
+        self.assertIn("页面版本 visible-progress-20260818_v9_12", html_content)
         self.assertNotIn('<script>\n    const DEFAULT_REVIEW_SCOPE', html_content)
 
 
@@ -981,7 +981,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("mod-chip", js_content)
         self.assertIn("mod-more-chip", js_content)
         self.assertIn("bar-high", js_content)
-        self.assertIn("visible-progress-20260817_v9_11", js_content)
+        self.assertIn("visible-progress-20260818_v9_12", js_content)
 
     def test_atomic_write_file_creates_and_renames(self):
         target_path = os.path.join(enhance_coverage.BACKGROUND_JOBS_STORAGE_DIR, "test_atomic.json")

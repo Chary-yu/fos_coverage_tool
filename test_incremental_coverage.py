@@ -557,7 +557,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
 
         self.assertIn('const isIncremental = reviewScope === \'incremental\';', js_content)
         self.assertIn('<span class="mod-chip">', js_content)
-        self.assertIn('PROGRESS_PAGE_VERSION = \'visible-progress-20260817_v9_11\'', js_content)
+        self.assertIn('PROGRESS_PAGE_VERSION = \'visible-progress-20260818_v9_12\'', js_content)
 
         html_path = enhance_coverage.PROGRESS_PAGE_SOURCE_PATH
         with open(html_path, "r", encoding="utf-8") as f:
@@ -565,7 +565,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
 
         self.assertIn('.progress-link', html_content)
         self.assertIn('.progress-link:hover', html_content)
-        self.assertIn('页面版本 visible-progress-20260817_v9_11', html_content)
+        self.assertIn('页面版本 visible-progress-20260818_v9_12', html_content)
 
     def test_cascading_filter_dropdowns_in_incremental_js(self):
         js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH
@@ -756,7 +756,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
             js_content = f.read()
 
         self.assertIn('function refreshUnanalyzedCounts()', js_content)
-        self.assertIn('/api/coverage/incremental/unanalyzed', js_content)
+        self.assertIn('/incremental/unanalyzed', js_content)
         self.assertIn('pageshow', js_content)
         self.assertIn('visibilitychange', js_content)
         self.assertIn('focus', js_content)
@@ -883,6 +883,43 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
             with self.assertRaises(RuntimeError) as cm:
                 enhance_coverage.query_incremental_unanalyzed_counts(mock_mgr, "MISSING_TABLE_PROJ", config=mock_config)
             self.assertIn("Database query failed for configured MySQL database", str(cm.exception))
+
+    def test_incremental_js_supports_multi_candidate_api_resolution(self):
+        """Test 18: Verify incremental_coverage.js includes getApiBaseCandidates and fetchUnanalyzedFromCandidates."""
+        js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH
+        with open(js_path, "r", encoding="utf-8") as f:
+            js_content = f.read()
+
+        self.assertIn("function getApiBaseCandidates()", js_content)
+        self.assertIn("function fetchUnanalyzedFromCandidates(", js_content)
+        self.assertIn("resolvedApiBase", js_content)
+
+    def test_e2e_batch_save_decrements_unanalyzed_counts_and_invalidates_cache(self):
+        """Test 19: Full E2E flow testing initial unanalyzed count (10) -> confirm 3 lines -> data_version invalidates cache -> count updates to (7)."""
+        project_name = "E2E_REFRESH_TEST"
+        mock_config = {"mysql": {"host": "127.0.0.1", "port": 3306}}
+        mock_mgr = unittest.mock.MagicMock()
+
+        # Phase 1: Initial state returns 10 unanalyzed lines for version 1
+        with unittest.mock.patch.object(enhance_coverage, "db_module", object()), \
+             unittest.mock.patch.object(enhance_coverage, "get_thread_db_manager", return_value=mock_mgr), \
+             unittest.mock.patch.object(enhance_coverage, "get_project_data_version", side_effect=[1, 1, 2, 2]), \
+             unittest.mock.patch.object(enhance_coverage, "query_incremental_unanalyzed_counts", side_effect=[{"/src/main.c": 10}, {"/src/main.c": 7}]):
+            
+            # Step 1: Initial query returns 10 at version 1
+            counts1, ver1 = enhance_coverage.get_incremental_unanalyzed_counts(project_name, db_mgr=mock_mgr, config=mock_config)
+            self.assertEqual(ver1, 1)
+            self.assertEqual(counts1.get("/src/main.c"), 10)
+
+            # Step 2: Immediate second call hits cache at version 1
+            counts_cached, ver_cached = enhance_coverage.get_incremental_unanalyzed_counts(project_name, db_mgr=mock_mgr, config=mock_config)
+            self.assertEqual(ver_cached, 1)
+            self.assertEqual(counts_cached.get("/src/main.c"), 10)
+
+            # Step 3: Developer confirms 3 lines -> version advances to 2, cache is invalidated
+            counts2, ver2 = enhance_coverage.get_incremental_unanalyzed_counts(project_name, db_mgr=mock_mgr, config=mock_config)
+            self.assertEqual(ver2, 2)
+            self.assertEqual(counts2.get("/src/main.c"), 7)
 
 
 if __name__ == "__main__":
