@@ -57,7 +57,7 @@ PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "visible-progress-20260817_v9_10"
+ASSET_VERSION = "visible-progress-20260817_v9_11"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 
 
@@ -2055,9 +2055,9 @@ def write_progress_page_targets(output_dir, real_output_html, review_scope="full
 
 
 def is_mysql_configured(config=None):
-    """Return True if MySQL database settings (host, etc.) are present in config and PyMySQL driver is loaded."""
-    if db_module is None:
-        return False
+    """Inspect MySQL config and PyMySQL driver presence.
+    Returns (is_configured, is_driver_available).
+    """
     cfg = config
     if cfg is None:
         try:
@@ -2065,7 +2065,9 @@ def is_mysql_configured(config=None):
         except Exception:
             cfg = {}
     mysql_cfg = (cfg or {}).get("mysql") or {}
-    return bool(str(mysql_cfg.get("host") or "").strip())
+    is_configured = bool(str(mysql_cfg.get("host") or "").strip())
+    is_driver_available = db_module is not None
+    return is_configured, is_driver_available
 
 
 class DatabaseManager:
@@ -4725,7 +4727,10 @@ def query_incremental_unanalyzed_counts(db_mgr, project_name, config=None):
     Does NOT rely on Connection context manager (__enter__) for legacy PyMySQL compatibility.
     Raises exception on database failure if MySQL is configured.
     """
-    is_configured = is_mysql_configured(config)
+    is_configured, is_driver = is_mysql_configured(config)
+    if is_configured and not is_driver:
+        raise RuntimeError("MySQL is configured in coverage_config.json, but PyMySQL driver is not installed")
+
     conn = getattr(db_mgr, "conn", None) if db_mgr else None
     if not conn:
         if is_configured:
@@ -4776,9 +4781,6 @@ def query_incremental_unanalyzed_counts(db_mgr, project_name, config=None):
                 unanalyzed_by_file[_normalize_ownership_path(fpath)] = int(count or 0)
         return unanalyzed_by_file
     except Exception as err:
-        err_msg = str(err).lower()
-        if "doesn't exist" in err_msg or "does not exist" in err_msg or "no such table" in err_msg:
-            return {}
         if is_configured:
             raise RuntimeError("Database query failed for configured MySQL database: {}".format(err))
         raise
@@ -4825,11 +4827,13 @@ def sync_incremental_unanalyzed_counts(project_name, result, config=None):
         details_by_file.setdefault(key, []).append(item)
 
     cfg = load_config() if config is None else config
-    is_configured = is_mysql_configured(cfg)
-    db_mgr = get_thread_db_manager(cfg)
-    is_db_active = db_mgr and db_mgr.is_available()
+    is_configured, is_driver = is_mysql_configured(cfg)
 
     if is_configured:
+        if not is_driver:
+            raise RuntimeError("MySQL is configured for project '{}', but PyMySQL driver is not installed".format(project_name))
+        db_mgr = get_thread_db_manager(cfg)
+        is_db_active = db_mgr and db_mgr.is_available()
         if not is_db_active:
             raise RuntimeError("MySQL is configured for project '{}', but database connection is unavailable".format(project_name))
         try:
@@ -4852,13 +4856,15 @@ def sync_incremental_unanalyzed_counts(project_name, result, config=None):
             matched_count += 1
             total_unanalyzed += unanalyzed_by_file[file_key]
         else:
-            if is_configured and is_db_active and unanalyzed_by_file:
+            if is_configured:
                 path_miss_count += 1
                 print("[WARNING] Path miss for unanalyzed counts: '{}' (repository: '{}'), defaulting to uncovered count ({})".format(file_key, repository_name, uncovered_count), flush=True)
             total_unanalyzed += uncovered_count
 
-    if is_configured and is_db_active:
+    if is_configured:
         print("[Unanalyzed Sync] Project '{}': Matched {} file(s), missed {} file(s) against MySQL line index.".format(project_name, matched_count, path_miss_count), flush=True)
+        if details_by_file and not unanalyzed_by_file:
+            print("[WARNING] MySQL query returned 0 unanalyzed file records for project '{}'. All {} report file(s) defaulted to uncovered count!".format(project_name, len(details_by_file)), flush=True)
 
     summary["unanalyzed"] = total_unanalyzed
     return unanalyzed_by_file
@@ -5035,6 +5041,7 @@ h1{{margin:0 0 8px;font-size:26px;font-weight:800;letter-spacing:-0.6px;color:#1
 .val-uncovered{{color:#007aff}}
 .val-rate{{color:#007aff}}
 .val-missing{{color:#ff9500}}
+#incremental-unanalyzed-total.refresh-failed::after{{content:" ⚠";color:#e65100;font-weight:bold;margin-left:4px}}
 section{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:16px;overflow:hidden;box-shadow:0 4px 20px -2px rgba(0,0,0,0.04)}}
 h2{{margin:0;padding:16px 20px;font-size:16px;font-weight:700;background:rgba(242,242,247,0.7);border-bottom:1px solid rgba(60,60,67,0.1)}}
 .filters{{display:flex;gap:12px;align-items:center;flex-wrap:wrap;padding:14px 20px;background:rgba(242,242,247,0.4);border-bottom:1px solid rgba(60,60,67,0.08)}}

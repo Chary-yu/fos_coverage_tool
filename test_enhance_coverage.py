@@ -776,7 +776,7 @@ class TestScalableProgress(unittest.TestCase):
         with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as html_file:
             html_content = html_file.read()
         self.assertIn('src="coverage_progress.js?v=', html_content)
-        self.assertIn("页面版本 visible-progress-20260817_v9_10", html_content)
+        self.assertIn("页面版本 visible-progress-20260817_v9_11", html_content)
         self.assertNotIn('<script>\n    const DEFAULT_REVIEW_SCOPE', html_content)
 
 
@@ -839,7 +839,8 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
                     }
                 ],
             }
-            enhance_coverage.write_incremental_summary_page(temp_dir, "test_proj", result)
+            with unittest.mock.patch.object(enhance_coverage, "is_mysql_configured", return_value=(False, False)):
+                enhance_coverage.write_incremental_summary_page(temp_dir, "test_proj", result)
             summary_html = os.path.join(temp_dir, "incremental_coverage.html")
             with open(summary_html, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -980,7 +981,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("mod-chip", js_content)
         self.assertIn("mod-more-chip", js_content)
         self.assertIn("bar-high", js_content)
-        self.assertIn("visible-progress-20260817_v9_10", js_content)
+        self.assertIn("visible-progress-20260817_v9_11", js_content)
 
     def test_atomic_write_file_creates_and_renames(self):
         target_path = os.path.join(enhance_coverage.BACKGROUND_JOBS_STORAGE_DIR, "test_atomic.json")

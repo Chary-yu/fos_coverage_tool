@@ -330,10 +330,11 @@ class TestIncrementalReviewInjection(unittest.TestCase):
             "uncovered_lines_by_file": {"src/main.c": [11]},
         }
 
-        enhance_coverage.generate_incremental_review(
-            self.repo_dir, "old123", "new456", "coverage.info", self.input_dir,
-            self.output_dir, "incremental_test", workers=1, render_mode="lazy",
-        )
+        with unittest.mock.patch.object(enhance_coverage, "is_mysql_configured", return_value=(False, False)):
+            enhance_coverage.generate_incremental_review(
+                self.repo_dir, "old123", "new456", "coverage.info", self.input_dir,
+                self.output_dir, "incremental_test", workers=1, render_mode="lazy",
+            )
 
         with open(os.path.join(self.output_dir, "module.c.gcov.html"), "r", encoding="utf-8") as page:
             enhanced = page.read()
@@ -405,9 +406,10 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
             "review_lines_by_file": {self.repo_a_source: [11], self.repo_b_source: [11]},
         }
 
-        enhance_coverage.build_incremental_review_site(
-            result, self.input_dir, self.output_dir, "multi_review", workers=1, render_mode="lazy"
-        )
+        with unittest.mock.patch.object(enhance_coverage, "is_mysql_configured", return_value=(False, False)):
+            enhance_coverage.build_incremental_review_site(
+                result, self.input_dir, self.output_dir, "multi_review", workers=1, render_mode="lazy"
+            )
 
         for filename in ("repo_a.c.gcov.html", "repo_b.c.gcov.html"):
             with open(os.path.join(self.output_dir, filename), "r", encoding="utf-8") as page:
@@ -445,7 +447,8 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
             ],
         }
 
-        enhance_coverage.write_incremental_summary_page(self.output_dir, "sort_test", result)
+        with unittest.mock.patch.object(enhance_coverage, "is_mysql_configured", return_value=(False, False)):
+            enhance_coverage.write_incremental_summary_page(self.output_dir, "sort_test", result)
 
         with open(os.path.join(self.output_dir, "incremental_coverage.html"), "r", encoding="utf-8") as summary_page:
             summary_html = summary_page.read()
@@ -480,9 +483,10 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
             }],
         }
 
-        enhance_coverage.write_incremental_summary_page(
-            self.output_dir, "ownership_test", result
-        )
+        with unittest.mock.patch.object(enhance_coverage, "is_mysql_configured", return_value=(False, False)):
+            enhance_coverage.write_incremental_summary_page(
+                self.output_dir, "ownership_test", result
+            )
 
         with open(os.path.join(self.output_dir, "incremental_coverage.html"), "r", encoding="utf-8") as summary_page:
             summary_html = summary_page.read()
@@ -553,7 +557,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
 
         self.assertIn('const isIncremental = reviewScope === \'incremental\';', js_content)
         self.assertIn('<span class="mod-chip">', js_content)
-        self.assertIn('PROGRESS_PAGE_VERSION = \'visible-progress-20260817_v9_10\'', js_content)
+        self.assertIn('PROGRESS_PAGE_VERSION = \'visible-progress-20260817_v9_11\'', js_content)
 
         html_path = enhance_coverage.PROGRESS_PAGE_SOURCE_PATH
         with open(html_path, "r", encoding="utf-8") as f:
@@ -561,7 +565,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
 
         self.assertIn('.progress-link', html_content)
         self.assertIn('.progress-link:hover', html_content)
-        self.assertIn('页面版本 visible-progress-20260817_v9_10', html_content)
+        self.assertIn('页面版本 visible-progress-20260817_v9_11', html_content)
 
     def test_cascading_filter_dropdowns_in_incremental_js(self):
         js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH
@@ -596,7 +600,8 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
                 {"repository": "ssf", "file_path": "b.c", "status": coverage_check.STATUS_UNCOVERED},
             ]
         }
-        res = enhance_coverage.sync_incremental_unanalyzed_counts("test_project", sample_result)
+        with unittest.mock.patch.object(enhance_coverage, "is_mysql_configured", return_value=(False, False)):
+            res = enhance_coverage.sync_incremental_unanalyzed_counts("test_project", sample_result)
         self.assertEqual(sample_result["summary"]["unanalyzed"], 2)
 
     def test_legacy_pymysql_connection_without_enter_context_manager(self):
@@ -688,7 +693,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
     def test_api_incremental_unanalyzed_success(self):
         """Test 6: Verify GET /api/coverage/incremental/unanalyzed returns success JSON."""
         counts = {"/src/a.c": 3, "/src/b.c": 0}
-        with unittest.mock.patch.object(enhance_coverage, "is_mysql_configured", return_value=True), \
+        with unittest.mock.patch.object(enhance_coverage, "is_mysql_configured", return_value=(True, True)), \
              unittest.mock.patch.object(enhance_coverage, "get_incremental_unanalyzed_counts", return_value=(counts, 42)):
             handler = unittest.mock.MagicMock()
             handler.path = "/api/coverage/incremental/unanalyzed?project=FOS_V6R2"
@@ -706,7 +711,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
 
     def test_api_incremental_unanalyzed_db_failure(self):
         """Test 7: Verify GET /api/coverage/incremental/unanalyzed returns 500 when DB query fails."""
-        with unittest.mock.patch.object(enhance_coverage, "is_mysql_configured", return_value=True), \
+        with unittest.mock.patch.object(enhance_coverage, "is_mysql_configured", return_value=(True, True)), \
              unittest.mock.patch.object(enhance_coverage, "get_incremental_unanalyzed_counts", side_effect=RuntimeError("DB Connection Lost")):
             handler = unittest.mock.MagicMock()
             handler.path = "/api/coverage/incremental/unanalyzed?project=FOS_V6R2"
@@ -733,9 +738,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
                     {"repository": "repo_a", "file_path": "/src/main.c", "review_file_path": "/src/main.c", "status": coverage_check.STATUS_UNCOVERED},
                 ]
             }
-            mock_mgr = unittest.mock.MagicMock()
-            mock_mgr.is_available.return_value = False
-            with unittest.mock.patch.object(enhance_coverage, "get_thread_db_manager", return_value=mock_mgr):
+            with unittest.mock.patch.object(enhance_coverage, "is_mysql_configured", return_value=(False, False)):
                 enhance_coverage.write_incremental_summary_page(tmp_dir, "FOS_V6R2", sample_result)
             html_path = os.path.join(tmp_dir, "incremental_coverage.html")
             with open(html_path, "r", encoding="utf-8") as f:
@@ -852,6 +855,34 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         self.assertIn('totalEl.setAttribute("title", "待分析动态刷新失败，正在显示当前快照数值 (" + (err.message || err) + ")");', js_content)
         self.assertIn('totalEl.classList.add("refresh-failed")', js_content)
         self.assertIn('totalEl.removeAttribute("title")', js_content)
+
+    def test_configured_mysql_missing_pymysql_driver_raises_runtime_error(self):
+        """Test 16: Verify RuntimeError raised when MySQL host is configured but PyMySQL driver is missing."""
+        sample_result = {
+            "summary": {"uncovered": 5, "unanalyzed": 5},
+            "details": [{"repository": "ssf", "file_path": "a.c", "status": coverage_check.STATUS_UNCOVERED}]
+        }
+        mock_config = {"mysql": {"host": "127.0.0.1", "port": 3306}}
+
+        with unittest.mock.patch.object(enhance_coverage, "db_module", None):
+            with self.assertRaises(RuntimeError) as cm:
+                enhance_coverage.sync_incremental_unanalyzed_counts("NO_DRIVER_PROJ", sample_result, config=mock_config)
+            self.assertIn("PyMySQL driver is not installed", str(cm.exception))
+
+    def test_configured_mysql_missing_table_raises_runtime_error(self):
+        """Test 17: Verify RuntimeError raised when MySQL is configured but database table does not exist."""
+        mock_config = {"mysql": {"host": "127.0.0.1", "port": 3306}}
+        mock_conn = unittest.mock.MagicMock()
+        mock_cursor = unittest.mock.MagicMock()
+        mock_cursor.execute.side_effect = RuntimeError("Table 'coverage.coverage_line_index' doesn't exist")
+        mock_conn.cursor.return_value = mock_cursor
+        mock_mgr = unittest.mock.MagicMock()
+        mock_mgr.conn = mock_conn
+
+        with unittest.mock.patch.object(enhance_coverage, "db_module", object()):
+            with self.assertRaises(RuntimeError) as cm:
+                enhance_coverage.query_incremental_unanalyzed_counts(mock_mgr, "MISSING_TABLE_PROJ", config=mock_config)
+            self.assertIn("Database query failed for configured MySQL database", str(cm.exception))
 
 
 if __name__ == "__main__":
