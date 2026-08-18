@@ -57,7 +57,7 @@ PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "visible-progress-20260817_v9_5"
+ASSET_VERSION = "visible-progress-20260817_v9_6"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 
 
@@ -1062,7 +1062,7 @@ def save_job_to_db(job):
                 error_message = VALUES(error_message),
                 updated_at = NOW(6),
                 heartbeat_at = NOW(6),
-                finished_at = IF(VALUES(state) IN ('completed', 'failed', 'expired'), NOW(6), finished_at);
+                finished_at = IF(VALUES(state) IN ('completed', 'failed', 'expired', 'cancelled'), NOW(6), finished_at);
             """
             cursor.execute(sql, (
                 job["id"],
@@ -1115,7 +1115,7 @@ def _cleanup_background_jobs_locked(now):
             cursor = db_manager.conn.cursor()
             cursor.execute("""
                 DELETE FROM coverage_background_jobs
-                WHERE state IN ('completed', 'failed', 'expired')
+                WHERE state IN ('completed', 'failed', 'expired', 'cancelled')
                 AND finished_at IS NOT NULL
                 AND finished_at < DATE_SUB(NOW(6), INTERVAL 30 MINUTE)
             """)
@@ -1266,6 +1266,7 @@ def _run_progress_background_job(job_id, project_name):
     except JobCancelledError as e:
         print("[Progress Job] Job '{}' cancelled cleanly: {}".format(job_id, e), flush=True)
         _cancel_background_job(job_id, str(e))
+    except Exception as error:
         print("[Progress Job] Failed for project '{}': {}".format(project_name, error), flush=True)
         _finish_background_job(
             job_id,

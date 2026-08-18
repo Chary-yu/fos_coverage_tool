@@ -776,7 +776,7 @@ class TestScalableProgress(unittest.TestCase):
         with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as html_file:
             html_content = html_file.read()
         self.assertIn('src="coverage_progress.js?v=', html_content)
-        self.assertIn("页面版本 visible-progress-20260817_v9_5", html_content)
+        self.assertIn("页面版本 visible-progress-20260817_v9_6", html_content)
         self.assertNotIn('<script>\n    const DEFAULT_REVIEW_SCOPE', html_content)
 
 
@@ -980,7 +980,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("mod-chip", js_content)
         self.assertIn("mod-more-chip", js_content)
         self.assertIn("bar-high", js_content)
-        self.assertIn("visible-progress-20260817_v9_5", js_content)
+        self.assertIn("visible-progress-20260817_v9_6", js_content)
 
     def test_atomic_write_file_creates_and_renames(self):
         target_path = os.path.join(enhance_coverage.BACKGROUND_JOBS_STORAGE_DIR, "test_atomic.json")
@@ -1046,6 +1046,28 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
                 enhance_coverage._update_background_job(job_id, 10, "exporting", "test")
         with enhance_coverage._background_jobs_lock:
             enhance_coverage._background_jobs.pop(job_id, None)
+
+    def test_run_progress_background_job_cancellation_and_error_handling(self):
+        # 1. Test JobCancelledError handling
+        job_id_1 = "test_progress_job_cancel"
+        with enhance_coverage._background_jobs_lock:
+            enhance_coverage._background_jobs[job_id_1] = {"id": job_id_1, "state": "running", "kind": "progress"}
+        with unittest.mock.patch.object(enhance_coverage, "compute_progress_data", side_effect=enhance_coverage.JobCancelledError("cancel test")):
+            enhance_coverage._run_progress_background_job(job_id_1, "proj_cancel")
+        job_1 = enhance_coverage._background_jobs.get(job_id_1)
+        self.assertIsNotNone(job_1)
+        self.assertEqual(job_1["state"], "cancelled")
+
+        # 2. Test ordinary Exception handling
+        job_id_2 = "test_progress_job_err"
+        with enhance_coverage._background_jobs_lock:
+            enhance_coverage._background_jobs[job_id_2] = {"id": job_id_2, "state": "running", "kind": "progress"}
+        with unittest.mock.patch.object(enhance_coverage, "compute_progress_data", side_effect=RuntimeError("boom test")):
+            enhance_coverage._run_progress_background_job(job_id_2, "proj_err")
+        job_2 = enhance_coverage._background_jobs.get(job_id_2)
+        self.assertIsNotNone(job_2)
+        self.assertEqual(job_2["state"], "failed")
+        self.assertIn("boom test", job_2.get("error_message", ""))
 
     def test_completed_job_db_restoration_restores_finished_at_and_enforces_retention(self):
         import time
