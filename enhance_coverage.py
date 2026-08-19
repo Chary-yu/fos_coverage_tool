@@ -127,10 +127,10 @@ REPORT_REGISTRY_DIR = get_configured_registry_dir()
 REPORT_REGISTRY_LEGACY_PATH = os.path.join(SCRIPT_DIR, ".report_registry.json")
 
 
-def prune_stale_report_registry(reg_dir: Optional[str] = None):
-    """Clean up registry entries where registered directories no longer exist on disk."""
-    d = reg_dir or get_configured_registry_dir()
-    if not os.path.isdir(d):
+def prune_stale_report_registry(registry_dir: Optional[str] = None):
+    """Prune registry files pointing to deleted directories or deleted report caches."""
+    d = registry_dir or get_configured_registry_dir()
+    if not d or not os.path.isdir(d):
         return
     try:
         for entry in os.listdir(d):
@@ -139,10 +139,18 @@ def prune_stale_report_registry(reg_dir: Optional[str] = None):
                 try:
                     with open(fpath, "r", encoding="utf-8") as f:
                         data = json.load(f)
+                    report_id = data.get("report_id") or os.path.splitext(entry)[0]
                     dirs = data.get("directories", []) if isinstance(data, dict) else []
                     if isinstance(dirs, str):
                         dirs = [dirs]
-                    valid_dirs = [x for x in dirs if x and os.path.exists(x)]
+                    valid_dirs = []
+                    for x in dirs:
+                        if not x or not os.path.exists(x):
+                            continue
+                        sidecar_dir = os.path.join(x, ".source_cache", report_id)
+                        # Keep directory if sidecar cache exists for this report_id, or if non-lazy-collapse directory exists
+                        if os.path.isdir(sidecar_dir) or not os.path.isdir(os.path.join(x, ".source_cache")):
+                            valid_dirs.append(x)
                     if not valid_dirs:
                         try:
                             os.remove(fpath)
@@ -2179,47 +2187,69 @@ def load_config():
 
 
 def write_configured_enhance_js(output_path, project_name, render_mode="lazy_collapse", review_scope="full", report_id=""):
-    """Copy the frontend script and inject project, render mode, review scope and report_id."""
+    """Copy the frontend script and inject fallback configuration."""
     with open(JS_SOURCE_PATH, 'r', encoding='utf-8') as f:
         content = f.read()
 
     project_literal = json.dumps(str(project_name), ensure_ascii=False)
     new_content, replace_count = re.subn(
-        r"const\s+DEFAULT_PROJECT\s*=\s*(['\"]).*?\1\s*;",
-        f"const DEFAULT_PROJECT = {project_literal};",
+        r"getMetaContent\('coverage-project'\)\s*\|\|\s*(['\"]).*?\1",
+        f"getMetaContent('coverage-project') || {project_literal}",
         content,
         count=1
     )
-    if replace_count != 1:
-        raise RuntimeError("Failed to inject project_name into coverage_enhance.js")
+    if replace_count == 0:
+        new_content, _ = re.subn(
+            r"const\s+DEFAULT_PROJECT\s*=\s*(['\"]).*?\1\s*;",
+            f"const DEFAULT_PROJECT = {project_literal};",
+            content,
+            count=1
+        )
 
     render_mode_literal = json.dumps(str(render_mode), ensure_ascii=False)
     new_content, replace_count = re.subn(
-        r"const\s+RENDER_MODE\s*=\s*(['\"]).*?\1\s*;",
-        f"const RENDER_MODE = {render_mode_literal};",
+        r"getMetaContent\('coverage-render-mode'\)\s*\|\|\s*(['\"]).*?\1",
+        f"getMetaContent('coverage-render-mode') || {render_mode_literal}",
         new_content,
         count=1
     )
-    if replace_count != 1:
-        raise RuntimeError("Failed to inject RENDER_MODE into coverage_enhance.js")
+    if replace_count == 0:
+        new_content, _ = re.subn(
+            r"const\s+RENDER_MODE\s*=\s*(['\"]).*?\1\s*;",
+            f"const RENDER_MODE = {render_mode_literal};",
+            new_content,
+            count=1
+        )
 
     scope_literal = json.dumps(str(review_scope), ensure_ascii=False)
     new_content, replace_count = re.subn(
-        r"const\s+REVIEW_SCOPE\s*=\s*(['\"]).*?\1\s*;",
-        f"const REVIEW_SCOPE = {scope_literal};",
+        r"getMetaContent\('coverage-review-scope'\)\s*\|\|\s*(['\"]).*?\1",
+        f"getMetaContent('coverage-review-scope') || {scope_literal}",
         new_content,
         count=1
     )
-    if replace_count != 1:
-        raise RuntimeError("Failed to inject REVIEW_SCOPE into coverage_enhance.js")
+    if replace_count == 0:
+        new_content, _ = re.subn(
+            r"const\s+REVIEW_SCOPE\s*=\s*(['\"]).*?\1\s*;",
+            f"const REVIEW_SCOPE = {scope_literal};",
+            new_content,
+            count=1
+        )
 
     report_id_literal = json.dumps(str(report_id or ""), ensure_ascii=False)
-    new_content, _ = re.subn(
-        r"const\s+DEFAULT_REPORT_ID\s*=\s*(['\"]).*?\1\s*;",
-        f"const DEFAULT_REPORT_ID = {report_id_literal};",
+    new_content, replace_count = re.subn(
+        r"getMetaContent\('coverage-report-id'\)\s*\|\|\s*(['\"]).*?\1",
+        f"getMetaContent('coverage-report-id') || {report_id_literal}",
         new_content,
         count=1
     )
+    if replace_count == 0:
+        new_content, _ = re.subn(
+            r"const\s+DEFAULT_REPORT_ID\s*=\s*(['\"]).*?\1\s*;",
+            f"const DEFAULT_REPORT_ID = {report_id_literal};",
+            new_content,
+            count=1
+        )
 
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(new_content)
@@ -4062,6 +4092,12 @@ def get_code_detail_service(db_mgr=None, search_dirs=None):
         for r_root in cfg_report_roots:
             if r_root and os.path.exists(r_root):
                 dirs.append(os.path.abspath(r_root))
+    env_report_roots = os.environ.get("COVERAGE_REPORT_ROOTS", "")
+    if env_report_roots:
+        for r_root in re.split(r'[:,]', env_report_roots):
+            r_root = r_root.strip()
+            if r_root and os.path.exists(r_root):
+                dirs.append(os.path.abspath(r_root))
     if search_dirs:
         dirs.extend(search_dirs)
     if _global_code_detail_service is None or _global_code_detail_service.db_manager != manager:
@@ -4568,8 +4604,8 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
             if ranges is not None and (not isinstance(ranges, list) or len(ranges) > 1000):
                 self.send_error_response(400, "ranges must be a list with at most 1000 items")
                 return
-            if region_ids is not None and not isinstance(region_ids, list):
-                self.send_error_response(400, "region_ids must be a list")
+            if region_ids is not None and (not isinstance(region_ids, list) or len(region_ids) > 1000):
+                self.send_error_response(400, "region_ids must be a list with at most 1000 items")
                 return
             try:
                 service = get_code_detail_service()
@@ -4916,6 +4952,13 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             source_content = f.read()
 
+    if render_mode == "lazy_collapse":
+        if re.search(r'<meta\s+name=["\']coverage-report-id["\']', source_content) and re.search(r'<pre\s+class=["\']source["\']>\s*</pre>', source_content):
+            raise ValueError(
+                f"Input file '{rel_path}' appears to be an already stripped Lazy Collapse report. "
+                f"Please provide the original unstripped LCOV report as input."
+            )
+
     with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
         file_content = f.read()
 
@@ -4981,9 +5024,11 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
                 sidecar_saved = False
 
     meta_tags = (
+        f'<meta name="coverage-project" content="{html.escape(project_name)}">\n'
         f'<meta name="coverage-report-id" content="{html.escape(report_id)}">\n'
         f'<meta name="coverage-file-path" content="{html.escape(report_file_path)}">\n'
         f'<meta name="coverage-render-mode" content="{html.escape(render_mode)}">\n'
+        f'<meta name="coverage-review-scope" content="{html.escape(review_scope)}">\n'
     )
 
     should_strip = (render_mode == "lazy_collapse" and sidecar_saved)

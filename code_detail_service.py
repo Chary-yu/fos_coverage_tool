@@ -123,7 +123,8 @@ def is_safe_relative_path(path: str) -> bool:
     return True
 
 
-MAX_CONTEXT_CACHE_ENTRIES = 64
+MAX_CONTEXT_CACHE_ENTRIES = 16
+MAX_CONTEXT_CACHE_TOTAL_LINES = 1_000_000
 
 
 class CodeDetailService:
@@ -135,16 +136,26 @@ class CodeDetailService:
         search_dirs: Optional[List[str]] = None,
         review_scope: str = "full",
         max_cache_entries: int = MAX_CONTEXT_CACHE_ENTRIES,
+        max_cache_total_lines: int = MAX_CONTEXT_CACHE_TOTAL_LINES,
     ):
         self.db_manager = db_manager
-        self.search_dirs = [os.path.abspath(d) for d in (search_dirs or []) if os.path.isdir(d)]
+        all_dirs = list(search_dirs or [])
+        env_roots = os.environ.get("COVERAGE_REPORT_ROOTS", "")
+        if env_roots:
+            for r_root in re.split(r'[:,]', env_roots):
+                r_root = r_root.strip()
+                if r_root and os.path.exists(r_root):
+                    all_dirs.append(r_root)
+
+        self.search_dirs = [os.path.abspath(d) for d in all_dirs if os.path.isdir(d)]
         self.review_scope = review_scope
         self._context_cache: Dict[Tuple[str, str, str, str], Tuple[float, SourceContext]] = {}
         self._cache_ttl_sec = 60.0
         self._max_cache_entries = max_cache_entries
+        self._max_cache_total_lines = max_cache_total_lines
 
     def _prune_context_cache(self, now: Optional[float] = None):
-        """Prune expired cache entries and enforce LRU / max entries limit."""
+        """Prune expired cache entries and enforce LRU / max entries & total lines limits."""
         if now is None:
             now = time.time()
         # 1. Remove expired entries
@@ -155,12 +166,15 @@ class CodeDetailService:
         for k in expired_keys:
             self._context_cache.pop(k, None)
 
-        # 2. Enforce maximum capacity by evicting oldest entries
-        if len(self._context_cache) > self._max_cache_entries:
+        # 2. Enforce maximum capacity (entries count and total lines sum) by evicting oldest entries
+        total_lines_sum = sum(ctx.total_lines for _, ctx in self._context_cache.values())
+        if len(self._context_cache) > self._max_cache_entries or total_lines_sum > self._max_cache_total_lines:
             sorted_items = sorted(self._context_cache.items(), key=lambda item: item[1][0])
-            to_remove = len(self._context_cache) - self._max_cache_entries
-            for i in range(to_remove):
-                self._context_cache.pop(sorted_items[i][0], None)
+            for k, (ts, ctx) in sorted_items:
+                if len(self._context_cache) <= self._max_cache_entries and total_lines_sum <= self._max_cache_total_lines:
+                    break
+                self._context_cache.pop(k, None)
+                total_lines_sum -= ctx.total_lines
 
     def clear_context_cache(self):
         """Explicitly clear in-memory context cache."""

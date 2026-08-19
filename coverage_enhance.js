@@ -9,12 +9,21 @@
  * 5. CodeRegionController: 区域交互、分批 DOM 渲染调度与展开/折叠控制
  */
 (function() {
-    const ENHANCE_VERSION = 'lazy-collapse-20260819_v11_3';
+    function getMetaContent(name, fallback = '') {
+        try {
+            const meta = document.querySelector(`meta[name="${name}"]`);
+            return meta ? (meta.getAttribute('content') || fallback) : fallback;
+        } catch (e) {
+            return fallback;
+        }
+    }
+
+    const ENHANCE_VERSION = 'lazy-collapse-20260819_v11_6';
     const SERVER_URL = '/api/coverage';
-    const DEFAULT_PROJECT = 'Gemini-NOS';
-    const DEFAULT_REPORT_ID = '';
-    const RENDER_MODE = 'lazy_collapse'; // 'lazy_collapse', 'lazy', 'immediate'
-    const REVIEW_SCOPE = 'full'; // 'full' or 'incremental'
+    const DEFAULT_PROJECT = getMetaContent('coverage-project') || 'Gemini-NOS';
+    const DEFAULT_REPORT_ID = getMetaContent('coverage-report-id') || '';
+    const RENDER_MODE = getMetaContent('coverage-render-mode') || 'lazy_collapse'; // 'lazy_collapse', 'lazy', 'immediate'
+    const REVIEW_SCOPE = getMetaContent('coverage-review-scope') || 'full'; // 'full' or 'incremental'
     const ENHANCE_SCRIPT_URL = document.currentScript && document.currentScript.src
         ? document.currentScript.src
         : '';
@@ -129,8 +138,10 @@
             attempted.push(url);
             try {
                 const response = await fetch(url, options || {});
-                const contentType = response.headers.get('Content-Type') || '';
-                const data = contentType.includes('application/json')
+                const contentType = (response.headers && typeof response.headers.get === 'function'
+                    ? response.headers.get('Content-Type')
+                    : 'application/json') || '';
+                const data = (contentType.includes('application/json') || typeof response.json === 'function')
                     ? await response.json()
                     : null;
                 if (response.ok && data && data.status === 'success') {
@@ -159,7 +170,11 @@
 
     function yieldToBrowser() {
         return new Promise(resolve => {
-            requestAnimationFrame(() => resolve());
+            if (typeof requestAnimationFrame === 'function') {
+                requestAnimationFrame(() => resolve());
+            } else {
+                setTimeout(resolve, 0);
+            }
         });
     }
 
@@ -931,6 +946,14 @@
                     const key = `${reg.startLine}-${reg.endLine}`;
                     if (rangeMap.has(key)) {
                         CodeRegionStore.setLoaded(reg.id, rangeMap.get(key));
+                    } else {
+                        CodeRegionStore.setCollapsed(reg.id);
+                    }
+                });
+            } else {
+                expandedRegions.forEach(reg => {
+                    if (!reg.loaded) {
+                        CodeRegionStore.setCollapsed(reg.id);
                     }
                 });
             }
@@ -1552,10 +1575,11 @@
             region.loadGeneration = (region.loadGeneration || 0) + 1;
             const currentGen = region.loadGeneration;
 
-            // Load lines via Loader with chunk streaming
+            // Load lines via Loader with chunk streaming - clear any partially loaded DOM lines from prior failed attempt
             this.updatePlaceholderState(region);
             try {
-                this.prepareRegionLinesContainer(region);
+                this.prepareRegionLinesContainer(region, { reset: true });
+                region.lines = [];
 
                 await CodeRegionLoader.loadRegion(this.filePath, region, async (chunkLines, start, end, loaded, total) => {
                     if (region.loadGeneration !== currentGen) return;
@@ -1575,7 +1599,7 @@
             }
         },
 
-        prepareRegionLinesContainer(region) {
+        prepareRegionLinesContainer(region, options = {}) {
             const container = region.domContainer;
             if (!container) return;
 
@@ -1607,6 +1631,8 @@
                 linesContainer.className = 'coverage-region-lines';
                 region.linesEl = linesContainer;
                 container.appendChild(linesContainer);
+            } else if (options.reset) {
+                region.linesEl.innerHTML = '';
             }
         },
 
@@ -1694,6 +1720,10 @@
             }
         },
 
+        operationGeneration: 0,
+        expandAllBtnEl: null,
+        toolbarStatusEl: null,
+
         createTopToolbar() {
             const existing = document.querySelector('.coverage-lazy-toolbar');
             if (existing) existing.remove();
@@ -1704,12 +1734,14 @@
 
             const statusSpan = document.createElement('span');
             statusSpan.className = 'coverage-lazy-toolbar-status';
+            this.toolbarStatusEl = statusSpan;
 
             const expandAllBtn = document.createElement('button');
             expandAllBtn.type = 'button';
             expandAllBtn.className = 'coverage-lazy-toolbar-btn primary';
             expandAllBtn.innerText = '📖 展开全部';
             expandAllBtn.title = '分批逐步展开当前文件的全部代码行';
+            this.expandAllBtnEl = expandAllBtn;
 
             const restoreDefaultBtn = document.createElement('button');
             restoreDefaultBtn.type = 'button';
@@ -1733,6 +1765,9 @@
         },
 
         async expandAll(btn, statusEl) {
+            this.operationGeneration = (this.operationGeneration || 0) + 1;
+            const currentOpGen = this.operationGeneration;
+
             btn.disabled = true;
             btn.innerText = '展开中…';
             const allRegions = CodeRegionStore.getAll();
@@ -1741,6 +1776,9 @@
             let failedCount = 0;
 
             for (let i = 0; i < allRegions.length; i++) {
+                if (this.operationGeneration !== currentOpGen) {
+                    break;
+                }
                 const reg = allRegions[i];
                 statusEl.innerText = `正在展开 ${loadedLinesCount} / ${totalLines} 行 (${i + 1}/${allRegions.length})…`;
                 try {
@@ -1749,6 +1787,9 @@
                         continue;
                     }
                     await this.expandRegion(reg);
+                    if (this.operationGeneration !== currentOpGen) {
+                        break;
+                    }
                     loadedLinesCount += reg.lineCount;
                 } catch (err) {
                     console.error(`[CodeRegionController] Expand all failed on ${reg.id}:`, err);
@@ -1757,18 +1798,30 @@
                 await yieldToBrowser();
             }
 
-            statusEl.innerText = '';
-            btn.disabled = false;
-            btn.innerText = '📖 展开全部';
+            if (this.operationGeneration === currentOpGen) {
+                statusEl.innerText = '';
+                btn.disabled = false;
+                btn.innerText = '📖 展开全部';
 
-            if (failedCount > 0) {
-                showToast(`已展开 ${allRegions.length - failedCount} 个区域，${failedCount} 个区域加载失败`);
-            } else {
-                showToast('已全部展开');
+                if (failedCount > 0) {
+                    showToast(`已展开 ${allRegions.length - failedCount} 个区域，${failedCount} 个区域加载失败`);
+                } else {
+                    showToast('已全部展开');
+                }
             }
         },
 
         restoreDefault() {
+            this.operationGeneration = (this.operationGeneration || 0) + 1;
+
+            if (this.expandAllBtnEl) {
+                this.expandAllBtnEl.disabled = false;
+                this.expandAllBtnEl.innerText = '📖 展开全部';
+            }
+            if (this.toolbarStatusEl) {
+                this.toolbarStatusEl.innerText = '';
+            }
+
             const allRegions = CodeRegionStore.getAll();
             allRegions.forEach(reg => {
                 if (reg.defaultState === 'expanded') {
@@ -1776,6 +1829,10 @@
                         this.expandRegion(reg.id);
                     }
                 } else {
+                    if (reg.loading) {
+                        reg.loadGeneration = (reg.loadGeneration || 0) + 1;
+                        CodeRegionStore.setCollapsed(reg.id);
+                    }
                     this.collapseRegion(reg.id);
                 }
             });
@@ -1880,7 +1937,7 @@
             } catch (err) {
                 console.warn('[CoverageEnhance] Failed to initialize via backend layout:', err.message);
                 // If the source was already stripped, display clear error message
-                if (preSource.children.length === 0 && preSource.textContent.trim() === '') {
+                if (preSource.children.length === 0 && (preSource.textContent || preSource.innerText || '').trim() === '') {
                     const errBanner = document.createElement('div');
                     errBanner.className = 'coverage-region-placeholder error';
                     errBanner.innerHTML = `
@@ -2134,5 +2191,15 @@
                 updateHeaderStatistics();
                 updateBatchToolbar();
             });
+    }
+
+    if (typeof window !== 'undefined') {
+        window.__COVERAGE_ENHANCE_INTERNALS__ = {
+            ReviewDraftStore,
+            CodeRegionStore,
+            CodeRegionLoader,
+            CodeLineRenderer,
+            CodeRegionController
+        };
     }
 })();

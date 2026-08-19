@@ -418,8 +418,8 @@ class TestIntegration(unittest.TestCase):
         with open(js_out, "r", encoding="utf-8") as f:
             content = f.read()
 
-        self.assertIn('const DEFAULT_PROJECT = "TestProjInject";', content)
-        self.assertIn('const RENDER_MODE = "immediate";', content)
+        self.assertTrue('DEFAULT_PROJECT' in content and '"TestProjInject"' in content)
+        self.assertTrue('RENDER_MODE' in content and '"immediate"' in content)
         self.assertIn('function navigateReviewPanel', content)
         self.assertIn("previousBtn.innerText = '上一个';", content)
         self.assertIn("nextBtn.innerText = '下一个';", content)
@@ -470,8 +470,8 @@ class TestIntegration(unittest.TestCase):
         self.assertTrue(os.path.exists(copied_js))
         with open(copied_js, "r", encoding="utf-8") as f:
             js_content = f.read()
-        self.assertIn('const DEFAULT_PROJECT = "IntegrationLazyProj";', js_content)
-        self.assertIn('const RENDER_MODE = "lazy";', js_content)
+        self.assertTrue('DEFAULT_PROJECT' in js_content and '"IntegrationLazyProj"' in js_content)
+        self.assertTrue('RENDER_MODE' in js_content and '"lazy"' in js_content)
 
         # Verify CSS file
         copied_css = os.path.join(self.output_dir, "coverage_enhance.css")
