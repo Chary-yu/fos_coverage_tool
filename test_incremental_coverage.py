@@ -418,7 +418,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
                 self.assertIn('data-coverage-review="incremental"', page.read())
         with open(os.path.join(self.output_dir, "incremental_coverage.html"), "r", encoding="utf-8") as summary_page:
             summary_html = summary_page.read()
-        self.assertIn("2 个仓库的 Git 范围", summary_html)
+        self.assertIn("多仓库联合审查 (2)", summary_html)
         self.assertIn("repo_a", summary_html)
         self.assertIn("repo_b", summary_html)
         self.assertIn('data-sort-key="uncovered"', summary_html)
