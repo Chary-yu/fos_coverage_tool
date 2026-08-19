@@ -1,5 +1,7 @@
 """
-Source Reader module for OneSensor code coverage detail page.
+Source Reader module for code coverage detail page.
+Parses, sanitizes, and serializes GCOV HTML source lines into unified DTOs
+and server-side sidecars.
 Reads and slices source code lines, extracts function ranges using token-aware brace depth tracking,
 detects basic blocks, and merges review/analysis state into unified Line DTOs.
 Supports source sidecar serialization and deserialization for true lazy loading.
@@ -805,7 +807,7 @@ def read_source_ranges(
     source_context: SourceContext,
     ranges: List[Dict[str, int]],
     max_ranges: int = 1000,
-    max_total_lines: int = MAX_BATCH_TOTAL_LINES,
+    max_total_lines: Optional[int] = MAX_BATCH_TOTAL_LINES,
 ) -> List[Dict[str, Any]]:
     """
     Read line DTOs for multiple ranges in a single batch.
@@ -824,7 +826,7 @@ def read_source_ranges(
             raise ValueError(f"Invalid range: [{s_line}..{e_line}]")
         total_requested_lines += (e_line - s_line + 1)
 
-    if total_requested_lines > max_total_lines:
+    if max_total_lines is not None and total_requested_lines > max_total_lines:
         raise ValueError(f"Total requested lines ({total_requested_lines}) exceeds maximum batch limit ({max_total_lines})")
 
     results = []

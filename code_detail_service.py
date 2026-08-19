@@ -1,5 +1,5 @@
 """
-Code Detail Service module for OneSensor code coverage detail page.
+Code Detail Service module for code coverage detail page.
 Provides high-level APIs for layout calculation, batch lines loading,
 and single-region source retrieval with security validation, sidecar caching,
 and exact report ID binding.
@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,25 +32,53 @@ from source_reader import (
 logger = logging.getLogger(__name__)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPORT_REGISTRY_PATH = os.path.join(SCRIPT_DIR, ".report_registry.json")
+REPORT_REGISTRY_DIR = os.environ.get(
+    "COVERAGE_REGISTRY_DIR",
+    "/var/lib/onesensor-coverage/report-registry"
+    if os.path.exists("/var/lib/onesensor-coverage/report-registry") or (os.path.exists("/var/lib") and os.access("/var/lib", os.W_OK))
+    else os.path.join(tempfile.gettempdir(), ".onesensor_report_registry")
+)
+REPORT_REGISTRY_LEGACY_PATH = os.path.join(SCRIPT_DIR, ".report_registry.json")
 
 
 def load_report_registry() -> Dict[str, List[str]]:
-    """Load persistent report registry."""
-    if os.path.exists(REPORT_REGISTRY_PATH):
+    """Load persistent report registry from per-report files and legacy registry."""
+    result: Dict[str, List[str]] = {}
+
+    if os.path.isdir(REPORT_REGISTRY_DIR):
         try:
-            with open(REPORT_REGISTRY_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                result = {}
-                for k, v in data.items():
-                    if isinstance(v, str):
-                        result[k] = [v]
-                    elif isinstance(v, list):
-                        result[k] = [str(x) for x in v if x]
-                return result
+            for entry in os.listdir(REPORT_REGISTRY_DIR):
+                if entry.endswith(".json") and not entry.startswith("."):
+                    file_path = os.path.join(REPORT_REGISTRY_DIR, entry)
+                    try:
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        if isinstance(data, dict):
+                            r_id = data.get("report_id") or os.path.splitext(entry)[0]
+                            dirs = data.get("directories", [])
+                            if isinstance(dirs, str):
+                                dirs = [dirs]
+                            result[r_id] = [str(d) for d in dirs if d]
+                    except Exception:
+                        pass
         except Exception:
             pass
-    return {}
+
+    if os.path.isfile(REPORT_REGISTRY_LEGACY_PATH):
+        try:
+            with open(REPORT_REGISTRY_LEGACY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if k not in result:
+                        if isinstance(v, str):
+                            result[k] = [v]
+                        elif isinstance(v, list):
+                            result[k] = [str(x) for x in v if x]
+        except Exception:
+            pass
+
+    return result
 
 
 def is_safe_relative_path(path: str) -> bool:
@@ -326,12 +355,13 @@ class CodeDetailService:
         self,
         project_name: str,
         file_path: str,
-        ranges: List[Dict[str, int]],
+        ranges: Optional[List[Dict[str, int]]] = None,
+        region_ids: Optional[List[str]] = None,
         report_id: str = "",
         review_scope: str = "full",
         content_override: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Batch load line data for specified ranges (up to 1000 ranges)."""
+        """Batch load line data for specified ranges (up to 1000 ranges) or verified default region IDs."""
         t_start = time.perf_counter()
         context = self.get_source_context(
             project_name=project_name,
@@ -340,7 +370,35 @@ class CodeDetailService:
             review_scope=review_scope,
             content_override=content_override,
         )
-        range_results = read_source_ranges(context, ranges, max_ranges=1000)
+
+        verified_ranges = []
+        is_verified_default_batch = False
+
+        if region_ids and isinstance(region_ids, list):
+            regions = build_code_regions(
+                total_lines=context.total_lines,
+                pending_lines=context.pending_lines,
+                function_ranges=context.function_ranges,
+            )
+            expanded_region_map = {r.region_id: r for r in regions if r.default_state == "expanded"}
+            for reg_id in region_ids:
+                if reg_id in expanded_region_map:
+                    reg = expanded_region_map[reg_id]
+                    verified_ranges.append({"start_line": reg.start_line, "end_line": reg.end_line})
+                else:
+                    raise ValueError(f"Requested region '{reg_id}' is not a valid default expanded region")
+            is_verified_default_batch = True
+
+        if is_verified_default_batch:
+            target_ranges = verified_ranges
+            max_lines = None
+        else:
+            if not ranges:
+                raise ValueError("ranges or region_ids is required")
+            target_ranges = ranges
+            max_lines = 50000
+
+        range_results = read_source_ranges(context, target_ranges, max_ranges=1000, max_total_lines=max_lines)
         elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 
         total_lines_read = sum(len(r["lines"]) for r in range_results)
@@ -352,6 +410,7 @@ class CodeDetailService:
             "perf": {
                 "batch_load_ms": round(elapsed_ms, 2),
                 "total_lines_read": total_lines_read,
+                "verified_default_batch": is_verified_default_batch,
             },
         }
 

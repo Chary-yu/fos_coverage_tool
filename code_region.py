@@ -1,7 +1,7 @@
 """
-Code Region Builder module for OneSensor code coverage detail page.
-Calculates expanded and collapsed regions based on pending analysis lines
-and function boundaries.
+Code Region Builder module for code coverage detail page.
+Partitions a source file into expanded / collapsed CodeRegion chunks
+according to uncovered/pending line analysis and C/C++ function ranges.
 """
 
 from bisect import bisect_right
@@ -150,7 +150,8 @@ def find_function_containing_line(
 ) -> Optional[FunctionRange]:
     """
     Find the function containing line_number in O(log F) time.
-    If multiple nested functions contain the line, returns the most specific (innermost/smallest).
+    For C/C++ where functions are non-overlapping and sorted by start_line,
+    only the immediately preceding candidate (idx - 1) needs to be checked.
     """
     if not sorted_function_ranges:
         return None
@@ -165,11 +166,6 @@ def find_function_containing_line(
     cand = sorted_function_ranges[idx - 1]
     if cand.contains(line_number):
         return cand
-
-    for i in range(idx - 2, -1, -1):
-        fn = sorted_function_ranges[i]
-        if fn.contains(line_number):
-            return fn
 
     return None
 
@@ -230,8 +226,6 @@ def build_code_regions(
             cand = valid_functions[fn_idx]
             if cand.contains(line):
                 matched_fn = cand
-            else:
-                matched_fn = find_function_containing_line(line, valid_functions, start_lines)
 
         if matched_fn is not None:
             label = matched_fn.name if matched_fn.name else None

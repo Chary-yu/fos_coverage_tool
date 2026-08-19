@@ -234,17 +234,16 @@ class TestCodeRegionBuilder(unittest.TestCase):
         fns = sanitize_function_ranges([
             FunctionRange(10, 50, "a()"),
             FunctionRange(60, 100, "b()"),
-            FunctionRange(200, 300, "c()"),
-            FunctionRange(220, 260, "c_inner()"),
+            FunctionRange(200, 260, "c()"),
+            FunctionRange(270, 300, "d()"),
         ])
         self.assertEqual(find_function_containing_line(5, fns), None)
         self.assertEqual(find_function_containing_line(10, fns).name, "a()")
         self.assertEqual(find_function_containing_line(30, fns).name, "a()")
         self.assertEqual(find_function_containing_line(50, fns).name, "a()")
         self.assertEqual(find_function_containing_line(55, fns), None)
-        # Inner function selected when nested
-        self.assertEqual(find_function_containing_line(230, fns).name, "c_inner()")
-        self.assertEqual(find_function_containing_line(280, fns).name, "c()")
+        self.assertEqual(find_function_containing_line(230, fns).name, "c()")
+        self.assertEqual(find_function_containing_line(280, fns).name, "d()")
 
 
 if __name__ == "__main__":

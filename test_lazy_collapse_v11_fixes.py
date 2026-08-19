@@ -15,6 +15,7 @@ import io
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
 import unittest
@@ -24,6 +25,7 @@ from code_region import CodeRegion, FunctionRange, build_code_regions, find_func
 from source_reader import (
     SourceContext,
     SourceLineDTO,
+    calc_sidecar_file_key,
     extract_c_function_ranges,
     is_line_pending_analysis,
     load_source_sidecar,
@@ -32,6 +34,7 @@ from source_reader import (
     read_source_ranges,
     save_source_sidecar,
 )
+import code_detail_service
 from code_detail_service import CodeDetailService, compute_file_path_hash
 import enhance_coverage
 from enhance_coverage import (
@@ -315,7 +318,7 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
         )
 
         expected_key = calc_sidecar_file_key("src/test.c")
-        report_id = f"report_{enhance_coverage.calc_file_path_hash(os.path.abspath(output_dir))[:16]}"
+        report_id = os.listdir(os.path.join(output_dir, ".source_cache"))[0]
         sidecar_file = os.path.join(output_dir, ".source_cache", report_id, f"{expected_key}.source.json")
         self.assertTrue(os.path.isfile(sidecar_file), f"Sidecar file missing at {sidecar_file}")
 
@@ -376,7 +379,7 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
             reuse_output=True,
         )
 
-        report_id = f"report_{enhance_coverage.calc_file_path_hash(os.path.abspath(output_dir))[:16]}"
+        report_id = os.listdir(os.path.join(output_dir, ".source_cache"))[0]
         service = CodeDetailService()
         lines_data = service.get_code_lines_single("ReuseProj", "src/reuse.c", start_line=1, end_line=2, report_id=report_id)
         self.assertEqual(len(lines_data["lines"]), 2)
@@ -508,7 +511,9 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
         with open(os.path.join(out_dir, "incremental_coverage.html"), "r", encoding="utf-8") as f:
             inc_html = f.read()
         self.assertIn("v11.3 2026-08-19", inc_html)
-        self.assertIn('<span class="page-version-badge">v11.3 2026-08-19</span>', inc_html)
+        self.assertIn("page-version-badge", inc_html)
+        self.assertIn("whats-new-modal", inc_html)
+        self.assertIn("whats-new-btn", inc_html)
 
         # 2. Check developer tasks page does NOT contain badge or footer version
         enhance_coverage.write_incremental_developer_tasks_page(out_dir, "TestProj", result_mock)
@@ -525,6 +530,150 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
         with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as f:
             prog_html = f.read()
         self.assertNotIn("v11.3 2026-08-19", prog_html)
+
+    def test_17_smoke_tests_import_and_help(self):
+        """P0-1 Smoke Test: test module imports and CLI --help execution."""
+        import subprocess
+        # 1. Test CLI --help
+        res = subprocess.run([sys.executable, "enhance_coverage.py", "--help"], cwd=enhance_coverage.SCRIPT_DIR, capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0)
+        self.assertIn("Usage:", res.stdout)
+
+        # 2. Test imports
+        res_import = subprocess.run([sys.executable, "-c", "import enhance_coverage, code_detail_service, source_reader"], cwd=enhance_coverage.SCRIPT_DIR, capture_output=True, text=True)
+        self.assertEqual(res_import.returncode, 0)
+
+    def test_18_batch_lines_region_ids_bypasses_arbitrary_limit_for_verified_defaults(self):
+        """P0-2: Verify verified default expanded regions load completely even for 60,000 lines."""
+        # Create a mock source file with 60,000 lines
+        lines_count = 60000
+        mock_lines = [
+            SourceLineDTO(
+                line_no=i,
+                source=f"    int x_{i} = {i};",
+                coverage_state="uncovered" if i == 10 else "covered",
+                is_pending_analysis=(i == 10),
+            )
+            for i in range(1, lines_count + 1)
+        ]
+        context = SourceContext(
+            project_name="BigFuncProj",
+            file_path="big_func.c",
+            lines=mock_lines,
+            function_ranges=[FunctionRange(1, lines_count, "super_big_function")],
+            pending_lines=[10],
+            total_uncovered_count=1,
+            report_id="report_big_test",
+        )
+
+        service = CodeDetailService()
+        service._context_cache[("BigFuncProj", "report_big_test", "big_func.c", "full")] = (time.time(), context)
+
+        # 1. Arbitrary ranges > 50000 should raise ValueError
+        with self.assertRaises(ValueError) as cm:
+            service.get_code_lines_batch(
+                project_name="BigFuncProj",
+                file_path="big_func.c",
+                ranges=[{"start_line": 1, "end_line": lines_count}],
+                report_id="report_big_test",
+            )
+        self.assertIn("exceeds maximum batch limit", str(cm.exception))
+
+        # 2. Verified default region_id should succeed without limit
+        res = service.get_code_lines_batch(
+            project_name="BigFuncProj",
+            file_path="big_func.c",
+            region_ids=["region-1-60000"],
+            report_id="report_big_test",
+        )
+        self.assertEqual(len(res["ranges"]), 1)
+        self.assertEqual(len(res["ranges"][0]["lines"]), lines_count)
+        self.assertTrue(res["perf"]["verified_default_batch"])
+
+    def test_19_immutable_report_id_and_incremental_review_set_hash(self):
+        """P0-3 & P1-2: Verify report_id and signature depend on incremental review set and isolate cache."""
+        input_dir = os.path.join(self.temp_dir, "test_sig_in")
+        out_dir = os.path.join(self.temp_dir, "test_sig_out")
+        os.makedirs(os.path.join(input_dir, "html"), exist_ok=True)
+        with open(os.path.join(input_dir, "html", "sample.c.gcov.html"), "w", encoding="utf-8") as f:
+            f.write("<html><head></head><body><pre class=\"source\">int main(){ return 0; }</pre></body></html>")
+
+        # Sig 1 with incremental lines {1}
+        sig1 = enhance_coverage.compute_directory_signature(
+            os.path.join(input_dir, "html"), project_name="SigProj", review_scope="incremental",
+            render_mode="lazy_collapse", incremental_lines_by_file={"sample.c": [1]}
+        )
+        # Sig 2 with incremental lines {2}
+        sig2 = enhance_coverage.compute_directory_signature(
+            os.path.join(input_dir, "html"), project_name="SigProj", review_scope="incremental",
+            render_mode="lazy_collapse", incremental_lines_by_file={"sample.c": [2]}
+        )
+
+        self.assertNotEqual(sig1["incremental_review_set_hash"], sig2["incremental_review_set_hash"])
+
+    def test_20_perf_pending_lines_in_global_gaps(self):
+        """P1-1: Benchmark 10,000 functions + 10,000 pending lines in global gaps (< 50ms)."""
+        num_fns = 10000
+        fn_ranges = []
+        pending_gaps = []
+        for i in range(num_fns):
+            s_line = i * 20 + 2
+            e_line = s_line + 10
+            fn_ranges.append(FunctionRange(s_line, e_line, f"func_{i}"))
+            # Gap line between previous function and current function
+            gap_line = i * 20 + 1
+            pending_gaps.append(gap_line)
+
+        t0 = time.perf_counter()
+        regions = build_code_regions(
+            total_lines=num_fns * 20 + 50,
+            pending_lines=pending_gaps,
+            function_ranges=fn_ranges,
+        )
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        print(f"\n[Perf Test] 10,000 functions + 10,000 gap pending lines build time = {elapsed_ms:.2f}ms")
+        self.assertLess(elapsed_ms, 50.0)
+        self.assertTrue(len(regions) > 0)
+
+    def test_21_lazy_collapse_same_input_output_dir_raises(self):
+        """P1-3: Verify lazy_collapse mode forbids same input_dir and output_dir."""
+        same_dir = os.path.join(self.temp_dir, "same_in_out")
+        os.makedirs(same_dir, exist_ok=True)
+        with self.assertRaises(ValueError) as cm:
+            enhance_coverage.inject_coverage_report(
+                same_dir, same_dir, project_name="SameDirProj", render_mode="lazy_collapse"
+            )
+        self.assertIn("must be distinct directories", str(cm.exception))
+
+    def test_22_report_registry_dir_multi_process_isolation(self):
+        """P1-4: Verify report registry creates per-report files in registry directory."""
+        test_reg_dir = os.path.join(self.temp_dir, "custom_registry_dir")
+        old_reg_env = os.environ.get("COVERAGE_REGISTRY_DIR")
+        os.environ["COVERAGE_REGISTRY_DIR"] = test_reg_dir
+        enhance_coverage.REPORT_REGISTRY_DIR = test_reg_dir
+        code_detail_service.REPORT_REGISTRY_DIR = test_reg_dir
+        try:
+            r1_dir = os.path.join(self.temp_dir, "r1_dir")
+            r2_dir = os.path.join(self.temp_dir, "r2_dir")
+            os.makedirs(r1_dir, exist_ok=True)
+            os.makedirs(r2_dir, exist_ok=True)
+
+            enhance_coverage.register_report_directory("report_iso_1", r1_dir)
+            enhance_coverage.register_report_directory("report_iso_2", r2_dir)
+
+            self.assertTrue(os.path.isfile(os.path.join(test_reg_dir, "report_iso_1.json")))
+            self.assertTrue(os.path.isfile(os.path.join(test_reg_dir, "report_iso_2.json")))
+
+            loaded = code_detail_service.load_report_registry()
+            self.assertIn("report_iso_1", loaded)
+            self.assertIn("report_iso_2", loaded)
+            self.assertIn(os.path.abspath(r1_dir), loaded["report_iso_1"])
+            self.assertIn(os.path.abspath(r2_dir), loaded["report_iso_2"])
+        finally:
+            if old_reg_env is not None:
+                os.environ["COVERAGE_REGISTRY_DIR"] = old_reg_env
+            else:
+                os.environ.pop("COVERAGE_REGISTRY_DIR", None)
 
 
 if __name__ == "__main__":

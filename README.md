@@ -119,7 +119,7 @@ python3.6 coverage_check.py ...
     "enabled": true,
     "xlsx_path": "代码目录归属模块统计.xlsx"
   },
-  "render_mode": "lazy",
+  "render_mode": "lazy_collapse",
   "project_name": "review_main_202605"
 }
 ```
@@ -132,7 +132,7 @@ python3.6 coverage_check.py ...
 * `worker_threads` 控制注入写库和按目录导出 Excel 的并发线程数，建议从 4 开始，数据库压力允许时再调大；
 * `ownership.xlsx_path` 指向代码目录归属表，支持绝对路径；相对路径按 `enhance_coverage.py` 所在目录解析；
 * `ownership.enabled=false` 可以临时停用小组/组长归类，但不会影响原有项目、目录、文件进度；
-* `render_mode` 控制覆盖率页面右侧控件的默认显示方式，`lazy` 为轻量占位、点击展开，`immediate` 为打开页面后直接渲染完整控件；
+* `render_mode` 控制覆盖率页面右侧控件的默认显示方式，`lazy_collapse` 为待分析函数优先+懒加载折叠（v11 默认生产模式），`lazy` 为轻量占位点击展开（兼容模式），`immediate` 为打开页面后直接渲染完整控件（兼容/调试模式）；
 * `server.host` 建议使用 `127.0.0.1`，由 Nginx 反向代理给浏览器访问。
 
 首次启动或注入时，脚本会自动建库、建表并升级表结构。
@@ -155,7 +155,7 @@ python3 enhance_coverage.py inject \
   --project review_main_202605 \
   --dir /opt/coverage_reports/raw_main_202605 \
   --out /opt/coverage_tool/review_main_202605 \
-  --mode lazy \
+  --mode lazy_collapse \
   --workers 4
 ```
 
@@ -194,11 +194,12 @@ python3 enhance_coverage.py inject \
 
 控件显示模式说明：
 
-* `--mode lazy`：默认推荐。页面先显示轻量 `分析` 占位按钮，点击后再展开完整输入框，适合未覆盖块很多的大文件；
-* `--mode immediate`：打开页面后直接渲染完整输入框，适合文件较小或希望保持旧交互习惯的项目；
-* 未传 `--mode` 时使用 `coverage_config.json` 中的 `render_mode`，配置不存在或非法时默认使用 `lazy`；
-* 临时查看时也可以在网页 URL 后追加 `?mode=lazy` 或 `?mode=immediate` 覆盖默认模式；如果 URL 已经带有其他参数，则使用 `&mode=lazy` 或 `&mode=immediate`；
-* 覆盖率源码页右下角也提供显示模式切换器，可以在当前页面快速切换 `lazy` / `immediate`。
+* `--mode lazy_collapse`：v11 默认生产模式。待分析函数优先展开，非待分析代码块折叠懒加载，大幅减轻 DOM 压力并提升大文件加载速度；
+* `--mode lazy`：轻量占位兼容模式。页面先显示轻量 `分析` 占位按钮，点击后再展开完整输入框；
+* `--mode immediate`：打开页面后直接渲染完整输入框，适合小文件或调试用途；
+* 未传 `--mode` 时使用 `coverage_config.json` 中的 `render_mode`，配置不存在或非法时默认使用 `lazy_collapse`；
+* 临时查看时也可以在网页 URL 后追加 `?mode=lazy_collapse`、`?mode=lazy` 或 `?mode=immediate` 覆盖默认模式；
+* 覆盖率源码页右上角也提供显示模式切换器，可以在当前页面快速切换模式。
 
 ---
 
@@ -216,7 +217,7 @@ python3 enhance_coverage.py incremental \
   --info /opt/coverage_reports/main_202606/coverage.info \
   --dir /opt/coverage_reports/raw_main_202606 \
   --out /opt/coverage_tool/review_main_202606_incremental \
-  --mode lazy \
+  --mode lazy_collapse \
   --workers 4
 ```
 

@@ -462,6 +462,42 @@
         });
     }
 
+    // What's new modal initialization
+    (function initWhatsNewModal() {
+        var whatsNewBtn = document.getElementById("whats-new-btn");
+        var modal = document.getElementById("whats-new-modal");
+        var closeX = document.getElementById("modal-close-x");
+        var closeBtn = document.getElementById("modal-close-btn");
+
+        if (!whatsNewBtn || !modal) return;
+
+        function openModal() {
+            modal.classList.add("active");
+            modal.setAttribute("aria-hidden", "false");
+            document.body.style.overflow = "hidden";
+        }
+
+        function closeModal() {
+            modal.classList.remove("active");
+            modal.setAttribute("aria-hidden", "true");
+            document.body.style.overflow = "";
+        }
+
+        whatsNewBtn.addEventListener("click", openModal);
+        if (closeX) closeX.addEventListener("click", closeModal);
+        if (closeBtn) closeBtn.addEventListener("click", closeModal);
+
+        modal.addEventListener("click", function(e) {
+            if (e.target === modal) closeModal();
+        });
+
+        document.addEventListener("keydown", function(e) {
+            if (e.key === "Escape" && modal.classList.contains("active")) {
+                closeModal();
+            }
+        });
+    })();
+
     sortRows("uncovered", -1);
     refreshUnanalyzedCounts();
 })();

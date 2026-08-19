@@ -28,6 +28,7 @@ import importlib
 import uuid
 import tempfile
 import logging
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from xml.etree import ElementTree
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
@@ -71,7 +72,13 @@ for module_name in ['pymysql', 'mysql.connector']:
 # 脚本根目录和配置文件位置
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "coverage_config.json")
-REPORT_REGISTRY_PATH = os.path.join(SCRIPT_DIR, ".report_registry.json")
+REPORT_REGISTRY_DIR = os.environ.get(
+    "COVERAGE_REGISTRY_DIR",
+    "/var/lib/onesensor-coverage/report-registry"
+    if os.path.exists("/var/lib/onesensor-coverage/report-registry") or (os.path.exists("/var/lib") and os.access("/var/lib", os.W_OK))
+    else os.path.join(tempfile.gettempdir(), ".onesensor_report_registry")
+)
+REPORT_REGISTRY_LEGACY_PATH = os.path.join(SCRIPT_DIR, ".report_registry.json")
 JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
 CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
 PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
@@ -85,45 +92,81 @@ DEFAULT_PROJECT_NAME = "Gemini-NOS"
 
 
 def register_report_directory(report_id: str, *dirs: str):
-    """Register report_id to persistent registry file."""
+    """Register report_id to per-report persistent registry file atomically."""
     if not report_id:
         return
     valid_dirs = [os.path.abspath(d) for d in dirs if d and os.path.exists(d)]
     if not valid_dirs:
         return
-    registry = load_report_registry()
-    existing_dirs = registry.get(report_id, [])
-    if isinstance(existing_dirs, str):
-        existing_dirs = [existing_dirs]
+
+    try:
+        os.makedirs(REPORT_REGISTRY_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+    target_file = os.path.join(REPORT_REGISTRY_DIR, f"{report_id}.json")
+    existing_dirs = []
+    if os.path.isfile(target_file):
+        try:
+            with open(target_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    existing_dirs = data.get("directories", [])
+                elif isinstance(data, list):
+                    existing_dirs = data
+        except Exception:
+            pass
+
     merged = list(dict.fromkeys(existing_dirs + valid_dirs))
-    registry[report_id] = merged
-    tmp_path = f"{REPORT_REGISTRY_PATH}.tmp.{os.getpid()}_{time.time()}"
+    tmp_path = f"{target_file}.tmp.{os.getpid()}_{time.time()}"
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(registry, f, indent=2, ensure_ascii=False)
+            json.dump({"report_id": report_id, "directories": merged}, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, REPORT_REGISTRY_PATH)
+        os.replace(tmp_path, target_file)
     except Exception as e:
-        logger.warning(f"[ReportRegistry] Failed to persist report registry: {e}")
+        logger.warning(f"[ReportRegistry] Failed to persist report registry for {report_id}: {e}")
 
 
 def load_report_registry() -> Dict[str, List[str]]:
-    """Load persistent report registry."""
-    if os.path.exists(REPORT_REGISTRY_PATH):
+    """Load persistent report registry from per-report files and legacy registry."""
+    result: Dict[str, List[str]] = {}
+
+    if os.path.isdir(REPORT_REGISTRY_DIR):
         try:
-            with open(REPORT_REGISTRY_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                result = {}
-                for k, v in data.items():
-                    if isinstance(v, str):
-                        result[k] = [v]
-                    elif isinstance(v, list):
-                        result[k] = [str(x) for x in v if x]
-                return result
+            for entry in os.listdir(REPORT_REGISTRY_DIR):
+                if entry.endswith(".json") and not entry.startswith("."):
+                    file_path = os.path.join(REPORT_REGISTRY_DIR, entry)
+                    try:
+                        with open(file_path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        if isinstance(data, dict):
+                            r_id = data.get("report_id") or os.path.splitext(entry)[0]
+                            dirs = data.get("directories", [])
+                            if isinstance(dirs, str):
+                                dirs = [dirs]
+                            result[r_id] = [str(d) for d in dirs if d]
+                    except Exception:
+                        pass
         except Exception:
             pass
-    return {}
+
+    if os.path.isfile(REPORT_REGISTRY_LEGACY_PATH):
+        try:
+            with open(REPORT_REGISTRY_LEGACY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if k not in result:
+                        if isinstance(v, str):
+                            result[k] = [v]
+                        elif isinstance(v, list):
+                            result[k] = [str(x) for x in v if x]
+        except Exception:
+            pass
+
+    return result
 
 
 class JobCancelledError(Exception):
@@ -148,8 +191,26 @@ class PerfTimer(object):
         return duration
 
 
-def compute_directory_signature(input_html_dir, project_name=None, review_scope=None, render_mode=None):
-    """Compute a comprehensive directory signature (count, max mtime, size, project, scope, mode) for input HTML reports."""
+def calc_incremental_review_set_hash(incremental_lines_by_file: Optional[Dict[str, Any]]) -> str:
+    """Deterministic hash of incremental lines review set."""
+    if not incremental_lines_by_file:
+        return ""
+    normalized = {
+        str(k).replace("\\", "/").strip("/"): sorted(int(x) for x in v)
+        for k, v in incremental_lines_by_file.items()
+    }
+    dumped = json.dumps(normalized, sort_keys=True)
+    return hashlib.sha256(dumped.encode("utf-8")).hexdigest()[:16]
+
+
+def compute_directory_signature(
+    input_html_dir,
+    project_name=None,
+    review_scope=None,
+    render_mode=None,
+    incremental_lines_by_file=None,
+):
+    """Compute a comprehensive directory signature (count, max mtime, size, project, scope, mode, incremental set) for input HTML reports."""
     file_count = 0
     latest_mtime = 0.0
     total_size = 0
@@ -168,6 +229,8 @@ def compute_directory_signature(input_html_dir, project_name=None, review_scope=
                     except OSError:
                         pass
 
+    inc_hash = calc_incremental_review_set_hash(incremental_lines_by_file)
+
     return {
         "project_name": str(project_name or ""),
         "review_scope": str(review_scope or ""),
@@ -176,6 +239,7 @@ def compute_directory_signature(input_html_dir, project_name=None, review_scope=
         "latest_mtime": round(latest_mtime, 3),
         "total_size": total_size,
         "tool_version": ASSET_VERSION,
+        "incremental_review_set_hash": inc_hash,
     }
 REVIEW_STATUS_UNCONFIRMED = "未确认"
 REVIEW_CONFIRMED_STATUSES = ("可覆盖", "无法覆盖", "冗余代码")
@@ -4387,6 +4451,7 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
             report_id = str(payload.get("report_id") or payload.get("report") or "").strip()
             review_scope = str(payload.get("scope") or payload.get("review_scope") or "full").strip()
             ranges = payload.get("ranges")
+            region_ids = payload.get("region_ids")
             if not project_name or not file_path:
                 self.send_error_response(400, "Missing required parameters (project_name, file_path)")
                 return
@@ -4399,11 +4464,14 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
             if not is_valid_review_scope(review_scope):
                 self.send_error_response(400, f"Invalid review_scope: '{review_scope}' (must be 'full' or 'incremental')")
                 return
-            if not isinstance(ranges, list) or not ranges:
-                self.send_error_response(400, "ranges must be a non-empty array")
+            if not ranges and not region_ids:
+                self.send_error_response(400, "Either 'ranges' or 'region_ids' must be provided")
                 return
-            if len(ranges) > 1000:
-                self.send_error_response(400, "Too many ranges requested (max 1000)")
+            if ranges is not None and (not isinstance(ranges, list) or len(ranges) > 1000):
+                self.send_error_response(400, "ranges must be a list with at most 1000 items")
+                return
+            if region_ids is not None and (not isinstance(region_ids, list) or len(region_ids) > 1000):
+                self.send_error_response(400, "region_ids must be a list with at most 1000 items")
                 return
             try:
                 service = get_code_detail_service()
@@ -4411,6 +4479,7 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                     project_name=project_name,
                     file_path=file_path,
                     ranges=ranges,
+                    region_ids=region_ids,
                     report_id=report_id,
                     review_scope=review_scope,
                 )
@@ -4873,10 +4942,27 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
     if reuse_output is None:
         reuse_output = config.get("reuse_output", False)
 
+    if render_mode is None:
+        render_mode = config.get("render_mode", "lazy_collapse")
+    if render_mode not in VALID_RENDER_MODES:
+        render_mode = "lazy_collapse"
+    if review_scope not in ("full", "incremental"):
+        raise ValueError("review_scope must be 'full' or 'incremental'")
+
+    if render_mode == "lazy_collapse" and os.path.abspath(input_dir) == os.path.abspath(output_dir):
+        raise ValueError(
+            "In 'lazy_collapse' render mode, input_dir and output_dir must be distinct directories "
+            "to protect original HTML source files from being stripped."
+        )
+
     timer = PerfTimer(f"InjectCoverageReport[{project_name}]")
     sig_file = os.path.join(output_dir, ".onesensor_source_signature.json")
     current_sig = compute_directory_signature(
-        real_input_html, project_name=project_name, review_scope=review_scope, render_mode=render_mode
+        real_input_html,
+        project_name=project_name,
+        review_scope=review_scope,
+        render_mode=render_mode,
+        incremental_lines_by_file=incremental_lines_by_file,
     )
     can_reuse = False
 
@@ -4917,14 +5003,9 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
         print(f"[Error] Real output html directory '{real_output_html}' does not exist.")
         return
 
-    if render_mode is None:
-        render_mode = config.get("render_mode", "lazy_collapse")
-    if render_mode not in VALID_RENDER_MODES:
-        render_mode = "lazy_collapse"
-    if review_scope not in ("full", "incremental"):
-        raise ValueError("review_scope must be 'full' or 'incremental'")
-
-    report_id = f"report_{calc_file_path_hash(os.path.abspath(real_output_html))[:16]}"
+    output_path_hash = calc_file_path_hash(os.path.abspath(real_output_html))[:8]
+    sig_hash = hashlib.sha256(json.dumps(current_sig, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    report_id = f"report_{output_path_hash}_{sig_hash}"
     register_report_directory(report_id, real_output_html, output_dir, os.path.join(real_output_html, ".source_cache"))
     get_code_detail_service(search_dirs=[real_output_html, output_dir, os.path.join(real_output_html, ".source_cache")])
 
@@ -5403,7 +5484,31 @@ main{{max-width:1280px;margin:0 auto;padding:24px 24px 48px}}
 .hero-card{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:18px;padding:24px 28px;box-shadow:0 4px 20px -2px rgba(0,0,0,0.04);text-align:center;margin-bottom:20px}}
 h1{{margin:0 0 8px;font-size:26px;font-weight:800;letter-spacing:-0.6px;color:#1c1c1e}}
 .muted{{color:#8e8e93;font-size:13px}}
-.page-version-badge{{display:inline-flex;align-items:center;gap:6px;background:rgba(118,118,128,0.1);padding:4px 12px;border-radius:8px;font-size:12px;color:#3a3a3c;margin-top:10px}}
+.version-badge-container{{display:flex;justify-content:center;align-items:center;margin-top:10px}}
+.page-version-badge{{display:inline-flex;align-items:center;gap:8px;background:rgba(118,118,128,0.1);padding:4px 6px 4px 12px;border-radius:999px;font-size:12px;color:#3a3a3c}}
+.whats-new-badge-btn{{display:inline-flex;align-items:center;gap:4px;background:#007aff;color:#ffffff;border:none;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:700;cursor:pointer;transition:all 0.18s ease;box-shadow:0 2px 6px rgba(0,122,255,0.25)}}
+.whats-new-badge-btn:hover{{background:#0056b3;transform:scale(1.04);box-shadow:0 3px 8px rgba(0,122,255,0.35)}}
+.whats-new-badge-btn:active{{transform:scale(0.97)}}
+.modal-overlay{{position:fixed;inset:0;background:rgba(0,0,0,0.45);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:center;z-index:99999;opacity:0;visibility:hidden;transition:opacity 0.22s cubic-bezier(0.16,1,0.3,1),visibility 0.22s}}
+.modal-overlay.active{{opacity:1;visibility:visible}}
+.modal-card{{background:#ffffff;width:90%;max-width:620px;max-height:85vh;border-radius:20px;box-shadow:0 20px 48px rgba(0,0,0,0.18),0 0 0 1px rgba(0,0,0,0.06);display:flex;flex-direction:column;transform:scale(0.94) translateY(10px);transition:transform 0.22s cubic-bezier(0.16,1,0.3,1);overflow:hidden;text-align:left}}
+.modal-overlay.active .modal-card{{transform:scale(1.0) translateY(0)}}
+.modal-header{{padding:20px 24px 16px;border-bottom:1px solid rgba(60,60,67,0.08);display:flex;justify-content:space-between;align-items:flex-start}}
+.modal-title{{margin:0;font-size:18px;font-weight:800;color:#1c1c1e;letter-spacing:-0.4px}}
+.modal-subtitle{{font-size:12px;color:#8e8e93;margin-top:4px;font-weight:500}}
+.modal-close-btn{{background:rgba(118,118,128,0.1);border:none;width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:18px;line-height:1;color:#8e8e93;cursor:pointer;transition:all 0.15s ease;padding:0}}
+.modal-close-btn:hover{{background:rgba(118,118,128,0.2);color:#1c1c1e}}
+.modal-body{{padding:20px 24px;overflow-y:auto;display:flex;flex-direction:column;gap:14px}}
+.feature-section{{background:rgba(242,242,247,0.5);border-radius:12px;padding:14px 16px;border:1px solid rgba(0,0,0,0.03)}}
+.feature-heading{{font-size:14px;font-weight:700;color:#1c1c1e;display:flex;align-items:center;gap:8px;margin-bottom:8px}}
+.feature-icon{{font-size:15px}}
+.feature-list{{margin:0;padding-left:18px;font-size:13px;color:#3a3a3c;line-height:1.6}}
+.feature-list li{{margin-bottom:6px}}
+.feature-list li:last-child{{margin-bottom:0}}
+.feature-list strong{{color:#1c1c1e}}
+.modal-footer{{padding:14px 24px;border-top:1px solid rgba(60,60,67,0.08);display:flex;justify-content:flex-end;background:rgba(242,242,247,0.3)}}
+.modal-action-btn{{background:#007aff;color:#ffffff;border:none;padding:8px 22px;border-radius:10px;font-size:13px;font-weight:600;cursor:pointer;transition:all 0.15s ease}}
+.modal-action-btn:hover{{background:#0056b3}}
 .repo-badges{{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:10px}}
 .repo-chip{{display:inline-flex;align-items:center;gap:6px;background:rgba(0,122,255,0.08);padding:4px 10px;border-radius:8px;font-size:12px}}
 .repo-name{{color:#007aff;font-weight:700}}
@@ -5446,7 +5551,7 @@ td a:hover{{text-decoration:underline}}
 <div class="hero-card">
   <h1>增量覆盖率审查</h1>
   <div class="muted">项目：{project}；Git 范围：{git_range_text}；生成时间：{generated_at}</div>{repository_ranges}
-  <div><span class="page-version-badge">{version_label}</span></div>
+  <div class="version-badge-container"><span class="page-version-badge"><span>{version_label}</span><button type="button" id="whats-new-btn" class="whats-new-badge-btn" title="查看新特性说明" aria-haspopup="dialog">✨ 新特性</button></span></div>
   <div class="links-segmented">
     <a href="coverage_progress.html?scope=incremental&amp;project={project_url}">📊 查看填写进度</a>
     <a href="incremental_developer_tasks.html">👨‍💻 开发人员待填写清单</a>
@@ -5472,7 +5577,44 @@ td a:hover{{text-decoration:underline}}
   <span id="filter-count" class="filter-count"></span>
 </div>
 <table id="incremental-file-table"><thead><tr><th data-sort-key="repository" aria-sort="none"><button type="button" class="sort-button" data-sort-key="repository" data-sort-type="text">仓库 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="team" aria-sort="none"><button type="button" class="sort-button" data-sort-key="team" data-sort-type="text">小组 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="leader" aria-sort="none"><button type="button" class="sort-button" data-sort-key="leader" data-sort-type="text">组长 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="module" aria-sort="none"><button type="button" class="sort-button" data-sort-key="module" data-sort-type="text">组件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="file" aria-sort="none"><button type="button" class="sort-button" data-sort-key="file" data-sort-type="text">文件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="changed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="changed" data-sort-type="number">新增行 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="covered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="covered" data-sort-type="number">已覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="uncovered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="uncovered" data-sort-type="number">未覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ignored" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ignored" data-sort-type="number">无需覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="unanalyzed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="unanalyzed" data-sort-type="number">待分析行数 <span class="sort-indicator" aria-hidden="true">↕</span></button></th></tr></thead><tbody>{table_rows}</tbody></table></section>
-<footer style="text-align:center;color:#8e8e93;font-size:12px;padding:24px 0 12px;">OneSensor 覆盖率审查系统 · {version_label}</footer>
+<footer style="text-align:center;color:#8e8e93;font-size:12px;padding:24px 0 12px;">覆盖率审查系统 · {version_label}</footer>
+<div id="whats-new-modal" class="modal-overlay" aria-hidden="true" role="dialog" aria-modal="true" aria-labelledby="whats-new-title">
+  <div class="modal-card">
+    <div class="modal-header">
+      <div>
+        <h3 id="whats-new-title" class="modal-title">🚀 覆盖率审查系统 · v11.3 更新说明</h3>
+        <div class="modal-subtitle">发布日期：2026-08-19</div>
+      </div>
+      <button type="button" id="modal-close-x" class="modal-close-btn" aria-label="关闭">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="feature-section">
+        <div class="feature-heading"><span class="feature-icon">⚡</span> 极速加载与折叠架构</div>
+        <ul class="feature-list">
+          <li><strong>10x 加载提速</strong>：引入 Lazy Collapse 架构，非待分析代码块默认折叠懒加载，大幅减轻 DOM 节点压力，超大文件秒级打开。</li>
+          <li><strong>待分析函数无条件展开</strong>：包含未覆盖/待审行的函数自动完整呈现，支持超大函数 Initial Batch 一键极速载入。</li>
+        </ul>
+      </div>
+      <div class="feature-section">
+        <div class="feature-heading"><span class="feature-icon">📝</span> 交互体验与状态保障</div>
+        <ul class="feature-list">
+          <li><strong>草稿与本地编辑严格解耦</strong>：ReviewDraftStore 分离本地 Dirty 编辑与服务端 Draft 草稿，收起/展开源码绝不丢失未保存内容。</li>
+          <li><strong>丝滑流式全量展开</strong>：大文件一键 Expand All 采用分批渐进流式加载与进度调度，彻底杜绝浏览器界面假死。</li>
+        </ul>
+      </div>
+      <div class="feature-section">
+        <div class="feature-heading"><span class="feature-icon">🛡️</span> 架构可靠性与缓存隔离</div>
+        <ul class="feature-list">
+          <li><strong>增量指纹版本化隔离</strong>：报告 ID 深度绑定 Git 评审集 Hash 与目录指纹，彻底杜绝跨版本旧缓存干扰。</li>
+          <li><strong>并发安全 Sidecar 注册体系</strong>：原子事务写入，支持多进程并发注入，严格保护原始覆盖率报告与数据库行索引。</li>
+        </ul>
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button type="button" id="modal-close-btn" class="modal-action-btn">知道了</button>
+    </div>
+  </div>
+</div>
 </main><script src="incremental_coverage.js?v={asset_version}"></script></body></html>""".format(
         asset_version=ASSET_VERSION,
         version_label=VERSION_DISPLAY_LABEL,
@@ -5797,9 +5939,9 @@ def has_arg(args, name):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
+    if len(sys.argv) < 2 or sys.argv[1] in ("--help", "-h", "help"):
         print_help()
-        sys.exit(1)
+        sys.exit(0 if len(sys.argv) >= 2 and sys.argv[1] in ("--help", "-h", "help") else 1)
 
     cmd = sys.argv[1]
     if cmd == "inject":

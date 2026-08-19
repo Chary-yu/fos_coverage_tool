@@ -908,6 +908,7 @@
             // Mark all target regions as loading immediately to prevent duplicate triggers
             expandedRegions.forEach(r => CodeRegionStore.setLoading(r.id, '正在加载…'));
 
+            const regionIds = expandedRegions.map(r => r.id);
             const ranges = expandedRegions.map(r => ({
                 start_line: r.startLine,
                 end_line: r.endLine
@@ -921,6 +922,7 @@
                     file_path: filePath,
                     report_id: currentReportId,
                     scope: REVIEW_SCOPE,
+                    region_ids: regionIds,
                     ranges: ranges
                 })
             });
