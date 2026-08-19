@@ -556,8 +556,7 @@ pre.source > span{{display:block;position:relative;white-space:pre}}.lineCov{{ba
 
     index = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Coverage Tool Demo</title>
-<style>body{font:16px/1.6 Arial,"Microsoft YaHei",sans-serif;max-width:850px;margin:50px auto;padding:0 20px;color:#172033}h1{font-size:28px}.card{padding:22px;border:1px solid #d8e0ea;border-radius:8px;background:#f8fafc}a{display:inline-block;margin:8px 8px 0 0;padding:9px 14px;border-radius:5px;background:#1769e0;color:white;text-decoration:none}.secondary{background:#7c3aed}code{background:#eef2f7;padding:2px 5px}</style></head>
-<body><h1>Coverage Tool 浏览器 Demo</h1><div class="card"><p>项目：<code>coverage_demo</code>。示例使用 SQLite 持久化，不需要安装 MySQL。</p><p>建议先打开源码填写页，填写一条后暂存，再到进展页查看并导出报表。也可打开增量任务清单，查看 Git 作者、提交文件和待填写行的关联效果。</p><a href="html/calculator.c.gcov.html?mode=immediate">打开源码填写页</a><a class="secondary" href="html/coverage_progress.html?project=coverage_demo">查看进展与导出</a><a href="html/incremental_developer_tasks.html">查看开发人员增量清单</a></div></body></html>"""
+<body><h1>Coverage Tool 浏览器 Demo</h1><div class="card"><p>项目：<code>coverage_demo</code>。示例使用 SQLite 持久化，不需要安装 MySQL。</p><p>建议先打开增量覆盖率审查汇总页（可查看完整版本号、生成时间与新特性说明），或直接打开源码填写页进行在线分析暂存与提交。</p><a href="html/incremental_coverage.html">打开增量覆盖率审查汇总页</a><a href="html/calculator.c.gcov.html?mode=lazy_collapse">打开源码填写页 (Lazy Collapse)</a><a class="secondary" href="html/coverage_progress.html?project=coverage_demo">查看进展与导出</a><a href="html/incremental_developer_tasks.html">查看开发人员增量清单</a></div></body></html>"""
     with open(os.path.join(output_dir, "index.html"), "w", encoding="utf-8") as target:
         target.write(index)
 

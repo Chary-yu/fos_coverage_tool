@@ -5816,19 +5816,17 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
     sections_html = "".join(developer_sections) or (
         '<section><h2>暂无开发人员任务</h2><p>请确认提交范围内存在 Git commit，且当前执行用户可读取仓库历史。</p></section>'
     )
-    generated_at = escaped(result.get("generated_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     page = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>开发人员待填写清单</title><style>
 body{{margin:0;background:#f2f2f7;color:#1c1c1e;font:14px/1.5 "Microsoft YaHei","微软雅黑",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;-webkit-font-smoothing:antialiased}}
 main{{max-width:1320px;margin:0 auto;padding:24px 24px 48px}}
-.hero-card{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:18px;padding:24px 28px;box-shadow:0 4px 20px -2px rgba(0,0,0,0.04);margin-bottom:20px;text-align:center}}
+.hero-card{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:18px;padding:24px 28px;box-shadow:0 4px 20px -2px rgba(0,0,0,0.04);margin-bottom:20px}}
 h1{{margin:0 0 8px;font-size:26px;font-weight:800;letter-spacing:-0.6px;color:#1c1c1e}}
 h2{{margin:0;padding:16px 20px;font-size:16px;font-weight:700;background:rgba(242,242,247,0.7);border-bottom:1px solid rgba(60,60,67,0.1);letter-spacing:-0.3px}}
 .muted{{color:#8e8e93;font-size:13px}}
-.version-badge-container{{display:flex;justify-content:center;align-items:center;margin-top:10px}}
 .page-version-badge{{display:inline-flex;align-items:center;gap:6px;background:rgba(118,118,128,0.1);padding:4px 12px;border-radius:8px;font-size:12px;color:#3a3a3c;margin-top:10px}}
-.links-segmented{{display:inline-flex;gap:4px;background:rgba(118,118,128,0.12);padding:4px;border-radius:12px;margin-top:14px;flex-wrap:wrap;justify-content:center}}
+.links-segmented{{display:inline-flex;gap:4px;background:rgba(118,118,128,0.12);padding:4px;border-radius:12px;margin-top:14px;flex-wrap:wrap}}
 .links-segmented a{{color:#007aff;text-decoration:none;font-weight:600;font-size:13px;padding:6px 14px;border-radius:9px;transition:all 0.15s ease}}
 .links-segmented a:hover{{background:#ffffff;color:#0051a8;box-shadow:0 2px 8px rgba(0,0,0,0.08)}}
 section{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:16px;margin:20px 0;overflow:hidden;box-shadow:0 4px 20px -2px rgba(0,0,0,0.04);transition:all 0.2s ease}}
@@ -5854,8 +5852,7 @@ td a:hover{{text-decoration:underline}}
 </style></head><body><main>
 <div class="hero-card">
   <h1>开发人员待填写清单</h1>
-  <div class="muted">项目：{project}；数据来源：Git 提交作者与增量覆盖率结果；生成时间：{generated_at}</div>
-  <div class="version-badge-container"><span class="page-version-badge"><span>{version_label}</span></span></div>
+  <div class="muted">项目：{project}；数据来源：Git 提交作者与增量覆盖率结果。</div>
   <div class="links-segmented">
     <a href="incremental_coverage.html">↩ 返回增量审查汇总</a>
     <a href="coverage_progress.html?scope=incremental&amp;project={project_url}">📊 查看填写进度</a>
@@ -5865,12 +5862,9 @@ td a:hover{{text-decoration:underline}}
 <section><h2>👥 人员概览</h2><div class="table-wrap"><table><thead><tr><th>开发人员</th><th>提交数</th><th>提交文件</th><th>需填写文件</th><th>待填写行</th></tr></thead><tbody>{summary_rows}</tbody></table></div></section>
 <aside class="muted" style="margin:12px 0 20px;text-align:center">说明：按 Git author 的“姓名 + 邮箱”区分人员。多人提交同一文件时，文件会同时出现在每位相关开发人员的清单中；“待填写”仅统计本次 Git diff 中 LCOV 未覆盖的新增行。</aside>
 {sections}
-<footer style="text-align:center;color:#8e8e93;font-size:12px;padding:24px 0 12px;">覆盖率审查系统 · {version_label}</footer>
 </main></body></html>""".format(
         project=escaped(project_name),
         project_url=escaped(urllib.parse.quote(str(project_name), safe="")),
-        version_label=VERSION_DISPLAY_LABEL,
-        generated_at=generated_at,
         summary_rows=summary_table_rows,
         sections=sections_html,
     )
