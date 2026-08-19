@@ -11,6 +11,7 @@ import subprocess
 from datetime import datetime, timezone
 from typing import Dict, Any, Optional
 
+DEFAULT_VERSION = "v11.7 2026-08-19"
 DEFAULT_SCHEMA_VERSION = 2
 RELEASE_MANIFEST_NAME = "release_manifest.json"
 
@@ -43,7 +44,7 @@ def compute_asset_hash(file_paths: list) -> str:
 
 def generate_release_identity(
     repo_root: Optional[str] = None,
-    version: str = "v11.4",
+    version: str = DEFAULT_VERSION,
     schema_version: int = DEFAULT_SCHEMA_VERSION,
     asset_files: Optional[list] = None
 ) -> Dict[str, Any]:
@@ -69,7 +70,10 @@ def generate_release_identity(
                 asset_files.append(c)
                 
     asset_hash = compute_asset_hash(asset_files)
-    build_id = f"{version}-{commit_sha[:8]}-{asset_hash[:8]}"
+    clean_ver = version.split()[0]
+    build_id = f"{clean_ver}-{commit_sha[:8]}-{asset_hash[:8]}"
+    
+    utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if hasattr(timezone, "utc") else datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     
     identity = {
         "version": version,
@@ -77,7 +81,7 @@ def generate_release_identity(
         "build_id": build_id,
         "asset_hash": asset_hash,
         "schema_version": schema_version,
-        "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if hasattr(timezone, "utc") else datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        "built_at": utc_now
     }
     return identity
 
@@ -99,14 +103,28 @@ def load_release_manifest(manifest_path: str) -> Optional[Dict[str, Any]]:
     return None
 
 def get_current_release_identity(repo_root: Optional[str] = None) -> Dict[str, Any]:
-    """Get active release identity, preferring existing manifest if valid, else dynamically generating."""
+    """
+    Get active release identity. Verifies that cached manifest matches current git HEAD commit SHA.
+    If commit SHA or asset hash has diverged, dynamically regenerates and updates manifest.
+    """
     if repo_root is None:
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     manifest_path = os.path.join(repo_root, RELEASE_MANIFEST_NAME)
     manifest = load_release_manifest(manifest_path)
-    if manifest and "version" in manifest and "asset_hash" in manifest:
+    
+    current_head = _get_git_commit_sha(repo_root)
+    if (manifest and 
+        manifest.get("commit_sha") == current_head and 
+        manifest.get("version") == DEFAULT_VERSION and
+        "asset_hash" in manifest):
         return manifest
-    return generate_release_identity(repo_root=repo_root)
+        
+    identity = generate_release_identity(repo_root=repo_root, version=DEFAULT_VERSION)
+    try:
+        save_release_manifest(manifest_path, identity)
+    except Exception:
+        pass
+    return identity
 
 if __name__ == "__main__":
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

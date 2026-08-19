@@ -35,7 +35,7 @@
         : (RENDER_MODE || 'lazy_collapse');
     const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖', '冗余代码'];
     const CONFIRMED_STATUS_SET = new Set(['可覆盖', '无法覆盖', '冗余代码']);
-    const RENDER_BATCH_SIZE = 400;
+    const RENDER_BATCH_SIZE = 250;
     const NETWORK_CHUNK_LINES = 500;
     const RENDER_BATCH_LINES = 250;
     const MAX_CHUNK_CONCURRENCY = 3;
@@ -878,6 +878,10 @@
                 r.lines = lines;
                 r.error = null;
                 r.currentState = 'expanded-loaded';
+                if (typeof RegionLineLRUCache !== 'undefined' && RegionLineLRUCache.touch) {
+                    RegionLineLRUCache.touch(regionId, (lines || []).length);
+                    RegionLineLRUCache.evictIfOverBudget();
+                }
             }
         },
 

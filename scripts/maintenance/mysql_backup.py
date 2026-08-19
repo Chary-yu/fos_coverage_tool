@@ -6,7 +6,7 @@ Provides automated backup generation:
 - schema.sql
 - critical-counts.json
 - critical-content-hashes.json
-Includes automated backup verification gates before proceeding with upgrade.
+Enforces zero data loss: fails closed if mysqldump is missing.
 """
 
 import os
@@ -33,7 +33,8 @@ def compute_file_sha256(filepath: str) -> str:
 def perform_database_backup(
     db_config: Dict[str, Any],
     backup_dir: str,
-    connection=None
+    connection=None,
+    allow_mock_in_test: bool = False
 ) -> Tuple[bool, Dict[str, Any], Optional[str]]:
     """
     Execute full backup workflow and verify all safety gates.
@@ -59,18 +60,16 @@ def perform_database_backup(
     if connection:
         try:
             snapshot = capture_database_snapshot(connection)
-            # Write critical counts
             counts = {k: v.get("count", 0) for k, v in snapshot.get("tables", {}).items()}
             with open(counts_file, "w", encoding="utf-8") as f:
                 json.dump(counts, f, indent=2)
-            # Write critical hashes
             hashes = {k: v.get("content_hash", "") for k, v in snapshot.get("tables", {}).items()}
             with open(hashes_file, "w", encoding="utf-8") as f:
                 json.dump(hashes, f, indent=2)
         except Exception as e:
             return False, {}, f"Failed to capture pre-backup data snapshot: {e}"
             
-    # 2. Execute mysqldump (or write mock/snapshot dump for tests)
+    # 2. Check mysqldump binary
     has_mysqldump = False
     try:
         res = subprocess.run(["which", "mysqldump"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -78,9 +77,18 @@ def perform_database_backup(
     except Exception:
         pass
         
-    if has_mysqldump:
+    if not has_mysqldump:
+        if not allow_mock_in_test:
+            return False, {}, "CRITICAL: mysqldump utility is not installed or not in PATH. Full database backup failed; stopping upgrade to prevent data risk."
+        else:
+            # Only allowed in mock test harness
+            dummy_sql = f"-- Test Mock Backup for {database}\n"
+            with gzip.open(full_sql_gz, "wt", encoding="utf-8") as gz_out:
+                gz_out.write(dummy_sql)
+            with open(schema_sql, "w", encoding="utf-8") as f:
+                f.write(f"-- Test Mock Schema for {database}\n")
+    else:
         try:
-            # Dump full database to gzip
             env = os.environ.copy()
             if password:
                 env["MYSQL_PWD"] = str(password)
@@ -105,7 +113,6 @@ def perform_database_backup(
                     err = proc.stderr.read().decode("utf-8", errors="ignore")
                     return False, {}, f"mysqldump failed with code {proc.returncode}: {err}"
                     
-            # Dump schema only
             schema_cmd = [
                 "mysqldump",
                 f"--host={host}",
@@ -121,13 +128,6 @@ def perform_database_backup(
                     return False, {}, f"mysqldump schema-only failed: {err}"
         except Exception as e:
             return False, {}, f"Exception during mysqldump: {e}"
-    else:
-        # Fallback simulation or basic dump
-        dummy_sql = f"-- Full Backup Fallback for {database}\n-- No mysqldump CLI binary detected.\n"
-        with gzip.open(full_sql_gz, "wt", encoding="utf-8") as gz_out:
-            gz_out.write(dummy_sql)
-        with open(schema_sql, "w", encoding="utf-8") as f:
-            f.write(f"-- Schema Dump Fallback for {database}\n")
             
     # 3. Compute SHA256 of full.sql.gz
     if not os.path.isfile(full_sql_gz) or os.path.getsize(full_sql_gz) == 0:

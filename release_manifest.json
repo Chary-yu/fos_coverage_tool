@@ -1,8 +1,8 @@
 {
-  "version": "v11.4",
-  "commit_sha": "03dcd79c42a47976c0780dbf3b50c093cd124790",
-  "build_id": "v11.4-03dcd79c-972a59db",
-  "asset_hash": "972a59dbc17f0067",
+  "version": "v11.7 2026-08-19",
+  "commit_sha": "1c830387fd6d69aeac217ac408e7d36973e3337d",
+  "build_id": "v11.7-1c830387-2acac094",
+  "asset_hash": "2acac094881a8b54",
   "schema_version": 2,
-  "built_at": "2026-08-19T08:02:29Z"
+  "built_at": "2026-08-19T09:07:41Z"
 }

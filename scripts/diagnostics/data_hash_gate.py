@@ -17,7 +17,7 @@ from typing import Dict, Any, Optional, Tuple, List
 try:
     from datetime import datetime, timezone
     def get_utc_iso():
-        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if hasattr(timezone, "utc") else datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 except ImportError:
     from datetime import datetime
     def get_utc_iso():
@@ -27,8 +27,8 @@ def hash_analysis_records(cursor, chunk_size: int = 10000) -> Tuple[int, str]:
     """Compute deterministic SHA256 over business fields of coverage_analysis."""
     sql = """
         SELECT project_name, file_path_hash, line_number, 
-               COALESCE(reviewer, ""), COALESCE(status, ""), COALESCE(is_draft, 0),
-               COALESCE(coverage_method, ""), COALESCE(uncovered_reason, "")
+               COALESCE(reviewer, ''), COALESCE(status, ''), COALESCE(is_draft, 0),
+               COALESCE(coverage_method, ''), COALESCE(uncovered_reason, '')
         FROM coverage_analysis
         ORDER BY project_name, file_path_hash, line_number
     """
@@ -50,8 +50,8 @@ def hash_line_index_records(cursor, chunk_size: int = 10000) -> Tuple[int, str]:
     sql = """
         SELECT project_name, file_path_hash, line_number,
                COALESCE(block_start_line, 0), COALESCE(block_end_line, 0),
-               COALESCE(block_type, ""), COALESCE(function_hash, ""),
-               COALESCE(code_line_hash, ""), COALESCE(code_occurrence, 0)
+               COALESCE(block_type, ''), COALESCE(function_hash, ''),
+               COALESCE(code_line_hash, ''), COALESCE(code_occurrence, 0)
         FROM coverage_line_index
         ORDER BY project_name, file_path_hash, line_number
     """
@@ -82,9 +82,9 @@ def hash_project_state_records(cursor) -> Tuple[int, str, Dict[str, int]]:
     return len(rows), hasher.hexdigest(), states
 
 def hash_background_jobs_records(cursor) -> Tuple[int, str, Dict[str, int]]:
-    """Compute status distribution and deterministic SHA256 over coverage_background_jobs."""
+    """Compute status distribution and deterministic SHA256 over coverage_background_jobs using real schema."""
     sql = """
-        SELECT job_id, project_name, job_type, status, COALESCE(error_message, "")
+        SELECT job_id, project_name, COALESCE(kind, ''), COALESCE(state, ''), COALESCE(error_message, '')
         FROM coverage_background_jobs
         ORDER BY job_id
     """
@@ -93,8 +93,8 @@ def hash_background_jobs_records(cursor) -> Tuple[int, str, Dict[str, int]]:
     hasher = hashlib.sha256()
     dist = {}
     for r in rows:
-        status = str(r[3])
-        dist[status] = dist.get(status, 0) + 1
+        state = str(r[3])
+        dist[state] = dist.get(state, 0) + 1
         line = "|".join(str(val) for val in r) + "\n"
         hasher.update(line.encode("utf-8"))
     return len(rows), hasher.hexdigest(), dist

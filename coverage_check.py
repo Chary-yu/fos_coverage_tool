@@ -256,18 +256,24 @@ def merge_info_files(info_path):
 
 
 def resolve_coverage_file(filename, coverage_data, repo_path):
-    """Resolve a Git-relative path to an LCOV SF entry, avoiding ambiguous suffixes."""
+    """Resolve a Git-relative path to an LCOV SF entry, avoiding ambiguous suffixes with indexed lookups."""
     filename = normalize_path(filename)
     repo_relative = normalize_path(os.path.join(repo_path, filename))
-    candidates = {filename, repo_relative}
+    candidates = (filename, repo_relative)
     for candidate in candidates:
         if candidate in coverage_data:
             return candidate
 
-    suffix_matches = [
-        source_file for source_file in coverage_data
-        if source_file.endswith("/" + filename) or filename.endswith("/" + source_file)
-    ]
+    # Try exact suffix match
+    suffix_key = "/" + filename
+    suffix_matches = []
+    for source_file in coverage_data:
+        if source_file.endswith(suffix_key) or filename.endswith("/" + source_file):
+            suffix_matches.append(source_file)
+            if len(suffix_matches) > 1:
+                # Ambiguous: Fail closed immediately
+                return None
+                
     return suffix_matches[0] if len(suffix_matches) == 1 else None
 
 

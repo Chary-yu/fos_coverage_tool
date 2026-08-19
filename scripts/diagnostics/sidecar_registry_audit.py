@@ -5,6 +5,7 @@ Scans and validates report registry files and source cache directories:
 - Detects orphaned cache directories
 - Detects format distribution (Legacy v1 vs Chunked v2)
 - Enforces path escape and security boundaries
+- Fails is_safe if corruptions, orphaned caches, or broken chunk files are detected
 """
 
 import os
@@ -48,6 +49,7 @@ def audit_sidecar_and_registry(search_roots: List[str]) -> Dict[str, Any]:
     chunked_v2_count = 0
     legacy_v1_count = 0
     orphaned_caches = []
+    corrupted_chunks = []
     
     for s_root in search_roots:
         cache_base = os.path.join(s_root, ".source_cache")
@@ -65,22 +67,35 @@ def audit_sidecar_and_registry(search_roots: List[str]) -> Dict[str, Any]:
                 
             for item in os.listdir(r_path):
                 item_path = os.path.join(r_path, item)
-                if os.path.isdir(item_path) and os.path.isfile(os.path.join(item_path, "meta.json")):
-                    chunked_v2_count += 1
-                    total_sidecars += 1
+                if os.path.isdir(item_path):
+                    meta_path = os.path.join(item_path, "meta.json")
+                    if os.path.isfile(meta_path):
+                        try:
+                            with open(meta_path, "r", encoding="utf-8") as mf:
+                                mdata = json.load(mf)
+                            if "total_lines" not in mdata or "total_chunks" not in mdata:
+                                corrupted_chunks.append(f"Missing required fields in {meta_path}")
+                        except Exception as e:
+                            corrupted_chunks.append(f"Corrupted meta.json in {item_path}: {e}")
+                        chunked_v2_count += 1
+                        total_sidecars += 1
                 elif item.endswith(".source.json"):
                     legacy_v1_count += 1
                     total_sidecars += 1
                     
+    is_safe = (len(corrupted_registries) == 0 and len(corrupted_chunks) == 0 and len(orphaned_caches) == 0)
+    
     return {
-        "status": "AUDIT_PASSED" if len(corrupted_registries) == 0 else "VIOLATIONS_FOUND",
+        "status": "AUDIT_PASSED" if is_safe else "VIOLATIONS_FOUND",
         "registered_report_count": len(registered_reports),
         "corrupted_registries": corrupted_registries,
+        "corrupted_chunks": corrupted_chunks,
         "orphaned_cache_count": len(orphaned_caches),
+        "orphaned_caches": orphaned_caches,
         "total_sidecars": total_sidecars,
         "chunked_v2_count": chunked_v2_count,
         "legacy_v1_count": legacy_v1_count,
-        "is_safe": (len(corrupted_registries) == 0)
+        "is_safe": is_safe
     }
 
 if __name__ == "__main__":

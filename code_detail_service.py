@@ -128,6 +128,8 @@ MAX_CONTEXT_CACHE_ENTRIES = 16
 MAX_CONTEXT_CACHE_TOTAL_LINES = 1_000_000
 
 
+from app.code_detail.sidecar_store import SidecarStore
+
 class CodeDetailService:
     """Service handling code detail layout calculation and range retrieval."""
 
@@ -153,6 +155,7 @@ class CodeDetailService:
         self.review_scope = review_scope
         self._context_cache: Dict[Tuple[str, str, str, str], Tuple[float, SourceContext]] = {}
         self._overlay_cache = AnalysisOverlayCache()
+        self._sidecar_store = SidecarStore(search_dirs=self.search_dirs)
         self._cache_ttl_sec = 60.0
         self._max_cache_entries = max_cache_entries
         self._max_cache_total_lines = max_cache_total_lines
@@ -188,6 +191,43 @@ class CodeDetailService:
             abs_dir = os.path.abspath(directory)
             if abs_dir not in self.search_dirs:
                 self.search_dirs.append(abs_dir)
+                self._sidecar_store.add_search_dir(abs_dir)
+
+    def get_analysis_overlay(
+        self,
+        project_name: str,
+        file_path_hash: str,
+        file_path: str,
+        review_scope: str = "full"
+    ) -> Optional[AnalysisOverlay]:
+        if not self.db_manager:
+            return None
+        data_version = 1
+        if hasattr(self.db_manager, "get_project_data_version"):
+            try:
+                data_version = self.db_manager.get_project_data_version(project_name)
+            except Exception:
+                data_version = 1
+                
+        cached = self._overlay_cache.get(project_name, file_path_hash, review_scope, data_version)
+        if cached is not None:
+            return cached
+            
+        try:
+            records = self.db_manager.fetch_records(project_name, file_path) or []
+        except Exception as e:
+            logger.warning(f"[CodeDetailService] fetch_records failed: {e}")
+            records = []
+            
+        overlay = AnalysisOverlay(
+            project_name=project_name,
+            file_path_hash=file_path_hash,
+            review_scope=review_scope,
+            data_version=data_version,
+            records=records
+        )
+        self._overlay_cache.put(overlay)
+        return overlay
 
     def locate_gcov_file(self, file_path: str, report_id: str = "") -> Optional[str]:
         """
@@ -296,9 +336,20 @@ class CodeDetailService:
                 for r_dir in registry[report_id]:
                     if r_dir not in dirs_to_check:
                         dirs_to_check.insert(0, r_dir)
+                        self._sidecar_store.add_search_dir(r_dir)
             for std_dir in ["/opt/coverage_tool", "/opt/coverage_reports/review", "/opt/coverage_reports/review_incremental", "/opt/coverage_reports"]:
                 if os.path.isdir(std_dir) and std_dir not in dirs_to_check:
                     dirs_to_check.append(std_dir)
+                    self._sidecar_store.add_search_dir(std_dir)
+
+            # Try SidecarStore first (Chunked v2 + Legacy v1)
+            ctx = self._sidecar_store.load_full_source_context(report_id, file_hash)
+            if ctx:
+                if self.db_manager:
+                    self._refresh_analysis_records(ctx, project_name, file_path, scope)
+                self._context_cache[cache_key] = (now, ctx)
+                self._prune_context_cache(now)
+                return ctx
 
             for s_dir in dirs_to_check:
                 sidecar_ctx = load_source_sidecar(s_dir, report_id, file_hash)
@@ -309,7 +360,6 @@ class CodeDetailService:
                     self._prune_context_cache(now)
                     return sidecar_ctx
 
-            # Authoritative: when report_id is provided, do NOT fallback to stripped .gcov.html
             raise FileNotFoundError(
                 f"Source context sidecar missing or unavailable for project='{project_name}', file='{file_path}', report_id='{report_id}'"
             )
@@ -342,45 +392,45 @@ class CodeDetailService:
     def _refresh_analysis_records(
         self, context: SourceContext, project_name: str, file_path: str, review_scope: str = "full"
     ):
-        """Update review state on existing lines from database using unified pending logic."""
-        try:
-            records = self.db_manager.fetch_records(project_name, file_path) or []
-            rec_map = {int(r["line_number"]): r for r in records if "line_number" in r}
-            pending_lines = []
-            confirmed_count = 0
+        """Update review state on existing lines using AnalysisOverlay."""
+        file_hash = compute_file_path_hash(file_path)
+        overlay = self.get_analysis_overlay(project_name, file_hash, file_path, review_scope)
+        if not overlay:
+            return
 
-            for line in context.lines:
-                rec = rec_map.get(line.line_no)
-                if rec:
-                    line.analysis_state = rec.get("status") or "未确认"
-                    line.reviewer = rec.get("reviewer") or ""
-                    line.is_draft = bool(rec.get("is_draft", False))
-                    line.coverage_method = rec.get("coverage_method") or ""
-                    line.uncovered_reason = rec.get("uncovered_reason") or ""
-                else:
-                    line.analysis_state = "未确认"
-                    line.reviewer = ""
-                    line.is_draft = False
-                    line.coverage_method = ""
-                    line.uncovered_reason = ""
+        pending_lines = []
+        confirmed_count = 0
 
-                is_pending = is_line_pending_analysis(
-                    coverage_state=line.coverage_state,
-                    analysis_state=line.analysis_state,
-                    is_draft=line.is_draft,
-                    fill_status="已填写" if rec and rec.get("status") else "未填写",
-                )
-                line.is_pending_analysis = is_pending
+        for line in context.lines:
+            rec = overlay.get_line_analysis(line.line_no)
+            if rec:
+                line.analysis_state = rec.get("status") or "未确认"
+                line.reviewer = rec.get("reviewer") or ""
+                line.is_draft = bool(rec.get("is_draft", False))
+                line.coverage_method = rec.get("coverage_method") or ""
+                line.uncovered_reason = rec.get("uncovered_reason") or ""
+            else:
+                line.analysis_state = "未确认"
+                line.reviewer = ""
+                line.is_draft = False
+                line.coverage_method = ""
+                line.uncovered_reason = ""
 
-                if is_pending:
-                    pending_lines.append(line.line_no)
-                elif line.coverage_state == "uncovered" and line.analysis_state in {"可覆盖", "无法覆盖", "冗余代码"} and not line.is_draft:
-                    confirmed_count += 1
+            is_pending = is_line_pending_analysis(
+                coverage_state=line.coverage_state,
+                analysis_state=line.analysis_state,
+                is_draft=line.is_draft,
+                fill_status="已填写" if rec and rec.get("status") else "未填写",
+            )
+            line.is_pending_analysis = is_pending
 
-            context.pending_lines = pending_lines
-            context.confirmed_count = confirmed_count
-        except Exception as e:
-            logger.debug(f"[CodeDetailService] refresh records failed: {e}")
+            if is_pending:
+                pending_lines.append(line.line_no)
+            elif line.coverage_state == "uncovered" and line.analysis_state in {"可覆盖", "无法覆盖", "冗余代码"} and not line.is_draft:
+                confirmed_count += 1
+
+        context.pending_lines = pending_lines
+        context.confirmed_count = confirmed_count
 
     def get_code_layout(
         self,
@@ -390,13 +440,81 @@ class CodeDetailService:
         review_scope: str = "full",
         content_override: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Compute the CodeRegion layout for the file."""
+        """Compute the CodeRegion layout for the file (O(1) fast metadata path when sidecar exists)."""
         t_start = time.perf_counter()
+        file_hash = compute_file_path_hash(file_path)
+        scope = (review_scope or "full").lower()
+
+        # Fast Metadata Path (Items 1 & 13)
+        if report_id and not content_override:
+            registry = load_report_registry(report_id)
+            if report_id in registry:
+                for r_dir in registry[report_id]:
+                    self._sidecar_store.add_search_dir(r_dir)
+
+            meta = self._sidecar_store.load_metadata(report_id, file_hash)
+            if meta:
+                overlay = self.get_analysis_overlay(project_name, file_hash, file_path, scope)
+                
+                raw_func_ranges = meta.get("function_ranges", [])
+                func_ranges = [
+                    FunctionRange(r[0], r[1], r[2]) if isinstance(r, (list, tuple)) else (
+                        FunctionRange(r["start_line"], r["end_line"], r["name"]) if isinstance(r, dict) else r
+                    )
+                    for r in raw_func_ranges
+                ]
+                
+                pending_lines = list(meta.get("pending_lines", []))
+                confirmed_count = meta.get("confirmed_count", 0)
+                
+                if overlay:
+                    updated_pending = []
+                    updated_confirmed = 0
+                    for pl in pending_lines:
+                        rec = overlay.get_line_analysis(pl)
+                        if rec and rec.get("status") in {"可覆盖", "无法覆盖", "冗余代码"} and not rec.get("is_draft"):
+                            updated_confirmed += 1
+                        else:
+                            updated_pending.append(pl)
+                    pending_lines = updated_pending
+                    confirmed_count = updated_confirmed
+
+                total_lines = meta.get("total_lines", 0)
+                regions = build_code_regions(
+                    total_lines=total_lines,
+                    pending_lines=pending_lines,
+                    function_ranges=func_ranges,
+                )
+                elapsed_ms = (time.perf_counter() - t_start) * 1000.0
+                expanded_count = sum(1 for r in regions if r.default_state == "expanded")
+                expanded_lines = sum(r.line_count for r in regions if r.default_state == "expanded")
+                collapsed_lines = sum(r.line_count for r in regions if r.default_state == "collapsed")
+
+                return {
+                    "project_name": project_name,
+                    "file_path": file_path,
+                    "report_id": report_id,
+                    "total_lines": total_lines,
+                    "total_uncovered_count": meta.get("total_uncovered_count", len(pending_lines)),
+                    "pending_line_count": len(pending_lines),
+                    "confirmed_count": confirmed_count,
+                    "regions": [r.to_dict() for r in regions],
+                    "perf": {
+                        "layout_build_ms": round(elapsed_ms, 2),
+                        "pending_line_count": len(pending_lines),
+                        "region_count": len(regions),
+                        "expanded_region_count": expanded_count,
+                        "expanded_line_count": expanded_lines,
+                        "collapsed_line_count": collapsed_lines,
+                    },
+                }
+
+        # Fallback to full context
         context = self.get_source_context(
             project_name=project_name,
             file_path=file_path,
             report_id=report_id,
-            review_scope=review_scope,
+            review_scope=scope,
             content_override=content_override,
         )
 
@@ -411,15 +529,6 @@ class CodeDetailService:
         expanded_lines = sum(r.line_count for r in regions if r.default_state == "expanded")
         collapsed_lines = sum(r.line_count for r in regions if r.default_state == "collapsed")
 
-        perf_stats = {
-            "layout_build_ms": round(elapsed_ms, 2),
-            "pending_line_count": len(context.pending_lines),
-            "region_count": len(regions),
-            "expanded_region_count": expanded_count,
-            "expanded_line_count": expanded_lines,
-            "collapsed_line_count": collapsed_lines,
-        }
-
         return {
             "project_name": project_name,
             "file_path": file_path,
@@ -429,7 +538,14 @@ class CodeDetailService:
             "pending_line_count": len(context.pending_lines),
             "confirmed_count": context.confirmed_count,
             "regions": [r.to_dict() for r in regions],
-            "perf": perf_stats,
+            "perf": {
+                "layout_build_ms": round(elapsed_ms, 2),
+                "pending_line_count": len(context.pending_lines),
+                "region_count": len(regions),
+                "expanded_region_count": expanded_count,
+                "expanded_line_count": expanded_lines,
+                "collapsed_line_count": collapsed_lines,
+            },
         }
 
     def get_code_lines_batch(
@@ -443,68 +559,116 @@ class CodeDetailService:
         review_scope: str = "full",
         content_override: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Batch load line data for specified ranges, region IDs, or all default expanded regions."""
+        """Batch load line data for specified ranges or regions (Slice-based streaming)."""
         t_start = time.perf_counter()
-        context = self.get_source_context(
-            project_name=project_name,
-            file_path=file_path,
-            report_id=report_id,
-            review_scope=review_scope,
-            content_override=content_override,
-        )
-
+        file_hash = compute_file_path_hash(file_path)
+        scope = (review_scope or "full").lower()
+        
+        # 1. Determine verified ranges
         verified_ranges = []
         is_verified_default_batch = False
 
-        if load_default_expanded:
-            regions = build_code_regions(
-                total_lines=context.total_lines,
-                pending_lines=context.pending_lines,
-                function_ranges=context.function_ranges,
+        if load_default_expanded or region_ids:
+            layout = self.get_code_layout(
+                project_name=project_name,
+                file_path=file_path,
+                report_id=report_id,
+                review_scope=scope,
+                content_override=content_override,
             )
-            for reg in regions:
-                if reg.default_state == "expanded":
-                    verified_ranges.append({"start_line": reg.start_line, "end_line": reg.end_line})
-            is_verified_default_batch = True
-        elif region_ids and isinstance(region_ids, list):
-            regions = build_code_regions(
-                total_lines=context.total_lines,
-                pending_lines=context.pending_lines,
-                function_ranges=context.function_ranges,
-            )
-            expanded_region_map = {r.region_id: r for r in regions if r.default_state == "expanded"}
-            for reg_id in region_ids:
-                if reg_id in expanded_region_map:
-                    reg = expanded_region_map[reg_id]
-                    verified_ranges.append({"start_line": reg.start_line, "end_line": reg.end_line})
-                else:
-                    raise ValueError(f"Requested region '{reg_id}' is not a valid default expanded region")
-            is_verified_default_batch = True
-
-        if is_verified_default_batch:
-            target_ranges = verified_ranges
-            max_ranges_limit = max(1000, len(target_ranges) + 10)
-            max_lines = None
+            reg_map = {r["region_id"]: r for r in layout["regions"]}
+            if load_default_expanded:
+                for r in layout["regions"]:
+                    if r["default_state"] == "expanded":
+                        verified_ranges.append({"start_line": r["start_line"], "end_line": r["end_line"]})
+                is_verified_default_batch = True
+            elif region_ids:
+                for rid in region_ids:
+                    r = reg_map.get(str(rid))
+                    if r and r["default_state"] == "expanded":
+                        verified_ranges.append({"start_line": r["start_line"], "end_line": r["end_line"]})
+                    else:
+                        raise ValueError(f"Requested region '{rid}' is not a valid default expanded region")
+                is_verified_default_batch = True
+        elif ranges:
+            if not isinstance(ranges, list):
+                raise ValueError("ranges must be a list of ranges")
+            total_req_lines = sum(int(r.get("end_line", 1)) - int(r.get("start_line", 1)) + 1 for r in ranges)
+            if total_req_lines > 50000 or len(ranges) > 1000:
+                raise ValueError("Requested lines exceeds maximum batch limit of 50000 lines")
+            verified_ranges = ranges
         else:
-            if not ranges:
-                raise ValueError("ranges, region_ids, or load_default_expanded is required")
-            target_ranges = ranges
-            max_ranges_limit = 1000
-            max_lines = 50000
+            raise ValueError("ranges, region_ids, or load_default_expanded is required")
 
-        range_results = read_source_ranges(context, target_ranges, max_ranges=max_ranges_limit, max_total_lines=max_lines)
+        overlay = self.get_analysis_overlay(project_name, file_hash, file_path, scope)
+        
+        # 2. Extract lines for each range
+        batch_results = []
+        total_returned_lines = 0
+
+        for rng in verified_ranges:
+            start_l = rng.get("start_line", 1)
+            end_l = rng.get("end_line", 1)
+            if start_l > end_l:
+                continue
+
+            lines_dicts = None
+            if report_id and not content_override:
+                lines_dicts = self._sidecar_store.load_lines_range(report_id, file_hash, start_l, end_l)
+
+            if lines_dicts is None:
+                ctx = self.get_source_context(
+                    project_name=project_name,
+                    file_path=file_path,
+                    report_id=report_id,
+                    review_scope=scope,
+                    content_override=content_override,
+                )
+                lines_slice = [l for l in ctx.lines if start_l <= l.line_no <= end_l]
+                lines_dicts = [l.to_dict() for l in lines_slice]
+
+            if overlay:
+                for ld in lines_dicts:
+                    l_no = ld.get("line_no", 0)
+                    rec = overlay.get_line_analysis(l_no)
+                    if rec:
+                        ld["analysis_state"] = rec.get("status") or "未确认"
+                        ld["reviewer"] = rec.get("reviewer") or ""
+                        ld["is_draft"] = bool(rec.get("is_draft", False))
+                        ld["coverage_method"] = rec.get("coverage_method") or ""
+                        ld["uncovered_reason"] = rec.get("uncovered_reason") or ""
+                    else:
+                        ld["analysis_state"] = "未确认"
+                        ld["reviewer"] = ""
+                        ld["is_draft"] = False
+                    is_pend = is_line_pending_analysis(
+                        coverage_state=ld.get("coverage_state", "covered"),
+                        analysis_state=ld.get("analysis_state", "未确认"),
+                        is_draft=ld.get("is_draft", False),
+                        fill_status="已填写" if rec and rec.get("status") else "未填写"
+                    )
+                    ld["is_pending_analysis"] = is_pend
+
+            batch_results.append({
+                "start_line": start_l,
+                "end_line": end_l,
+                "lines": lines_dicts,
+            })
+            total_returned_lines += len(lines_dicts)
+
         elapsed_ms = (time.perf_counter() - t_start) * 1000.0
-
-        total_lines_read = sum(len(r["lines"]) for r in range_results)
         return {
             "project_name": project_name,
             "file_path": file_path,
-            "report_id": context.report_id,
-            "ranges": range_results,
+            "report_id": report_id,
+            "ranges": batch_results,
+            "is_default_batch": is_verified_default_batch,
             "perf": {
                 "batch_load_ms": round(elapsed_ms, 2),
-                "total_lines_read": total_lines_read,
+                "total_lines_read": total_returned_lines,
+                "total_lines_loaded": total_returned_lines,
                 "verified_default_batch": is_verified_default_batch,
+                "range_count": len(batch_results),
             },
         }
 
@@ -518,27 +682,23 @@ class CodeDetailService:
         review_scope: str = "full",
         content_override: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Load single range line data."""
-        t_start = time.perf_counter()
-        context = self.get_source_context(
+        """Fetch a single line range."""
+        res = self.get_code_lines_batch(
             project_name=project_name,
             file_path=file_path,
+            ranges=[{"start_line": start_line, "end_line": end_line}],
             report_id=report_id,
             review_scope=review_scope,
             content_override=content_override,
         )
-        lines = read_source_lines(context, start_line, end_line)
-        elapsed_ms = (time.perf_counter() - t_start) * 1000.0
-
+        rngs = res.get("ranges", [])
+        lines = rngs[0]["lines"] if rngs else []
         return {
             "project_name": project_name,
             "file_path": file_path,
-            "report_id": context.report_id,
-            "start_line": int(start_line),
-            "end_line": int(end_line),
+            "report_id": report_id,
+            "start_line": start_line,
+            "end_line": end_line,
             "lines": lines,
-            "perf": {
-                "load_ms": round(elapsed_ms, 2),
-                "line_count": len(lines),
-            },
+            "perf": res.get("perf", {}),
         }

@@ -34,10 +34,14 @@ def print_help():
 
 
 def table_count(cursor, table_name, project_name=None):
+    if table_name not in ("coverage_analysis", "coverage_line_index", "coverage_project_state", "coverage_background_jobs", "coverage_file_state"):
+        raise ValueError("Invalid table name: {}".format(table_name))
+    sql = "SELECT COUNT(*) FROM `{}`".format(table_name)
     if project_name:
-        cursor.execute(f"SELECT COUNT(*) FROM {table_name} WHERE project_name = %s", (project_name,))
+        sql += " WHERE project_name = %s"
+        cursor.execute(sql, (project_name,))
     else:
-        cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+        cursor.execute(sql)
     row = cursor.fetchone()
     if isinstance(row, dict):
         return next(iter(row.values()))
@@ -78,7 +82,7 @@ def main():
         known_projects = set()
         for tbl in ("coverage_project_state", "coverage_background_jobs", "coverage_analysis", "coverage_line_index"):
             try:
-                cursor.execute(f"SELECT DISTINCT project_name FROM {tbl}")
+                cursor.execute("SELECT DISTINCT project_name FROM `{}`".format(tbl))
                 for row in cursor.fetchall():
                     pname = row.get("project_name") if isinstance(row, dict) else row[0]
                     if pname:

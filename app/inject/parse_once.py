@@ -3,9 +3,8 @@ Inject Parse Once Module (Item 10)
 Parses .gcov.html source files in a single pass to produce ParsedSourceArtifact:
 - Source lines and coverage status
 - Function ranges
-- Line-index records for DB sync
+- Full line-index records adhering to the complete database contract
 - SourceContext for sidecar persistence
-Eliminates redundant multi-pass HTML parsing across injector workers.
 """
 
 import os
@@ -35,6 +34,7 @@ class ParsedSourceArtifact:
         self.report_id = report_id
         self.file_path = file_path
         self.file_path_hash = compute_file_path_hash(file_path)
+        self.source_file_name = os.path.basename(file_path)
         self.review_scope = review_scope
         
         # Single-pass parse
@@ -50,24 +50,40 @@ class ParsedSourceArtifact:
         self.source_lines = self.source_context.lines
         self.function_ranges = self.source_context.function_ranges
         
-        # Build line-index records in same pass
+        # Build line-index records adhering to full DB contract
         self.line_index_records: List[Dict[str, Any]] = self._build_line_index_records()
 
     def _build_line_index_records(self) -> List[Dict[str, Any]]:
-        """Construct DB index records for uncovered lines."""
+        """Construct full DB index records for uncovered lines."""
         records = []
+        code_occurrence_tracker: Dict[str, int] = {}
+
         for line in self.source_lines:
             if line.coverage_state == "uncovered":
+                line_str = (line.source or "").strip()
+                code_hash = hashlib.sha256(line_str.encode("utf-8")).hexdigest()[:16]
+                
+                # Occurrence index for identical lines in file
+                occ = code_occurrence_tracker.get(code_hash, 0) + 1
+                code_occurrence_tracker[code_hash] = occ
+                
+                func_name = line.function_name or ""
+                func_hash = hashlib.sha256(func_name.strip().encode("utf-8")).hexdigest()[:16] if func_name else ""
+                
                 records.append({
                     "project_name": self.project_name,
                     "file_path_hash": self.file_path_hash,
                     "file_path": self.file_path,
+                    "source_file_name": self.source_file_name,
                     "line_number": line.line_no,
+                    "line_text": line.source or "",
                     "block_start_line": line.block_start_line or line.line_no,
                     "block_end_line": line.block_end_line or line.line_no,
                     "block_type": line.block_type or "statement",
-                    "code_line_hash": hashlib.sha256((line.source or "").strip().encode("utf-8")).hexdigest()[:16],
-                    "code_occurrence": 1
+                    "function_name": func_name,
+                    "function_hash": func_hash,
+                    "code_line_hash": code_hash,
+                    "code_occurrence": occ
                 })
         return records
 
@@ -76,7 +92,8 @@ def parse_gcov_source_once(
     report_id: str,
     file_path: str,
     html_content: str,
-    review_scope: str = "full"
+    review_scope: str = "full",
+    incremental_lines: Optional[Set[int]] = None
 ) -> ParsedSourceArtifact:
     """Convenience factory for single-pass artifact generation."""
     return ParsedSourceArtifact(
@@ -84,5 +101,6 @@ def parse_gcov_source_once(
         report_id=report_id,
         file_path=file_path,
         html_content=html_content,
-        review_scope=review_scope
+        review_scope=review_scope,
+        incremental_lines=incremental_lines
     )

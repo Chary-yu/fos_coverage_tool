@@ -87,7 +87,8 @@ class TestPhase0Baseline(unittest.TestCase):
         backup_dir = os.path.join(self.test_dir, "backup")
         ok, manifest, err = perform_database_backup(
             db_config={"database": "test_db"},
-            backup_dir=backup_dir
+            backup_dir=backup_dir,
+            allow_mock_in_test=True
         )
         self.assertTrue(ok)
         self.assertTrue(os.path.isfile(os.path.join(backup_dir, "full.sql.gz")))
@@ -136,13 +137,23 @@ class TestPhase0Baseline(unittest.TestCase):
     def test_item_28_evidence_manifest_governance(self):
         """Verify evidence manifest structure and final gate validation."""
         pem = ProductionEvidenceManifest(repo_root=self.test_dir)
+        pem.record("release_identity", {"version": "v11.7", "commit_sha": "abc1234", "build_id": "v11.7-abc1234-12345678"})
         pem.record("schema_migration", {"preflight_safe": True})
         pem.record("data_hash_verification", {"verified": True})
         pem.record("targeted_tests", {"phase0": {"status": "PASSED"}})
-        pem.record("security_audit", {"critical_count": 0})
+        pem.record("browser_smoke_suite", {"status": "PASSED"})
+        pem.record("sidecar_audit", {"is_safe": True})
+        pem.record("security_audit", {"is_safe": True, "critical_count": 0, "high_count": 0})
+        pem.record("performance_benchmark", {
+            "Tier_A_1k": {"status": "PASSED"},
+            "Tier_B_10k": {"status": "PASSED"},
+            "Tier_C_50k": {"status": "PASSED"},
+            "Tier_D_100k": {"status": "PASSED"}
+        })
+        pem.record("backup_evidence", {"status": "BACKUP_VERIFIED", "full_sql_gz_sha256": "fakehash"})
         
         passed, unmet = pem.validate_final_gate()
-        self.assertTrue(passed)
+        self.assertTrue(passed, f"Unmet: {unmet}")
         self.assertEqual(pem.data["status"], "UPGRADE_SUCCESS")
 
 if __name__ == "__main__":

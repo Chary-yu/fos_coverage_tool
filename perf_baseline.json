@@ -1,45 +1,47 @@
 {
-  "timestamp": "2026-08-19T08:06:45Z",
-  "tiers": {
-    "Tier_A_1k": {
-      "total_regions": 1,
-      "default_expanded_count": 1,
-      "collapsed_count": 0,
-      "layout_median_ms": 0.1,
-      "layout_p95_ms": 0.16,
-      "initial_batch_median_ms": 0.37,
-      "single_expand_median_ms": 0.26,
-      "total_lines": 1000
-    },
-    "Tier_B_10k": {
-      "total_regions": 1,
-      "default_expanded_count": 1,
-      "collapsed_count": 0,
-      "layout_median_ms": 0.82,
-      "layout_p95_ms": 0.89,
-      "initial_batch_median_ms": 7.43,
-      "single_expand_median_ms": 6.91,
-      "total_lines": 10000
-    },
-    "Tier_C_50k": {
-      "total_regions": 1,
-      "default_expanded_count": 1,
-      "collapsed_count": 0,
-      "layout_median_ms": 4.72,
-      "layout_p95_ms": 6.06,
-      "initial_batch_median_ms": 54.66,
-      "single_expand_median_ms": 37.89,
-      "total_lines": 50000
-    },
-    "Tier_HugeFunc_50k": {
-      "total_regions": 1,
-      "default_expanded_count": 1,
-      "collapsed_count": 0,
-      "layout_median_ms": 2.1,
-      "layout_p95_ms": 2.43,
-      "initial_batch_median_ms": 44.41,
-      "single_expand_median_ms": 56.71,
-      "total_lines": 55000
-    }
+  "Tier_A_1k": {
+    "total_lines": 1000,
+    "function_count": 50,
+    "pending_lines": 50,
+    "region_count": 1,
+    "layout_latency_ms": 4.54,
+    "chunk_slice_latency_ms": 2.77,
+    "status": "PASSED"
+  },
+  "Tier_B_10k": {
+    "total_lines": 10000,
+    "function_count": 500,
+    "pending_lines": 500,
+    "region_count": 1,
+    "layout_latency_ms": 4.86,
+    "chunk_slice_latency_ms": 5.95,
+    "status": "PASSED"
+  },
+  "Tier_C_50k": {
+    "total_lines": 50000,
+    "function_count": 2500,
+    "pending_lines": 2500,
+    "region_count": 1,
+    "layout_latency_ms": 6.44,
+    "chunk_slice_latency_ms": 7.06,
+    "status": "PASSED"
+  },
+  "Tier_D_100k": {
+    "total_lines": 100000,
+    "function_count": 5000,
+    "pending_lines": 5000,
+    "region_count": 1,
+    "layout_latency_ms": 9.09,
+    "chunk_slice_latency_ms": 6.19,
+    "status": "PASSED"
+  },
+  "Huge_Function_55k": {
+    "total_lines": 55000,
+    "function_count": 1,
+    "pending_lines": 1000,
+    "region_count": 1,
+    "layout_latency_ms": 4.26,
+    "chunk_slice_latency_ms": 4.04,
+    "status": "PASSED"
   }
 }

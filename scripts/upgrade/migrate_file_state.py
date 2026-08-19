@@ -11,20 +11,19 @@ import json
 import logging
 from typing import Dict, Any, List, Tuple, Optional
 
+from app.progress.file_state_service import (
+    query_project_progress_aggregated,
+    query_authoritative_progress
+)
+
 logger = logging.getLogger(__name__)
 
 def backfill_file_state_for_project(connection, project_name: str) -> Dict[str, Any]:
-    """
-    Backfill coverage_file_state for a single project from historical facts.
-    """
+    """Backfill coverage_file_state for a single project from historical facts."""
     with connection.cursor() as cursor:
-        sql_distinct_files = """
-            SELECT DISTINCT file_path_hash, COALESCE(file_path, '')
-            FROM coverage_line_index
-            WHERE project_name = %s
-        """
-        cursor.execute(sql_distinct_files, (project_name,))
-        files = cursor.fetchall()
+        cursor.execute("SELECT data_version FROM coverage_project_state WHERE project_name = %s", (project_name,))
+        p_row = cursor.fetchone()
+        current_version = int(p_row[0]) if p_row else 1
         
         sql_insert_batch = """
             INSERT INTO coverage_file_state (
@@ -43,7 +42,7 @@ def backfill_file_state_for_project(connection, project_name: str) -> Dict[str, 
                 SUM(CASE WHEN ana.is_draft = 0 AND ana.status = '可覆盖' THEN 1 ELSE 0 END) as coverable_total,
                 SUM(CASE WHEN ana.is_draft = 0 AND ana.status = '无法覆盖' THEN 1 ELSE 0 END) as uncoverable_total,
                 SUM(CASE WHEN ana.is_draft = 0 AND ana.status = '冗余代码' THEN 1 ELSE 0 END) as redundant_total,
-                1 as data_version
+                %s as data_version
             FROM coverage_line_index idx
             LEFT JOIN coverage_analysis ana 
                    ON idx.project_name = ana.project_name 
@@ -59,44 +58,48 @@ def backfill_file_state_for_project(connection, project_name: str) -> Dict[str, 
                 confirmed_total = VALUES(confirmed_total),
                 coverable_total = VALUES(coverable_total),
                 uncoverable_total = VALUES(uncoverable_total),
-                redundant_total = VALUES(redundant_total)
+                redundant_total = VALUES(redundant_total),
+                data_version = VALUES(data_version)
         """
-        cursor.execute(sql_insert_batch, (project_name,))
+        cursor.execute(sql_insert_batch, (current_version, project_name))
         connection.commit()
         
         return {
             "project_name": project_name,
-            "files_processed": len(files),
+            "data_version": current_version,
             "status": "BACKFILLED"
         }
 
 def reconcile_project_progress(connection, project_name: str) -> Tuple[bool, Dict[str, Any]]:
     """
-    Reconcile aggregated coverage_file_state summary against authoritative query.
+    Reconcile aggregated coverage_file_state summary against true authoritative facts.
     Returns (is_exact_match, diff_report).
     """
-    from app.progress.file_state_service import query_project_progress_aggregated
+    # 1. Query derived aggregate table
+    agg = query_project_progress_aggregated(connection, project_name, fallback_authoritative=False)
+    # 2. Query true authoritative facts table directly
+    auth = query_authoritative_progress(connection, project_name)
     
-    with connection.cursor() as cursor:
-        agg = query_project_progress_aggregated(connection, project_name, fallback_authoritative=False)
-        auth = query_project_progress_aggregated(connection, project_name, fallback_authoritative=True)
-        
-        diff = {}
-        fields = ["total_uncovered", "filled_total", "draft_total", "confirmed_total", "coverable_total", "uncoverable_total", "redundant_total"]
-        for f in fields:
-            agg_val = agg.get(f, 0)
-            auth_val = auth.get(f, 0)
-            if agg_val != auth_val:
-                diff[f] = {"aggregated": agg_val, "authoritative": auth_val}
-                
-        is_match = (len(diff) == 0)
-        return is_match, {
-            "project_name": project_name,
-            "reconciled": is_match,
-            "diff": diff,
-            "aggregated_summary": agg,
-            "authoritative_summary": auth
-        }
+    diff = {}
+    fields = [
+        "total_uncovered", "filled_total", "draft_total", 
+        "confirmed_total", "coverable_total", "uncoverable_total", 
+        "redundant_total", "file_count"
+    ]
+    for f in fields:
+        agg_val = agg.get(f, 0)
+        auth_val = auth.get(f, 0)
+        if agg_val != auth_val:
+            diff[f] = {"aggregated": agg_val, "authoritative": auth_val}
+            
+    is_match = (len(diff) == 0 and agg.get("source") == "coverage_file_state")
+    return is_match, {
+        "project_name": project_name,
+        "reconciled": is_match,
+        "diff": diff,
+        "aggregated_summary": agg,
+        "authoritative_summary": auth
+    }
 
 if __name__ == "__main__":
     print("File State Migration & Backfill Module ready.")

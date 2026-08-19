@@ -3,8 +3,8 @@ Coverage File State Aggregation Layer (Item 7)
 Derived progress aggregation table management:
 - Maintains project-level aggregate statistics from coverage_file_state
 - Dual updates on review save and line-index sync
-- Fast O(Files) progress aggregation vs slow O(Lines) scans
-- Automatic fallback to authoritative query if file state table is unpopulated
+- Validates data_version against coverage_project_state to prevent stale aggregate reads
+- Automatic fallback to authoritative query if file state table is missing, empty, or stale
 """
 
 import logging
@@ -19,11 +19,21 @@ def query_project_progress_aggregated(
 ) -> Dict[str, Any]:
     """
     Query project progress using derived coverage_file_state.
-    If coverage_file_state has no records for project and fallback_authoritative is True,
-    falls back to legacy authoritative query over coverage_analysis and coverage_line_index.
+    Validates that coverage_file_state.data_version matches coverage_project_state.data_version.
+    If stale or unpopulated and fallback_authoritative is True, falls back to authoritative query.
     """
     with connection.cursor() as cursor:
-        # 1. Try aggregated coverage_file_state query
+        # 1. Fetch expected project data_version
+        expected_version = 1
+        try:
+            cursor.execute("SELECT data_version FROM coverage_project_state WHERE project_name = %s", (project_name,))
+            p_row = cursor.fetchone()
+            if p_row:
+                expected_version = int(p_row[0])
+        except Exception:
+            expected_version = 1
+
+        # 2. Try aggregated coverage_file_state query with version validation
         try:
             sql = """
                 SELECT COUNT(*) as file_count,
@@ -33,32 +43,48 @@ def query_project_progress_aggregated(
                        COALESCE(SUM(confirmed_total), 0) as confirmed_total,
                        COALESCE(SUM(coverable_total), 0) as coverable_total,
                        COALESCE(SUM(uncoverable_total), 0) as uncoverable_total,
-                       COALESCE(SUM(redundant_total), 0) as redundant_total
+                       COALESCE(SUM(redundant_total), 0) as redundant_total,
+                       COALESCE(MIN(data_version), 0) as min_version,
+                       COALESCE(MAX(data_version), 0) as max_version
                 FROM coverage_file_state
                 WHERE project_name = %s
             """
             cursor.execute(sql, (project_name,))
             row = cursor.fetchone()
-            if row and row[0] > 0: # file_count > 0
-                return {
-                    "source": "coverage_file_state",
-                    "file_count": int(row[0]),
-                    "total_uncovered": int(row[1]),
-                    "filled_total": int(row[2]),
-                    "draft_total": int(row[3]),
-                    "confirmed_total": int(row[4]),
-                    "coverable_total": int(row[5]),
-                    "uncoverable_total": int(row[6]),
-                    "redundant_total": int(row[7]),
-                    "pending_unconfirmed": max(0, int(row[1]) - int(row[4]))
-                }
+            if row and row[0] > 0:
+                file_count = int(row[0])
+                min_v = int(row[8])
+                max_v = int(row[9])
+                
+                # Check version freshness
+                if min_v == expected_version and max_v == expected_version:
+                    return {
+                        "source": "coverage_file_state",
+                        "data_version": expected_version,
+                        "file_count": file_count,
+                        "total_uncovered": int(row[1]),
+                        "filled_total": int(row[2]),
+                        "draft_total": int(row[3]),
+                        "confirmed_total": int(row[4]),
+                        "coverable_total": int(row[5]),
+                        "uncoverable_total": int(row[6]),
+                        "redundant_total": int(row[7]),
+                        "pending_unconfirmed": max(0, int(row[1]) - int(row[4]))
+                    }
+                else:
+                    logger.info(f"[FileStateService] Stale aggregate detected for '{project_name}' (min={min_v}, max={max_v}, expected={expected_version}). Falling back.")
         except Exception as e:
-            logger.warning(f"[FileStateService] Failed to query coverage_file_state, checking fallback: {e}")
+            logger.warning(f"[FileStateService] Failed to query coverage_file_state: {e}")
 
         if not fallback_authoritative:
-            return {"source": "empty", "total_uncovered": 0, "confirmed_total": 0}
+            return {"source": "empty_or_stale", "total_uncovered": 0, "confirmed_total": 0}
 
-        # 2. Legacy Authoritative Fallback Query
+        # 3. Direct Authoritative Query (Bypasses coverage_file_state completely)
+        return query_authoritative_progress(connection, project_name)
+
+def query_authoritative_progress(connection, project_name: str) -> Dict[str, Any]:
+    """Execute direct authoritative count over coverage_line_index and coverage_analysis."""
+    with connection.cursor() as cursor:
         sql_fallback = """
             SELECT COUNT(DISTINCT idx.file_path_hash) as file_count,
                    COUNT(idx.line_number) as total_uncovered,
@@ -81,7 +107,7 @@ def query_project_progress_aggregated(
             total_uncovered = int(row[1] or 0)
             confirmed_total = int(row[4] or 0)
             return {
-                "source": "authoritative_fallback",
+                "source": "authoritative_facts",
                 "file_count": int(row[0] or 0),
                 "total_uncovered": total_uncovered,
                 "filled_total": int(row[2] or 0),
@@ -101,10 +127,7 @@ def update_file_state_for_file(
     file_path_hash: str,
     data_version: int = 1
 ) -> None:
-    """
-    Recalculate and upsert single file state into coverage_file_state.
-    Safe and idempotent.
-    """
+    """Recalculate and upsert single file state into coverage_file_state."""
     with connection.cursor() as cursor:
         sql_calc = """
             SELECT COUNT(idx.line_number) as total_uncovered,

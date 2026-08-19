@@ -2364,13 +2364,15 @@ class DatabaseManager:
             return None
 
     def ensure_index(self, cursor, table_name, index_name, create_sql):
-        cursor.execute(f"SHOW INDEX FROM {table_name} WHERE Key_name = %s", (index_name,))
+        clean_tbl = re.sub(r"[^a-zA-Z0-9_]", "", str(table_name))
+        cursor.execute("SHOW INDEX FROM `{}` WHERE Key_name = %s".format(clean_tbl), (index_name,))
         if not cursor.fetchall():
             print(f"[DB] Creating index {index_name} on {table_name}...")
             cursor.execute(create_sql)
 
     def ensure_column(self, cursor, table_name, column_name, alter_sql):
-        cursor.execute(f"SHOW COLUMNS FROM {table_name} LIKE %s", (column_name,))
+        clean_tbl = re.sub(r"[^a-zA-Z0-9_]", "", str(table_name))
+        cursor.execute("SHOW COLUMNS FROM `{}` LIKE %s".format(clean_tbl), (column_name,))
         if not cursor.fetchall():
             print(f"[DB] Adding column {column_name} to {table_name}...")
             cursor.execute(alter_sql)
@@ -2384,7 +2386,8 @@ class DatabaseManager:
             db_name = self.config["database"]
             
             print(f"[DB] Checking / Creating database '{db_name}'...")
-            cursor.execute(f"CREATE DATABASE IF NOT EXISTS {db_name} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+            clean_db = re.sub(r"[^a-zA-Z0-9_]", "", str(db_name))
+            cursor.execute("CREATE DATABASE IF NOT EXISTS `{}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci".format(clean_db))
             cursor.close()
             conn.close()
 

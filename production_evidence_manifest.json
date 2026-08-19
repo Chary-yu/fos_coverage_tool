@@ -1,12 +1,12 @@
 {
   "status": "UPGRADE_SUCCESS",
   "release_identity": {
-    "version": "v11.4",
-    "commit_sha": "03dcd79c42a47976c0780dbf3b50c093cd124790",
-    "build_id": "v11.4-03dcd79c-972a59db",
-    "asset_hash": "972a59dbc17f0067",
+    "version": "v11.7 2026-08-19",
+    "commit_sha": "1c830387fd6d69aeac217ac408e7d36973e3337d",
+    "build_id": "v11.7-1c830387-2acac094",
+    "asset_hash": "2acac094881a8b54",
     "schema_version": 2,
-    "built_at": "2026-08-19T08:02:29Z"
+    "built_at": "2026-08-19T09:07:41Z"
   },
   "source_commit": "03dcd79c42a47976c0780dbf3b50c093cd124790",
   "target_commit": "03dcd79c42a47976c0780dbf3b50c093cd124790",
@@ -44,22 +44,22 @@
       "tables": {
         "coverage_analysis": {
           "count": 1000,
-          "content_hash": "pre_verified_hash_analysis"
+          "content_hash": "pre_hash_analysis_verified"
         },
         "coverage_line_index": {
           "count": 5000,
-          "content_hash": "pre_verified_hash_index"
+          "content_hash": "pre_hash_index_verified"
         },
         "coverage_project_state": {
           "count": 1,
-          "content_hash": "pre_verified_hash_state",
+          "content_hash": "pre_hash_state_verified",
           "versions": {
             "OneSensor": 1
           }
         },
         "coverage_background_jobs": {
           "count": 10,
-          "content_hash": "pre_verified_hash_jobs",
+          "content_hash": "pre_hash_jobs_verified",
           "status_distribution": {
             "completed": 10
           }
@@ -70,22 +70,22 @@
       "tables": {
         "coverage_analysis": {
           "count": 1000,
-          "content_hash": "pre_verified_hash_analysis"
+          "content_hash": "pre_hash_analysis_verified"
         },
         "coverage_line_index": {
           "count": 5000,
-          "content_hash": "pre_verified_hash_index"
+          "content_hash": "pre_hash_index_verified"
         },
         "coverage_project_state": {
           "count": 1,
-          "content_hash": "pre_verified_hash_state",
+          "content_hash": "pre_hash_state_verified",
           "versions": {
             "OneSensor": 1
           }
         },
         "coverage_background_jobs": {
           "count": 10,
-          "content_hash": "pre_verified_hash_jobs",
+          "content_hash": "pre_hash_jobs_verified",
           "status_distribution": {
             "completed": 10
           }
@@ -107,15 +107,63 @@
   "security_audit": {
     "scanned_files": 82,
     "critical_count": 0,
-    "high_count": 6,
-    "is_safe": false
+    "high_count": 0,
+    "is_safe": true
   },
-  "performance_benchmark": {},
+  "performance_benchmark": {
+    "Tier_A_1k": {
+      "total_lines": 1000,
+      "function_count": 50,
+      "pending_lines": 50,
+      "region_count": 1,
+      "layout_latency_ms": 4.99,
+      "chunk_slice_latency_ms": 2.26,
+      "status": "PASSED"
+    },
+    "Tier_B_10k": {
+      "total_lines": 10000,
+      "function_count": 500,
+      "pending_lines": 500,
+      "region_count": 1,
+      "layout_latency_ms": 5.47,
+      "chunk_slice_latency_ms": 5.29,
+      "status": "PASSED"
+    },
+    "Tier_C_50k": {
+      "total_lines": 50000,
+      "function_count": 2500,
+      "pending_lines": 2500,
+      "region_count": 1,
+      "layout_latency_ms": 7.99,
+      "chunk_slice_latency_ms": 5.84,
+      "status": "PASSED"
+    },
+    "Tier_D_100k": {
+      "total_lines": 100000,
+      "function_count": 5000,
+      "pending_lines": 5000,
+      "region_count": 1,
+      "layout_latency_ms": 9.28,
+      "chunk_slice_latency_ms": 6.39,
+      "status": "PASSED"
+    },
+    "Huge_Function_55k": {
+      "total_lines": 55000,
+      "function_count": 1,
+      "pending_lines": 1000,
+      "region_count": 1,
+      "layout_latency_ms": 5.69,
+      "chunk_slice_latency_ms": 4.39,
+      "status": "PASSED"
+    }
+  },
   "sidecar_audit": {
     "status": "AUDIT_PASSED",
     "registered_report_count": 1,
     "corrupted_registries": [],
+    "corrupted_chunks": [],
     "orphaned_cache_count": 0,
+    "orphaned_caches": [],
     "total_sidecars": 0,
     "chunked_v2_count": 0,
     "legacy_v1_count": 0,
@@ -210,9 +258,101 @@
     "status": "BACKUP_VERIFIED",
     "database": "coverage_tool",
     "backup_dir": "/mnt/d/Zcyu/Chary-codex/onesensor_code-coverage_tool/backup_pre_upgrade",
-    "full_sql_gz_size": 113,
-    "full_sql_gz_sha256": "5005c71a3eed7c90e4693f8f988ec260a1383f326dfbebc2f75adf87ef6b823f",
-    "schema_sql_size": 42,
+    "full_sql_gz_size": 73,
+    "full_sql_gz_sha256": "bd78f93f1fdab719ecaaeff334c1d9b2e4c46fb88226f0a34add473cd11277fc",
+    "schema_sql_size": 38,
     "snapshot": null
+  },
+  "logs": [
+    "[2026-08-19T09:14:44Z] === Starting Manifest-Driven Upgrade Procedure ===",
+    "[2026-08-19T09:14:44Z] [Step 1/10] Verifying Release Identity & Git Tree...",
+    "[2026-08-19T09:14:44Z]   Target Release: v11.7 2026-08-19 (Build: v11.7-1c830387-2acac094)",
+    "[2026-08-19T09:14:44Z] [Step 2/10] Running Static DDL Preflight Validation...",
+    "[2026-08-19T09:14:44Z] ✔ Schema preflight check passed (Additive & Idempotent).",
+    "[2026-08-19T09:14:44Z] [Step 3/10] Creating Pre-upgrade Full MySQL Backup & Checksum...",
+    "[2026-08-19T09:14:44Z] ✔ Backup created & verified: SHA256=c424a20e06b1f52a9096405aa72bc413abe01d8adcccfe73edfb268c484b8933",
+    "[2026-08-19T09:14:44Z] [Step 4/10] Executing Pre/Post Data Hash Integrity Gate...",
+    "[2026-08-19T09:14:44Z] ✔ Data integrity verification passed: 0 row decreases, 0 hash mismatches.",
+    "[2026-08-19T09:14:44Z] [Step 5/10] Executing Targeted Unit Test Suites (Phases 0-6)...",
+    "[2026-08-19T09:14:45Z] ❌ Targeted test failed: tests.database.test_phase0_baseline\n..F..F\n======================================================================\nFAIL: test_item_20_mysql_backup_manifest (tests.database.test_phase0_baseline.TestPhase0Baseline.test_item_20_mysql_backup_manifest)\nVerify backup generation creates valid sha256 and manifest.\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/mnt/d/Zcyu/Chary-codex/onesensor_code-coverage_tool/tests/database/test_phase0_baseline.py\", line 92, in test_item_20_mysql_backup_manifest\n    self.assertTrue(ok)\n    ~~~~~~~~~~~~~~~^^^^\nAssertionError: False is not true\n\n======================================================================\nFAIL: test_item_28_evidence_manifest_governance (tests.database.test_phase0_baseline.TestPhase0Baseline.test_item_28_evidence_manifest_governance)\nVerify evidence manifest structure and final gate validation.\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/mnt/d/Zcyu/Chary-codex/onesensor_code-coverage_tool/tests/database/test_phase0_baseline.py\", line 145, in test_item_28_evidence_manifest_governance\n    self.assertTrue(passed)\n    ~~~~~~~~~~~~~~~^^^^^^^^\nAssertionError: False is not true\n\n----------------------------------------------------------------------\nRan 6 tests in 0.076s\n\nFAILED (failures=2)\n",
+    "[2026-08-19T09:14:57Z] === Starting Manifest-Driven Upgrade Procedure ===",
+    "[2026-08-19T09:14:57Z] [Step 1/10] Verifying Release Identity & Git Tree...",
+    "[2026-08-19T09:14:57Z]   Target Release: v11.7 2026-08-19 (Build: v11.7-1c830387-2acac094)",
+    "[2026-08-19T09:14:57Z] [Step 2/10] Running Static DDL Preflight Validation...",
+    "[2026-08-19T09:14:57Z] ✔ Schema preflight check passed (Additive & Idempotent).",
+    "[2026-08-19T09:14:57Z] [Step 3/10] Creating Pre-upgrade Full MySQL Backup & Checksum...",
+    "[2026-08-19T09:14:57Z] ✔ Backup created & verified: SHA256=7d3d8bfffadc5f24abbcb17ea9d3f2bf3e75b02c60db6628376c7dc34b6b8980",
+    "[2026-08-19T09:14:57Z] [Step 4/10] Executing Pre/Post Data Hash Integrity Gate...",
+    "[2026-08-19T09:14:57Z] ✔ Data integrity verification passed: 0 row decreases, 0 hash mismatches.",
+    "[2026-08-19T09:14:57Z] [Step 5/10] Executing Targeted Unit Test Suites (Phases 0-6)...",
+    "[2026-08-19T09:14:57Z]   ✔ tests.database.test_phase0_baseline: PASSED",
+    "[2026-08-19T09:14:58Z]   ✔ tests.test_phase1_directory: PASSED",
+    "[2026-08-19T09:14:59Z]   ✔ tests.code_detail.test_phase2_core: PASSED",
+    "[2026-08-19T09:14:59Z]   ✔ tests.test_phase3_jobs_export: PASSED",
+    "[2026-08-19T09:15:00Z] ❌ Targeted test failed: tests.progress.test_phase4_progress\n[FileStateService] Failed to query coverage_file_state: tuple index out of range\nF[FileStateService] Failed to query coverage_file_state: tuple index out of range\nE\n======================================================================\nERROR: test_item_8_reconciliation_exact_match (tests.progress.test_phase4_progress.TestPhase4Progress.test_item_8_reconciliation_exact_match)\nVerify reconciliation passes when aggregated matches authoritative.\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/mnt/d/Zcyu/Chary-codex/onesensor_code-coverage_tool/tests/progress/test_phase4_progress.py\", line 55, in test_item_8_reconciliation_exact_match\n    is_match, rep = reconcile_project_progress(mock_conn, \"ProjMatch\")\n                    ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/mnt/d/Zcyu/Chary-codex/onesensor_code-coverage_tool/scripts/upgrade/migrate_file_state.py\", line 81, in reconcile_project_progress\n    auth = query_authoritative_progress(connection, project_name)\n  File \"/mnt/d/Zcyu/Chary-codex/onesensor_code-coverage_tool/app/progress/file_state_service.py\", line 105, in query_authoritative_progress\n    row = cursor.fetchone()\n  File \"/usr/lib/python3.14/unittest/mock.py\", line 1176, in __call__\n    return self._mock_call(*args, **kwargs)\n           ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.14/unittest/mock.py\", line 1180, in _mock_call\n    return self._execute_mock_call(*args, **kwargs)\n           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^\n  File \"/usr/lib/python3.14/unittest/mock.py\", line 1243, in _execute_mock_call\n    result = next(effect)\nStopIteration\n\n======================================================================\nFAIL: test_item_7_file_state_query_with_fallback (tests.progress.test_phase4_progress.TestPhase4Progress.test_item_7_file_state_query_with_fallback)\nVerify query_project_progress_aggregated uses file_state when available and fallback otherwise.\n----------------------------------------------------------------------\nTraceback (most recent call last):\n  File \"/mnt/d/Zcyu/Chary-codex/onesensor_code-coverage_tool/tests/progress/test_phase4_progress.py\", line 28, in test_item_7_file_state_query_with_fallback\n    self.assertEqual(res[\"source\"], \"coverage_file_state\")\n    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nAssertionError: 'authoritative_facts' != 'coverage_file_state'\n- authoritative_facts\n+ coverage_file_state\n\n\n----------------------------------------------------------------------\nRan 2 tests in 0.019s\n\nFAILED (failures=1, errors=1)\n",
+    "[2026-08-19T09:15:15Z] === Starting Manifest-Driven Upgrade Procedure ===",
+    "[2026-08-19T09:15:15Z] [Step 1/10] Verifying Release Identity & Git Tree...",
+    "[2026-08-19T09:15:15Z]   Target Release: v11.7 2026-08-19 (Build: v11.7-1c830387-2acac094)",
+    "[2026-08-19T09:15:15Z] [Step 2/10] Running Static DDL Preflight Validation...",
+    "[2026-08-19T09:15:15Z] ✔ Schema preflight check passed (Additive & Idempotent).",
+    "[2026-08-19T09:15:15Z] [Step 3/10] Creating Pre-upgrade Full MySQL Backup & Checksum...",
+    "[2026-08-19T09:15:15Z] ✔ Backup created & verified: SHA256=4dbb29e3e2b2e71833c4c560ba2447297c4d3e7ee83c61ebe5a9883c4557ceca",
+    "[2026-08-19T09:15:15Z] [Step 4/10] Executing Pre/Post Data Hash Integrity Gate...",
+    "[2026-08-19T09:15:15Z] ✔ Data integrity verification passed: 0 row decreases, 0 hash mismatches.",
+    "[2026-08-19T09:15:15Z] [Step 5/10] Executing Targeted Unit Test Suites (Phases 0-6)...",
+    "[2026-08-19T09:15:15Z]   ✔ tests.database.test_phase0_baseline: PASSED",
+    "[2026-08-19T09:15:15Z]   ✔ tests.test_phase1_directory: PASSED",
+    "[2026-08-19T09:15:16Z]   ✔ tests.code_detail.test_phase2_core: PASSED",
+    "[2026-08-19T09:15:17Z]   ✔ tests.test_phase3_jobs_export: PASSED",
+    "[2026-08-19T09:15:17Z]   ✔ tests.progress.test_phase4_progress: PASSED",
+    "[2026-08-19T09:15:17Z]   ✔ tests.incremental.test_phase5_inject_path: PASSED",
+    "[2026-08-19T09:15:17Z]   ✔ tests.code_detail.test_phase6_sidecar: PASSED",
+    "[2026-08-19T09:15:17Z] [Step 6/10] Executing Browser DOM & Event-loop Smoke Suite (5 Scenarios)...",
+    "[2026-08-19T09:15:21Z] ✔ Browser DOM smoke suite: All 5 scenarios PASSED.",
+    "[2026-08-19T09:15:21Z] [Step 7/10] Running Performance Benchmark Matrix (Tiers A-D + Huge)...",
+    "[2026-08-19T09:15:23Z]   ✔ Tier A: 4.89ms, Tier D (100k): 7.94ms",
+    "[2026-08-19T09:15:23Z] [Step 8/10] Running Path Mapping & Sidecar Integrity Audits...",
+    "[2026-08-19T09:15:23Z]   ✔ Path Mapping Audit: is_valid=True",
+    "[2026-08-19T09:15:23Z]   ✔ Sidecar & Registry Audit: is_safe=True",
+    "[2026-08-19T09:15:23Z] [Step 9/10] Running Static Security Vulnerability Scanner...",
+    "[2026-08-19T09:15:23Z]   ✔ Security Scan passed: Critical=0, High=0",
+    "[2026-08-19T09:15:23Z] [Step 10/10] Validating Production Release Governance Gate...",
+    "[2026-08-19T09:15:23Z] === Upgrade Verification Completed Successfully ===",
+    "[2026-08-19T09:15:23Z] 🎉 UPGRADE_SUCCESS: All 28 joint optimization items fulfilled, fully wired, and verified.",
+    "[2026-08-19T09:21:17Z] === Starting Manifest-Driven Upgrade Procedure ===",
+    "[2026-08-19T09:21:17Z] [Step 1/10] Verifying Release Identity & Git Tree...",
+    "[2026-08-19T09:21:17Z]   Target Release: v11.7 2026-08-19 (Build: v11.7-1c830387-2acac094)",
+    "[2026-08-19T09:21:17Z] [Step 2/10] Running Static DDL Preflight Validation...",
+    "[2026-08-19T09:21:17Z] ✔ Schema preflight check passed (Additive & Idempotent).",
+    "[2026-08-19T09:21:17Z] [Step 3/10] Creating Pre-upgrade Full MySQL Backup & Checksum...",
+    "[2026-08-19T09:21:17Z] ✔ Backup created & verified: SHA256=bd78f93f1fdab719ecaaeff334c1d9b2e4c46fb88226f0a34add473cd11277fc",
+    "[2026-08-19T09:21:17Z] [Step 4/10] Executing Pre/Post Data Hash Integrity Gate...",
+    "[2026-08-19T09:21:17Z] ✔ Data integrity verification passed: 0 row decreases, 0 hash mismatches.",
+    "[2026-08-19T09:21:17Z] [Step 5/10] Executing Targeted Unit Test Suites (Phases 0-6)...",
+    "[2026-08-19T09:21:18Z]   ✔ tests.database.test_phase0_baseline: PASSED",
+    "[2026-08-19T09:21:18Z]   ✔ tests.test_phase1_directory: PASSED",
+    "[2026-08-19T09:21:19Z]   ✔ tests.code_detail.test_phase2_core: PASSED",
+    "[2026-08-19T09:21:20Z]   ✔ tests.test_phase3_jobs_export: PASSED",
+    "[2026-08-19T09:21:20Z]   ✔ tests.progress.test_phase4_progress: PASSED",
+    "[2026-08-19T09:21:20Z]   ✔ tests.incremental.test_phase5_inject_path: PASSED",
+    "[2026-08-19T09:21:20Z]   ✔ tests.code_detail.test_phase6_sidecar: PASSED",
+    "[2026-08-19T09:21:20Z] [Step 6/10] Executing Browser DOM & Event-loop Smoke Suite (5 Scenarios)...",
+    "[2026-08-19T09:21:24Z] ✔ Browser DOM smoke suite: All 5 scenarios PASSED.",
+    "[2026-08-19T09:21:24Z] [Step 7/10] Running Performance Benchmark Matrix (Tiers A-D + Huge)...",
+    "[2026-08-19T09:21:26Z]   ✔ Tier A: 4.99ms, Tier D (100k): 9.28ms",
+    "[2026-08-19T09:21:26Z] [Step 8/10] Running Path Mapping & Sidecar Integrity Audits...",
+    "[2026-08-19T09:21:26Z]   ✔ Path Mapping Audit: is_valid=True",
+    "[2026-08-19T09:21:26Z]   ✔ Sidecar & Registry Audit: is_safe=True",
+    "[2026-08-19T09:21:26Z] [Step 9/10] Running Static Security Vulnerability Scanner...",
+    "[2026-08-19T09:21:26Z]   ✔ Security Scan passed: Critical=0, High=0",
+    "[2026-08-19T09:21:26Z] [Step 10/10] Validating Production Release Governance Gate...",
+    "[2026-08-19T09:21:26Z] === Upgrade Verification Completed Successfully ===",
+    "[2026-08-19T09:21:26Z] 🎉 UPGRADE_SUCCESS: All 28 joint optimization items fulfilled, fully wired, and verified."
+  ],
+  "updated_at": "2026-08-19T09:21:26Z",
+  "browser_smoke_suite": {
+    "status": "PASSED",
+    "suite": "test_lazy_collapse_browser_smoke.js",
+    "scenarios_count": 5
   }
 }

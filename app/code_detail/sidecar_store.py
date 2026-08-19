@@ -202,6 +202,14 @@ class SidecarStore:
             os.replace(tmp_chunk, chunk_filepath)
             
         # 2. Write meta.json
+        func_ranges_json = [
+            r.to_dict() if hasattr(r, "to_dict") else (
+                {"start_line": r.start_line, "end_line": r.end_line, "name": r.name} if hasattr(r, "start_line") else (
+                    {"start_line": r[0], "end_line": r[1], "name": r[2]} if isinstance(r, (list, tuple)) and len(r) >= 3 else r
+                )
+            )
+            for r in (context.function_ranges or [])
+        ]
         meta = {
             "schema_version": CHUNKED_SCHEMA_VERSION,
             "project_name": context.project_name,
@@ -211,7 +219,7 @@ class SidecarStore:
             "total_uncovered_count": context.total_uncovered_count,
             "pending_lines": context.pending_lines,
             "confirmed_count": context.confirmed_count,
-            "function_ranges": context.function_ranges,
+            "function_ranges": func_ranges_json,
             "chunk_size": c_size,
             "total_chunks": total_chunks
         }
