@@ -823,22 +823,19 @@ Ctrl + F5
 
 大文件变慢通常有两部分原因：
 
-* LCOV 原始 HTML 本身很大，浏览器解析和渲染代码需要时间；
-* 增强脚本需要扫描未覆盖行并创建分析入口。
+* LCOV 原始 HTML 本身很大，浏览器解析和渲染数万行代码需要大量 DOM 节点和内存；
+* 增强脚本需要扫描未覆盖行并创建交互控件。
 
-新版前端支持两种控件显示模式。默认推荐 `lazy`，大文件打开时页面只会先在未覆盖代码块右侧生成一个很小的 `分析` 按钮；点击某一行的 `分析` 按钮后，才会展开状态、确认人、覆盖建议、无法覆盖原因和保存按钮。若执行 `inject` 时使用 `--mode immediate`，则打开页面后直接显示完整输入框。
+新版系统支持三种渲染模式：
 
-当分析块较多时，右上角会显示类似进度：
+1. **`lazy_collapse`（默认推荐，生产首选）**：代码懒加载与按需折叠模式。默认仅加载并展开包含待分析行的函数/代码区域，无待分析区域按需分块流式加载；初始 HTML 不携带完整源码文本，显著降低大文件首次 DOM 压力与渲染卡顿。
+2. **`lazy`**：全量代码初始渲染，未覆盖行右侧生成轻量占位按钮，点击后才展开完整评审控件。
+3. **`immediate`**：全量代码与全量评审控件直接全部渲染。
 
-```text
-Coverage controls: 800/3200 (25.0%)
-```
-
-如果数据库中已有填写结果，占位按钮会直接显示 `可覆盖`、`无法覆盖`、`冗余代码` 等状态。点击后展开的完整输入框会自动带出已有内容。
-
-如果想临时切换当前网页的控件模式，可以使用页面右下角的显示模式切换器，或在 URL 后追加：
+如果想临时切换当前网页的显示模式，可以使用页面右下角的显示模式切换器，或在 URL 后追加：
 
 ```text
+?mode=lazy_collapse
 ?mode=lazy
 ?mode=immediate
 ```
@@ -846,11 +843,28 @@ Coverage controls: 800/3200 (25.0%)
 如果 URL 已经带有其他查询参数，则改用：
 
 ```text
+&mode=lazy_collapse
 &mode=lazy
 &mode=immediate
 ```
 
-如果仍然明显卡顿，建议从源头拆分覆盖率报告，例如按模块、目录或子工程分别生成 LCOV HTML，再分别执行 `inject`。这样每个 `.gcov.html` 页面更小，浏览器体验会明显更稳。
+### 服务端注册表与持久化目录配置
+
+在 API 服务端部署或生产容器环境下，可通过环境变量或 `coverage_config.json` 显式指定 Report Registry 注册表持久化目录及报告根目录：
+
+```json
+{
+  "report_registry_dir": "/var/lib/onesensor-coverage/report-registry",
+  "report_roots": [
+    "/opt/coverage_tool",
+    "/opt/coverage_reports"
+  ]
+}
+```
+
+也可以配置系统环境变量：
+* `COVERAGE_REGISTRY_DIR`: 报告注册表目录（默认 `/var/lib/onesensor-coverage/report-registry`，不可写时自动降级到临时目录）
+* `COVERAGE_REPORT_ROOTS`: 报告根目录列表（以冒号或逗号分隔）
 
 ### 数据串到其他版本
 

@@ -33,10 +33,10 @@ def normalize_path(path):
     return normalized
 
 
-VALID_SOURCE_EXTENSIONS = ('.c', '.h')
+VALID_SOURCE_EXTENSIONS = ('.c', '.h', '.cc', '.cpp', '.cxx', '.hh', '.hpp', '.hxx', '.inl')
 
 def is_valid_source_file(file_path):
-    """Return True if the file path ends with .c or .h (case-insensitive)."""
+    """Return True if the file path ends with C/C++ source/header extension (case-insensitive)."""
     if not file_path:
         return False
     lower_path = str(file_path).lower()

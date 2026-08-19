@@ -305,8 +305,8 @@
                 lineEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 return;
             }
-            if (typeof CodeRegionStore !== 'undefined' && CodeRegionStore.getRegionForLine) {
-                const region = CodeRegionStore.getRegionForLine(lineNum);
+            if (typeof CodeRegionStore !== 'undefined' && CodeRegionStore.findByLine) {
+                const region = CodeRegionStore.findByLine(lineNum);
                 if (region && region.placeholderEl && region.placeholderEl.isConnected) {
                     region.placeholderEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 }
@@ -825,7 +825,8 @@
                     domContainer: null,
                     placeholderEl: null,
                     linesEl: null,
-                    headerEl: null
+                    headerEl: null,
+                    loadGeneration: 0
                 };
                 this._regions.set(r.region_id, regState);
             });
@@ -903,16 +904,11 @@
         _inflightPromises: new Map(), // regionId or 'batch' -> Promise
 
         async loadInitialBatch(filePath, expandedRegions) {
-            if (!expandedRegions.length) return [];
-            
-            // Mark all target regions as loading immediately to prevent duplicate triggers
-            expandedRegions.forEach(r => CodeRegionStore.setLoading(r.id, '正在加载…'));
+            if (!expandedRegions || expandedRegions.length === 0) {
+                return [];
+            }
 
-            const regionIds = expandedRegions.map(r => r.id);
-            const ranges = expandedRegions.map(r => ({
-                start_line: r.startLine,
-                end_line: r.endLine
-            }));
+            expandedRegions.forEach(r => CodeRegionStore.setLoading(r.id, '正在加载…'));
 
             const data = await requestCoverageApi('/code-lines/batch', {
                 method: 'POST',
@@ -922,16 +918,19 @@
                     file_path: filePath,
                     report_id: currentReportId,
                     scope: REVIEW_SCOPE,
-                    region_ids: regionIds,
-                    ranges: ranges
+                    load_default_expanded: true
                 })
             });
 
             if (data && data.data && data.data.ranges) {
-                data.data.ranges.forEach((rangeResult, idx) => {
-                    const reg = expandedRegions[idx];
-                    if (reg) {
-                        CodeRegionStore.setLoaded(reg.id, rangeResult.lines || []);
+                const rangeMap = new Map();
+                data.data.ranges.forEach(r => {
+                    rangeMap.set(`${r.start_line}-${r.end_line}`, r.lines || []);
+                });
+                expandedRegions.forEach(reg => {
+                    const key = `${reg.startLine}-${reg.endLine}`;
+                    if (rangeMap.has(key)) {
+                        CodeRegionStore.setLoaded(reg.id, rangeMap.get(key));
                     }
                 });
             }
@@ -949,6 +948,7 @@
 
             const loadPromise = (async () => {
                 CodeRegionStore.setLoading(region.id, '正在加载…');
+                const generation = region.loadGeneration || 0;
                 const totalLinesToLoad = region.endLine - region.startLine + 1;
 
                 if (totalLinesToLoad > LOAD_CHUNK_SIZE) {
@@ -968,14 +968,19 @@
                         if (currentReportId) query.set('report_id', currentReportId);
 
                         const chunkData = await requestCoverageApi(`/code-lines?${query.toString()}`, { method: 'GET' });
+                        if (region.loadGeneration !== generation) {
+                            return allLines;
+                        }
                         const chunkLines = chunkData && chunkData.data && chunkData.data.lines ? chunkData.data.lines : [];
                         allLines.push(...chunkLines);
 
-                        if (typeof onChunkProgress === 'function') {
+                        if (typeof onChunkProgress === 'function' && region.loadGeneration === generation) {
                             await onChunkProgress(chunkLines, start, end, allLines.length, totalLinesToLoad);
                         }
                     }
-                    CodeRegionStore.setLoaded(region.id, allLines);
+                    if (region.loadGeneration === generation) {
+                        CodeRegionStore.setLoaded(region.id, allLines);
+                    }
                     return allLines;
                 } else {
                     const query = new URLSearchParams({
@@ -988,6 +993,9 @@
                     if (currentReportId) query.set('report_id', currentReportId);
 
                     const data = await requestCoverageApi(`/code-lines?${query.toString()}`, { method: 'GET' });
+                    if (region.loadGeneration !== generation) {
+                        return [];
+                    }
                     const lines = data && data.data && data.data.lines ? data.data.lines : [];
                     CodeRegionStore.setLoaded(region.id, lines);
                     return lines;
@@ -1532,18 +1540,33 @@
                 return;
             }
 
+            if (CodeRegionLoader._inflightPromises.has(region.id)) {
+                // In-flight load already in progress, await it without re-preparing DOM
+                await CodeRegionLoader._inflightPromises.get(region.id);
+                if (region.loaded && (!region.linesEl || !region.linesEl.children.length)) {
+                    await this.renderRegionLines(region);
+                }
+                return;
+            }
+
+            region.loadGeneration = (region.loadGeneration || 0) + 1;
+            const currentGen = region.loadGeneration;
+
             // Load lines via Loader with chunk streaming
             this.updatePlaceholderState(region);
             try {
                 this.prepareRegionLinesContainer(region);
 
                 await CodeRegionLoader.loadRegion(this.filePath, region, async (chunkLines, start, end, loaded, total) => {
+                    if (region.loadGeneration !== currentGen) return;
                     region.progressText = `正在展开 ${loaded} / ${total} 行…`;
                     this.updatePlaceholderState(region);
                     await this.appendChunkLines(region, chunkLines);
                 });
 
-                await this.finalizeRegionLoaded(region);
+                if (region.loadGeneration === currentGen && region.currentState !== 'collapsed-unloaded' && region.currentState !== 'collapsed-loaded') {
+                    await this.finalizeRegionLoaded(region);
+                }
             } catch (err) {
                 console.error(`[CodeRegionController] Failed to expand region ${region.id}:`, err);
                 CodeRegionStore.setError(region.id, err.message || String(err));
@@ -1572,6 +1595,7 @@
                 header.querySelector('.coverage-region-collapse-btn').addEventListener('click', (e) => {
                     e.preventDefault();
                     e.stopPropagation();
+                    if (region.loading) return; // Prevent collapse race during active chunk loading
                     this.collapseRegion(region.id);
                 });
                 region.headerEl = header;
@@ -1583,8 +1607,6 @@
                 linesContainer.className = 'coverage-region-lines';
                 region.linesEl = linesContainer;
                 container.appendChild(linesContainer);
-            } else {
-                region.linesEl.innerHTML = '';
             }
         },
 
@@ -1599,6 +1621,9 @@
         },
 
         async finalizeRegionLoaded(region) {
+            if (region.currentState === 'collapsed-loaded' || region.currentState === 'collapsed-unloaded') {
+                return;
+            }
             if (region.placeholderEl) {
                 region.placeholderEl.style.display = 'none';
             }
@@ -1608,8 +1633,11 @@
         },
 
         collapseRegion(regionId) {
-            const region = CodeRegionStore.get(regionId);
+            const region = typeof regionId === 'string' ? CodeRegionStore.get(regionId) : regionId;
             if (!region || !region.domContainer) return;
+            if (region.loading) return; // Prevent collapse while chunk stream loading
+
+            region.loadGeneration = (region.loadGeneration || 0) + 1;
 
             // Free DOM memory while preserving DraftStore edits
             if (region.linesEl) {
@@ -1621,7 +1649,7 @@
                 region.headerEl = null;
             }
 
-            CodeRegionStore.setCollapsed(regionId);
+            CodeRegionStore.setCollapsed(region.id);
 
             // Re-display placeholder
             if (!region.placeholderEl) {

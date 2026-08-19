@@ -510,7 +510,7 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
         
         with open(os.path.join(out_dir, "incremental_coverage.html"), "r", encoding="utf-8") as f:
             inc_html = f.read()
-        self.assertIn("v11.3 2026-08-19", inc_html)
+        self.assertIn(enhance_coverage.VERSION_DISPLAY_LABEL, inc_html)
         self.assertIn("page-version-badge", inc_html)
         self.assertIn("whats-new-modal", inc_html)
         self.assertIn("whats-new-btn", inc_html)
@@ -519,7 +519,7 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
         enhance_coverage.write_incremental_developer_tasks_page(out_dir, "TestProj", result_mock)
         with open(os.path.join(out_dir, "incremental_developer_tasks.html"), "r", encoding="utf-8") as f:
             dev_html = f.read()
-        self.assertNotIn("v11.3 2026-08-19", dev_html)
+        self.assertNotIn(enhance_coverage.VERSION_DISPLAY_LABEL, dev_html)
 
         # 3. Check other pages and components do NOT contain toolbar or badge version
         with open(enhance_coverage.JS_SOURCE_PATH, "r", encoding="utf-8") as f:
@@ -672,6 +672,214 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
         finally:
             if old_reg_env is not None:
                 os.environ["COVERAGE_REGISTRY_DIR"] = old_reg_env
+            else:
+                os.environ.pop("COVERAGE_REGISTRY_DIR", None)
+
+    def test_23_cpp_files_injected_and_sidecar_generated(self):
+        """P0-1: Verify C++ .cpp.gcov.html, .cc.gcov.html, .hpp.gcov.html files are injected and sidecars generated."""
+        input_dir = os.path.join(self.temp_dir, "cpp_input")
+        output_dir = os.path.join(self.temp_dir, "cpp_output")
+        os.makedirs(input_dir, exist_ok=True)
+
+        cpp_files = ["calc.cpp.gcov.html", "engine.cc.gcov.html", "header.hpp.gcov.html"]
+        for fname in cpp_files:
+            content = f"""<!DOCTYPE html><html><head><title>LCOV - cov - src/{fname.replace('.gcov.html', '')}</title></head>
+<body><pre class="source">
+<span class="lineNum">    1 </span><span id="L1" class="lineCov">int foo() {{</span>
+<span class="lineNum">    2 </span><span id="L2" class="lineNoCov tlaUNC tlaBgUNC">    return 42;</span>
+<span class="lineNum">    3 </span><span id="L3" class="lineCov">}}</span>
+</pre></body></html>"""
+            with open(os.path.join(input_dir, fname), "w", encoding="utf-8") as f:
+                f.write(content)
+
+        enhance_coverage.inject_coverage_report(
+            input_dir, output_dir, project_name="CppProj", render_mode="lazy_collapse"
+        )
+
+        cache_root = os.path.join(output_dir, ".source_cache")
+        self.assertTrue(os.path.isdir(cache_root))
+        report_ids = [d for d in os.listdir(cache_root) if not d.startswith(".")]
+        self.assertEqual(len(report_ids), 1)
+        report_id = report_ids[0]
+
+        service = CodeDetailService(search_dirs=[output_dir])
+
+        for fname in cpp_files:
+            src_name = fname.replace(".gcov.html", "")
+            out_file = os.path.join(output_dir, fname)
+            self.assertTrue(os.path.isfile(out_file))
+
+            with open(out_file, "r", encoding="utf-8") as f:
+                html_out = f.read()
+
+            self.assertIn("coverage_enhance.js", html_out)
+            self.assertIn("coverage_enhance.css", html_out)
+            self.assertNotIn("return 42;", html_out, "HTML source code should be stripped")
+
+            # Layout API check
+            layout = service.get_code_layout("CppProj", f"src/{src_name}", report_id=report_id)
+            self.assertEqual(layout["total_lines"], 3)
+            self.assertEqual(layout["pending_line_count"], 1)
+
+    def test_24_dynamic_asset_version_format(self):
+        """P1-1: Verify ASSET_VERSION includes dynamic hash format."""
+        self.assertTrue(enhance_coverage.ASSET_VERSION.startswith("lazy-collapse-"))
+        self.assertIn("_", enhance_coverage.ASSET_VERSION)
+
+    def test_25_signature_manifest_hash_collision_protection(self):
+        """P1-2: Verify modify content without changing file size or max mtime changes signature manifest_hash."""
+        sig_dir = os.path.join(self.temp_dir, "sig_test_dir")
+        os.makedirs(sig_dir, exist_ok=True)
+
+        f1 = os.path.join(sig_dir, "a.gcov.html")
+        f2 = os.path.join(sig_dir, "b.gcov.html")
+
+        with open(f1, "w", encoding="utf-8") as f:
+            f.write("AAAA")
+        with open(f2, "w", encoding="utf-8") as f:
+            f.write("BBBB")
+
+        # Give f2 higher mtime
+        t_high = time.time() + 100
+        os.utime(f2, (t_high, t_high))
+
+        sig1 = enhance_coverage.compute_directory_signature(sig_dir, project_name="SigTest")
+
+        # Now change f1 content from AAAA to CCCC (same size 4 bytes, mtime still < f2)
+        with open(f1, "w", encoding="utf-8") as f:
+            f.write("CCCC")
+
+        sig2 = enhance_coverage.compute_directory_signature(sig_dir, project_name="SigTest")
+
+        self.assertNotEqual(sig1["manifest_hash"], sig2["manifest_hash"])
+
+    def test_26_context_cache_ttl_and_lru_eviction(self):
+        """P1-3: Verify CodeDetailService context cache evicts oldest entries and expires TTL."""
+        service = CodeDetailService(max_cache_entries=2)
+        service._cache_ttl_sec = 0.05
+
+        def make_dummy_html(name):
+            return f"""<!DOCTYPE html><html><head><title>LCOV - {name}</title></head>
+            <body><pre class="source"><span id="L1" class="lineCov">int x = 1;</span></pre></body></html>"""
+
+        # Add item 1
+        service.get_source_context("P", "f1.c", content_override=make_dummy_html("f1.c"))
+        self.assertIn(("P", "", "f1.c", "full"), service._context_cache)
+
+        # Add item 2
+        service.get_source_context("P", "f2.c", content_override=make_dummy_html("f2.c"))
+        self.assertIn(("P", "", "f2.c", "full"), service._context_cache)
+
+        # Add item 3 -> should evict item 1 (capacity = 2)
+        service.get_source_context("P", "f3.c", content_override=make_dummy_html("f3.c"))
+        self.assertEqual(len(service._context_cache), 2)
+        self.assertNotIn(("P", "", "f1.c", "full"), service._context_cache)
+        self.assertIn(("P", "", "f3.c", "full"), service._context_cache)
+
+        # Test TTL expiration
+        time.sleep(0.06)
+        service._prune_context_cache()
+        self.assertEqual(len(service._context_cache), 0)
+
+    def test_27_batch_over_1000_default_expanded_regions(self):
+        """P1-4: Verify get_code_lines_batch with load_default_expanded supports >1000 regions without error."""
+        # Build a synthetic HTML with 1001 functions, each with 1 pending line
+        num_fns = 1001
+        lines = ['<!DOCTYPE html><html><head><title>LCOV - huge</title></head><body><pre class="source">']
+        for i in range(1, num_fns + 1):
+            s_line = (i - 1) * 30 + 1
+            lines.append(f'<span class="lineNum">{s_line:5d}</span><span id="L{s_line}" class="lineCov">int fn_{i}() {{</span>')
+            lines.append(f'<span class="lineNum">{s_line+1:5d}</span><span id="L{s_line+1}" class="lineNoCov tlaUNC tlaBgUNC">    return {i};</span>')
+            lines.append(f'<span class="lineNum">{s_line+2:5d}</span><span id="L{s_line+2}" class="lineCov">}}</span>')
+            for filler in range(s_line + 3, s_line + 30):
+                lines.append(f'<span class="lineNum">{filler:5d}</span><span id="L{filler}" class="lineCov">    int pad = {filler};</span>')
+        lines.append('</pre></body></html>')
+        huge_html = "\n".join(lines)
+
+        service = CodeDetailService()
+        batch = service.get_code_lines_batch(
+            project_name="HugeProj",
+            file_path="huge.c",
+            load_default_expanded=True,
+            content_override=huge_html,
+        )
+        self.assertEqual(len(batch["ranges"]), num_fns)
+        self.assertTrue(batch["perf"]["verified_default_batch"])
+
+    def test_28_cpp_function_parser_edge_cases(self):
+        """P2-4: Verify C++ function parser handles templates, multiline return types, operator(), and attributes."""
+        raw_lines = [
+            # 1. Template function
+            {"line_no": 1, "code_text": "template <typename T>"},
+            {"line_no": 2, "code_text": "T Foo<T>::bar(const T& x) const {"},
+            {"line_no": 3, "code_text": "    return x;"},
+            {"line_no": 4, "code_text": "}"},
+            # 2. Multiline return type
+            {"line_no": 5, "code_text": "static int"},
+            {"line_no": 6, "code_text": "multi_return_foo(int x)"},
+            {"line_no": 7, "code_text": "{"},
+            {"line_no": 8, "code_text": "    return x * 2;"},
+            {"line_no": 9, "code_text": "}"},
+            # 3. operator()
+            {"line_no": 10, "code_text": "int Foo::operator()(int x) const {"},
+            {"line_no": 11, "code_text": "    return x + 1;"},
+            {"line_no": 12, "code_text": "}"},
+            # 4. GNU attribute
+            {"line_no": 13, "code_text": "__attribute__((noinline)) int attr_foo(int x) {"},
+            {"line_no": 14, "code_text": "    return x;"},
+            {"line_no": 15, "code_text": "}"},
+        ]
+
+        functions = extract_c_function_ranges(raw_lines)
+        self.assertEqual(len(functions), 4)
+
+        # Template function range should start at line 1 (includes template <...>)
+        self.assertEqual(functions[0].start_line, 1)
+        self.assertEqual(functions[0].end_line, 4)
+
+        # Multi-line return type function range should start at line 5
+        self.assertEqual(functions[1].start_line, 5)
+        self.assertEqual(functions[1].end_line, 9)
+        self.assertEqual(functions[1].name, "multi_return_foo")
+
+        # operator()
+        self.assertEqual(functions[2].start_line, 10)
+        self.assertEqual(functions[2].end_line, 12)
+        self.assertEqual(functions[2].name, "Foo::operator()")
+
+        # Attribute
+        self.assertEqual(functions[3].start_line, 13)
+        self.assertEqual(functions[3].end_line, 15)
+        self.assertEqual(functions[3].name, "attr_foo")
+
+    def test_29_registry_fast_lookup_and_cleanup(self):
+        """P2-5 & P2-6: Verify single report_id fast lookup and stale registry cleanup."""
+        reg_dir = os.path.join(self.temp_dir, "test_reg_p2")
+        old_env = os.environ.get("COVERAGE_REGISTRY_DIR")
+        os.environ["COVERAGE_REGISTRY_DIR"] = reg_dir
+        try:
+            d_alive = os.path.join(self.temp_dir, "alive_dir")
+            d_stale = os.path.join(self.temp_dir, "stale_dir")
+            os.makedirs(d_alive, exist_ok=True)
+            os.makedirs(d_stale, exist_ok=True)
+
+            enhance_coverage.register_report_directory("report_alive", d_alive)
+            enhance_coverage.register_report_directory("report_stale", d_stale)
+
+            # Fast single lookup
+            loaded_single = code_detail_service.load_report_registry("report_alive")
+            self.assertEqual(len(loaded_single), 1)
+            self.assertIn("report_alive", loaded_single)
+
+            # Remove d_stale and run prune
+            shutil.rmtree(d_stale)
+            enhance_coverage.prune_stale_report_registry(reg_dir)
+
+            self.assertTrue(os.path.isfile(os.path.join(reg_dir, "report_alive.json")))
+            self.assertFalse(os.path.isfile(os.path.join(reg_dir, "report_stale.json")))
+        finally:
+            if old_env is not None:
+                os.environ["COVERAGE_REGISTRY_DIR"] = old_env
             else:
                 os.environ.pop("COVERAGE_REGISTRY_DIR", None)
 

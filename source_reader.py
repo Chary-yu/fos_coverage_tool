@@ -66,12 +66,31 @@ def extract_function_name_from_signature(sig_text: str) -> str:
     - Standard C functions (int foo(int a))
     - C++ scoped names (Namespace::Class::func)
     - Constructors and Destructors (Foo::Foo, Foo::~Foo)
-    - Operators (operator==, operator(), operator new)
+    - Operators (operator==, operator(), operator new, Foo::operator())
+    - GNU attributes (__attribute__((noinline)) int foo(int a))
+    - C++11 attributes ([[nodiscard]] int foo(int a))
+    - Templates (template <typename T> T Foo<T>::bar(const T& x))
     - Trailing return types (auto func() -> type)
     - Qualifiers (const, noexcept, override)
     """
     sig_text = re.sub(r'/\*.*?\*/', '', sig_text).strip()
     sig_text = re.sub(r'//.*$', '', sig_text).strip()
+
+    # Strip GNU __attribute__((...)), __declspec(...), and C++11 [[...]] attributes
+    sig_text = re.sub(r'__attribute__\s*\(\(.*?\)\)', '', sig_text)
+    sig_text = re.sub(r'__declspec\s*\([^\)]*\)', '', sig_text)
+    sig_text = re.sub(r'\[\[.*?\]\]', '', sig_text)
+    sig_text = sig_text.strip()
+
+    # Strip leading template <...> if present
+    sig_text = re.sub(r'^template\s*<.*?>\s*', '', sig_text)
+
+    # Check for C++ operator overloads first (especially operator(), operator[], Foo::operator())
+    op_match = re.search(r'((?:[~A-Za-z_]\w*(?:<[^>]*>)?\s*::\s*)*operator\s*(?:\(\)|\[\]|->|\+\+|--|[^\s\(]+))\s*\(', sig_text)
+    if op_match:
+        raw_op = op_match.group(1)
+        return re.sub(r'\s+', '', raw_op)
+
     paren_idx = sig_text.find('(')
     if paren_idx < 0:
         return ""
@@ -79,13 +98,8 @@ def extract_function_name_from_signature(sig_text: str) -> str:
     if not prefix:
         return ""
 
-    # Check for operator overload
-    op_match = re.search(r'\boperator\s*([^\s\(]+|\(\)|\[\])\s*$', prefix)
-    if op_match:
-        return f"operator{op_match.group(1)}"
-
-    # Match identifier or C++ qualified name (e.g., Foo::bar, ~Foo, Foo::Foo, ns::Class::method)
-    match = re.search(r'([~A-Za-z_]\w*(?:\s*::\s*[~A-Za-z_]\w*)*)\s*$', prefix)
+    # Match identifier or C++ qualified name (e.g., Foo::bar, ~Foo, Foo::Foo, ns::Class::method, Foo<T>::bar)
+    match = re.search(r'([~A-Za-z_]\w*(?:<[^>]*>)?(?:\s*::\s*[~A-Za-z_]\w*(?:<[^>]*>)?)*)\s*$', prefix)
     if match:
         name = re.sub(r'\s+', '', match.group(1))
         # Exclude language keywords
@@ -356,6 +370,7 @@ def extract_c_function_ranges(raw_lines: List[dict]) -> List[FunctionRange]:
     paren_depth = 0
     brace_depth = 0
     current_fn_name = ""
+    candidate_prefix_lines = []
 
     for idx, item in enumerate(raw_lines):
         line_no = item["line_no"]
@@ -416,7 +431,10 @@ def extract_c_function_ranges(raw_lines: List[dict]) -> List[FunctionRange]:
         is_macro = clean_text.startswith('#')
 
         if state == 'SEEKING':
-            if not clean_text or is_macro:
+            if not clean_text:
+                continue
+            if is_macro:
+                candidate_prefix_lines = []
                 continue
 
             if '(' in clean_text:
@@ -426,14 +444,18 @@ def extract_c_function_ranges(raw_lines: List[dict]) -> List[FunctionRange]:
                     re.match(r'^(typedef|struct|enum|union|using|namespace|return|goto|break|continue)\b', prefix)
                     or is_control_flow_text(prefix)
                 ):
+                    candidate_prefix_lines = []
                     continue
 
-                fn_name = extract_function_name_from_signature(clean_text)
+                combined_sig = " ".join([p[1] for p in candidate_prefix_lines] + [clean_text]) if candidate_prefix_lines else clean_text
+                fn_name = extract_function_name_from_signature(combined_sig) or extract_function_name_from_signature(clean_text)
                 if not fn_name:
+                    candidate_prefix_lines = []
                     continue
 
-                sig_start_line = line_no
-                sig_text_buffer = [clean_text]
+                sig_start_line = candidate_prefix_lines[0][0] if candidate_prefix_lines else line_no
+                sig_text_buffer = [p[1] for p in candidate_prefix_lines] + [clean_text] if candidate_prefix_lines else [clean_text]
+                candidate_prefix_lines = []
                 current_fn_name = fn_name
                 paren_depth = clean_text.count('(') - clean_text.count(')')
 
@@ -460,6 +482,14 @@ def extract_c_function_ranges(raw_lines: List[dict]) -> List[FunctionRange]:
                             state = 'IN_BODY'
                     else:
                         state = 'WAITING_FOR_BODY'
+            else:
+                if ';' in clean_text or '{' in clean_text or '}' in clean_text or clean_text.endswith(':') or is_control_flow_text(clean_text):
+                    candidate_prefix_lines = []
+                else:
+                    if not candidate_prefix_lines or (line_no - candidate_prefix_lines[-1][0] <= 2):
+                        candidate_prefix_lines.append((line_no, clean_text))
+                    else:
+                        candidate_prefix_lines = [(line_no, clean_text)]
 
         elif state == 'IN_SIGNATURE':
             if is_macro:

@@ -25,8 +25,11 @@ class TestCoverageCheck(unittest.TestCase):
 
         self.assertTrue(coverage_check.is_valid_source_file("src/main.c"))
         self.assertTrue(coverage_check.is_valid_source_file("include/header.H"))
+        self.assertTrue(coverage_check.is_valid_source_file("src/main.cpp"))
+        self.assertTrue(coverage_check.is_valid_source_file("src/engine.cc"))
+        self.assertTrue(coverage_check.is_valid_source_file("include/math.hpp"))
         self.assertFalse(coverage_check.is_valid_source_file("README.md"))
-        self.assertFalse(coverage_check.is_valid_source_file("src/main.cpp"))
+        self.assertFalse(coverage_check.is_valid_source_file("script.py"))
         self.assertFalse(coverage_check.is_valid_source_file(""))
 
     def test_parse_diff_text_unified_diff(self):

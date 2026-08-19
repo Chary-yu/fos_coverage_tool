@@ -32,24 +32,54 @@ from source_reader import (
 logger = logging.getLogger(__name__)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPORT_REGISTRY_DIR = os.environ.get(
-    "COVERAGE_REGISTRY_DIR",
-    "/var/lib/onesensor-coverage/report-registry"
-    if os.path.exists("/var/lib/onesensor-coverage/report-registry") or (os.path.exists("/var/lib") and os.access("/var/lib", os.W_OK))
-    else os.path.join(tempfile.gettempdir(), ".onesensor_report_registry")
-)
+
+
+def get_configured_registry_dir() -> str:
+    if "COVERAGE_REGISTRY_DIR" in os.environ:
+        return os.environ["COVERAGE_REGISTRY_DIR"]
+    try:
+        cfg_path = os.path.join(SCRIPT_DIR, "coverage_config.json")
+        if os.path.isfile(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if cfg.get("report_registry_dir"):
+                return cfg["report_registry_dir"]
+    except Exception:
+        pass
+    if os.path.exists("/var/lib/onesensor-coverage/report-registry") or (os.path.exists("/var/lib") and os.access("/var/lib", os.W_OK)):
+        return "/var/lib/onesensor-coverage/report-registry"
+    return os.path.join(tempfile.gettempdir(), ".onesensor_report_registry")
+
+
+REPORT_REGISTRY_DIR = get_configured_registry_dir()
 REPORT_REGISTRY_LEGACY_PATH = os.path.join(SCRIPT_DIR, ".report_registry.json")
 
 
-def load_report_registry() -> Dict[str, List[str]]:
-    """Load persistent report registry from per-report files and legacy registry."""
+def load_report_registry(report_id: Optional[str] = None) -> Dict[str, List[str]]:
+    """Load persistent report registry. If report_id is provided, read single file directly."""
     result: Dict[str, List[str]] = {}
+    reg_dir = get_configured_registry_dir()
 
-    if os.path.isdir(REPORT_REGISTRY_DIR):
+    if report_id and os.path.isdir(reg_dir):
+        file_path = os.path.join(reg_dir, f"{report_id}.json")
+        if os.path.isfile(file_path):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    dirs = data.get("directories", [])
+                    if isinstance(dirs, str):
+                        dirs = [dirs]
+                    result[report_id] = [str(d) for d in dirs if d]
+                    return result
+            except Exception:
+                pass
+
+    if os.path.isdir(reg_dir):
         try:
-            for entry in os.listdir(REPORT_REGISTRY_DIR):
+            for entry in os.listdir(reg_dir):
                 if entry.endswith(".json") and not entry.startswith("."):
-                    file_path = os.path.join(REPORT_REGISTRY_DIR, entry)
+                    file_path = os.path.join(reg_dir, entry)
                     try:
                         with open(file_path, "r", encoding="utf-8") as f:
                             data = json.load(f)
@@ -93,6 +123,9 @@ def is_safe_relative_path(path: str) -> bool:
     return True
 
 
+MAX_CONTEXT_CACHE_ENTRIES = 64
+
+
 class CodeDetailService:
     """Service handling code detail layout calculation and range retrieval."""
 
@@ -101,12 +134,37 @@ class CodeDetailService:
         db_manager=None,
         search_dirs: Optional[List[str]] = None,
         review_scope: str = "full",
+        max_cache_entries: int = MAX_CONTEXT_CACHE_ENTRIES,
     ):
         self.db_manager = db_manager
         self.search_dirs = [os.path.abspath(d) for d in (search_dirs or []) if os.path.isdir(d)]
         self.review_scope = review_scope
         self._context_cache: Dict[Tuple[str, str, str, str], Tuple[float, SourceContext]] = {}
         self._cache_ttl_sec = 60.0
+        self._max_cache_entries = max_cache_entries
+
+    def _prune_context_cache(self, now: Optional[float] = None):
+        """Prune expired cache entries and enforce LRU / max entries limit."""
+        if now is None:
+            now = time.time()
+        # 1. Remove expired entries
+        expired_keys = [
+            k for k, (ts, _) in self._context_cache.items()
+            if (now - ts) >= self._cache_ttl_sec
+        ]
+        for k in expired_keys:
+            self._context_cache.pop(k, None)
+
+        # 2. Enforce maximum capacity by evicting oldest entries
+        if len(self._context_cache) > self._max_cache_entries:
+            sorted_items = sorted(self._context_cache.items(), key=lambda item: item[1][0])
+            to_remove = len(self._context_cache) - self._max_cache_entries
+            for i in range(to_remove):
+                self._context_cache.pop(sorted_items[i][0], None)
+
+    def clear_context_cache(self):
+        """Explicitly clear in-memory context cache."""
+        self._context_cache.clear()
 
     def add_search_dir(self, directory: str):
         if directory and os.path.isdir(directory):
@@ -128,7 +186,7 @@ class CodeDetailService:
 
         dirs_to_check = list(self.search_dirs)
         if report_id:
-            registry = load_report_registry()
+            registry = load_report_registry(report_id)
             if report_id in registry:
                 for r_dir in registry[report_id]:
                     if r_dir not in dirs_to_check:
@@ -178,10 +236,13 @@ class CodeDetailService:
 
         cache_key = (project_name, report_id or "", file_path, scope)
         now = time.time()
+        self._prune_context_cache(now)
 
         if not content_override and cache_key in self._context_cache:
             ts, cached_ctx = self._context_cache[cache_key]
             if now - ts < self._cache_ttl_sec:
+                # Update access timestamp for LRU
+                self._context_cache[cache_key] = (now, cached_ctx)
                 if self.db_manager:
                     self._refresh_analysis_records(cached_ctx, project_name, file_path, scope)
                 return cached_ctx
@@ -205,6 +266,7 @@ class CodeDetailService:
                 report_id=report_id,
             )
             self._context_cache[cache_key] = (now, context)
+            self._prune_context_cache(now)
             return context
 
         file_hash = compute_file_path_hash(file_path)
@@ -212,12 +274,12 @@ class CodeDetailService:
         # 1. Try to load from server-side source sidecar if report_id given
         if report_id:
             dirs_to_check = list(self.search_dirs)
-            registry = load_report_registry()
+            registry = load_report_registry(report_id)
             if report_id in registry:
                 for r_dir in registry[report_id]:
                     if r_dir not in dirs_to_check:
                         dirs_to_check.insert(0, r_dir)
-            for std_dir in ["/opt/coverage_reports/review", "/opt/coverage_reports/review_incremental", "/opt/coverage_reports"]:
+            for std_dir in ["/opt/coverage_tool", "/opt/coverage_reports/review", "/opt/coverage_reports/review_incremental", "/opt/coverage_reports"]:
                 if os.path.isdir(std_dir) and std_dir not in dirs_to_check:
                     dirs_to_check.append(std_dir)
 
@@ -227,6 +289,7 @@ class CodeDetailService:
                     if self.db_manager:
                         self._refresh_analysis_records(sidecar_ctx, project_name, file_path, scope)
                     self._context_cache[cache_key] = (now, sidecar_ctx)
+                    self._prune_context_cache(now)
                     return sidecar_ctx
 
             # Authoritative: when report_id is provided, do NOT fallback to stripped .gcov.html
@@ -357,11 +420,12 @@ class CodeDetailService:
         file_path: str,
         ranges: Optional[List[Dict[str, int]]] = None,
         region_ids: Optional[List[str]] = None,
+        load_default_expanded: bool = False,
         report_id: str = "",
         review_scope: str = "full",
         content_override: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Batch load line data for specified ranges (up to 1000 ranges) or verified default region IDs."""
+        """Batch load line data for specified ranges, region IDs, or all default expanded regions."""
         t_start = time.perf_counter()
         context = self.get_source_context(
             project_name=project_name,
@@ -374,7 +438,17 @@ class CodeDetailService:
         verified_ranges = []
         is_verified_default_batch = False
 
-        if region_ids and isinstance(region_ids, list):
+        if load_default_expanded:
+            regions = build_code_regions(
+                total_lines=context.total_lines,
+                pending_lines=context.pending_lines,
+                function_ranges=context.function_ranges,
+            )
+            for reg in regions:
+                if reg.default_state == "expanded":
+                    verified_ranges.append({"start_line": reg.start_line, "end_line": reg.end_line})
+            is_verified_default_batch = True
+        elif region_ids and isinstance(region_ids, list):
             regions = build_code_regions(
                 total_lines=context.total_lines,
                 pending_lines=context.pending_lines,
@@ -391,14 +465,16 @@ class CodeDetailService:
 
         if is_verified_default_batch:
             target_ranges = verified_ranges
+            max_ranges_limit = max(1000, len(target_ranges) + 10)
             max_lines = None
         else:
             if not ranges:
-                raise ValueError("ranges or region_ids is required")
+                raise ValueError("ranges, region_ids, or load_default_expanded is required")
             target_ranges = ranges
+            max_ranges_limit = 1000
             max_lines = 50000
 
-        range_results = read_source_ranges(context, target_ranges, max_ranges=1000, max_total_lines=max_lines)
+        range_results = read_source_ranges(context, target_ranges, max_ranges=max_ranges_limit, max_total_lines=max_lines)
         elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 
         total_lines_read = sum(len(r["lines"]) for r in range_results)

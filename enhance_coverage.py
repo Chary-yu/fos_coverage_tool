@@ -72,23 +72,86 @@ for module_name in ['pymysql', 'mysql.connector']:
 # 脚本根目录和配置文件位置
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "coverage_config.json")
-REPORT_REGISTRY_DIR = os.environ.get(
-    "COVERAGE_REGISTRY_DIR",
-    "/var/lib/onesensor-coverage/report-registry"
-    if os.path.exists("/var/lib/onesensor-coverage/report-registry") or (os.path.exists("/var/lib") and os.access("/var/lib", os.W_OK))
-    else os.path.join(tempfile.gettempdir(), ".onesensor_report_registry")
-)
-REPORT_REGISTRY_LEGACY_PATH = os.path.join(SCRIPT_DIR, ".report_registry.json")
 JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
 CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
 PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "lazy-collapse-20260819_v11_3"
+
+
+def _compute_asset_version() -> str:
+    hasher = hashlib.sha256()
+    for fp in (JS_SOURCE_PATH, CSS_SOURCE_PATH, INCREMENTAL_JS_SOURCE_PATH, PROGRESS_JS_SOURCE_PATH):
+        if os.path.isfile(fp):
+            try:
+                with open(fp, "rb") as f:
+                    hasher.update(f.read())
+            except Exception:
+                pass
+    asset_hash = hasher.hexdigest()[:8]
+    return f"lazy-collapse-20260819_v11_6_{asset_hash}"
+
+
+ASSET_VERSION = _compute_asset_version()
 ASSET_RELEASE_TIME = "2026-08-19"
-VERSION_DISPLAY_LABEL = "v11.3 2026-08-19"
+VERSION_DISPLAY_LABEL = "v11.6 2026-08-19"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
+VALID_SOURCE_EXTENSIONS = ('.c', '.h', '.cc', '.cpp', '.cxx', '.hh', '.hpp', '.hxx', '.inl')
+
+
+def is_source_gcov_page(filename: str) -> bool:
+    """Return True if filename represents an LCOV .gcov.html source page."""
+    if not filename or not isinstance(filename, str):
+        return False
+    return filename.endswith(".gcov.html")
+
+
+def get_configured_registry_dir() -> str:
+    if "COVERAGE_REGISTRY_DIR" in os.environ:
+        return os.environ["COVERAGE_REGISTRY_DIR"]
+    try:
+        if os.path.isfile(CONFIG_PATH):
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+            if cfg.get("report_registry_dir"):
+                return cfg["report_registry_dir"]
+    except Exception:
+        pass
+    if os.path.exists("/var/lib/onesensor-coverage/report-registry") or (os.path.exists("/var/lib") and os.access("/var/lib", os.W_OK)):
+        return "/var/lib/onesensor-coverage/report-registry"
+    return os.path.join(tempfile.gettempdir(), ".onesensor_report_registry")
+
+
+REPORT_REGISTRY_DIR = get_configured_registry_dir()
+REPORT_REGISTRY_LEGACY_PATH = os.path.join(SCRIPT_DIR, ".report_registry.json")
+
+
+def prune_stale_report_registry(reg_dir: Optional[str] = None):
+    """Clean up registry entries where registered directories no longer exist on disk."""
+    d = reg_dir or get_configured_registry_dir()
+    if not os.path.isdir(d):
+        return
+    try:
+        for entry in os.listdir(d):
+            if entry.endswith(".json") and not entry.startswith("."):
+                fpath = os.path.join(d, entry)
+                try:
+                    with open(fpath, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    dirs = data.get("directories", []) if isinstance(data, dict) else []
+                    if isinstance(dirs, str):
+                        dirs = [dirs]
+                    valid_dirs = [x for x in dirs if x and os.path.exists(x)]
+                    if not valid_dirs:
+                        try:
+                            os.remove(fpath)
+                        except OSError:
+                            pass
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def register_report_directory(report_id: str, *dirs: str):
@@ -99,12 +162,13 @@ def register_report_directory(report_id: str, *dirs: str):
     if not valid_dirs:
         return
 
+    reg_dir = get_configured_registry_dir()
     try:
-        os.makedirs(REPORT_REGISTRY_DIR, exist_ok=True)
+        os.makedirs(reg_dir, exist_ok=True)
     except Exception:
         pass
 
-    target_file = os.path.join(REPORT_REGISTRY_DIR, f"{report_id}.json")
+    target_file = os.path.join(reg_dir, f"{report_id}.json")
     existing_dirs = []
     if os.path.isfile(target_file):
         try:
@@ -125,19 +189,36 @@ def register_report_directory(report_id: str, *dirs: str):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, target_file)
+        prune_stale_report_registry(reg_dir)
     except Exception as e:
         logger.warning(f"[ReportRegistry] Failed to persist report registry for {report_id}: {e}")
 
 
-def load_report_registry() -> Dict[str, List[str]]:
-    """Load persistent report registry from per-report files and legacy registry."""
+def load_report_registry(report_id: Optional[str] = None) -> Dict[str, List[str]]:
+    """Load persistent report registry. If report_id is provided, read single file directly."""
     result: Dict[str, List[str]] = {}
+    reg_dir = get_configured_registry_dir()
 
-    if os.path.isdir(REPORT_REGISTRY_DIR):
+    if report_id and os.path.isdir(reg_dir):
+        file_path = os.path.join(reg_dir, f"{report_id}.json")
+        if os.path.isfile(file_path):
+            try:
+                with open(file_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    dirs = data.get("directories", [])
+                    if isinstance(dirs, str):
+                        dirs = [dirs]
+                    result[report_id] = [str(d) for d in dirs if d]
+                    return result
+            except Exception:
+                pass
+
+    if os.path.isdir(reg_dir):
         try:
-            for entry in os.listdir(REPORT_REGISTRY_DIR):
+            for entry in os.listdir(reg_dir):
                 if entry.endswith(".json") and not entry.startswith("."):
-                    file_path = os.path.join(REPORT_REGISTRY_DIR, entry)
+                    file_path = os.path.join(reg_dir, entry)
                     try:
                         with open(file_path, "r", encoding="utf-8") as f:
                             data = json.load(f)
@@ -210,25 +291,40 @@ def compute_directory_signature(
     render_mode=None,
     incremental_lines_by_file=None,
 ):
-    """Compute a comprehensive directory signature (count, max mtime, size, project, scope, mode, incremental set) for input HTML reports."""
+    """Compute a comprehensive directory signature (manifest hash, count, max mtime, size, project, scope, mode, incremental set) for input HTML reports."""
     file_count = 0
     latest_mtime = 0.0
     total_size = 0
+    file_entries = []
 
     if os.path.exists(input_html_dir):
         for root, dirs, files in os.walk(input_html_dir):
-            for f in files:
+            dirs.sort()
+            for f in sorted(files):
                 if f.endswith(".html") or f.endswith(".css") or f.endswith(".js"):
                     file_count += 1
                     fp = os.path.join(root, f)
+                    rel_p = os.path.relpath(fp, input_html_dir).replace(os.sep, "/")
                     try:
                         st = os.stat(fp)
                         total_size += st.st_size
+                        mtime_ns = getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9))
                         if st.st_mtime > latest_mtime:
                             latest_mtime = st.st_mtime
+                        content_hash = ""
+                        if is_source_gcov_page(f):
+                            try:
+                                with open(fp, "rb") as cf:
+                                    content_hash = hashlib.sha256(cf.read()).hexdigest()[:16]
+                            except Exception:
+                                pass
+                        file_entries.append((rel_p, st.st_size, mtime_ns, content_hash))
                     except OSError:
                         pass
 
+    file_entries.sort()
+    manifest_str = "|".join(f"{p}:{sz}:{mt}:{ch}" for p, sz, mt, ch in file_entries)
+    manifest_hash = hashlib.sha256(manifest_str.encode("utf-8")).hexdigest()[:16]
     inc_hash = calc_incremental_review_set_hash(incremental_lines_by_file)
 
     return {
@@ -238,6 +334,7 @@ def compute_directory_signature(
         "file_count": file_count,
         "latest_mtime": round(latest_mtime, 3),
         "total_size": total_size,
+        "manifest_hash": manifest_hash,
         "tool_version": ASSET_VERSION,
         "incremental_review_set_hash": inc_hash,
     }
@@ -4450,6 +4547,7 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
             file_path = str(payload.get("file_path") or payload.get("file") or "").strip()
             report_id = str(payload.get("report_id") or payload.get("report") or "").strip()
             review_scope = str(payload.get("scope") or payload.get("review_scope") or "full").strip()
+            load_default_expanded = bool(payload.get("load_default_expanded"))
             ranges = payload.get("ranges")
             region_ids = payload.get("region_ids")
             if not project_name or not file_path:
@@ -4464,14 +4562,14 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
             if not is_valid_review_scope(review_scope):
                 self.send_error_response(400, f"Invalid review_scope: '{review_scope}' (must be 'full' or 'incremental')")
                 return
-            if not ranges and not region_ids:
-                self.send_error_response(400, "Either 'ranges' or 'region_ids' must be provided")
+            if not ranges and not region_ids and not load_default_expanded:
+                self.send_error_response(400, "Either 'ranges', 'region_ids', or 'load_default_expanded' must be provided")
                 return
             if ranges is not None and (not isinstance(ranges, list) or len(ranges) > 1000):
                 self.send_error_response(400, "ranges must be a list with at most 1000 items")
                 return
-            if region_ids is not None and (not isinstance(region_ids, list) or len(region_ids) > 1000):
-                self.send_error_response(400, "region_ids must be a list with at most 1000 items")
+            if region_ids is not None and not isinstance(region_ids, list):
+                self.send_error_response(400, "region_ids must be a list")
                 return
             try:
                 service = get_code_detail_service()
@@ -4480,6 +4578,7 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                     file_path=file_path,
                     ranges=ranges,
                     region_ids=region_ids,
+                    load_default_expanded=load_default_expanded,
                     report_id=report_id,
                     review_scope=review_scope,
                 )
@@ -5046,7 +5145,7 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
     for root, dirs, files in os.walk(real_output_html):
         dirs.sort()
         for file in sorted(files):
-            if not (file.endswith(".c.gcov.html") or file.endswith(".h.gcov.html")):
+            if not is_source_gcov_page(file):
                 continue
             file_path = os.path.join(root, file)
             rel_path = os.path.relpath(file_path, real_output_html)
@@ -5135,7 +5234,7 @@ def find_report_page_links(report_html_dir, target_basenames=None):
     for root, dirs, files in os.walk(report_html_dir):
         dirs.sort()
         for filename in sorted(files):
-            if not (filename.endswith(".c.gcov.html") or filename.endswith(".h.gcov.html")):
+            if not is_source_gcov_page(filename):
                 continue
             if target_basenames is not None and filename not in target_basenames:
                 continue
@@ -5582,7 +5681,7 @@ td a:hover{{text-decoration:underline}}
   <div class="modal-card">
     <div class="modal-header">
       <div>
-        <h3 id="whats-new-title" class="modal-title">🚀 覆盖率审查系统 · v11.3 更新说明</h3>
+        <h3 id="whats-new-title" class="modal-title">🚀 覆盖率审查系统 · {version_label} 更新说明</h3>
         <div class="modal-subtitle">发布日期：2026-08-19</div>
       </div>
       <button type="button" id="modal-close-x" class="modal-close-btn" aria-label="关闭">&times;</button>
@@ -5591,7 +5690,7 @@ td a:hover{{text-decoration:underline}}
       <div class="feature-section">
         <div class="feature-heading"><span class="feature-icon">⚡</span> 极速加载与折叠架构</div>
         <ul class="feature-list">
-          <li><strong>10x 加载提速</strong>：引入 Lazy Collapse 架构，非待分析代码块默认折叠懒加载，大幅减轻 DOM 节点压力，超大文件秒级打开。</li>
+          <li><strong>显著降低大文件首次 DOM 压力</strong>：引入 Lazy Collapse 架构，非待分析代码块默认折叠懒加载，大幅减轻 DOM 节点压力，超大文件秒级打开。</li>
           <li><strong>待分析函数无条件展开</strong>：包含未覆盖/待审行的函数自动完整呈现，支持超大函数 Initial Batch 一键极速载入。</li>
         </ul>
       </div>

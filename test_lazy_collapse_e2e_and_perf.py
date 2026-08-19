@@ -58,6 +58,19 @@ def generate_synthetic_gcov_html(total_lines: int, pending_ratio: float = 0.05, 
     return "\n".join(lines_html)
 
 
+def measure_median_time(benchmark_fn, warmup: int = 1, runs: int = 5) -> float:
+    """Run warmup and multiple iterations, returning median elapsed milliseconds."""
+    for _ in range(warmup):
+        benchmark_fn()
+    times = []
+    for _ in range(runs):
+        t0 = time.perf_counter()
+        benchmark_fn()
+        times.append((time.perf_counter() - t0) * 1000.0)
+    times.sort()
+    return times[len(times) // 2]
+
+
 class TestLazyCollapseE2EAndPerf(unittest.TestCase):
 
     def setUp(self):
@@ -177,12 +190,11 @@ class TestLazyCollapseE2EAndPerf(unittest.TestCase):
             for r in regions if r.default_state == "expanded"
         ]
 
-        t0 = time.perf_counter()
+        median_ms = measure_median_time(lambda: read_source_ranges(ctx, expanded_ranges), warmup=1, runs=5)
         batch_results = read_source_ranges(ctx, expanded_ranges)
-        elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         self.assertEqual(len(batch_results), len(expanded_ranges))
-        self.assertLess(elapsed_ms, 50.0)  # fast batch reading
+        self.assertLess(median_ms, 50.0)  # fast batch reading
 
     # =========================================================================
     # Phase 4.2: Performance Benchmarks (Datasets A-D, Datasets 1-4)
@@ -191,45 +203,57 @@ class TestLazyCollapseE2EAndPerf(unittest.TestCase):
     def test_dataset_a_1000_lines_performance(self):
         """Dataset A: 1,000 lines file layout computation and initial batch reading."""
         html_content = generate_synthetic_gcov_html(total_lines=1000, pending_ratio=0.05, fn_size=50)
-        t_start = time.perf_counter()
+        median_ms = measure_median_time(
+            lambda: self.service.get_code_layout("Test", "bench_1k.c", content_override=html_content),
+            warmup=1,
+            runs=5,
+        )
         layout = self.service.get_code_layout("Test", "bench_1k.c", content_override=html_content)
-        elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 
-        print(f"[Benchmark] Dataset A (1,000 lines): Layout build time = {elapsed_ms:.2f}ms")
-        self.assertLess(elapsed_ms, 50.0, "Dataset A layout calculation must be < 50ms")
+        print(f"[Benchmark] Dataset A (1,000 lines): Layout build median = {median_ms:.2f}ms")
+        self.assertLess(median_ms, 50.0, "Dataset A layout calculation median must be < 50ms")
         self.assertEqual(layout["total_lines"], 1000)
 
     def test_dataset_b_10000_lines_performance(self):
         """Dataset B: 10,000 lines file layout computation."""
         html_content = generate_synthetic_gcov_html(total_lines=10000, pending_ratio=0.03, fn_size=50)
-        t_start = time.perf_counter()
+        median_ms = measure_median_time(
+            lambda: self.service.get_code_layout("Test", "bench_10k.c", content_override=html_content),
+            warmup=1,
+            runs=5,
+        )
         layout = self.service.get_code_layout("Test", "bench_10k.c", content_override=html_content)
-        elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 
-        print(f"[Benchmark] Dataset B (10,000 lines): Layout build time = {elapsed_ms:.2f}ms")
-        self.assertLess(elapsed_ms, 200.0, "Dataset B layout calculation must be < 200ms")
+        print(f"[Benchmark] Dataset B (10,000 lines): Layout build median = {median_ms:.2f}ms")
+        self.assertLess(median_ms, 200.0, "Dataset B layout calculation median must be < 200ms")
         self.assertEqual(layout["total_lines"], 10000)
 
     def test_dataset_c_50000_lines_performance(self):
         """Dataset C: 50,000 lines file layout computation."""
         html_content = generate_synthetic_gcov_html(total_lines=50000, pending_ratio=0.02, fn_size=100)
-        t_start = time.perf_counter()
+        median_ms = measure_median_time(
+            lambda: self.service.get_code_layout("Test", "bench_50k.c", content_override=html_content),
+            warmup=1,
+            runs=5,
+        )
         layout = self.service.get_code_layout("Test", "bench_50k.c", content_override=html_content)
-        elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 
-        print(f"[Benchmark] Dataset C (50,000 lines): Layout build time = {elapsed_ms:.2f}ms")
-        self.assertLess(elapsed_ms, 600.0, "Dataset C layout calculation must be < 600ms")
+        print(f"[Benchmark] Dataset C (50,000 lines): Layout build median = {median_ms:.2f}ms")
+        self.assertLess(median_ms, 600.0, "Dataset C layout calculation median must be < 600ms")
         self.assertEqual(layout["total_lines"], 50000)
 
     def test_dataset_d_100000_lines_performance(self):
         """Dataset D: 100,000 lines file layout computation."""
         html_content = generate_synthetic_gcov_html(total_lines=100000, pending_ratio=0.01, fn_size=100)
-        t_start = time.perf_counter()
+        median_ms = measure_median_time(
+            lambda: self.service.get_code_layout("Test", "bench_100k.c", content_override=html_content),
+            warmup=1,
+            runs=5,
+        )
         layout = self.service.get_code_layout("Test", "bench_100k.c", content_override=html_content)
-        elapsed_ms = (time.perf_counter() - t_start) * 1000.0
 
-        print(f"[Benchmark] Dataset D (100,000 lines): Layout build time = {elapsed_ms:.2f}ms")
-        self.assertLess(elapsed_ms, 1200.0, "Dataset D layout calculation must be < 1200ms")
+        print(f"[Benchmark] Dataset D (100,000 lines): Layout build median = {median_ms:.2f}ms")
+        self.assertLess(median_ms, 1200.0, "Dataset D layout calculation median must be < 1200ms")
         self.assertEqual(layout["total_lines"], 100000)
 
     def test_datasets_1_to_4_ratio_scenarios(self):
