@@ -326,6 +326,7 @@ class CodeDetailService:
                     report_id=report_id,
                 )
                 self._context_cache[cache_key] = (now, context)
+                self._prune_context_cache(now)
                 return context
             except Exception as e:
                 logger.warning(f"[CodeDetailService] Error reading file {gcov_file}: {e}")

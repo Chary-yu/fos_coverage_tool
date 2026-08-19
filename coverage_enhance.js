@@ -900,6 +900,9 @@
         setCollapsed(regionId) {
             const r = this._regions.get(regionId);
             if (r) {
+                r.loading = false;
+                r.error = null;
+                r.progressText = '';
                 r.currentState = r.loaded ? 'collapsed-loaded' : 'collapsed-unloaded';
             }
         },
@@ -907,6 +910,9 @@
         setExpanded(regionId) {
             const r = this._regions.get(regionId);
             if (r) {
+                r.loading = false;
+                r.error = null;
+                r.progressText = '';
                 r.currentState = 'expanded-loaded';
             }
         }
@@ -1452,7 +1458,11 @@
                 try {
                     await CodeRegionLoader.loadInitialBatch(this.filePath, defaultExpanded);
                     for (const reg of defaultExpanded) {
-                        await this.renderRegionLines(reg);
+                        if (reg.loaded && reg.currentState === 'expanded-loaded') {
+                            await this.renderRegionLines(reg);
+                        } else {
+                            this.collapseRegion(reg.id, true);
+                        }
                     }
                 } catch (err) {
                     console.error('[CodeRegionController] Initial batch load failed:', err);
@@ -1658,10 +1668,10 @@
             updateHeaderStatistics();
         },
 
-        collapseRegion(regionId) {
+        collapseRegion(regionId, force = false) {
             const region = typeof regionId === 'string' ? CodeRegionStore.get(regionId) : regionId;
             if (!region || !region.domContainer) return;
-            if (region.loading) return; // Prevent collapse while chunk stream loading
+            if (region.loading && !force) return; // Prevent manual collapse during chunk stream loading
 
             region.loadGeneration = (region.loadGeneration || 0) + 1;
 
@@ -1683,7 +1693,9 @@
             }
             region.placeholderEl.style.display = '';
             this.updatePlaceholderState(region);
-            region.domContainer.appendChild(region.placeholderEl);
+            if (!region.placeholderEl.parentNode) {
+                region.domContainer.appendChild(region.placeholderEl);
+            }
 
             updateReviewNavigation();
             updateHeaderStatistics();
@@ -1829,11 +1841,7 @@
                         this.expandRegion(reg.id);
                     }
                 } else {
-                    if (reg.loading) {
-                        reg.loadGeneration = (reg.loadGeneration || 0) + 1;
-                        CodeRegionStore.setCollapsed(reg.id);
-                    }
-                    this.collapseRegion(reg.id);
+                    this.collapseRegion(reg.id, true);
                 }
             });
             showToast('已恢复默认折叠状态');

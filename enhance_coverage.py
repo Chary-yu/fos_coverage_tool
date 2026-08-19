@@ -2186,73 +2186,9 @@ def load_config():
     return default_config
 
 
-def write_configured_enhance_js(output_path, project_name, render_mode="lazy_collapse", review_scope="full", report_id=""):
-    """Copy the frontend script and inject fallback configuration."""
-    with open(JS_SOURCE_PATH, 'r', encoding='utf-8') as f:
-        content = f.read()
-
-    project_literal = json.dumps(str(project_name), ensure_ascii=False)
-    new_content, replace_count = re.subn(
-        r"getMetaContent\('coverage-project'\)\s*\|\|\s*(['\"]).*?\1",
-        f"getMetaContent('coverage-project') || {project_literal}",
-        content,
-        count=1
-    )
-    if replace_count == 0:
-        new_content, _ = re.subn(
-            r"const\s+DEFAULT_PROJECT\s*=\s*(['\"]).*?\1\s*;",
-            f"const DEFAULT_PROJECT = {project_literal};",
-            content,
-            count=1
-        )
-
-    render_mode_literal = json.dumps(str(render_mode), ensure_ascii=False)
-    new_content, replace_count = re.subn(
-        r"getMetaContent\('coverage-render-mode'\)\s*\|\|\s*(['\"]).*?\1",
-        f"getMetaContent('coverage-render-mode') || {render_mode_literal}",
-        new_content,
-        count=1
-    )
-    if replace_count == 0:
-        new_content, _ = re.subn(
-            r"const\s+RENDER_MODE\s*=\s*(['\"]).*?\1\s*;",
-            f"const RENDER_MODE = {render_mode_literal};",
-            new_content,
-            count=1
-        )
-
-    scope_literal = json.dumps(str(review_scope), ensure_ascii=False)
-    new_content, replace_count = re.subn(
-        r"getMetaContent\('coverage-review-scope'\)\s*\|\|\s*(['\"]).*?\1",
-        f"getMetaContent('coverage-review-scope') || {scope_literal}",
-        new_content,
-        count=1
-    )
-    if replace_count == 0:
-        new_content, _ = re.subn(
-            r"const\s+REVIEW_SCOPE\s*=\s*(['\"]).*?\1\s*;",
-            f"const REVIEW_SCOPE = {scope_literal};",
-            new_content,
-            count=1
-        )
-
-    report_id_literal = json.dumps(str(report_id or ""), ensure_ascii=False)
-    new_content, replace_count = re.subn(
-        r"getMetaContent\('coverage-report-id'\)\s*\|\|\s*(['\"]).*?\1",
-        f"getMetaContent('coverage-report-id') || {report_id_literal}",
-        new_content,
-        count=1
-    )
-    if replace_count == 0:
-        new_content, _ = re.subn(
-            r"const\s+DEFAULT_REPORT_ID\s*=\s*(['\"]).*?\1\s*;",
-            f"const DEFAULT_REPORT_ID = {report_id_literal};",
-            new_content,
-            count=1
-        )
-
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(new_content)
+def write_configured_enhance_js(output_path, project_name=None, render_mode="lazy_collapse", review_scope="full", report_id=""):
+    """Copy the frontend script as a truly static asset (configuration is decoupled via HTML meta tags)."""
+    shutil.copy2(JS_SOURCE_PATH, output_path)
 
 
 def write_progress_page_targets(output_dir, real_output_html, review_scope="full"):

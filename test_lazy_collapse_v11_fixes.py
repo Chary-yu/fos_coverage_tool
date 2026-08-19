@@ -271,11 +271,13 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
         self.assertIn('meta name="coverage-report-id"', injected_html)
         self.assertIn('meta name="coverage-file-path"', injected_html)
 
-        # Injected JS must configure lazy_collapse
+        # Injected JS must be identical to static source (no string injection)
         injected_js_file = os.path.join(output_dir, "coverage_enhance.js")
         with open(injected_js_file, "r", encoding="utf-8") as f:
             js_content = f.read()
-        self.assertTrue('RENDER_MODE' in js_content and 'lazy_collapse' in js_content)
+        with open(enhance_coverage.JS_SOURCE_PATH, "r", encoding="utf-8") as f_src:
+            src_js = f_src.read()
+        self.assertEqual(js_content, src_js)
 
     def test_8_batch_loading_over_100_ranges_succeeds(self):
         """Batch loading 150 ranges succeeds with limit raised to 1000."""
@@ -886,25 +888,38 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
 
     def test_30_region_ids_exceeding_1000_rejected(self):
         """P1-4: Verify passing >1000 region_ids without load_default_expanded is rejected with 400."""
+        from enhance_coverage import CoverageHTTPRequestHandler
+
         handler = CoverageHTTPRequestHandler.__new__(CoverageHTTPRequestHandler)
-        handler.headers = {"Content-Length": "100"}
+        handler.path = "/api/coverage/code-lines/batch"
         handler.send_error_response = MagicMock()
+        handler.send_json_response = MagicMock()
 
         dummy_payload = {
             "project_name": "TestProj",
             "file_path": "src/test.c",
             "region_ids": [f"reg_{i}" for i in range(1001)]
         }
-        handler.rfile = io.BytesIO(json.dumps(dummy_payload).encode("utf-8"))
-        handler.headers["Content-Length"] = str(len(handler.rfile.getvalue()))
+        payload_bytes = json.dumps(dummy_payload).encode("utf-8")
+        handler.rfile = io.BytesIO(payload_bytes)
+        handler.headers = {"Content-Length": str(len(payload_bytes))}
         
-        parsed_url = MagicMock()
-        parsed_url.path = "/api/coverage/code-lines/batch"
+        handler.do_POST()
+        handler.send_error_response.assert_called_with(400, "region_ids must be a list with at most 1000 items")
+
+        # Also test ranges exceeding 1000
+        handler.send_error_response.reset_mock()
+        dummy_payload_ranges = {
+            "project_name": "TestProj",
+            "file_path": "src/test.c",
+            "ranges": [{"start_line": i, "end_line": i} for i in range(1001)]
+        }
+        payload_bytes_ranges = json.dumps(dummy_payload_ranges).encode("utf-8")
+        handler.rfile = io.BytesIO(payload_bytes_ranges)
+        handler.headers = {"Content-Length": str(len(payload_bytes_ranges))}
         
-        with patch.object(handler, "send_error_response") as mock_err:
-            handler.do_POST_with_url(parsed_url) if hasattr(handler, "do_POST_with_url") else None
-            # Test direct logic validation
-            self.assertTrue(len(dummy_payload["region_ids"]) > 1000)
+        handler.do_POST()
+        handler.send_error_response.assert_called_with(400, "ranges must be a list with at most 1000 items")
 
     def test_31_coverage_report_roots_env_var(self):
         """P1-5: Verify COVERAGE_REPORT_ROOTS is parsed and added to search_dirs."""
@@ -952,6 +967,21 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
         self.assertNotIn(("P", "", "f1.c", "full"), service._context_cache)
         self.assertIn(("P", "", "f2.c", "full"), service._context_cache)
         self.assertIn(("P", "", "f3.c", "full"), service._context_cache)
+
+        # Test legacy file path on disk without content_override
+        legacy_dir = os.path.join(self.temp_dir, "legacy_cache_test")
+        os.makedirs(legacy_dir, exist_ok=True)
+        legacy_file = os.path.join(legacy_dir, "f4.c.gcov.html")
+        with open(legacy_file, "w", encoding="utf-8") as f:
+            f.write(make_html("f4.c", 120))
+        
+        service_legacy = CodeDetailService(search_dirs=[legacy_dir], max_cache_entries=10, max_cache_total_lines=150)
+        service_legacy.get_source_context("P", "f2.c", content_override=make_html("f2.c", 40))
+        self.assertIn(("P", "", "f2.c", "full"), service_legacy._context_cache)
+        # Loading f4 (120 lines) via legacy disk path must evict f2 (total would be 160 > 150)
+        service_legacy.get_source_context("P", "f4.c")
+        self.assertNotIn(("P", "", "f2.c", "full"), service_legacy._context_cache)
+        self.assertIn(("P", "", "f4.c", "full"), service_legacy._context_cache)
 
     def test_33_prune_registry_checks_source_cache(self):
         """P2-7: Verify prune_stale_report_registry prunes entry when directory exists but .source_cache/report_id is missing."""

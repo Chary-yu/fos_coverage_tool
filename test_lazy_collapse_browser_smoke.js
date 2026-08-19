@@ -14,9 +14,37 @@ function createDOMEnvironment(htmlContent, fetchMock) {
     const elementsById = new Map();
 
     function makeElement(tag) {
+        const classSet = new Set();
         const el = {
             tagName: tag.toUpperCase(),
-            className: '',
+            _className: '',
+            get className() { return this._className; },
+            set className(val) {
+                this._className = val || '';
+                classSet.clear();
+                (this._className).split(/\s+/).filter(Boolean).forEach(c => classSet.add(c));
+            },
+            classList: {
+                add(...cls) {
+                    cls.forEach(c => c && classSet.add(c));
+                    el._className = Array.from(classSet).join(' ');
+                },
+                remove(...cls) {
+                    cls.forEach(c => classSet.delete(c));
+                    el._className = Array.from(classSet).join(' ');
+                },
+                contains(c) {
+                    return classSet.has(c);
+                },
+                toggle(c, force) {
+                    if (force !== undefined) {
+                        if (force) classSet.add(c); else classSet.delete(c);
+                    } else {
+                        if (classSet.has(c)) classSet.delete(c); else classSet.add(c);
+                    }
+                    el._className = Array.from(classSet).join(' ');
+                }
+            },
             style: {},
             children: [],
             _innerHTML: '',
@@ -29,18 +57,38 @@ function createDOMEnvironment(htmlContent, fetchMock) {
             textContent: '',
             dataset: {},
             isConnected: true,
+            parentNode: null,
             setAttribute(k, v) { this[k] = v; },
             getAttribute(k) { return this[k]; },
             appendChild(child) {
                 if (child.nodeType === 11) {
+                    child.children.forEach(c => { c.parentNode = this; });
                     this.children.push(...child.children);
                 } else {
+                    child.parentNode = this;
                     this.children.push(child);
                 }
                 return child;
             },
+            insertBefore(newNode, refNode) {
+                newNode.parentNode = this;
+                const idx = this.children.indexOf(refNode);
+                if (idx >= 0) {
+                    this.children.splice(idx, 0, newNode);
+                } else {
+                    this.children.push(newNode);
+                }
+                return newNode;
+            },
             remove() {
                 this.isConnected = false;
+                if (this.parentNode && this.parentNode.children) {
+                    const idx = this.parentNode.children.indexOf(this);
+                    if (idx >= 0) {
+                        this.parentNode.children.splice(idx, 1);
+                    }
+                }
+                this.parentNode = null;
             },
             querySelector(sel) {
                 if (sel === '.coverage-region-collapse-btn') {
@@ -53,6 +101,12 @@ function createDOMEnvironment(htmlContent, fetchMock) {
             },
             addEventListener(ev, fn) {
                 this[`on_${ev}`] = fn;
+            },
+            dispatchEvent(event) {
+                const fn = this[`on_${event.type}`];
+                if (typeof fn === 'function') {
+                    fn(event);
+                }
             },
             scrollIntoView() {}
         };
@@ -299,11 +353,24 @@ async function runSmokeTests() {
 
     await expandAllPromise;
 
-    // r2 and r3 should be collapsed, r1 expanded
+    // r2 and r3 should be collapsed, loading === false, r1 expanded
     assert.strictEqual(store2.get('r1').defaultState, 'expanded');
-    assert.strictEqual(store2.get('r2').currentState.startsWith('collapsed'), true, 'r2 should be collapsed after restoreDefault');
-    assert.strictEqual(store2.get('r3').currentState.startsWith('collapsed'), true, 'r3 should be collapsed after restoreDefault');
-    console.log('✔ [Smoke Test 2 Passed] Restore Default cleanly cancelled Expand All.');
+    assert.strictEqual(store2.get('r2').currentState, 'collapsed-unloaded', 'r2 should be collapsed-unloaded after restoreDefault');
+    assert.strictEqual(store2.get('r2').loading, false, 'r2.loading must be false after restoreDefault');
+    assert.strictEqual(store2.get('r3').currentState, 'collapsed-unloaded', 'r3 should be collapsed-unloaded after restoreDefault');
+    assert.strictEqual(store2.get('r3').loading, false, 'r3.loading must be false after restoreDefault');
+
+    // Crucial check: verify that after cancellation, clicking placeholder on r2 expands without deadlock
+    console.log('[Smoke Test 2] Clicking placeholder to verify r2 can be expanded...');
+    const r2 = store2.get('r2');
+    assert.ok(r2.placeholderEl, 'r2 placeholder must exist');
+    r2.placeholderEl.dispatchEvent({ type: 'click', preventDefault() {}, stopPropagation() {} });
+    await new Promise(res => setTimeout(res, 50));
+
+    assert.strictEqual(r2.currentState, 'expanded-loaded', 'r2 must successfully transition to expanded-loaded on click');
+    assert.strictEqual(r2.loading, false, 'r2 loading must be false after loaded');
+    assert.ok(r2.linesEl, 'r2 linesEl must exist');
+    console.log('✔ [Smoke Test 2 Passed] Restore Default cleanly cancelled Expand All and regions remain fully interactive.');
 
     // -------------------------------------------------------------------------
     // Test 3: ReviewDraftStore unsubmitted edit persistence across collapse/expand
@@ -322,6 +389,80 @@ async function runSmokeTests() {
     assert.strictEqual(draft.uncovered_reason, 'Will cover in next sprint');
     assert.strictEqual(draft.isDirty, true);
     console.log('✔ [Smoke Test 3 Passed] ReviewDraftStore edit state preserved perfectly.');
+
+    // -------------------------------------------------------------------------
+    // Test 4: Batch Layout Range Mismatch Graceful Fallback
+    // -------------------------------------------------------------------------
+    console.log('[Smoke Test 4] Verifying Batch Layout Range Mismatch Fallback...');
+    const fetchMock4 = async (url, opts) => {
+        if (url.includes('/code-layout')) {
+            return {
+                ok: true,
+                json: async () => ({
+                    status: 'success',
+                    data: {
+                        project_name: 'SmokeProj',
+                        file_path: 'src/smoke_test.c',
+                        total_lines: 200,
+                        regions: [
+                            { region_id: 'm1', start_line: 1, end_line: 100, default_state: 'expanded', kind: 'analysis', line_count: 100 },
+                            { region_id: 'm2', start_line: 101, end_line: 200, default_state: 'expanded', kind: 'analysis', line_count: 100 }
+                        ]
+                    }
+                })
+            };
+        }
+        if (url.includes('/code-lines/batch')) {
+            // Server only returns range for m1, missing m2
+            return {
+                ok: true,
+                json: async () => ({
+                    status: 'success',
+                    data: {
+                        ranges: [{ start_line: 1, end_line: 100, lines: [{ line_no: 1, source: 'm1 code', coverage_state: 'uncovered' }] }]
+                    }
+                })
+            };
+        }
+        if (url.includes('/code-lines?')) {
+            return {
+                ok: true,
+                json: async () => ({ status: 'success', data: { lines: [{ line_no: 101, source: 'm2 individual code', coverage_state: 'uncovered' }] } })
+            };
+        }
+        return { ok: true, json: async () => ({ status: 'success', data: {} }) };
+    };
+
+    const env4 = createDOMEnvironment(mockHtml, fetchMock4);
+    const ctx4 = vm.createContext(env4.window);
+    ctx4.window = env4.window;
+    ctx4.document = env4.document;
+    ctx4.URL = URL;
+    ctx4.URLSearchParams = URLSearchParams;
+    ctx4.fetch = fetchMock4;
+
+    vm.runInContext(jsSource, ctx4);
+    for (const h of (env4.events['DOMContentLoaded'] || [])) {
+        await h();
+    }
+
+    const { CodeRegionStore: store4 } = ctx4.window.__COVERAGE_ENHANCE_INTERNALS__;
+    const m1 = store4.get('m1');
+    const m2 = store4.get('m2');
+
+    assert.strictEqual(m1.currentState, 'expanded-loaded', 'm1 returned in batch must be expanded-loaded');
+    assert.strictEqual(m1.loading, false, 'm1 loading must be false');
+    assert.strictEqual(m2.currentState, 'collapsed-unloaded', 'm2 missing in batch must gracefully fallback to collapsed-unloaded');
+    assert.strictEqual(m2.loading, false, 'm2 loading must be false');
+    assert.ok(m2.placeholderEl, 'm2 placeholder must be mounted');
+    assert.strictEqual(m2.placeholderEl.style.display, '', 'm2 placeholder must be visible');
+
+    // Verify m2 can be expanded individually on user click
+    m2.placeholderEl.dispatchEvent({ type: 'click', preventDefault() {}, stopPropagation() {} });
+    await new Promise(res => setTimeout(res, 50));
+    assert.strictEqual(m2.currentState, 'expanded-loaded', 'm2 must expand successfully on click');
+    assert.strictEqual(m2.loading, false, 'm2 loading must be false after loaded');
+    console.log('✔ [Smoke Test 4 Passed] Missing batch range cleanly fell back to interactive collapsed state.');
 
     console.log('=== All Browser Smoke Tests Passed Successfully ===');
 }

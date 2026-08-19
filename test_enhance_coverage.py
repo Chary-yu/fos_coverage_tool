@@ -418,8 +418,11 @@ class TestIntegration(unittest.TestCase):
         with open(js_out, "r", encoding="utf-8") as f:
             content = f.read()
 
-        self.assertTrue('DEFAULT_PROJECT' in content and '"TestProjInject"' in content)
-        self.assertTrue('RENDER_MODE' in content and '"immediate"' in content)
+        with open(enhance_coverage.JS_SOURCE_PATH, "r", encoding="utf-8") as f_src:
+            src_js = f_src.read()
+        self.assertEqual(content, src_js)
+        self.assertIn("getMetaContent('coverage-project')", content)
+        self.assertIn("getMetaContent('coverage-render-mode')", content)
         self.assertIn('function navigateReviewPanel', content)
         self.assertIn("previousBtn.innerText = '上一个';", content)
         self.assertIn("nextBtn.innerText = '下一个';", content)
@@ -470,8 +473,11 @@ class TestIntegration(unittest.TestCase):
         self.assertTrue(os.path.exists(copied_js))
         with open(copied_js, "r", encoding="utf-8") as f:
             js_content = f.read()
-        self.assertTrue('DEFAULT_PROJECT' in js_content and '"IntegrationLazyProj"' in js_content)
-        self.assertTrue('RENDER_MODE' in js_content and '"lazy"' in js_content)
+        with open(enhance_coverage.JS_SOURCE_PATH, "r", encoding="utf-8") as f_src:
+            src_js = f_src.read()
+        self.assertEqual(js_content, src_js)
+        self.assertIn('meta name="coverage-project" content="IntegrationLazyProj"', html_content)
+        self.assertIn('meta name="coverage-render-mode" content="lazy"', html_content)
 
         # Verify CSS file
         copied_css = os.path.join(self.output_dir, "coverage_enhance.css")
