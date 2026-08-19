@@ -77,12 +77,13 @@ CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
 PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
+DEVELOPER_TASKS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_developer_tasks.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
 
 
 def _compute_asset_version() -> str:
     hasher = hashlib.sha256()
-    for fp in (JS_SOURCE_PATH, CSS_SOURCE_PATH, INCREMENTAL_JS_SOURCE_PATH, PROGRESS_JS_SOURCE_PATH):
+    for fp in (JS_SOURCE_PATH, CSS_SOURCE_PATH, INCREMENTAL_JS_SOURCE_PATH, PROGRESS_JS_SOURCE_PATH, DEVELOPER_TASKS_JS_SOURCE_PATH):
         if os.path.isfile(fp):
             try:
                 with open(fp, "rb") as f:
@@ -4039,7 +4040,8 @@ def get_code_detail_service(db_mgr=None, search_dirs=None):
                 dirs.append(os.path.abspath(r_root))
     env_report_roots = os.environ.get("COVERAGE_REPORT_ROOTS", "")
     if env_report_roots:
-        for r_root in re.split(r'[:,]', env_report_roots):
+        split_pat = r'[;,]' if os.name == 'nt' else r'[:,]'
+        for r_root in re.split(split_pat, env_report_roots):
             r_root = r_root.strip()
             if r_root and os.path.exists(r_root):
                 dirs.append(os.path.abspath(r_root))
@@ -5724,13 +5726,15 @@ td a:hover{{text-decoration:underline}}
 
 
 def write_incremental_developer_tasks_page(output_html_dir, project_name, result):
-    """Create a static, CSP-safe task list grouped by Git author.
-
-    This page intentionally contains no executable inline JavaScript: it must
-    also work when the review site is published with a strict CSP.
-    """
+    """Create a task list grouped by Git author with dynamic live refresh support."""
     report_pages = find_report_page_links(output_html_dir)
     developers = (result.get("developer_tasks") or {}).get("developers") or []
+
+    target_js_path = os.path.join(output_html_dir, "incremental_developer_tasks.js")
+    if os.path.exists(DEVELOPER_TASKS_JS_SOURCE_PATH):
+        shutil.copy2(DEVELOPER_TASKS_JS_SOURCE_PATH, target_js_path)
+    else:
+        raise RuntimeError(f"Required static asset {DEVELOPER_TASKS_JS_SOURCE_PATH} not found beside enhance_coverage.py")
 
     def escaped(value):
         return html.escape(str(value), quote=True)
@@ -5743,8 +5747,8 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
         email = escaped(developer.get("email", ""))
         display_name = name if not email else "{} &lt;{}&gt;".format(name, email)
         summary_rows.append(
-            "<tr><td><a href=\"#{}\">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
-                anchor, display_name, developer.get("commit_total", 0),
+            '<tr data-dev-anchor="{}"><td><a href="#{}">{}</a></td><td>{}</td><td>{}</td><td class="js-summary-review-files">{}</td><td class="js-summary-uncovered-lines">{}</td></tr>'.format(
+                anchor, anchor, display_name, developer.get("commit_total", 0),
                 developer.get("changed_file_total", 0), developer.get("review_file_total", 0),
                 developer.get("review_uncovered_total", 0),
             )
@@ -5753,6 +5757,7 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
         file_rows = []
         for file_task in developer.get("files") or []:
             source_path = file_task.get("review_file_path") or file_task.get("file_path", "")
+            file_key = _normalize_ownership_path(source_path)
             page_link = get_report_page_link(source_path, report_pages)
             file_path = escaped(file_task.get("file_path", ""))
             source_cell = file_path
@@ -5787,11 +5792,14 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
                 action = '<span class="muted">本次提交未产生新增代码行</span>'
 
             file_rows.append(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>"
-                "<td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+                '<tr data-file-key="{}" data-page-link="{}" data-changed="{}"><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>'
+                '<td>{}</td><td class="js-task-unanalyzed" data-sort-value="{}">{}</td><td>{}</td><td class="js-task-action">{}</td></tr>'.format(
+                    escaped(file_key),
+                    escaped(page_link or ""),
+                    changed,
                     escaped(file_task.get("repository", "") or "-"), source_cell,
                     escaped(", ".join(file_task.get("change_types") or [])), commit_text,
-                    changed, file_task.get("covered", 0), uncovered,
+                    changed, file_task.get("covered", 0), uncovered, uncovered,
                     file_task.get("missing", 0), action,
                 )
             )
@@ -5799,8 +5807,8 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
             file_rows.append('<tr><td colspan="9">此开发人员没有可展示的提交文件。</td></tr>')
         developer_sections.append(
             '<section id="{}"><h2>👤 {}</h2><div class="person-stats"><span class="stat-pill">提交 <strong>{}</strong> 个</span>'
-            '<span class="stat-pill">提交文件 <strong>{}</strong> 个</span><span class="stat-pill">需填写文件 <strong>{}</strong> 个</span>'
-            '<span class="stat-pill warn">待填写 <strong>{}</strong> 行</span></div><div class="table-wrap"><table>'
+            '<span class="stat-pill">提交文件 <strong>{}</strong> 个</span><span class="stat-pill">需填写文件 <strong class="js-dev-review-files">{}</strong> 个</span>'
+            '<span class="stat-pill warn js-dev-uncovered-pill">待填写 <strong class="js-dev-uncovered-lines">{}</strong> 行</span></div><div class="table-wrap"><table>'
             '<thead><tr><th>仓库</th><th>提交文件</th><th>变更类型</th><th>关联提交</th>'
             '<th>新增行</th><th>已覆盖</th><th>待填写</th><th>覆盖信息缺失</th><th>操作</th></tr></thead>'
             '<tbody>{}</tbody></table></div></section>'.format(
@@ -5833,6 +5841,7 @@ section{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:16px
 .person-stats{{display:flex;gap:10px;flex-wrap:wrap;align-items:center;padding:12px 20px;background:rgba(242,242,247,0.4);border-bottom:1px solid rgba(60,60,67,0.08);font-size:13px}}
 .stat-pill{{display:inline-flex;align-items:center;gap:4px;background:rgba(118,118,128,0.1);padding:4px 12px;border-radius:8px;font-size:12px;color:#3a3a3c}}
 .stat-pill.warn{{background:rgba(255,149,0,0.12);color:#c67600;font-weight:700}}
+.stat-pill.done-pill{{background:rgba(52,199,89,0.12);color:#248a3d;font-weight:700}}
 .table-wrap{{overflow:auto}}
 table{{width:100%;border-collapse:collapse;min-width:960px}}
 th,td{{padding:12px 16px;border-bottom:1px solid rgba(60,60,67,0.08);text-align:left;vertical-align:middle;font-variant-numeric:tabular-nums}}
@@ -5849,7 +5858,7 @@ tr:hover td{{background:rgba(0,122,255,0.03)}}
 td a{{color:#007aff;text-decoration:none;font-weight:600}}
 td a:hover{{text-decoration:underline}}
 @media(max-width:700px){{main{{padding:16px 12px}}}}
-</style></head><body><main>
+</style></head><body><main data-project="{project}">
 <div class="hero-card">
   <h1>开发人员待填写清单</h1>
   <div class="muted">项目：{project}；数据来源：Git 提交作者与增量覆盖率结果。</div>
@@ -5862,11 +5871,12 @@ td a:hover{{text-decoration:underline}}
 <section><h2>👥 人员概览</h2><div class="table-wrap"><table><thead><tr><th>开发人员</th><th>提交数</th><th>提交文件</th><th>需填写文件</th><th>待填写行</th></tr></thead><tbody>{summary_rows}</tbody></table></div></section>
 <aside class="muted" style="margin:12px 0 20px;text-align:center">说明：按 Git author 的“姓名 + 邮箱”区分人员。多人提交同一文件时，文件会同时出现在每位相关开发人员的清单中；“待填写”仅统计本次 Git diff 中 LCOV 未覆盖的新增行。</aside>
 {sections}
-</main></body></html>""".format(
+</main><script src="incremental_developer_tasks.js?v={version_tag}"></script></body></html>""".format(
         project=escaped(project_name),
         project_url=escaped(urllib.parse.quote(str(project_name), safe="")),
         summary_rows=summary_table_rows,
         sections=sections_html,
+        version_tag=escaped(ASSET_VERSION),
     )
     with open(os.path.join(output_html_dir, "incremental_developer_tasks.html"), "w", encoding="utf-8") as page_file:
         page_file.write(page)

@@ -937,7 +937,8 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
         os.makedirs(root_b, exist_ok=True)
 
         old_env = os.environ.get("COVERAGE_REPORT_ROOTS")
-        os.environ["COVERAGE_REPORT_ROOTS"] = f"{root_a}:{root_b}"
+        sep = os.pathsep
+        os.environ["COVERAGE_REPORT_ROOTS"] = f"{root_a}{sep}{root_b}"
         try:
             service = CodeDetailService()
             self.assertIn(os.path.abspath(root_a), service.search_dirs)

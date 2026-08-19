@@ -1,0 +1,54 @@
+{
+  "version": "1.0",
+  "created_at": "2026-08-19T08:00:00Z",
+  "modules": [
+    {
+      "name": "release_identity",
+      "old_path": "app/release_identity.py",
+      "new_path": "app/release_identity.py",
+      "role": "Unified release identity & asset hash governance"
+    },
+    {
+      "name": "db_pool",
+      "old_path": "app/db/connection_pool.py",
+      "new_path": "app/db/connection_pool.py",
+      "role": "MySQL Connection Pool and resource management (Item 4)"
+    },
+    {
+      "name": "code_detail_overlay",
+      "old_path": "app/code_detail/overlay_cache.py",
+      "new_path": "app/code_detail/overlay_cache.py",
+      "role": "Static SourceContext & AnalysisOverlay split cache (Item 1)"
+    },
+    {
+      "name": "job_executor",
+      "old_path": "app/jobs/bounded_executor.py",
+      "new_path": "app/jobs/bounded_executor.py",
+      "role": "Bounded background job execution & concurrency governance (Item 6)"
+    },
+    {
+      "name": "progress_file_state",
+      "old_path": "app/progress/file_state_service.py",
+      "new_path": "app/progress/file_state_service.py",
+      "role": "Derived coverage_file_state aggregation layer (Item 7 & 8)"
+    },
+    {
+      "name": "export_streaming",
+      "old_path": "app/jobs/excel_streaming.py",
+      "new_path": "app/jobs/excel_streaming.py",
+      "role": "Low-memory streaming Excel ZIP export (Item 9)"
+    },
+    {
+      "name": "inject_pipeline",
+      "old_path": "app/inject/parse_once.py",
+      "new_path": "app/inject/parse_once.py",
+      "role": "Single-pass LCOV source parse and index sync (Item 10 & 11)"
+    },
+    {
+      "name": "sidecar_store",
+      "old_path": "app/code_detail/sidecar_store.py",
+      "new_path": "app/code_detail/sidecar_store.py",
+      "role": "Unified Chunked and Legacy Sidecar reader/writer (Item 13 & 14)"
+    }
+  ]
+}

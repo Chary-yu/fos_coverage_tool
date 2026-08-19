@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Coverage Analysis Progress</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f2f2f7;
+      --panel: #ffffff;
+      --line: rgba(60, 60, 67, 0.12);
+      --text: #000000;
+      --muted: #8e8e93;
+      --head: rgba(242, 242, 247, 0.85);
+      --blue: #007aff;
+      --green: #34c759;
+      --red: #ff3b30;
+      --orange: #ff9500;
+    }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.5 "Microsoft YaHei", "微软雅黑", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    header {
+      padding: 18px 0;
+      background: rgba(255, 255, 255, 0.82);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--line);
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .header-inner {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 0 24px;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      text-align: left;
+    }
+    h1 { margin: 0 0 10px; font-size: 22px; font-weight: 700; letter-spacing: -0.4px; text-align: left; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; justify-content: flex-start; width: 100%; }
+    input {
+      width: min(380px, 100%);
+      height: 34px;
+      border: 1px solid rgba(0, 0, 0, 0.08);
+      border-radius: 10px;
+      padding: 0 12px;
+      font-size: 13px;
+      background: rgba(118, 118, 128, 0.08);
+      color: #000;
+      outline: none;
+      transition: all 0.2s ease;
+      text-align: left;
+    }
+    input:focus {
+      background: #ffffff;
+      border-color: var(--blue);
+      box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.15);
+    }
+    button, a.button {
+      height: 34px;
+      border: none;
+      border-radius: 10px;
+      background: var(--blue);
+      color: #ffffff;
+      padding: 0 14px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+      box-shadow: 0 2px 6px rgba(0, 122, 255, 0.2);
+    }
+    button:hover, a.button:hover {
+      background: #0062cc;
+      transform: translateY(-1px);
+      box-shadow: 0 4px 10px rgba(0, 122, 255, 0.3);
+    }
+    button.secondary, a.button.secondary {
+      background: rgba(118, 118, 128, 0.12);
+      color: var(--blue);
+      box-shadow: none;
+    }
+    button.secondary:hover, a.button.secondary:hover {
+      background: rgba(118, 118, 128, 0.2);
+    }
+    main { padding: 22px 24px 40px; max-width: 1400px; margin: 0 auto; }
+    .cards { display: grid; grid-template-columns: repeat(6, minmax(140px, 1fr)); gap: 12px; margin-bottom: 20px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid rgba(0, 0, 0, 0.04);
+      border-radius: 16px;
+      padding: 14px;
+      box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.05);
+      transition: all 0.2s ease;
+    }
+    .card:hover { transform: translateY(-2px); box-shadow: 0 6px 24px -2px rgba(0, 0, 0, 0.08); }
+    .label { color: var(--muted); font-size: 12px; font-weight: 500; letter-spacing: -0.1px; }
+    .value { font-size: 24px; font-weight: 800; margin-top: 6px; letter-spacing: -0.6px; color: #1c1c1e; }
+    .section {
+      background: var(--panel);
+      border: 1px solid rgba(0, 0, 0, 0.05);
+      border-radius: 16px;
+      margin-top: 18px;
+      overflow: hidden;
+      box-shadow: 0 4px 20px -2px rgba(0, 0, 0, 0.04);
+    }
+    .section h2 { margin: 0; padding: 12px 16px; font-size: 15px; font-weight: 700; background: var(--head); border-bottom: 1px solid var(--line); letter-spacing: -0.2px; }
+    .table-wrap { overflow: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 920px; }
+    th, td { border-bottom: 1px solid rgba(60, 60, 67, 0.08); padding: 9px 12px; text-align: left; vertical-align: middle; }
+    th { background: rgba(242, 242, 247, 0.95); font-weight: 600; font-size: 12px; color: #8e8e93; text-transform: uppercase; letter-spacing: 0.2px; position: sticky; top: 0; z-index: 1; }
+    tr:hover td { background: rgba(0, 122, 255, 0.02); }
+    td.path { word-break: break-all; font-weight: 500; }
+    .bar {
+      display: inline-block;
+      width: 76px;
+      height: 8px;
+      background: rgba(120, 120, 128, 0.16);
+      border-radius: 999px;
+      overflow: hidden;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
+    .bar span { display: block; height: 100%; background: var(--blue); border-radius: 999px; transition: width 0.3s ease; }
+    .bar.bar-high span { background: var(--green); }
+    .bar.bar-mid span { background: var(--orange); }
+    .bar.bar-low span { background: var(--blue); }
+    .mod-chip {
+      display: inline-block;
+      background: rgba(0, 122, 255, 0.08);
+      color: #007aff;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 6px;
+      margin: 1px 2px;
+      white-space: nowrap;
+    }
+    .mod-more-chip {
+      display: inline-block;
+      background: rgba(118, 118, 128, 0.12);
+      color: #8e8e93;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 6px;
+      margin: 1px 2px;
+    }
+    td, th { font-variant-numeric: tabular-nums; }
+    .status { margin-top: 8px; color: var(--muted); font-size: 13px; text-align: left; }
+    .page-version { margin-top: 6px; color: var(--muted); font-size: 12px; text-align: left; }
+    .error { color: var(--red); font-weight: 600; }
+    .warning { color: var(--orange); font-weight: 600; }
+    .matched { color: var(--green); font-weight: 600; }
+    .unmatched { color: var(--red); font-weight: 700; }
+    .ownership-status { margin-top: 8px; color: var(--muted); font-size: 13px; text-align: left; }
+    .job-progress {
+      display: none;
+      margin-top: 12px;
+      width: 100%;
+      max-width: 100%;
+      padding: 14px;
+      border: 1px solid rgba(0, 122, 255, 0.2);
+      border-radius: 12px;
+      background: rgba(0, 122, 255, 0.05);
+      text-align: left;
+    }
+    .job-progress.visible { display: block; }
+    .job-progress-head { display: flex; justify-content: space-between; gap: 12px; font-weight: 700; color: var(--blue); }
+    .job-track { height: 8px; margin: 8px 0; overflow: hidden; border-radius: 999px; background: rgba(0, 122, 255, 0.15); }
+    .job-track span { display: block; width: 0; height: 100%; background: var(--blue); border-radius: 999px; transition: width .25s ease; }
+    .job-progress.active .job-track span {
+      background-image: linear-gradient(45deg, rgba(255,255,255,.3) 25%, transparent 25%, transparent 50%, rgba(255,255,255,.3) 50%, rgba(255,255,255,.3) 75%, transparent 75%, transparent);
+      background-size: 20px 20px;
+      animation: progress-stripes .7s linear infinite;
+    }
+    @keyframes progress-stripes { from { background-position: 0 0; } to { background-position: 20px 0; } }
+    .file-detail-link { height: auto; padding: 0; border: 0; background: transparent; text-align: left; font-weight: 600; color: var(--blue); box-shadow: none; }
+    .file-detail-link:hover { background: transparent; text-decoration: underline; transform: none; box-shadow: none; }
+    .detail-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; background: var(--head); border-bottom: 1px solid var(--line); }
+    .detail-head h2 { padding: 0; border: 0; }
+    .detail-nav { display: flex; align-items: center; gap: 8px; padding: 10px 16px; }
+    .detail-nav button { height: 30px; border-radius: 8px; }
+    #detailTable { min-width: 1500px; }
+    #detailTable td.code { max-width: 520px; white-space: pre-wrap; word-break: break-all; font-family: SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 13px; }
+    .toggle-team-btn {
+      height: 22px;
+      width: 22px;
+      padding: 0;
+      border: none;
+      border-radius: 6px;
+      background: rgba(118, 118, 128, 0.12);
+      color: #3a3a3c;
+      font-size: 10px;
+      font-weight: bold;
+      cursor: pointer;
+      margin-right: 6px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: none;
+      transition: all 0.15s ease;
+    }
+    .toggle-team-btn:hover { background: rgba(118, 118, 128, 0.24); color: #000; transform: none; box-shadow: none; }
+    .toggle-team-spacer { display: inline-block; width: 28px; }
+    .section-header-flex { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; background: var(--head); border-bottom: 1px solid var(--line); }
+    .section-header-flex h2 { padding: 0 !important; border: 0 !important; background: transparent !important; }
+    .small-btn { height: 28px; padding: 0 10px; font-size: 12px; font-weight: 600; border-radius: 8px; background: rgba(0, 122, 255, 0.1); color: var(--blue); box-shadow: none; }
+    .small-btn:hover { background: rgba(0, 122, 255, 0.2); transform: none; box-shadow: none; }
+    .badge-pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 3px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1.2;
+    }
+    .badge-matched { background: rgba(52, 199, 89, 0.12); color: #248a3d; }
+    .badge-unmatched { background: rgba(255, 59, 48, 0.12); color: #d70015; }
+    .badge-confirmed { background: rgba(0, 122, 255, 0.12); color: #0051a8; }
+    .badge-warning { background: rgba(255, 149, 0, 0.12); color: #c25e00; }
+    .segmented-group {
+      display: inline-flex;
+      background: rgba(118, 118, 128, 0.12);
+      padding: 2px;
+      border-radius: 12px;
+      gap: 2px;
+    }
+    .segmented-group button, .segmented-group a.button {
+      background: transparent;
+      color: #3a3a3c;
+      box-shadow: none;
+      border-radius: 10px;
+      height: 30px;
+      font-size: 12px;
+    }
+    .segmented-group button:hover, .segmented-group a.button:hover {
+      background: #ffffff;
+      color: #000;
+      box-shadow: 0 2px 6px rgba(0, 0, 0, 0.08);
+      transform: none;
+    }
+    .progress-link {
+      color: #007aff !important;
+      text-decoration: none !important;
+      font-weight: 600 !important;
+      cursor: pointer !important;
+      transition: color 0.15s ease !important;
+    }
+    .progress-link:hover {
+      text-decoration: underline !important;
+      color: #0051a8 !important;
+    }
+    @media (max-width: 900px) { .cards { grid-template-columns: repeat(2, minmax(150px, 1fr)); } }
+  </style>
+</head>
+<body data-review-scope="full">
+  <header>
+    <div class="header-inner">
+      <h1 id="pageTitle">全量覆盖率分析进度</h1>
+      <div class="controls">
+        <input id="projectInput" list="projectOptions" placeholder="输入或选择数据库中的项目">
+        <datalist id="projectOptions"></datalist>
+        <button id="loadBtn" type="button">查看进度</button>
+        <div class="segmented-group">
+          <a id="returnSummaryLink" class="button" href="index.html">↩ 返回全量审查汇总</a>
+          <a id="csvLink" class="button" href="#" target="_blank">导出进度 Excel</a>
+          <a id="excelLink" class="button" href="#" target="_blank">导出目录 Excel ZIP</a>
+          <button id="detailExportBtn" type="button">后台导出详细 CSV</button>
+        </div>
+        <a id="detailDownloadLink" class="button" href="#" hidden>下载详细 CSV</a>
+      </div>
+      <div class="page-version">页面版本 v11.7 2026-08-19 · 覆盖率审查与进度导出系统</div>
+      <div id="status" class="status"></div>
+      <div id="jobProgress" class="job-progress" role="status" aria-live="polite">
+        <div class="job-progress-head"><span id="jobStage">准备中</span><span id="jobPercent">0%</span></div>
+        <div class="job-track"><span id="jobBar"></span></div>
+        <div id="jobMessage" class="status"></div>
+      </div>
+    </div>
+  </header>
+  <main>
+    <div class="cards">
+      <div class="card"><div id="totalUncoveredLabel" class="label">未覆盖行总数</div><div id="totalUncovered" class="value">-</div></div>
+      <div class="card"><div class="label">已填写</div><div id="filledTotal" class="value">-</div></div>
+      <div class="card"><div class="label">填写率</div><div id="fillRate" class="value">-</div></div>
+      <div class="card"><div class="label">确认率</div><div id="confirmedRate" class="value">-</div></div>
+      <div class="card"><div class="label">归属已匹配文件</div><div id="matchedFiles" class="value">-</div></div>
+      <div class="card"><div class="label">归属未匹配文件</div><div id="unmatchedFiles" class="value">-</div></div>
+    </div>
+    <div id="ownershipStatus" class="ownership-status"></div>
+    <section class="section">
+      <div class="section-header-flex">
+        <h2>小组 / 组长填写进度（支持展开模块明细）</h2>
+        <div>
+          <button id="expandAllTeamModulesBtn" type="button" class="small-btn">▶ 展开全部模块</button>
+          <button id="collapseAllTeamModulesBtn" type="button" class="small-btn">▼ 折叠全部模块</button>
+        </div>
+      </div>
+      <div class="table-wrap"><table id="teamTable"></table></div>
+    </section>
+    <section class="section">
+      <h2>目录进度</h2>
+      <div class="table-wrap"><table id="dirTable"></table></div>
+    </section>
+    <section class="section">
+      <h2>文件进度（点击文件路径查看详细填写数据）</h2>
+      <div class="table-wrap"><table id="fileTable"></table></div>
+    </section>
+    <section id="detailSection" class="section" hidden>
+      <div class="detail-head"><h2 id="detailTitle">详细填写数据</h2><button id="closeDetailBtn" type="button">关闭</button></div>
+      <div id="detailStatus" class="detail-nav"></div>
+      <div class="table-wrap"><table id="detailTable"></table></div>
+    </section>
+  </main>
+  <script src="coverage_progress.js?v=lazy-collapse-20260819_v11_3"></script>
+</body>
+</html>

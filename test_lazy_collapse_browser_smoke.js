@@ -464,6 +464,87 @@ async function runSmokeTests() {
     assert.strictEqual(m2.loading, false, 'm2 loading must be false after loaded');
     console.log('✔ [Smoke Test 4 Passed] Missing batch range cleanly fell back to interactive collapsed state.');
 
+    
+    // =========================================================================
+    // Smoke Test 5: Verifying RegionLineLRUCache Eviction & Draft Preservation (Item 5)
+    // =========================================================================
+    console.log("[Smoke Test 5] Verifying RegionLineLRUCache eviction and Draft preservation...");
+    const fetchMock5 = async (url) => {
+        if (url.includes("/code-layout")) {
+            return {
+                ok: true,
+                json: async () => ({
+                    status: "success",
+                    data: {
+                        project_name: "SmokeProj5",
+                        file_path: "src/smoke_lru.c",
+                        total_lines: 60000,
+                        regions: [
+                            { region_id: "lru_1", start_line: 1, end_line: 30000, default_state: "collapsed", kind: "collapsed", line_count: 30000 },
+                            { region_id: "lru_2", start_line: 30001, end_line: 60000, default_state: "collapsed", kind: "collapsed", line_count: 30000 }
+                        ]
+                    }
+                })
+            };
+        }
+        if (url.includes("/code-lines?")) {
+            const urlObj = new URL(url, "http://localhost:8000");
+            const start = parseInt(urlObj.searchParams.get("start_line"), 10);
+            const end = parseInt(urlObj.searchParams.get("end_line"), 10);
+            const lines = [];
+            for (let i = start; i <= end; i++) {
+                lines.push({ line_no: i, source: `int line_${i};`, coverage_state: i === 1 ? "uncovered" : "covered", is_block_entry: i === 1 });
+            }
+            return { ok: true, json: async () => ({ status: "success", data: { lines } }) };
+        }
+        return { ok: true, json: async () => ({ status: "success", data: {} }) };
+    };
+
+    const env5 = createDOMEnvironment(mockHtml, fetchMock5);
+    const ctx5 = vm.createContext(env5.window);
+    ctx5.window = env5.window;
+    ctx5.document = env5.document;
+    ctx5.URL = URL;
+    ctx5.URLSearchParams = URLSearchParams;
+    ctx5.fetch = fetchMock5;
+
+    vm.runInContext(jsSource, ctx5);
+    for (const h of (env5.events["DOMContentLoaded"] || [])) {
+        await h();
+    }
+
+    const { CodeRegionStore: store5, CodeRegionController: ctrl5, ReviewDraftStore: draftStore5, RegionLineLRUCache: lru5 } = ctx5.window.__COVERAGE_ENHANCE_INTERNALS__;
+    lru5.MAX_CACHED_LINES = 35000; // Set small budget for test
+
+    // 1. Expand lru_1 and save draft edit
+    await ctrl5.expandRegion("lru_1");
+    const lruReg1 = store5.get("lru_1");
+    assert.strictEqual(lruReg1.loaded, true);
+    assert.strictEqual(lruReg1.lines.length, 30000);
+
+    draftStore5.setDraft(1, { reviewer: "LRUTester", status: "可覆盖", uncovered_reason: "Survives LRU" });
+
+    // 2. Collapse lru_1
+    ctrl5.collapseRegion("lru_1");
+    assert.strictEqual(lruReg1.currentState, "collapsed-loaded");
+
+    // 3. Expand lru_2 (30000 lines) -> exceeds budget 35000 -> evicts collapsed lru_1
+    await ctrl5.expandRegion("lru_2");
+    const lruReg2 = store5.get("lru_2");
+    assert.strictEqual(lruReg2.loaded, true);
+
+    // Verify lru_1 was evicted (loaded=false) while draft survives!
+    assert.strictEqual(lruReg1.loaded, false, "Collapsed lru_1 must be evicted from line memory");
+    const lruDraft5 = draftStore5.getDraft(1);
+    assert.ok(lruDraft5, "Draft must survive LRU eviction");
+    assert.strictEqual(lruDraft5.reviewer, "LRUTester");
+
+    // 4. Re-expand lru_1
+    await ctrl5.expandRegion("lru_1");
+    assert.strictEqual(lruReg1.loaded, true, "lru_1 must reload on re-expansion");
+    assert.strictEqual(lruReg1.lines.length, 30000);
+    console.log("✔ [Smoke Test 5 Passed] LRU evicted collapsed region cleanly and preserved draft state across re-expansion.");
+
     console.log('=== All Browser Smoke Tests Passed Successfully ===');
 }
 

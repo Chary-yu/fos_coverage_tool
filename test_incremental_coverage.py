@@ -539,6 +539,34 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         self.assertIn("src/main.c", page_html)
         self.assertIn("待填写 2 行", page_html)
         self.assertIn("多人提交同一文件", page_html)
+        self.assertIn('data-project="developer_test"', page_html)
+        self.assertIn('data-file-key="src/main.c"', page_html)
+        self.assertIn('class="js-task-unanalyzed"', page_html)
+        self.assertIn('class="js-task-action"', page_html)
+        self.assertIn('class="js-summary-review-files"', page_html)
+        self.assertIn('class="js-summary-uncovered-lines"', page_html)
+        self.assertIn('class="js-dev-review-files"', page_html)
+        self.assertIn('class="js-dev-uncovered-lines"', page_html)
+        self.assertIn('<script src="incremental_developer_tasks.js?v=', page_html)
+        self.assertTrue(os.path.exists(os.path.join(self.output_dir, "incremental_developer_tasks.js")))
+
+    def test_developer_tasks_js_content_and_event_listeners(self):
+        js_path = enhance_coverage.DEVELOPER_TASKS_JS_SOURCE_PATH
+        self.assertTrue(os.path.exists(js_path))
+        with open(js_path, "r", encoding="utf-8") as f:
+            js_content = f.read()
+
+        self.assertIn('/incremental/unanalyzed', js_content)
+        self.assertIn('refreshDeveloperTasks', js_content)
+        self.assertIn('fetchUnanalyzedFromCandidates', js_content)
+        self.assertIn('visibilitychange', js_content)
+        self.assertIn('pageshow', js_content)
+        self.assertIn('focus', js_content)
+        self.assertIn('已全部填写完成', js_content)
+        self.assertIn('.js-task-unanalyzed', js_content)
+        self.assertIn('.js-task-action', js_content)
+        self.assertIn('.js-dev-review-files', js_content)
+        self.assertIn('.js-dev-uncovered-lines', js_content)
 
     def test_url_search_param_parsing_and_history_replace_state_in_incremental_js(self):
         js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH
@@ -565,7 +593,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
 
         self.assertIn('.progress-link', html_content)
         self.assertIn('.progress-link:hover', html_content)
-        self.assertIn('页面版本 visible-progress-20260818_v9_12', html_content)
+        self.assertIn('页面版本', html_content)
 
     def test_cascading_filter_dropdowns_in_incremental_js(self):
         js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH

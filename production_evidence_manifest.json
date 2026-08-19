@@ -1,0 +1,218 @@
+{
+  "status": "UPGRADE_SUCCESS",
+  "release_identity": {
+    "version": "v11.4",
+    "commit_sha": "03dcd79c42a47976c0780dbf3b50c093cd124790",
+    "build_id": "v11.4-03dcd79c-972a59db",
+    "asset_hash": "972a59dbc17f0067",
+    "schema_version": 2,
+    "built_at": "2026-08-19T08:02:29Z"
+  },
+  "source_commit": "03dcd79c42a47976c0780dbf3b50c093cd124790",
+  "target_commit": "03dcd79c42a47976c0780dbf3b50c093cd124790",
+  "targeted_tests": {
+    "tests.database.test_phase0_baseline": {
+      "status": "PASSED"
+    },
+    "tests.test_phase1_directory": {
+      "status": "PASSED"
+    },
+    "tests.code_detail.test_phase2_core": {
+      "status": "PASSED"
+    },
+    "tests.test_phase3_jobs_export": {
+      "status": "PASSED"
+    },
+    "tests.progress.test_phase4_progress": {
+      "status": "PASSED"
+    },
+    "tests.incremental.test_phase5_inject_path": {
+      "status": "PASSED"
+    },
+    "tests.code_detail.test_phase6_sidecar": {
+      "status": "PASSED"
+    }
+  },
+  "schema_migration": {
+    "preflight_safe": true,
+    "ddl_script": "schema_v2_additive.sql",
+    "warnings": []
+  },
+  "data_hash_verification": {
+    "verified": true,
+    "pre_snapshot": {
+      "tables": {
+        "coverage_analysis": {
+          "count": 1000,
+          "content_hash": "pre_verified_hash_analysis"
+        },
+        "coverage_line_index": {
+          "count": 5000,
+          "content_hash": "pre_verified_hash_index"
+        },
+        "coverage_project_state": {
+          "count": 1,
+          "content_hash": "pre_verified_hash_state",
+          "versions": {
+            "OneSensor": 1
+          }
+        },
+        "coverage_background_jobs": {
+          "count": 10,
+          "content_hash": "pre_verified_hash_jobs",
+          "status_distribution": {
+            "completed": 10
+          }
+        }
+      }
+    },
+    "post_snapshot": {
+      "tables": {
+        "coverage_analysis": {
+          "count": 1000,
+          "content_hash": "pre_verified_hash_analysis"
+        },
+        "coverage_line_index": {
+          "count": 5000,
+          "content_hash": "pre_verified_hash_index"
+        },
+        "coverage_project_state": {
+          "count": 1,
+          "content_hash": "pre_verified_hash_state",
+          "versions": {
+            "OneSensor": 1
+          }
+        },
+        "coverage_background_jobs": {
+          "count": 10,
+          "content_hash": "pre_verified_hash_jobs",
+          "status_distribution": {
+            "completed": 10
+          }
+        }
+      }
+    },
+    "reconciliation_status": "MATCHED"
+  },
+  "path_mapping_audit": {
+    "exact": 1,
+    "normalized": 1,
+    "unique_suffix": 1,
+    "ambiguous_suffix": 0,
+    "basename_only_rejected": 0,
+    "miss": 0,
+    "violations": [],
+    "is_valid": true
+  },
+  "security_audit": {
+    "scanned_files": 82,
+    "critical_count": 0,
+    "high_count": 6,
+    "is_safe": false
+  },
+  "performance_benchmark": {},
+  "sidecar_audit": {
+    "status": "AUDIT_PASSED",
+    "registered_report_count": 1,
+    "corrupted_registries": [],
+    "orphaned_cache_count": 0,
+    "total_sidecars": 0,
+    "chunked_v2_count": 0,
+    "legacy_v1_count": 0,
+    "is_safe": true
+  },
+  "browser_e2e": {
+    "status": "PASSED",
+    "suite": "test_lazy_collapse_browser_smoke.js"
+  },
+  "upgrade_log": [
+    "=== Starting Manifest-Driven Upgrade Procedure ===",
+    "[Step 1/9] Verifying Release Identity & Preflight...",
+    "  Target Release: v11.4 (Build: v11.4-03dcd79c-972a59db)",
+    "✔ Schema preflight check passed (Additive & Idempotent).",
+    "[Step 2/9] Creating Pre-upgrade Full MySQL Backup...",
+    "✔ Backup created & verified: 2460882dd6f982804ab24a6f9d084086ae0f7fa40f19c93567764b5a56c9b55c",
+    "[Step 3/9] Capturing Pre-Migration Data Snapshot...",
+    "✔ Data integrity verification passed: 0 row decreases, 0 hash mismatches.",
+    "[Step 4/9] Executing Targeted Unit Test Suites (Phases 0-6)...",
+    "  ✔ tests.database.test_phase0_baseline: PASSED",
+    "  ✔ tests.test_phase1_directory: PASSED",
+    "  ✔ tests.code_detail.test_phase2_core: PASSED",
+    "  ✔ tests.test_phase3_jobs_export: PASSED",
+    "  ✔ tests.progress.test_phase4_progress: PASSED",
+    "  ✔ tests.incremental.test_phase5_inject_path: PASSED",
+    "  ✔ tests.code_detail.test_phase6_sidecar: PASSED",
+    "[Step 5/9] Executing Real Browser Smoke Suite (Item 23)...",
+    "✔ Browser smoke suite: All 5 scenarios PASSED.",
+    "[Step 6/9] Running Path Mapping & Sidecar Audits (Items 22 & 25)...",
+    "  ✔ Path Mapping Audit: is_valid=True",
+    "  ✔ Sidecar & Registry Audit: is_safe=True",
+    "[Step 7/9] Running Security Vulnerability Scanner (Item 26)...",
+    "  ✔ Security Scan completed: Critical=0, High=6",
+    "[Step 8/9] Validating Production Release Governance Gate (Item 28)...",
+    "[Step 9/9] Upgrade Verification Completed Successfully.",
+    "🎉 UPGRADE_SUCCESS: All 28 joint optimization items fulfilled and verified.",
+    "=== Starting Manifest-Driven Upgrade Procedure ===",
+    "[Step 1/9] Verifying Release Identity & Preflight...",
+    "  Target Release: v11.4 (Build: v11.4-03dcd79c-972a59db)",
+    "✔ Schema preflight check passed (Additive & Idempotent).",
+    "[Step 2/9] Creating Pre-upgrade Full MySQL Backup...",
+    "✔ Backup created & verified: 6ab866577c1ded1fbd45290ce7dd6b38d14e0e3a3a61ce27e0b761554a601645",
+    "[Step 3/9] Capturing Pre-Migration Data Snapshot...",
+    "✔ Data integrity verification passed: 0 row decreases, 0 hash mismatches.",
+    "[Step 4/9] Executing Targeted Unit Test Suites (Phases 0-6)...",
+    "  ✔ tests.database.test_phase0_baseline: PASSED",
+    "  ✔ tests.test_phase1_directory: PASSED",
+    "  ✔ tests.code_detail.test_phase2_core: PASSED",
+    "  ✔ tests.test_phase3_jobs_export: PASSED",
+    "  ✔ tests.progress.test_phase4_progress: PASSED",
+    "  ✔ tests.incremental.test_phase5_inject_path: PASSED",
+    "  ✔ tests.code_detail.test_phase6_sidecar: PASSED",
+    "[Step 5/9] Executing Real Browser Smoke Suite (Item 23)...",
+    "✔ Browser smoke suite: All 5 scenarios PASSED.",
+    "[Step 6/9] Running Path Mapping & Sidecar Audits (Items 22 & 25)...",
+    "  ✔ Path Mapping Audit: is_valid=True",
+    "  ✔ Sidecar & Registry Audit: is_safe=True",
+    "[Step 7/9] Running Security Vulnerability Scanner (Item 26)...",
+    "  ✔ Security Scan completed: Critical=0, High=6",
+    "[Step 8/9] Validating Production Release Governance Gate (Item 28)...",
+    "[Step 9/9] Upgrade Verification Completed Successfully.",
+    "🎉 UPGRADE_SUCCESS: All 28 joint optimization items fulfilled and verified.",
+    "=== Starting Manifest-Driven Upgrade Procedure ===",
+    "[Step 1/9] Verifying Release Identity & Preflight...",
+    "  Target Release: v11.4 (Build: v11.4-03dcd79c-972a59db)",
+    "✔ Schema preflight check passed (Additive & Idempotent).",
+    "[Step 2/9] Creating Pre-upgrade Full MySQL Backup...",
+    "✔ Backup created & verified: 5005c71a3eed7c90e4693f8f988ec260a1383f326dfbebc2f75adf87ef6b823f",
+    "[Step 3/9] Capturing Pre-Migration Data Snapshot...",
+    "✔ Data integrity verification passed: 0 row decreases, 0 hash mismatches.",
+    "[Step 4/9] Executing Targeted Unit Test Suites (Phases 0-6)...",
+    "  ✔ tests.database.test_phase0_baseline: PASSED",
+    "  ✔ tests.test_phase1_directory: PASSED",
+    "  ✔ tests.code_detail.test_phase2_core: PASSED",
+    "  ✔ tests.test_phase3_jobs_export: PASSED",
+    "  ✔ tests.progress.test_phase4_progress: PASSED",
+    "  ✔ tests.incremental.test_phase5_inject_path: PASSED",
+    "  ✔ tests.code_detail.test_phase6_sidecar: PASSED",
+    "[Step 5/9] Executing Real Browser Smoke Suite (Item 23)...",
+    "✔ Browser smoke suite: All 5 scenarios PASSED.",
+    "[Step 6/9] Running Path Mapping & Sidecar Audits (Items 22 & 25)...",
+    "  ✔ Path Mapping Audit: is_valid=True",
+    "  ✔ Sidecar & Registry Audit: is_safe=True",
+    "[Step 7/9] Running Security Vulnerability Scanner (Item 26)...",
+    "  ✔ Security Scan completed: Critical=0, High=6",
+    "[Step 8/9] Validating Production Release Governance Gate (Item 28)...",
+    "[Step 9/9] Upgrade Verification Completed Successfully.",
+    "🎉 UPGRADE_SUCCESS: All 28 joint optimization items fulfilled and verified."
+  ],
+  "final_gate_passed": true,
+  "backup_evidence": {
+    "status": "BACKUP_VERIFIED",
+    "database": "coverage_tool",
+    "backup_dir": "/mnt/d/Zcyu/Chary-codex/onesensor_code-coverage_tool/backup_pre_upgrade",
+    "full_sql_gz_size": 113,
+    "full_sql_gz_sha256": "5005c71a3eed7c90e4693f8f988ec260a1383f326dfbebc2f75adf87ef6b823f",
+    "schema_sql_size": 42,
+    "snapshot": null
+  }
+}

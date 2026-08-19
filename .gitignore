@@ -73,3 +73,6 @@ demo_ui_output/
 .source_cache/
 .report_registry.json
 .report_registry.json.tmp.*
+backup_pre_upgrade/
+*.sql.gz
+*.part
