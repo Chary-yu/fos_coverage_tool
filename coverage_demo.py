@@ -545,7 +545,7 @@ pre.source > span{{display:block;position:relative;white-space:pre}}.lineCov{{ba
             demo_details, developer_changes
         ),
     }
-    enhance_coverage.write_incremental_summary_page(html_dir, DEMO_PROJECT, demo_result)
+    enhance_coverage.write_incremental_summary_page(html_dir, DEMO_PROJECT, demo_result, unanalyzed_by_file={})
     enhance_coverage.write_incremental_developer_tasks_page(html_dir, DEMO_PROJECT, demo_result)
     enhance_coverage.coverage_check.write_result_json(
         demo_result, os.path.join(html_dir, "incremental_coverage.json")
