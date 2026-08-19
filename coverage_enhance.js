@@ -9,7 +9,7 @@
  * 5. CodeRegionController: 区域交互、分批 DOM 渲染调度与展开/折叠控制
  */
 (function() {
-    const ENHANCE_VERSION = 'lazy-collapse-20260818_v11_0';
+    const ENHANCE_VERSION = 'lazy-collapse-20260819_v11_3';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = 'Gemini-NOS';
     const DEFAULT_REPORT_ID = '';
@@ -54,7 +54,7 @@
     // 1. ReviewDraftStore: 独立编辑状态存储 (保证收起/展开不丢失未保存编辑)
     // =========================================================================
     const ReviewDraftStore = {
-        _drafts: new Map(), // blockStartLine -> { reviewer, status, coverage_method, uncovered_reason, isDirty }
+        _drafts: new Map(), // blockStartLine -> { reviewer, status, coverage_method, uncovered_reason, isDirty, isDraft }
 
         setDraft(blockStartLine, data) {
             const line = Number(blockStartLine);
@@ -64,7 +64,8 @@
                 status: data.status !== undefined ? data.status : (existing.status || '未确认'),
                 coverage_method: data.coverage_method !== undefined ? data.coverage_method : (existing.coverage_method || ''),
                 uncovered_reason: data.uncovered_reason !== undefined ? data.uncovered_reason : (existing.uncovered_reason || ''),
-                isDirty: data.isDirty !== undefined ? Boolean(data.isDirty) : true,
+                isDirty: data.isDirty !== undefined ? Boolean(data.isDirty) : (existing.isDirty !== undefined ? existing.isDirty : false),
+                isDraft: data.isDraft !== undefined ? Boolean(data.isDraft) : (existing.isDraft !== undefined ? existing.isDraft : false),
             });
         },
 
@@ -217,7 +218,8 @@
                 status: values.status,
                 coverage_method: values.methodInput,
                 uncovered_reason: values.reasonInput,
-                isDirty: values.isDirty !== undefined ? values.isDirty : true
+                isDirty: values.isDirty !== undefined ? Boolean(values.isDirty) : false,
+                isDraft: values.isDraft !== undefined ? Boolean(values.isDraft) : (panel.values && panel.values.isDraft !== undefined ? Boolean(panel.values.isDraft) : false),
             });
         }
     }
@@ -225,9 +227,15 @@
     function markPanelDirty(startLineNum) {
         dirtyPanelStartLines.add(Number(startLineNum));
         const panel = panelsMap.get(Number(startLineNum));
-        if (panel && panel.saveBtn) {
-            panel.saveBtn.innerText = 'Save';
-            panel.saveBtn.className = 'coverage-analysis-btn';
+        if (panel) {
+            if (panel.values) {
+                panel.values.isDirty = true;
+            }
+            ReviewDraftStore.setDraft(startLineNum, { isDirty: true });
+            if (panel.saveBtn) {
+                panel.saveBtn.innerText = 'Save';
+                panel.saveBtn.className = 'coverage-analysis-btn';
+            }
         }
         updateBatchToolbar();
     }
@@ -235,12 +243,20 @@
     function clearPanelDirty(startLineNum, resetSaved = true) {
         dirtyPanelStartLines.delete(Number(startLineNum));
         const panel = panelsMap.get(Number(startLineNum));
-        if (panel && resetSaved && panel.saveBtn) {
-            const isDraft = panel.values && panel.values.isDraft;
-            const status = panel.values ? panel.values.status : '';
-            panel.saveBtn.innerText = isDraft ? '已暂存' : (CONFIRMED_STATUS_SET.has(status) ? '已确认' : 'Save');
-            if (isDraft || CONFIRMED_STATUS_SET.has(status)) {
-                panel.saveBtn.className = 'coverage-analysis-btn saved';
+        if (panel) {
+            if (panel.values) {
+                panel.values.isDirty = false;
+            }
+            ReviewDraftStore.setDraft(startLineNum, { isDirty: false });
+            if (resetSaved && panel.saveBtn) {
+                const isDraft = panel.values && panel.values.isDraft;
+                const status = panel.values ? panel.values.status : '';
+                panel.saveBtn.innerText = isDraft ? '已暂存' : (CONFIRMED_STATUS_SET.has(status) ? '已确认' : 'Save');
+                if (isDraft || CONFIRMED_STATUS_SET.has(status)) {
+                    panel.saveBtn.className = 'coverage-analysis-btn saved';
+                } else {
+                    panel.saveBtn.className = 'coverage-analysis-btn';
+                }
             }
         }
         updateBatchToolbar();
@@ -277,10 +293,24 @@
 
     function focusReviewPanel(panel) {
         if (!panel) return;
-        const targetEl = panel.select || (panel.block && document.getElementById(`L${panel.block.startLine}`));
-        if (targetEl) {
-            targetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-            if (panel.select) panel.select.focus();
+        if (panel.select && panel.select.isConnected) {
+            panel.select.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            panel.select.focus();
+            return;
+        }
+        const lineNum = panel.lineNum || (panel.block && panel.block.startLine);
+        if (lineNum) {
+            const lineEl = document.getElementById(`L${lineNum}`);
+            if (lineEl && lineEl.isConnected) {
+                lineEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                return;
+            }
+            if (typeof CodeRegionStore !== 'undefined' && CodeRegionStore.getRegionForLine) {
+                const region = CodeRegionStore.getRegionForLine(lineNum);
+                if (region && region.placeholderEl && region.placeholderEl.isConnected) {
+                    region.placeholderEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
+            }
         }
     }
 
@@ -353,7 +383,8 @@
                 status: b.status,
                 coverage_method: b.coverage_method,
                 uncovered_reason: b.uncovered_reason,
-                isDirty: false
+                isDirty: false,
+                isDraft: isDraft
             });
         });
 
@@ -414,7 +445,10 @@
             dirtyLines.forEach(l => {
                 const p = panelsMap.get(l);
                 if (p) {
-                    p.values.isDraft = isDraft;
+                    if (p.values) {
+                        p.values.isDraft = isDraft;
+                        p.values.isDirty = false;
+                    }
                     clearPanelDirty(l, true);
                 }
             });
@@ -1027,11 +1061,13 @@
 
             // Merge draft store if user had unsaved edits
             const draft = ReviewDraftStore.getDraft(startLineNum);
-            const initialStatus = draft ? draft.status : (lineData.analysis_state || '未确认');
-            const initialReviewer = draft ? draft.reviewer : (lineData.reviewer || '');
-            const initialMethod = draft ? draft.coverage_method : (lineData.coverage_method || '');
-            const initialReason = draft ? draft.uncovered_reason : (lineData.uncovered_reason || '');
-            const isDraftState = draft ? draft.isDirty : Boolean(lineData.is_draft);
+            const initialStatus = draft && draft.status !== undefined ? draft.status : (lineData.analysis_state || '未确认');
+            const initialReviewer = draft && draft.reviewer !== undefined ? draft.reviewer : (lineData.reviewer || '');
+            const initialMethod = draft && draft.coverage_method !== undefined ? draft.coverage_method : (lineData.coverage_method || '');
+            const initialReason = draft && draft.uncovered_reason !== undefined ? draft.uncovered_reason : (lineData.uncovered_reason || '');
+            const isDirty = draft && draft.isDirty !== undefined ? Boolean(draft.isDirty) : false;
+            const isDraft = draft && draft.isDraft !== undefined ? Boolean(draft.isDraft) : Boolean(lineData.is_draft);
+            const isConfirmed = !isDraft && CONFIRMED_STATUS_SET.has(initialStatus);
             const origSavedConfirmed = !lineData.is_draft && CONFIRMED_STATUS_SET.has(lineData.analysis_state);
 
             const panel = document.createElement('span');
@@ -1117,10 +1153,18 @@
             // Save button
             const saveBtn = document.createElement('button');
             saveBtn.className = 'coverage-analysis-btn';
-            const isConfirmed = CONFIRMED_STATUS_SET.has(initialStatus);
-            saveBtn.innerText = isDraftState ? 'Save' : (isConfirmed ? '已确认' : 'Save');
-            if (!isDraftState && (isConfirmed || lineData.is_draft)) {
-                saveBtn.classList.add('saved');
+            if (isDirty) {
+                saveBtn.innerText = 'Save';
+                saveBtn.className = 'coverage-analysis-btn';
+            } else if (isDraft) {
+                saveBtn.innerText = '已暂存';
+                saveBtn.className = 'coverage-analysis-btn saved';
+            } else if (isConfirmed) {
+                saveBtn.innerText = '已确认';
+                saveBtn.className = 'coverage-analysis-btn saved';
+            } else {
+                saveBtn.innerText = 'Save';
+                saveBtn.className = 'coverage-analysis-btn';
             }
 
             panel.appendChild(select);
@@ -1159,13 +1203,14 @@
                     reviewerInput: initialReviewer,
                     methodInput: initialMethod,
                     reasonInput: initialReason,
-                    isDraft: isDraftState,
+                    isDirty: isDirty,
+                    isDraft: isDraft,
                     _origSavedConfirmed: origSavedConfirmed
                 }
             };
 
             panelsMap.set(startLineNum, panelState);
-            if (draft && draft.isDirty) {
+            if (isDirty) {
                 dirtyPanelStartLines.add(startLineNum);
             }
 
@@ -1211,7 +1256,16 @@
                         methodInput: methodVal,
                         reasonInput: reasonVal,
                         isDraft: false,
+                        isDirty: false,
                         _origSavedConfirmed: true
+                    });
+                    ReviewDraftStore.setDraft(startLineNum, {
+                        reviewer: reviewerVal,
+                        status: statusVal,
+                        coverage_method: methodVal,
+                        uncovered_reason: reasonVal,
+                        isDraft: false,
+                        isDirty: false
                     });
                     clearPanelDirty(startLineNum, false);
                     saveBtn.innerText = '已确认';
@@ -1241,7 +1295,8 @@
                     status: getStoredPanelValue(previous, 'status') || '未确认',
                     reviewerInput: getStoredPanelValue(previous, 'reviewerInput'),
                     methodInput: getStoredPanelValue(previous, 'methodInput'),
-                    reasonInput: getStoredPanelValue(previous, 'reasonInput')
+                    reasonInput: getStoredPanelValue(previous, 'reasonInput'),
+                    isDirty: true
                 });
                 saveBtn.innerText = 'Save';
                 saveBtn.className = 'coverage-analysis-btn';
@@ -1262,7 +1317,8 @@
                     status: getStoredPanelValue(sourcePanel, 'status') || '未确认',
                     reviewerInput: getStoredPanelValue(sourcePanel, 'reviewerInput'),
                     methodInput: getStoredPanelValue(sourcePanel, 'methodInput'),
-                    reasonInput: getStoredPanelValue(sourcePanel, 'reasonInput')
+                    reasonInput: getStoredPanelValue(sourcePanel, 'reasonInput'),
+                    isDirty: true
                 };
                 const targetEntries = Array.from(panelsMap.entries())
                     .filter(([lineNum]) => lineNum > sourceLineNum && lineNum <= startLineNum)
@@ -1296,7 +1352,7 @@
                     saveBtn.innerText = 'Save';
                     saveBtn.className = 'coverage-analysis-btn';
                 }
-                setStoredPanelValues(panelState, { status: select.value });
+                setStoredPanelValues(panelState, { status: select.value, isDirty: true });
                 markPanelDirty(startLineNum);
             });
 
@@ -1305,7 +1361,8 @@
                     setStoredPanelValues(panelState, {
                         reviewerInput: reviewerInput.value,
                         methodInput: methodInput.value,
-                        reasonInput: reasonInput.value
+                        reasonInput: reasonInput.value,
+                        isDirty: true
                     });
                     markPanelDirty(startLineNum);
                 });
@@ -1464,7 +1521,7 @@
         },
 
         async expandRegion(regionId) {
-            const region = CodeRegionStore.get(regionId);
+            const region = typeof regionId === 'string' ? CodeRegionStore.get(regionId) : regionId;
             if (!region) return;
 
             if (region.loaded) {
@@ -1486,9 +1543,10 @@
 
                 await this.finalizeRegionLoaded(region);
             } catch (err) {
-                console.error(`[CodeRegionController] Failed to expand region ${regionId}:`, err);
-                CodeRegionStore.setError(regionId, err.message || String(err));
+                console.error(`[CodeRegionController] Failed to expand region ${region.id}:`, err);
+                CodeRegionStore.setError(region.id, err.message || String(err));
                 this.updatePlaceholderState(region);
+                throw err;
             }
         },
 
@@ -1660,10 +1718,7 @@
                         loadedLinesCount += reg.lineCount;
                         continue;
                     }
-                    if (!reg.loaded) {
-                        await CodeRegionLoader.loadRegion(this.filePath, reg);
-                    }
-                    await this.renderRegionLines(reg);
+                    await this.expandRegion(reg);
                     loadedLinesCount += reg.lineCount;
                 } catch (err) {
                     console.error(`[CodeRegionController] Expand all failed on ${reg.id}:`, err);

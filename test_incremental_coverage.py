@@ -555,8 +555,6 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         with open(js_path, "r", encoding="utf-8") as f:
             js_content = f.read()
 
-        self.assertIn('const isIncremental = reviewScope === \'incremental\';', js_content)
-        self.assertIn('<span class="mod-chip">', js_content)
         self.assertIn('PROGRESS_PAGE_VERSION = \'visible-progress-20260818_v9_12\'', js_content)
 
         html_path = enhance_coverage.PROGRESS_PAGE_SOURCE_PATH

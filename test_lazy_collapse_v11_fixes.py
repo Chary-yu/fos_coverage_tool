@@ -284,6 +284,248 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
         results = read_source_ranges(ctx, ranges, max_ranges=1000)
         self.assertEqual(len(results), 150)
 
+    def test_9_p0_1_sidecar_hash_consistency_injector_and_service(self):
+        """P0-1: Sidecar created by injector uses calc_sidecar_file_key and is found by CodeDetailService."""
+        from source_reader import calc_sidecar_file_key
+        input_dir = os.path.join(self.temp_dir, "input_p0_1")
+        output_dir = os.path.join(self.temp_dir, "output_p0_1")
+        os.makedirs(input_dir, exist_ok=True)
+
+        gcov_file = os.path.join(input_dir, "test.c.gcov.html")
+        sample_gcov_html = """<!DOCTYPE html>
+        <html>
+        <head><title>LCOV - cov - src/test.c</title></head>
+        <body>
+          <pre class="source">
+            <span class="lineNum"> 1 </span><span class="lineCov"> int a = 1;</span>
+            <span class="lineNum"> 2 </span><span class="lineNoCov"> int b = 2;</span>
+          </pre>
+        </body>
+        </html>"""
+
+        with open(gcov_file, "w", encoding="utf-8") as f:
+            f.write(sample_gcov_html)
+
+        inject_coverage_report(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            project_name="P0Proj",
+            render_mode="lazy_collapse",
+            reuse_output=False,
+        )
+
+        expected_key = calc_sidecar_file_key("src/test.c")
+        report_id = f"report_{enhance_coverage.calc_file_path_hash(os.path.abspath(output_dir))[:16]}"
+        sidecar_file = os.path.join(output_dir, ".source_cache", report_id, f"{expected_key}.source.json")
+        self.assertTrue(os.path.isfile(sidecar_file), f"Sidecar file missing at {sidecar_file}")
+
+        # CodeDetailService without explicit custom search dirs should find sidecar via report registry
+        service = CodeDetailService()
+        layout = service.get_code_layout("P0Proj", "src/test.c", report_id=report_id)
+        self.assertEqual(layout["total_lines"], 2)
+        self.assertEqual(layout["total_uncovered_count"], 1)
+
+    def test_10_p0_2_report_registry_persistence(self):
+        """P0-2: Separate process simulation locates sidecar via .report_registry.json."""
+        from enhance_coverage import register_report_directory, load_report_registry
+        report_id = "report_proc_test_123"
+        fake_report_dir = os.path.join(self.temp_dir, "fake_report")
+        os.makedirs(fake_report_dir, exist_ok=True)
+
+        register_report_directory(report_id, fake_report_dir)
+        registry = load_report_registry()
+        self.assertIn(report_id, registry)
+        self.assertIn(os.path.abspath(fake_report_dir), registry[report_id])
+
+    def test_11_p0_3_reuse_output_does_not_corrupt_sidecar(self):
+        """P0-3: --reuse-output repeated run does not overwrite sidecar with stripped HTML."""
+        input_dir = os.path.join(self.temp_dir, "input_reuse")
+        output_dir = os.path.join(self.temp_dir, "output_reuse")
+        os.makedirs(input_dir, exist_ok=True)
+
+        gcov_file = os.path.join(input_dir, "reuse.c.gcov.html")
+        sample_gcov_html = """<!DOCTYPE html>
+        <html>
+        <head><title>LCOV - cov - src/reuse.c</title></head>
+        <body>
+          <pre class="source">
+            <span class="lineNum"> 1 </span><span class="lineCov"> int first_line = 1;</span>
+            <span class="lineNum"> 2 </span><span class="lineNoCov"> int second_line = 2;</span>
+          </pre>
+        </body>
+        </html>"""
+
+        with open(gcov_file, "w", encoding="utf-8") as f:
+            f.write(sample_gcov_html)
+
+        # First run
+        inject_coverage_report(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            project_name="ReuseProj",
+            render_mode="lazy_collapse",
+            reuse_output=True,
+        )
+
+        # Second run with reuse_output=True
+        inject_coverage_report(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            project_name="ReuseProj",
+            render_mode="lazy_collapse",
+            reuse_output=True,
+        )
+
+        report_id = f"report_{enhance_coverage.calc_file_path_hash(os.path.abspath(output_dir))[:16]}"
+        service = CodeDetailService()
+        lines_data = service.get_code_lines_single("ReuseProj", "src/reuse.c", start_line=1, end_line=2, report_id=report_id)
+        self.assertEqual(len(lines_data["lines"]), 2)
+        self.assertEqual(lines_data["lines"][0]["source"], "int first_line = 1;")
+        self.assertEqual(lines_data["lines"][1]["source"], "int second_line = 2;")
+
+    def test_12_p0_4_sidecar_failure_does_not_strip_html(self):
+        """P0-4: If sidecar saving fails, HTML source must NOT be stripped."""
+        input_dir = os.path.join(self.temp_dir, "input_fail")
+        output_dir = os.path.join(self.temp_dir, "output_fail")
+        os.makedirs(input_dir, exist_ok=True)
+
+        gcov_file = os.path.join(input_dir, "fail.c.gcov.html")
+        sample_gcov_html = """<!DOCTYPE html>
+        <html>
+        <head><title>LCOV - cov - src/fail.c</title></head>
+        <body>
+          <pre class="source">
+            <span class="lineNum"> 1 </span><span class="lineNoCov"> int critical_source_code = 12345;</span>
+          </pre>
+        </body>
+        </html>"""
+
+        with open(gcov_file, "w", encoding="utf-8") as f:
+            f.write(sample_gcov_html)
+
+        with patch("enhance_coverage.save_source_sidecar", side_effect=IOError("Disk write error")):
+            inject_coverage_report(
+                input_dir=input_dir,
+                output_dir=output_dir,
+                project_name="FailProj",
+                render_mode="lazy_collapse",
+                reuse_output=False,
+            )
+
+        injected_html_file = os.path.join(output_dir, "fail.c.gcov.html")
+        with open(injected_html_file, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # HTML must still contain original source because sidecar failed to save
+        self.assertIn("critical_source_code", content)
+
+    def test_13_p1_1_cpp_signatures_multiline_and_qualifiers(self):
+        """P1-1: C/C++ function parser handles multi-line signatures, C++ namespaces, constructors, destructors."""
+        raw_lines = [
+            {"line_no": 1, "code_text": "class MyClass {"},
+            {"line_no": 2, "code_text": "public:"},
+            {"line_no": 3, "code_text": "    MyClass::MyClass() {"},
+            {"line_no": 4, "code_text": "        init();"},
+            {"line_no": 5, "code_text": "    }"},
+            {"line_no": 6, "code_text": "    MyClass::~MyClass() {"},
+            {"line_no": 7, "code_text": "        cleanup();"},
+            {"line_no": 8, "code_text": "    }"},
+            {"line_no": 9, "code_text": "    int multi_line("},
+            {"line_no": 10, "code_text": "        int a,"},
+            {"line_no": 11, "code_text": "        int b"},
+            {"line_no": 12, "code_text": "    ) const noexcept {"},
+            {"line_no": 13, "code_text": "        return a + b;"},
+            {"line_no": 14, "code_text": "    }"},
+            {"line_no": 15, "code_text": "    auto trailing_return(int x) -> int {"},
+            {"line_no": 16, "code_text": "        return x * 2;"},
+            {"line_no": 17, "code_text": "    }"},
+            {"line_no": 18, "code_text": "};"},
+        ]
+
+        functions = extract_c_function_ranges(raw_lines)
+        fn_map = {f.name: f for f in functions}
+
+        self.assertIn("MyClass::MyClass", fn_map)
+        self.assertEqual(fn_map["MyClass::MyClass"].start_line, 3)
+        self.assertEqual(fn_map["MyClass::MyClass"].end_line, 5)
+
+        self.assertIn("MyClass::~MyClass", fn_map)
+        self.assertEqual(fn_map["MyClass::~MyClass"].start_line, 6)
+        self.assertEqual(fn_map["MyClass::~MyClass"].end_line, 8)
+
+        self.assertIn("multi_line", fn_map)
+        self.assertEqual(fn_map["multi_line"].start_line, 9)
+        self.assertEqual(fn_map["multi_line"].end_line, 14)
+
+        self.assertIn("trailing_return", fn_map)
+        self.assertEqual(fn_map["trailing_return"].start_line, 15)
+        self.assertEqual(fn_map["trailing_return"].end_line, 17)
+
+    def test_14_p1_5_p1_6_validation_and_authoritative_sidecar(self):
+        """P1-5 & P1-6: Invalid report_id/review_scope is rejected; report_id requires valid sidecar."""
+        service = CodeDetailService()
+
+        # Invalid report_id format (e.g. path traversal characters or spaces)
+        with self.assertRaises(ValueError):
+            service.get_code_layout("Proj", "src/test.c", report_id="../../bad/path")
+
+        # Invalid review_scope
+        with self.assertRaises(ValueError):
+            service.get_code_layout("Proj", "src/test.c", review_scope="invalid_scope")
+
+        # Non-existent report_id raises FileNotFoundError without fallback
+        with self.assertRaises(FileNotFoundError):
+            service.get_code_layout("Proj", "src/test.c", report_id="report_nonexistent123")
+
+    def test_15_p2_1_max_batch_total_lines_limit(self):
+        """P2-1: Exceeding MAX_BATCH_TOTAL_LINES (50000) raises ValueError."""
+        ctx = SourceContext(
+            project_name="Proj",
+            file_path="src/large.c",
+            lines=[SourceLineDTO(i, f"int x_{i};", f"raw_{i}", "covered") for i in range(1, 60001)],
+        )
+        # Single range requesting 55,000 lines
+        with self.assertRaises(ValueError):
+            read_source_ranges(ctx, [{"start_line": 1, "end_line": 55000}])
+
+    def test_16_published_pages_version_only_on_incremental_page(self):
+        """Verify version identifier is displayed only on incremental coverage homepage."""
+        # 1. Check incremental_coverage.html renders version
+        result_mock = {
+            "summary": {"changed_lines": 10, "covered": 8, "uncovered": 2, "ignored": 0, "unanalyzed": 0, "missing": 0, "coverage_rate": 80.0},
+            "details": [],
+            "files": [],
+            "oldgit": "abc1234",
+            "newgit": "def5678",
+            "generated_at": "2026-08-19 09:00:00",
+            "git_range": "HEAD~1..HEAD",
+            "repository_ranges": {}
+        }
+        out_dir = os.path.join(self.temp_dir, "test_v16_out")
+        os.makedirs(out_dir, exist_ok=True)
+        enhance_coverage.write_incremental_summary_page(out_dir, "TestProj", result_mock, config={}, unanalyzed_by_file={})
+        
+        with open(os.path.join(out_dir, "incremental_coverage.html"), "r", encoding="utf-8") as f:
+            inc_html = f.read()
+        self.assertIn("v11.3 2026-08-19", inc_html)
+        self.assertIn('<span class="page-version-badge">v11.3 2026-08-19</span>', inc_html)
+
+        # 2. Check developer tasks page does NOT contain badge or footer version
+        enhance_coverage.write_incremental_developer_tasks_page(out_dir, "TestProj", result_mock)
+        with open(os.path.join(out_dir, "incremental_developer_tasks.html"), "r", encoding="utf-8") as f:
+            dev_html = f.read()
+        self.assertNotIn("v11.3 2026-08-19", dev_html)
+
+        # 3. Check other pages and components do NOT contain toolbar or badge version
+        with open(enhance_coverage.JS_SOURCE_PATH, "r", encoding="utf-8") as f:
+            js_code = f.read()
+        self.assertNotIn("coverage-lazy-toolbar-version", js_code)
+        self.assertNotIn("RELEASE_TIME", js_code)
+
+        with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as f:
+            prog_html = f.read()
+        self.assertNotIn("v11.3 2026-08-19", prog_html)
+
 
 if __name__ == "__main__":
     unittest.main()

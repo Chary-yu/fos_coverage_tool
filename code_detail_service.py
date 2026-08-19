@@ -6,6 +6,7 @@ and exact report ID binding.
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -16,7 +17,11 @@ from code_region import CodeRegion, FunctionRange, build_code_regions
 from source_reader import (
     SourceContext,
     SourceLineDTO,
+    calc_sidecar_file_key,
+    compute_file_path_hash,
     is_line_pending_analysis,
+    is_valid_report_id,
+    is_valid_review_scope,
     load_source_sidecar,
     parse_source_lines_from_gcov_html,
     read_source_lines,
@@ -25,11 +30,26 @@ from source_reader import (
 
 logger = logging.getLogger(__name__)
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPORT_REGISTRY_PATH = os.path.join(SCRIPT_DIR, ".report_registry.json")
 
-def compute_file_path_hash(file_path: str) -> str:
-    """Compute sha256 hash of normalized file path for sidecar indexing."""
-    normalized = file_path.replace("\\", "/").strip().lstrip("/")
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
+
+def load_report_registry() -> Dict[str, List[str]]:
+    """Load persistent report registry."""
+    if os.path.exists(REPORT_REGISTRY_PATH):
+        try:
+            with open(REPORT_REGISTRY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                result = {}
+                for k, v in data.items():
+                    if isinstance(v, str):
+                        result[k] = [v]
+                    elif isinstance(v, list):
+                        result[k] = [str(x) for x in v if x]
+                return result
+        except Exception:
+            pass
+    return {}
 
 
 def is_safe_relative_path(path: str) -> bool:
@@ -77,16 +97,24 @@ class CodeDetailService:
         ]
         candidates = [c for c in candidates if c]
 
+        dirs_to_check = list(self.search_dirs)
+        if report_id:
+            registry = load_report_registry()
+            if report_id in registry:
+                for r_dir in registry[report_id]:
+                    if r_dir not in dirs_to_check:
+                        dirs_to_check.insert(0, r_dir)
+
         # 1. If report_id specified, check subdirectories matching report_id
         if report_id:
-            for s_dir in self.search_dirs:
+            for s_dir in dirs_to_check:
                 for cand in candidates:
                     target = os.path.join(s_dir, report_id, cand)
                     if os.path.isfile(target):
                         return target
 
         # 2. Check exact paths relative to search_dirs
-        for s_dir in self.search_dirs:
+        for s_dir in dirs_to_check:
             for cand in candidates:
                 target = os.path.join(s_dir, cand)
                 if os.path.isfile(target):
@@ -112,7 +140,13 @@ class CodeDetailService:
         if not is_safe_relative_path(file_path):
             raise ValueError(f"Illegal or unsafe file path: {file_path}")
 
+        if report_id and not is_valid_report_id(report_id):
+            raise ValueError(f"Invalid report_id format: '{report_id}'")
+
         scope = review_scope or self.review_scope
+        if not is_valid_review_scope(scope):
+            raise ValueError(f"Invalid review_scope: '{scope}'")
+
         cache_key = (project_name, report_id or "", file_path, scope)
         now = time.time()
 
@@ -148,7 +182,17 @@ class CodeDetailService:
 
         # 1. Try to load from server-side source sidecar if report_id given
         if report_id:
-            for s_dir in self.search_dirs:
+            dirs_to_check = list(self.search_dirs)
+            registry = load_report_registry()
+            if report_id in registry:
+                for r_dir in registry[report_id]:
+                    if r_dir not in dirs_to_check:
+                        dirs_to_check.insert(0, r_dir)
+            for std_dir in ["/opt/coverage_reports/review", "/opt/coverage_reports/review_incremental", "/opt/coverage_reports"]:
+                if os.path.isdir(std_dir) and std_dir not in dirs_to_check:
+                    dirs_to_check.append(std_dir)
+
+            for s_dir in dirs_to_check:
                 sidecar_ctx = load_source_sidecar(s_dir, report_id, file_hash)
                 if sidecar_ctx:
                     if self.db_manager:
@@ -156,7 +200,12 @@ class CodeDetailService:
                     self._context_cache[cache_key] = (now, sidecar_ctx)
                     return sidecar_ctx
 
-        # 2. Try to locate exact .gcov.html on disk
+            # Authoritative: when report_id is provided, do NOT fallback to stripped .gcov.html
+            raise FileNotFoundError(
+                f"Source context sidecar missing or unavailable for project='{project_name}', file='{file_path}', report_id='{report_id}'"
+            )
+
+        # 2. Try to locate exact .gcov.html on disk (legacy / non-lazy fallback)
         gcov_file = self.locate_gcov_file(file_path, report_id=report_id)
         if gcov_file and os.path.isfile(gcov_file):
             try:

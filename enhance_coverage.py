@@ -27,15 +27,21 @@ import threading
 import importlib
 import uuid
 import tempfile
+import logging
 from xml.etree import ElementTree
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
+logger = logging.getLogger(__name__)
 
 import coverage_check
 from code_region import CodeRegion, FunctionRange, build_code_regions
 from source_reader import (
     SourceContext,
     SourceLineDTO,
+    calc_sidecar_file_key,
     is_line_pending_analysis,
+    is_valid_report_id,
+    is_valid_review_scope,
     load_source_sidecar,
     parse_source_lines_from_gcov_html,
     read_source_lines,
@@ -65,14 +71,59 @@ for module_name in ['pymysql', 'mysql.connector']:
 # 脚本根目录和配置文件位置
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "coverage_config.json")
+REPORT_REGISTRY_PATH = os.path.join(SCRIPT_DIR, ".report_registry.json")
 JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
 CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
 PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
 PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
 INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
-ASSET_VERSION = "visible-progress-20260818_v9_12"
+ASSET_VERSION = "lazy-collapse-20260819_v11_3"
+ASSET_RELEASE_TIME = "2026-08-19"
+VERSION_DISPLAY_LABEL = "v11.3 2026-08-19"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
+
+
+def register_report_directory(report_id: str, *dirs: str):
+    """Register report_id to persistent registry file."""
+    if not report_id:
+        return
+    valid_dirs = [os.path.abspath(d) for d in dirs if d and os.path.exists(d)]
+    if not valid_dirs:
+        return
+    registry = load_report_registry()
+    existing_dirs = registry.get(report_id, [])
+    if isinstance(existing_dirs, str):
+        existing_dirs = [existing_dirs]
+    merged = list(dict.fromkeys(existing_dirs + valid_dirs))
+    registry[report_id] = merged
+    tmp_path = f"{REPORT_REGISTRY_PATH}.tmp.{os.getpid()}_{time.time()}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(registry, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, REPORT_REGISTRY_PATH)
+    except Exception as e:
+        logger.warning(f"[ReportRegistry] Failed to persist report registry: {e}")
+
+
+def load_report_registry() -> Dict[str, List[str]]:
+    """Load persistent report registry."""
+    if os.path.exists(REPORT_REGISTRY_PATH):
+        try:
+            with open(REPORT_REGISTRY_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                result = {}
+                for k, v in data.items():
+                    if isinstance(v, str):
+                        result[k] = [v]
+                    elif isinstance(v, list):
+                        result[k] = [str(x) for x in v if x]
+                return result
+        except Exception:
+            pass
+    return {}
 
 
 class JobCancelledError(Exception):
@@ -2058,6 +2109,7 @@ def write_progress_page_targets(output_dir, real_output_html, review_scope="full
             )
             if runtime_replacement_count != 1:
                 raise RuntimeError("Failed to inject DEFAULT_REVIEW_SCOPE into coverage_progress.js")
+
             with open(
                 os.path.join(os.path.dirname(target), "coverage_progress.js"),
                 "w", encoding="utf-8"
@@ -3832,6 +3884,7 @@ def get_code_detail_service(db_mgr=None, search_dirs=None):
     """Return a configured CodeDetailService instance."""
     global _global_code_detail_service
     manager = db_mgr or globals().get("db_manager")
+    cfg = load_config()
     dirs = [
         SCRIPT_DIR,
         os.path.join(SCRIPT_DIR, "html"),
@@ -3839,7 +3892,15 @@ def get_code_detail_service(db_mgr=None, search_dirs=None):
         os.path.join(SCRIPT_DIR, ".coverage_demo", "html"),
         os.path.join(SCRIPT_DIR, "..", "build", "coverage"),
         os.path.join(SCRIPT_DIR, "..", "build", "coverage_review"),
+        "/opt/coverage_reports/review",
+        "/opt/coverage_reports/review_incremental",
+        "/opt/coverage_reports",
     ]
+    cfg_report_roots = cfg.get("report_roots", [])
+    if isinstance(cfg_report_roots, list):
+        for r_root in cfg_report_roots:
+            if r_root and os.path.exists(r_root):
+                dirs.append(os.path.abspath(r_root))
     if search_dirs:
         dirs.extend(search_dirs)
     if _global_code_detail_service is None or _global_code_detail_service.db_manager != manager:
@@ -3908,6 +3969,12 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
             if not is_safe_relative_path(file_path):
                 self.send_error_response(400, "Invalid or unsafe file path")
                 return
+            if report_id and not is_valid_report_id(report_id):
+                self.send_error_response(400, f"Invalid report_id format: '{report_id}'")
+                return
+            if not is_valid_review_scope(review_scope):
+                self.send_error_response(400, f"Invalid review_scope: '{review_scope}' (must be 'full' or 'incremental')")
+                return
             try:
                 service = get_code_detail_service()
                 data = service.get_code_layout(
@@ -3937,6 +4004,12 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 return
             if not is_safe_relative_path(file_path):
                 self.send_error_response(400, "Invalid or unsafe file path")
+                return
+            if report_id and not is_valid_report_id(report_id):
+                self.send_error_response(400, f"Invalid report_id format: '{report_id}'")
+                return
+            if not is_valid_review_scope(review_scope):
+                self.send_error_response(400, f"Invalid review_scope: '{review_scope}' (must be 'full' or 'incremental')")
                 return
             try:
                 start_line = int(query_params.get("start_line", ["1"])[0])
@@ -4320,6 +4393,12 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
             if not is_safe_relative_path(file_path):
                 self.send_error_response(400, "Invalid or unsafe file path")
                 return
+            if report_id and not is_valid_report_id(report_id):
+                self.send_error_response(400, f"Invalid report_id format: '{report_id}'")
+                return
+            if not is_valid_review_scope(review_scope):
+                self.send_error_response(400, f"Invalid review_scope: '{review_scope}' (must be 'full' or 'incremental')")
+                return
             if not isinstance(ranges, list) or not ranges:
                 self.send_error_response(400, "ranges must be a non-empty array")
                 return
@@ -4372,6 +4451,12 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 return
             if not is_safe_relative_path(file_path):
                 self.send_error_response(400, "Invalid or unsafe file path")
+                return
+            if report_id and not is_valid_report_id(report_id):
+                self.send_error_response(400, f"Invalid report_id format: '{report_id}'")
+                return
+            if not is_valid_review_scope(review_scope):
+                self.send_error_response(400, f"Invalid review_scope: '{review_scope}' (must be 'full' or 'incremental')")
                 return
             if start_line <= 0 or end_line <= 0 or start_line > end_line:
                 self.send_error_response(400, "Invalid start_line or end_line range")
@@ -4641,7 +4726,8 @@ def close_thread_db_manager():
 
 def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync_index=True,
                                  review_scope="full", incremental_lines_by_file=None,
-                                 render_mode="lazy_collapse", report_id="", output_dir=""):
+                                 render_mode="lazy_collapse", report_id="", output_dir="",
+                                 source_input_file=None, can_reuse=False):
     depth = len(rel_path.split(os.sep)) - 1
     prefix = "../" * depth
 
@@ -4649,19 +4735,35 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
     js_tag = f'<script type="text/javascript" src="{prefix}coverage_enhance.js?v={ASSET_VERSION}"></script>\n'
     inject_code = f"{css_tag}{js_tag}</head>"
 
-    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-        content = f.read()
+    # Read source content from unstripped source_input_file if available (prevents stripped output contamination)
+    source_content = ""
+    if source_input_file and os.path.isfile(source_input_file):
+        try:
+            with open(source_input_file, 'r', encoding='utf-8', errors='ignore') as f:
+                source_content = f.read()
+        except Exception:
+            source_content = ""
 
-    report_file_path = extract_report_file_path(content, rel_path)
-    report_file_hash = calc_file_path_hash(report_file_path)
+    if not source_content:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            source_content = f.read()
+
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        file_content = f.read()
+
+    report_file_path = extract_report_file_path(source_content, rel_path)
+    report_file_hash = calc_file_path_hash(report_file_path)  # DB MD5
+    sidecar_key = calc_sidecar_file_key(report_file_path)      # Sidecar SHA256[:32]
+
     review_line_numbers = None
     if review_scope == "incremental":
         review_line_numbers = get_incremental_lines_for_report(
             report_file_path, incremental_lines_by_file or {}
         )
-        content = mark_incremental_review_lines(content, review_line_numbers)
+        source_content = mark_incremental_review_lines(source_content, review_line_numbers)
+        file_content = mark_incremental_review_lines(file_content, review_line_numbers)
     file_line_index_records = extract_line_index_records(
-        content, rel_path, project_name, review_line_numbers
+        source_content, rel_path, project_name, review_line_numbers
     )
     file_index_synced = False
 
@@ -4684,21 +4786,31 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
 
     injected = 0
     updated = 0
+    sidecar_saved = False
 
+    sidecar_dir = output_dir or os.path.dirname(file_path)
     if render_mode == "lazy_collapse":
-        try:
-            source_ctx = parse_source_lines_from_gcov_html(
-                content=content,
-                project_name=project_name,
-                file_path=report_file_path,
-                review_scope=review_scope,
-                incremental_line_numbers=set(review_line_numbers) if review_line_numbers else None,
-                report_id=report_id,
-            )
-            sidecar_dir = output_dir or os.path.dirname(file_path)
-            save_source_sidecar(sidecar_dir, report_id, report_file_hash, source_ctx)
-        except Exception as err:
-            logger.warning(f"[Injector] Failed to save sidecar for {rel_path}: {err}")
+        if can_reuse:
+            existing_sidecar = load_source_sidecar(sidecar_dir, report_id, sidecar_key)
+            if existing_sidecar and existing_sidecar.total_lines > 0:
+                sidecar_saved = True
+
+        if not sidecar_saved:
+            try:
+                source_ctx = parse_source_lines_from_gcov_html(
+                    content=source_content,
+                    project_name=project_name,
+                    file_path=report_file_path,
+                    review_scope=review_scope,
+                    incremental_line_numbers=set(review_line_numbers) if review_line_numbers else None,
+                    report_id=report_id,
+                )
+                if source_ctx and source_ctx.total_lines > 0:
+                    save_source_sidecar(sidecar_dir, report_id, sidecar_key, source_ctx)
+                    sidecar_saved = True
+            except Exception as err:
+                logger.warning(f"[Injector] Failed to save sidecar for {rel_path}: {err}")
+                sidecar_saved = False
 
     meta_tags = (
         f'<meta name="coverage-report-id" content="{html.escape(report_id)}">\n'
@@ -4706,22 +4818,24 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
         f'<meta name="coverage-render-mode" content="{html.escape(render_mode)}">\n'
     )
 
-    if "coverage_enhance.js" in content:
-        new_content = re.sub(r'(href="[^"]*coverage_enhance\.css)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', content)
+    should_strip = (render_mode == "lazy_collapse" and sidecar_saved)
+
+    if "coverage_enhance.js" in file_content:
+        new_content = re.sub(r'(href="[^"]*coverage_enhance\.css)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', file_content)
         new_content = re.sub(r'(src="[^"]*coverage_enhance\.js)(?:\?v=[^"]*)?(")', rf'\1?v={ASSET_VERSION}\2', new_content)
         if meta_tags.strip() not in new_content and "<head>" in new_content:
             new_content = new_content.replace("<head>", f"<head>\n{meta_tags}", 1)
-        if render_mode == "lazy_collapse" and '<pre class="source">' in new_content:
+        if should_strip and '<pre class="source">' in new_content:
             new_content = re.sub(r'<pre class="source">.*?</pre>', r'<pre class="source"></pre>', new_content, flags=re.S)
-        if new_content != content:
+        if new_content != file_content:
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(new_content)
             updated = 1
-    elif "</head>" in content:
-        new_content = content.replace("</head>", f"{inject_code}", 1)
+    elif "</head>" in file_content:
+        new_content = file_content.replace("</head>", f"{inject_code}", 1)
         if "<head>" in new_content:
             new_content = new_content.replace("<head>", f"<head>\n{meta_tags}", 1)
-        if render_mode == "lazy_collapse" and '<pre class="source">' in new_content:
+        if should_strip and '<pre class="source">' in new_content:
             new_content = re.sub(r'<pre class="source">.*?</pre>', r'<pre class="source"></pre>', new_content, flags=re.S)
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(new_content)
@@ -4811,6 +4925,7 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
         raise ValueError("review_scope must be 'full' or 'incremental'")
 
     report_id = f"report_{calc_file_path_hash(os.path.abspath(real_output_html))[:16]}"
+    register_report_directory(report_id, real_output_html, output_dir, os.path.join(real_output_html, ".source_cache"))
     get_code_detail_service(search_dirs=[real_output_html, output_dir, os.path.join(real_output_html, ".source_cache")])
 
     write_configured_enhance_js(
@@ -4878,16 +4993,18 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
         futures = [
             executor.submit(
                 process_gcov_file_for_inject,
-                file_path,
-                rel_path,
-                project_name,
-                config,
-                index_manager is not None,
-                review_scope,
-                incremental_lines_by_file,
-                render_mode,
-                report_id,
-                real_output_html,
+                file_path=file_path,
+                rel_path=rel_path,
+                project_name=project_name,
+                config=config,
+                sync_index=index_manager is not None,
+                review_scope=review_scope,
+                incremental_lines_by_file=incremental_lines_by_file,
+                render_mode=render_mode,
+                report_id=report_id,
+                output_dir=real_output_html,
+                source_input_file=os.path.join(real_input_html, rel_path) if input_dir != output_dir else None,
+                can_reuse=can_reuse,
             )
             for file_path, rel_path in gcov_files
         ]
@@ -5286,6 +5403,7 @@ main{{max-width:1280px;margin:0 auto;padding:24px 24px 48px}}
 .hero-card{{background:#ffffff;border:1px solid rgba(0,0,0,0.04);border-radius:18px;padding:24px 28px;box-shadow:0 4px 20px -2px rgba(0,0,0,0.04);text-align:center;margin-bottom:20px}}
 h1{{margin:0 0 8px;font-size:26px;font-weight:800;letter-spacing:-0.6px;color:#1c1c1e}}
 .muted{{color:#8e8e93;font-size:13px}}
+.page-version-badge{{display:inline-flex;align-items:center;gap:6px;background:rgba(118,118,128,0.1);padding:4px 12px;border-radius:8px;font-size:12px;color:#3a3a3c;margin-top:10px}}
 .repo-badges{{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-top:10px}}
 .repo-chip{{display:inline-flex;align-items:center;gap:6px;background:rgba(0,122,255,0.08);padding:4px 10px;border-radius:8px;font-size:12px}}
 .repo-name{{color:#007aff;font-weight:700}}
@@ -5328,6 +5446,7 @@ td a:hover{{text-decoration:underline}}
 <div class="hero-card">
   <h1>增量覆盖率审查</h1>
   <div class="muted">项目：{project}；Git 范围：{git_range_text}；生成时间：{generated_at}</div>{repository_ranges}
+  <div><span class="page-version-badge">{version_label}</span></div>
   <div class="links-segmented">
     <a href="coverage_progress.html?scope=incremental&amp;project={project_url}">📊 查看填写进度</a>
     <a href="incremental_developer_tasks.html">👨‍💻 开发人员待填写清单</a>
@@ -5353,8 +5472,10 @@ td a:hover{{text-decoration:underline}}
   <span id="filter-count" class="filter-count"></span>
 </div>
 <table id="incremental-file-table"><thead><tr><th data-sort-key="repository" aria-sort="none"><button type="button" class="sort-button" data-sort-key="repository" data-sort-type="text">仓库 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="team" aria-sort="none"><button type="button" class="sort-button" data-sort-key="team" data-sort-type="text">小组 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="leader" aria-sort="none"><button type="button" class="sort-button" data-sort-key="leader" data-sort-type="text">组长 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="module" aria-sort="none"><button type="button" class="sort-button" data-sort-key="module" data-sort-type="text">组件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="file" aria-sort="none"><button type="button" class="sort-button" data-sort-key="file" data-sort-type="text">文件 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="changed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="changed" data-sort-type="number">新增行 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="covered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="covered" data-sort-type="number">已覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="uncovered" aria-sort="none"><button type="button" class="sort-button" data-sort-key="uncovered" data-sort-type="number">未覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="ignored" aria-sort="none"><button type="button" class="sort-button" data-sort-key="ignored" data-sort-type="number">无需覆盖 <span class="sort-indicator" aria-hidden="true">↕</span></button></th><th data-sort-key="unanalyzed" aria-sort="none"><button type="button" class="sort-button" data-sort-key="unanalyzed" data-sort-type="number">待分析行数 <span class="sort-indicator" aria-hidden="true">↕</span></button></th></tr></thead><tbody>{table_rows}</tbody></table></section>
+<footer style="text-align:center;color:#8e8e93;font-size:12px;padding:24px 0 12px;">OneSensor 覆盖率审查系统 · {version_label}</footer>
 </main><script src="incremental_coverage.js?v={asset_version}"></script></body></html>""".format(
         asset_version=ASSET_VERSION,
+        version_label=VERSION_DISPLAY_LABEL,
         project=escaped(project_name),
         project_url=escaped(urllib.parse.quote(str(project_name), safe="")),
         git_range_text=git_range_text,
@@ -5473,6 +5594,7 @@ main{{max-width:1320px;margin:0 auto;padding:24px 24px 48px}}
 h1{{margin:0 0 8px;font-size:26px;font-weight:800;letter-spacing:-0.6px;color:#1c1c1e}}
 h2{{margin:0;padding:16px 20px;font-size:16px;font-weight:700;background:rgba(242,242,247,0.7);border-bottom:1px solid rgba(60,60,67,0.1);letter-spacing:-0.3px}}
 .muted{{color:#8e8e93;font-size:13px}}
+.page-version-badge{{display:inline-flex;align-items:center;gap:6px;background:rgba(118,118,128,0.1);padding:4px 12px;border-radius:8px;font-size:12px;color:#3a3a3c;margin-top:10px}}
 .links-segmented{{display:inline-flex;gap:4px;background:rgba(118,118,128,0.12);padding:4px;border-radius:12px;margin-top:14px;flex-wrap:wrap}}
 .links-segmented a{{color:#007aff;text-decoration:none;font-weight:600;font-size:13px;padding:6px 14px;border-radius:9px;transition:all 0.15s ease}}
 .links-segmented a:hover{{background:#ffffff;color:#0051a8;box-shadow:0 2px 8px rgba(0,0,0,0.08)}}

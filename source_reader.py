@@ -5,20 +5,42 @@ detects basic blocks, and merges review/analysis state into unified Line DTOs.
 Supports source sidecar serialization and deserialization for true lazy loading.
 """
 
+import hashlib
 import html
 import json
 import logging
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from code_region import FunctionRange
 
 logger = logging.getLogger(__name__)
 
-CONTROL_FLOW_RE = re.compile(r'\b(if|else|for|while|do|switch|case|default)\b')
-FUNC_ENTRY_RE = re.compile(r'^[A-Za-z_][\w\s\*]*\s+[A-Za-z_]\w*\s*\([^;]*\)\s*(\{|$)', re.M)
+CONTROL_FLOW_RE = re.compile(r'\b(if|else|for|while|do|switch|case|default|catch)\b')
 CONFIRMED_STATUS_SET = {'可覆盖', '无法覆盖', '冗余代码'}
+
+
+def calc_sidecar_file_key(file_path: str) -> str:
+    """Compute stable SHA-256 hash (32 hex chars) of normalized file path for sidecar indexing."""
+    normalized = str(file_path or "").replace("\\", "/").strip().lstrip("/")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
+
+
+compute_file_path_hash = calc_sidecar_file_key
+
+
+def is_valid_report_id(report_id: str) -> bool:
+    """Validate report_id format (e.g. report_abc123 or alphanumeric with underscore/hyphen)."""
+    if not report_id:
+        return True
+    return bool(re.match(r'^[A-Za-z0-9_-]{1,64}$', str(report_id).strip()))
+
+
+def is_valid_review_scope(scope: str) -> bool:
+    """Validate review_scope is 'full' or 'incremental'."""
+    return scope in ("full", "incremental")
 
 
 def strip_html_text(value: str) -> str:
@@ -35,27 +57,85 @@ def is_control_flow_text(code_text: str) -> bool:
     return CONTROL_FLOW_RE.search(code_text) is not None
 
 
+def extract_function_name_from_signature(sig_text: str) -> str:
+    """
+    Extract function name from C/C++ function signature.
+    Supports:
+    - Standard C functions (int foo(int a))
+    - C++ scoped names (Namespace::Class::func)
+    - Constructors and Destructors (Foo::Foo, Foo::~Foo)
+    - Operators (operator==, operator(), operator new)
+    - Trailing return types (auto func() -> type)
+    - Qualifiers (const, noexcept, override)
+    """
+    sig_text = re.sub(r'/\*.*?\*/', '', sig_text).strip()
+    sig_text = re.sub(r'//.*$', '', sig_text).strip()
+    paren_idx = sig_text.find('(')
+    if paren_idx < 0:
+        return ""
+    prefix = sig_text[:paren_idx].strip()
+    if not prefix:
+        return ""
+
+    # Check for operator overload
+    op_match = re.search(r'\boperator\s*([^\s\(]+|\(\)|\[\])\s*$', prefix)
+    if op_match:
+        return f"operator{op_match.group(1)}"
+
+    # Match identifier or C++ qualified name (e.g., Foo::bar, ~Foo, Foo::Foo, ns::Class::method)
+    match = re.search(r'([~A-Za-z_]\w*(?:\s*::\s*[~A-Za-z_]\w*)*)\s*$', prefix)
+    if match:
+        name = re.sub(r'\s+', '', match.group(1))
+        # Exclude language keywords
+        if name in {
+            'if', 'for', 'while', 'switch', 'catch', 'do', 'return',
+            'sizeof', 'typeof', 'alignas', 'decltype', 'static_assert',
+            'typedef', 'struct', 'class', 'enum', 'union', 'namespace', 'using'
+        }:
+            return ""
+        return name
+    return ""
+
+
 def is_function_entry_text(code_text: str) -> bool:
     code_text = re.sub(r'/\*.*?\*/', '', code_text).strip()
-    code_text = re.sub(r'\s+', ' ', code_text)
+    code_text = re.sub(r'//.*$', '', code_text).strip()
     if not code_text or code_text.endswith(';') or is_control_flow_text(code_text):
         return False
-    if re.match(r'^(return|typedef|struct|enum|union)\b', code_text):
+    if re.match(r'^(typedef|struct|enum|union|using|namespace|return)\b', code_text):
         return False
-    return FUNC_ENTRY_RE.search(code_text) is not None
+    name = extract_function_name_from_signature(code_text)
+    return bool(name)
 
 
-def strip_line_comment(code_text: str) -> str:
-    return re.sub(r'//.*$', '', code_text or '').strip()
+def strip_line_comment(text: str) -> str:
+    in_single = False
+    in_double = False
+    escaped = False
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if escaped:
+            escaped = False
+            i += 1
+            continue
+        if c == '\\':
+            escaped = True
+            i += 1
+            continue
+        if c == "'" and not in_double:
+            in_single = not in_single
+        elif c == '"' and not in_single:
+            in_double = not in_double
+        elif not in_single and not in_double:
+            if c == '/' and i + 1 < len(text) and text[i + 1] == '/':
+                return text[:i].rstrip()
+        i += 1
+    return text
 
 
 def is_jump_text(code_text: str) -> bool:
-    return re.match(r'^(return|goto|break|continue)\b', strip_line_comment(code_text)) is not None
-
-
-def is_structural_text(code_text: str) -> bool:
-    text = strip_line_comment(code_text)
-    return text == '' or re.match(r'^[{}]+;?$', text) is not None
+    return re.search(r'\b(return|goto|break|continue|throw)\b', code_text) is not None
 
 
 def is_simple_auto_group_text(code_text: str) -> bool:
@@ -67,25 +147,13 @@ def is_simple_auto_group_text(code_text: str) -> bool:
         return False
     if not text.endswith(';'):
         return False
-    has_assignment = (
-        re.search(r'(^|[^=!<>])=([^=]|$)', text) is not None
-        or re.search(r'(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=)', text) is not None
-    )
-    is_simple_declaration = (
-        re.match(
-            r'^(?:const\s+|static\s+|volatile\s+|register\s+|unsigned\s+|signed\s+|struct\s+\w+\s+|enum\s+\w+\s+|union\s+\w+\s+|[A-Za-z_]\w*\s+)+[*\s]*[A-Za-z_]\w*(?:\s*=\s*[^;]+)?\s*;$',
-            text,
-        )
-        is not None
-    )
+    has_assignment = re.search(r'(^|[^=!<>])=([^=]|$)', text) is not None or re.search(r'(\+=|-=|\*=|/=|%=|&=|\|=|\^=|<<=|>>=)', text) is not None
+    is_simple_declaration = re.match(r'^(?:const\s+|static\s+|volatile\s+|register\s+|unsigned\s+|signed\s+|struct\s+\w+\s+|enum\s+\w+\s+|union\s+\w+\s+|[A-Za-z_]\w*\s+)+[*\s]*[A-Za-z_]\w*(?:\s*=\s*[^;]+)?\s*;$', text) is not None
     return has_assignment or is_simple_declaration
 
 
 def extract_function_name(code_text: str) -> str:
-    code_text = re.sub(r'/\*.*?\*/', '', code_text).strip()
-    code_text = re.sub(r'\s+', ' ', code_text)
-    match = re.search(r'([A-Za-z_]\w*)\s*\([^;]*\)\s*(\{|$)', code_text)
-    return match.group(1) if match else ""
+    return extract_function_name_from_signature(code_text)
 
 
 def extract_report_file_path(content: str, fallback_path: str = "") -> str:
@@ -267,21 +335,31 @@ class SourceContext:
 
 def extract_c_function_ranges(raw_lines: List[dict]) -> List[FunctionRange]:
     """
-    Extract accurate C/C++ function ranges using token-aware brace depth tracking.
-    Correctly ignores braces in comments, strings, char literals, and macros.
+    Extract accurate C/C++ function ranges using signature accumulation and
+    token-aware brace depth tracking.
+    Correctly handles:
+    - Multi-line parameter lists
+    - C++ scoped names (Namespace::Class::func)
+    - Constructors and destructors (Foo::Foo, Foo::~Foo)
+    - Trailing return types (auto func() -> type)
+    - Const / noexcept / override qualifiers
+    - Braces in comments, strings, char literals, and macros
     """
     functions: List[FunctionRange] = []
     in_block_comment = False
-    current_fn_name = None
-    current_fn_start_line = None
+
+    state = 'SEEKING'  # 'SEEKING', 'IN_SIGNATURE', 'WAITING_FOR_BODY', 'IN_BODY'
+    sig_start_line = None
+    sig_text_buffer = []
+    paren_depth = 0
     brace_depth = 0
-    entered_body = False
+    current_fn_name = ""
 
     for idx, item in enumerate(raw_lines):
         line_no = item["line_no"]
         text = item["code_text"]
 
-        # Clean string, char literals and comments to count real code braces
+        # Clean string, char literals and comments to get structural tokens
         i = 0
         n = len(text)
         line_cleaned = []
@@ -333,50 +411,128 @@ def extract_c_function_ranges(raw_lines: List[dict]) -> List[FunctionRange]:
             i += 1
 
         clean_text = "".join(line_cleaned).strip()
+        is_macro = clean_text.startswith('#')
 
-        if current_fn_start_line is None:
-            if is_function_entry_text(text):
-                fn_name = extract_function_name(text)
+        if state == 'SEEKING':
+            if not clean_text or is_macro:
+                continue
+
+            if '(' in clean_text:
+                first_paren = clean_text.find('(')
+                prefix = clean_text[:first_paren].strip()
+                if (
+                    re.match(r'^(typedef|struct|enum|union|using|namespace|return|goto|break|continue)\b', prefix)
+                    or is_control_flow_text(prefix)
+                ):
+                    continue
+
+                fn_name = extract_function_name_from_signature(clean_text)
+                if not fn_name:
+                    continue
+
+                sig_start_line = line_no
+                sig_text_buffer = [clean_text]
                 current_fn_name = fn_name
-                current_fn_start_line = line_no
+                paren_depth = clean_text.count('(') - clean_text.count(')')
+
+                if paren_depth > 0:
+                    state = 'IN_SIGNATURE'
+                else:
+                    after_paren = clean_text[clean_text.rfind(')'):]
+                    if ';' in after_paren:
+                        state = 'SEEKING'
+                        sig_start_line = None
+                        sig_text_buffer = []
+                        current_fn_name = ""
+                    elif '{' in after_paren:
+                        open_b = clean_text.count('{')
+                        close_b = clean_text.count('}')
+                        brace_depth = open_b - close_b
+                        if brace_depth <= 0:
+                            functions.append(FunctionRange(sig_start_line, line_no, current_fn_name))
+                            state = 'SEEKING'
+                            sig_start_line = None
+                            sig_text_buffer = []
+                            current_fn_name = ""
+                        else:
+                            state = 'IN_BODY'
+                    else:
+                        state = 'WAITING_FOR_BODY'
+
+        elif state == 'IN_SIGNATURE':
+            if is_macro:
+                continue
+            sig_text_buffer.append(clean_text)
+            paren_depth += (clean_text.count('(') - clean_text.count(')'))
+
+            if paren_depth <= 0:
+                full_sig = " ".join(sig_text_buffer)
+                if not current_fn_name:
+                    current_fn_name = extract_function_name_from_signature(full_sig)
+
+                after_paren = clean_text[clean_text.rfind(')'):] if ')' in clean_text else clean_text
+                if ';' in after_paren:
+                    state = 'SEEKING'
+                    sig_start_line = None
+                    sig_text_buffer = []
+                    current_fn_name = ""
+                elif '{' in after_paren:
+                    open_b = clean_text.count('{')
+                    close_b = clean_text.count('}')
+                    brace_depth = open_b - close_b
+                    if brace_depth <= 0:
+                        functions.append(FunctionRange(sig_start_line, line_no, current_fn_name))
+                        state = 'SEEKING'
+                        sig_start_line = None
+                        sig_text_buffer = []
+                        current_fn_name = ""
+                    else:
+                        state = 'IN_BODY'
+                else:
+                    state = 'WAITING_FOR_BODY'
+
+        elif state == 'WAITING_FOR_BODY':
+            if not clean_text or is_macro:
+                continue
+            if ';' in clean_text and '{' not in clean_text:
+                state = 'SEEKING'
+                sig_start_line = None
+                sig_text_buffer = []
+                current_fn_name = ""
+            elif '{' in clean_text:
                 open_b = clean_text.count('{')
                 close_b = clean_text.count('}')
                 brace_depth = open_b - close_b
-                entered_body = (open_b > 0)
-                if entered_body and brace_depth <= 0:
-                    # Single-line function
-                    functions.append(FunctionRange(current_fn_start_line, line_no, current_fn_name))
-                    current_fn_name = None
-                    current_fn_start_line = None
-                    brace_depth = 0
-                    entered_body = False
-        else:
+                if brace_depth <= 0:
+                    functions.append(FunctionRange(sig_start_line, line_no, current_fn_name))
+                    state = 'SEEKING'
+                    sig_start_line = None
+                    sig_text_buffer = []
+                    current_fn_name = ""
+                else:
+                    state = 'IN_BODY'
+            else:
+                if line_no - sig_start_line > 30:
+                    state = 'SEEKING'
+                    sig_start_line = None
+                    sig_text_buffer = []
+                    current_fn_name = ""
+
+        elif state == 'IN_BODY':
             open_b = clean_text.count('{')
             close_b = clean_text.count('}')
-            if not entered_body:
-                if open_b > 0:
-                    entered_body = True
-                    brace_depth = open_b - close_b
-                elif is_function_entry_text(text) and not clean_text.startswith('('):
-                    # Previous function signature had no body
-                    fn_name = extract_function_name(text)
-                    functions.append(FunctionRange(current_fn_start_line, raw_lines[idx - 1]["line_no"], current_fn_name))
-                    current_fn_name = fn_name
-                    current_fn_start_line = line_no
-                    brace_depth = open_b - close_b
-                    entered_body = (open_b > 0)
-            else:
-                brace_depth += (open_b - close_b)
+            brace_depth += (open_b - close_b)
 
-            if entered_body and brace_depth <= 0:
-                functions.append(FunctionRange(current_fn_start_line, line_no, current_fn_name))
-                current_fn_name = None
-                current_fn_start_line = None
+            if brace_depth <= 0:
+                functions.append(FunctionRange(sig_start_line, line_no, current_fn_name))
+                state = 'SEEKING'
+                sig_start_line = None
+                sig_text_buffer = []
+                current_fn_name = ""
                 brace_depth = 0
-                entered_body = False
 
-    if current_fn_start_line is not None and raw_lines:
-        functions.append(FunctionRange(current_fn_start_line, raw_lines[-1]["line_no"], current_fn_name))
+    if state == 'IN_BODY' and sig_start_line is not None and raw_lines:
+        functions.append(FunctionRange(sig_start_line, raw_lines[-1]["line_no"], current_fn_name))
 
     return functions
 
@@ -457,17 +613,22 @@ def parse_source_lines_from_gcov_html(
                 "is_incremental": is_inc,
             })
     else:
-        # Fallback: line-by-line raw text parsing
-        plain_lines = content.splitlines()
-        for idx, pl in enumerate(plain_lines, start=1):
-            raw_lines.append({
-                "line_no": idx,
-                "code_text": pl.strip(),
-                "raw_html": pl,
-                "coverage_state": "ignored",
-                "is_uncovered": False,
-                "is_incremental": False,
-            })
+        # Check if this is stripped HTML or empty page
+        if '<pre class="source"></pre>' in content or '<pre class="source"/>' in content or '<meta name="coverage-render-mode"' in content:
+            if report_id:
+                raise ValueError(f"Cannot parse source lines from stripped HTML report for report_id='{report_id}'")
+        elif not report_id:
+            # Fallback only for non-lazy plain text files
+            plain_lines = content.splitlines()
+            for idx, pl in enumerate(plain_lines, start=1):
+                raw_lines.append({
+                    "line_no": idx,
+                    "code_text": pl.strip(),
+                    "raw_html": pl,
+                    "coverage_state": "ignored",
+                    "is_uncovered": False,
+                    "is_incremental": False,
+                })
 
     # Ensure continuous 1..N
     raw_lines.sort(key=lambda item: item["line_no"])
@@ -637,19 +798,34 @@ def read_source_lines(
     return [dto.to_dict() for dto in sliced_dtos]
 
 
+MAX_BATCH_TOTAL_LINES = 50000
+
+
 def read_source_ranges(
     source_context: SourceContext,
     ranges: List[Dict[str, int]],
     max_ranges: int = 1000,
+    max_total_lines: int = MAX_BATCH_TOTAL_LINES,
 ) -> List[Dict[str, Any]]:
     """
     Read line DTOs for multiple ranges in a single batch.
-    Returns: [{'start_line': s, 'end_line': e, 'lines': [SourceLineDTO.to_dict(), ...]}, ...]
+    Validates range boundaries and total line count limits.
     """
     if not ranges:
         return []
     if len(ranges) > max_ranges:
         raise ValueError(f"Requested ranges count {len(ranges)} exceeds maximum allowed {max_ranges}")
+
+    total_requested_lines = 0
+    for r in ranges:
+        s_line = int(r.get("start_line", 0))
+        e_line = int(r.get("end_line", 0))
+        if s_line <= 0 or e_line <= 0 or s_line > e_line:
+            raise ValueError(f"Invalid range: [{s_line}..{e_line}]")
+        total_requested_lines += (e_line - s_line + 1)
+
+    if total_requested_lines > max_total_lines:
+        raise ValueError(f"Total requested lines ({total_requested_lines}) exceeds maximum batch limit ({max_total_lines})")
 
     results = []
     for r in ranges:
@@ -670,12 +846,18 @@ def save_source_sidecar(
     file_path_hash: str,
     source_context: SourceContext,
 ) -> str:
-    """Serialize SourceContext to a server-side sidecar file in .source_cache directory."""
+    """Serialize SourceContext to a server-side sidecar file in .source_cache directory with atomic replace."""
+    if not output_dir or not report_id or not file_path_hash:
+        raise ValueError("output_dir, report_id, and file_path_hash are required to save sidecar")
     cache_dir = os.path.join(output_dir, ".source_cache", report_id)
     os.makedirs(cache_dir, exist_ok=True)
     sidecar_path = os.path.join(cache_dir, f"{file_path_hash}.source.json")
-    with open(sidecar_path, "w", encoding="utf-8") as f:
+    tmp_path = f"{sidecar_path}.tmp.{os.getpid()}_{time.time()}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(source_context.to_dict(), f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, sidecar_path)
     return sidecar_path
 
 
