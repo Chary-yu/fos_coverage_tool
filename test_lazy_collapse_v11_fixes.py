@@ -63,8 +63,16 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.mkdtemp()
+        self.reg_dir = os.path.join(self.temp_dir, "test_registry")
+        os.makedirs(self.reg_dir, exist_ok=True)
+        self.old_reg_env = os.environ.get("COVERAGE_REGISTRY_DIR")
+        os.environ["COVERAGE_REGISTRY_DIR"] = self.reg_dir
 
     def tearDown(self):
+        if self.old_reg_env is not None:
+            os.environ["COVERAGE_REGISTRY_DIR"] = self.old_reg_env
+        else:
+            os.environ.pop("COVERAGE_REGISTRY_DIR", None)
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_1_accurate_c_function_boundaries_with_braces_in_comments_and_strings(self):
@@ -1053,11 +1061,16 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
         if not os.path.isfile(smoke_script):
             self.skipTest("test_lazy_collapse_browser_smoke.js not found")
         
+        node_bin = shutil.which("node")
+        if not node_bin:
+            self.skipTest("Node.js not installed in current environment")
+
         proc = subprocess.run(
-            ["node", smoke_script],
-            capture_output=True,
-            text=True,
-            timeout=30
+            [node_bin, smoke_script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+            timeout=30,
         )
         self.assertEqual(proc.returncode, 0, f"Node browser smoke tests failed:\n{proc.stdout}\n{proc.stderr}")
 

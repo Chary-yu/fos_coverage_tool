@@ -90,12 +90,12 @@ def _compute_asset_version() -> str:
             except Exception:
                 pass
     asset_hash = hasher.hexdigest()[:8]
-    return f"lazy-collapse-20260819_v11_6_{asset_hash}"
+    return f"lazy-collapse-20260819_v11_7_{asset_hash}"
 
 
 ASSET_VERSION = _compute_asset_version()
 ASSET_RELEASE_TIME = "2026-08-19"
-VERSION_DISPLAY_LABEL = "v11.6 2026-08-19"
+VERSION_DISPLAY_LABEL = "v11.7 2026-08-19"
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 VALID_SOURCE_EXTENSIONS = ('.c', '.h', '.cc', '.cpp', '.cxx', '.hh', '.hpp', '.hxx', '.inl')
 
@@ -145,16 +145,25 @@ def prune_stale_report_registry(registry_dir: Optional[str] = None):
                         dirs = [dirs]
                     valid_dirs = []
                     for x in dirs:
-                        if not x or not os.path.exists(x):
+                        if not x or not os.path.isdir(x):
                             continue
                         sidecar_dir = os.path.join(x, ".source_cache", report_id)
-                        # Keep directory if sidecar cache exists for this report_id, or if non-lazy-collapse directory exists
-                        if os.path.isdir(sidecar_dir) or not os.path.isdir(os.path.join(x, ".source_cache")):
+                        if os.path.isdir(os.path.join(x, ".source_cache")):
+                            if os.path.isdir(sidecar_dir):
+                                valid_dirs.append(x)
+                        else:
                             valid_dirs.append(x)
                     if not valid_dirs:
                         try:
                             os.remove(fpath)
                         except OSError:
+                            pass
+                    elif len(valid_dirs) != len(dirs):
+                        try:
+                            data["directories"] = valid_dirs
+                            with open(fpath, "w", encoding="utf-8") as f:
+                                json.dump(data, f, indent=2)
+                        except Exception:
                             pass
                 except Exception:
                     pass

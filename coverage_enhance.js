@@ -18,7 +18,7 @@
         }
     }
 
-    const ENHANCE_VERSION = 'lazy-collapse-20260819_v11_6';
+    const ENHANCE_VERSION = 'lazy-collapse-20260819_v11_7';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = getMetaContent('coverage-project') || 'Gemini-NOS';
     const DEFAULT_REPORT_ID = getMetaContent('coverage-report-id') || '';

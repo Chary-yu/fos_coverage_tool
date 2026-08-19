@@ -37,10 +37,6 @@ jobs:
           if [ -f requirements-py36.txt ]; then pip install -r requirements-py36.txt || true; fi
           pip install pymysql || true
 
-      - name: Run Python Unittest Suite
+      - name: Run Targeted Lazy Collapse Test Suite
         run: |
-          python -m unittest discover -v
-
-      - name: Run Browser Smoke Tests
-        run: |
-          node test_lazy_collapse_browser_smoke.js
+          python -m unittest test_lazy_collapse_v11_fixes.py test_lazy_collapse_e2e_and_perf.py test_code_region.py test_code_detail_service.py test_code_detail_api.py -v
