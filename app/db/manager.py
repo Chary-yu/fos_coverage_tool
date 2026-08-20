@@ -3,7 +3,7 @@
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
-from app.db.connection_pool import get_global_pool
+from app.db.connection_pool import get_global_pool, release_global_pool
 
 
 class DatabaseManager:
@@ -18,6 +18,7 @@ class DatabaseManager:
         self.config = dict(cfg)
         pool_config = dict(self.config)
         pool_config.update((self.config.get("pool") or {}))
+        self._owns_pool = pool is not None
         self.pool = pool or get_global_pool(pool_config)
         if self.pool is None:
             raise RuntimeError("database pool is not configured")
@@ -28,7 +29,10 @@ class DatabaseManager:
             yield conn
 
     def close(self):
-        self.pool.close_all()
+        if self._owns_pool:
+            self.pool.close_all()
+        else:
+            release_global_pool(self.pool)
 
     def health(self):
         return self.pool.metrics()

@@ -32,6 +32,17 @@ class ExportService(object):
         os.makedirs(self.output_root, exist_ok=True)
         return candidate
 
+    def download_path(self, result_path, job_id=""):
+        """Validate a completed export path before handing it to HTTP transport."""
+        candidate = os.path.realpath(str(result_path or ""))
+        try:
+            inside = os.path.commonpath((self.output_root, candidate)) == self.output_root
+        except ValueError:
+            inside = False
+        if not inside or not os.path.isfile(candidate) or candidate.endswith(".part"):
+            raise FileNotFoundError("export artifact is unavailable")
+        return candidate
+
     def export_scan(self, connection, project_name, scan_id, report_id="", output_path=None):
         project = self.projects.get_project_by_name(connection, project_name)
         if not project:

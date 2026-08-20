@@ -22,13 +22,14 @@
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = getMetaContent('coverage-project') || 'Gemini-NOS';
     const DEFAULT_REPORT_ID = getMetaContent('coverage-report-id') || '';
+    const DEFAULT_SCAN_ID = getMetaContent('coverage-scan-id') || '';
+    const DEFAULT_REPOSITORY_NAME = getMetaContent('coverage-repository-name') || '';
     const RENDER_MODE = getMetaContent('coverage-render-mode') || 'lazy_collapse'; // 'lazy_collapse', 'lazy', 'immediate'
     const REVIEW_SCOPE = getMetaContent('coverage-review-scope') || 'full'; // 'full' or 'incremental'
     const ENHANCE_SCRIPT_URL = document.currentScript && document.currentScript.src
         ? document.currentScript.src
         : '';
     const URL_PARAMS = new URLSearchParams(window.location.search);
-    const EXPLICIT_API_URL = URL_PARAMS.get('api');
     const QUERY_MODE = URL_PARAMS.get('mode');
     const ACTIVE_MODE = (QUERY_MODE === 'lazy_collapse' || QUERY_MODE === 'lazy' || QUERY_MODE === 'immediate')
         ? QUERY_MODE
@@ -56,6 +57,8 @@
 
     let resolvedServerUrl = '';
     let currentReportId = DEFAULT_REPORT_ID || '';
+    let currentScanId = DEFAULT_SCAN_ID || '';
+    let currentRepositoryName = DEFAULT_REPOSITORY_NAME || '';
     let currentFilePath = '';
     let dirtyPanelStartLines = new Set();
     let panelsMap = new Map(); // startLine -> panelState
@@ -152,10 +155,6 @@
                 reasonInput: null, saveBtn: null, previousBtn: null,
                 nextBtn: null, block: {
                     startLine: startLineNum, endLine: endLineNum,
-                    lineNums: Array.from(
-                        { length: Math.max(1, endLineNum - startLineNum + 1) },
-                        (_, i) => startLineNum + i
-                    ),
                     length: Math.max(1, endLineNum - startLineNum + 1)
                 },
                 lineNum: startLineNum,
@@ -168,11 +167,7 @@
         } else {
             panelState.block.startLine = startLineNum;
             panelState.block.endLine = endLineNum;
-            panelState.block.lineNums = Array.from(
-                { length: Math.max(1, endLineNum - startLineNum + 1) },
-                (_, i) => startLineNum + i
-            );
-            panelState.block.length = panelState.block.lineNums.length;
+            panelState.block.length = Math.max(1, endLineNum - startLineNum + 1);
         }
         return panelState;
     }
@@ -229,6 +224,35 @@
 
     function apiBaseCandidates() {
         return uniqueApiBases([SERVER_URL]);
+    }
+
+    function codeDetailIdentity(filePath) {
+        const identity = {
+            scan_id: currentScanId,
+            report_id: currentReportId,
+            repository_name: currentRepositoryName,
+            file_path: filePath || currentFilePath
+        };
+        if (!identity.scan_id || !identity.report_id || !identity.file_path) {
+            throw new Error('Code Detail requires scan_id, report_id and file_path');
+        }
+        return identity;
+    }
+
+    function codeDetailQuery(filePath, startLine, endLine) {
+        const identity = codeDetailIdentity(filePath);
+        const query = new URLSearchParams(identity);
+        if (startLine !== undefined) query.set('start_line', String(startLine));
+        if (endLine !== undefined) query.set('end_line', String(endLine));
+        query.set('scope', REVIEW_SCOPE);
+        return query;
+    }
+
+    function responseLines(payload) {
+        if (!payload) return [];
+        if (Array.isArray(payload.lines)) return payload.lines;
+        if (payload.data && Array.isArray(payload.data.lines)) return payload.data.lines;
+        return [];
     }
     async function requestCoverageApi(pathSuffix, options) {
         const attempted = [];
@@ -481,7 +505,10 @@
     async function saveReviewBlocksBatch(filePath, payloadBlocks, actionType = 'confirm') {
         const isDraft = actionType === 'draft';
         const records = payloadBlocks.map(b => ({
-            line_numbers: b.line_numbers,
+            line_start: b.line_start,
+            line_end: b.line_end,
+            file_path: filePath,
+            repository_name: currentRepositoryName,
             reviewer: b.reviewer || '',
             status: b.status || '未确认',
             coverage_method: b.coverage_method || '',
@@ -489,19 +516,21 @@
             is_draft: isDraft
         }));
 
-        const result = await requestCoverageApi('/batch', {
+        const result = await requestCoverageApi('/analysis', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 project_name: DEFAULT_PROJECT,
+                scan_id: currentScanId,
+                repository_name: currentRepositoryName,
                 file_path: filePath,
-                records: records
+                records
             })
         });
 
         // Update ReviewDraftStore and clear dirty
         payloadBlocks.forEach(b => {
-            const sLine = b.line_numbers[0];
+            const sLine = b.line_start;
             ReviewDraftStore.setDraft(sLine, {
                 reviewer: b.reviewer,
                 status: b.status,
@@ -551,9 +580,11 @@
                 }
             }
 
-            const blockLineNums = panel.block ? panel.block.lineNums : [lineNum];
+            const blockStart = panel.block ? panel.block.startLine : lineNum;
+            const blockEnd = panel.block ? panel.block.endLine : lineNum;
             payloadBlocks.push({
-                line_numbers: blockLineNums,
+                line_start: blockStart,
+                line_end: blockEnd,
                 reviewer: reviewerVal,
                 status: statusVal,
                 coverage_method: methodVal,
@@ -656,9 +687,11 @@
             if (currentReportId) {
                 progressUrl.searchParams.set('report_id', currentReportId);
             }
-            const apiUrl = resolvedServerUrl || EXPLICIT_API_URL;
-            if (apiUrl) {
-                progressUrl.searchParams.set('api', apiUrl);
+            if (currentScanId) {
+                progressUrl.searchParams.set('scan_id', currentScanId);
+            }
+            if (currentRepositoryName) {
+                progressUrl.searchParams.set('repository_name', currentRepositoryName);
             }
             progressLink.href = progressUrl.toString();
         }
@@ -778,7 +811,7 @@
                 const isDraft = panel.values && panel.values.isDraft === true;
                 const origSaved = panel.values && panel.values._origSavedConfirmed;
                 const nowConfirmed = !isDraft && CONFIRMED_STATUS_SET.has(status);
-                const bLen = panel.block ? (panel.block.length || (panel.block.lineNums ? panel.block.lineNums.length : 1)) : 1;
+                const bLen = panel.block ? (panel.block.length || 1) : 1;
 
                 if (nowConfirmed && !origSaved) {
                     confirmedCount += bLen;
@@ -792,7 +825,7 @@
                 const status = panel.select ? panel.select.value : (panel.values && panel.values.status);
                 const isDraft = panel.values && panel.values.isDraft === true;
                 if (!isDraft && CONFIRMED_STATUS_SET.has(status)) {
-                    const bLen = panel.block ? (panel.block.length || (panel.block.lineNums ? panel.block.lineNums.length : 1)) : 1;
+                    const bLen = panel.block ? (panel.block.length || 1) : 1;
                     confirmedCount += bLen;
                 }
             });
@@ -948,6 +981,7 @@
                     loaded: false,
                     loading: false,
                     lines: [],
+                    loadedLineCount: 0,
                     error: null,
                     domContainer: null,
                     placeholderEl: null,
@@ -960,7 +994,9 @@
                     virtualBottomSpacer: null,
                     virtualStart: 0,
                     virtualEnd: 0,
-                    virtualRenderPending: false
+                    virtualRenderPending: false,
+                    virtualLineHeight: VIRTUAL_LINE_HEIGHT,
+                    virtualRequest: null
                 };
                 this._regions.set(r.region_id, regState);
             });
@@ -993,6 +1029,7 @@
                 r.loaded = true;
                 r.loading = false;
                 r.lines = lines;
+                r.loadedLineCount = (lines || []).length;
                 r.error = null;
                 r.currentState = 'expanded-loaded';
                 (lines || []).forEach(registerReviewPanelMetadata);
@@ -1000,6 +1037,34 @@
                     RegionLineLRUCache.touch(regionId, (lines || []).length);
                     RegionLineLRUCache.evictIfOverBudget();
                 }
+            }
+        },
+
+        mergeLoadedLines(regionId, lines, startLine, totalLines) {
+            const r = this._regions.get(regionId);
+            if (!r) return;
+            if (!Array.isArray(r.lines) || r.lines.length !== Number(totalLines || r.lineCount)) {
+                r.lines = new Array(Number(totalLines || r.lineCount));
+            }
+            (lines || []).forEach(line => {
+                const index = Number(line.line_no) - Number(r.startLine);
+                if (index < 0 || index >= r.lines.length || !r.lines[index]) {
+                    if (index >= 0 && index < r.lines.length) r.lines[index] = line;
+                    return;
+                }
+                r.lines[index] = line;
+            });
+            r.loadedLineCount = r.lines.reduce(
+                (count, item) => count + (item ? 1 : 0), 0
+            );
+            r.loaded = true;
+            r.loading = false;
+            r.error = null;
+            r.currentState = 'expanded-loaded';
+            (lines || []).forEach(registerReviewPanelMetadata);
+            if (typeof RegionLineLRUCache !== 'undefined' && RegionLineLRUCache.touch) {
+                RegionLineLRUCache.touch(regionId);
+                RegionLineLRUCache.evictIfOverBudget();
             }
         },
 
@@ -1052,8 +1117,8 @@
             let totalLines = 0;
             const loadedCollapsed = [];
             regions.forEach(r => {
-                if (r.loaded && r.lines && r.lines.length) {
-                    totalLines += r.lines.length;
+                if (r.loaded && r.lines && r.loadedLineCount) {
+                    totalLines += r.loadedLineCount;
                     if (r.currentState === "collapsed-loaded" || r.currentState === "collapsed-unloaded") {
                         loadedCollapsed.push(r);
                     }
@@ -1063,7 +1128,7 @@
                 loadedCollapsed.sort((a, b) => (this._accessMap.get(a.id) || 0) - (this._accessMap.get(b.id) || 0));
                 for (const r of loadedCollapsed) {
                     if (totalLines <= this.MAX_CACHED_LINES) break;
-                    totalLines -= (r.lines ? r.lines.length : 0);
+                    totalLines -= (r.loadedLineCount || 0);
                     r.loaded = false;
                     r.lines = [];
                     r.currentState = "collapsed-unloaded";
@@ -1085,24 +1150,34 @@
 
             expandedRegions.forEach(r => CodeRegionStore.setLoading(r.id, '正在加载…'));
 
+            const batchRegions = expandedRegions.filter(
+                region => Number(region.lineCount || 0) <= 10000
+            );
+            if (!batchRegions.length) return expandedRegions;
+
             const data = await requestCoverageApi('/code-lines/batch', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
-                    project_name: DEFAULT_PROJECT,
+                    scan_id: currentScanId,
                     file_path: filePath,
+                    repository_name: currentRepositoryName,
                     report_id: currentReportId,
-                    scope: REVIEW_SCOPE,
-                    load_default_expanded: true
+                    ranges: batchRegions.map(region => ({
+                        start_line: region.startLine, end_line: region.endLine
+                    }))
                 })
             });
 
-            if (data && data.data && data.data.ranges) {
+            if (data && Array.isArray(data.batches)) {
                 const rangeMap = new Map();
-                data.data.ranges.forEach(r => {
-                    rangeMap.set(`${r.start_line}-${r.end_line}`, r.lines || []);
+                data.batches.forEach((r, index) => {
+                    const fallback = batchRegions[index];
+                    const start = r.start_line !== undefined ? r.start_line : fallback.startLine;
+                    const end = r.end_line !== undefined ? r.end_line : fallback.endLine;
+                    rangeMap.set(`${start}-${end}`, responseLines(r));
                 });
-                expandedRegions.forEach(reg => {
+                batchRegions.forEach(reg => {
                     const key = `${reg.startLine}-${reg.endLine}`;
                     if (rangeMap.has(key)) {
                         CodeRegionStore.setLoaded(reg.id, rangeMap.get(key));
@@ -1111,13 +1186,76 @@
                     }
                 });
             } else {
-                expandedRegions.forEach(reg => {
+                batchRegions.forEach(reg => {
                     if (!reg.loaded) {
                         CodeRegionStore.setCollapsed(reg.id);
                     }
                 });
             }
             return expandedRegions;
+        },
+
+        async fetchVirtualRange(filePath, region, startIndex, endIndex) {
+            const startLine = Number(region.startLine) + Number(startIndex);
+            const endLine = Math.min(
+                Number(region.endLine), Number(region.startLine) + Number(endIndex) - 1
+            );
+            if (endLine < startLine) return [];
+            const query = codeDetailQuery(filePath, startLine, endLine);
+            const data = await requestCoverageApi(`/code-lines?${query.toString()}`, { method: 'GET' });
+            const lines = responseLines(data);
+            PerformanceTelemetry.networkChunks += 1;
+            PerformanceTelemetry.networkLines += lines.length;
+            CodeRegionStore.mergeLoadedLines(region.id, lines, startLine, region.lineCount);
+            return lines;
+        },
+
+        async ensureVirtualWindow(filePath, region, startIndex, endIndex) {
+            if (!region || !region.virtualized) return;
+            const start = Math.max(0, Math.floor(startIndex));
+            const end = Math.min(Number(region.lineCount), Math.ceil(endIndex));
+            let missingStart = -1;
+            const missing = [];
+            for (let index = start; index < end; index += 1) {
+                if (!region.lines[index]) {
+                    if (missingStart < 0) missingStart = index;
+                } else if (missingStart >= 0) {
+                    missing.push([missingStart, index]);
+                    missingStart = -1;
+                }
+            }
+            if (missingStart >= 0) missing.push([missingStart, end]);
+            if (!missing.length) return;
+            const requests = [];
+            missing.forEach(([from, to]) => {
+                for (let cursor = from; cursor < to; cursor += NETWORK_CHUNK_LINES) {
+                    requests.push([cursor, Math.min(to, cursor + NETWORK_CHUNK_LINES)]);
+                }
+            });
+            const key = `${region.id}:${requests.map(item => item.join('-')).join(',')}`;
+            if (this._inflightPromises.has(key)) {
+                return this._inflightPromises.get(key);
+            }
+            const promise = (async () => {
+                let next = 0;
+                const worker = async () => {
+                    while (next < requests.length) {
+                        const index = next++;
+                        await this.fetchVirtualRange(
+                            filePath, region, requests[index][0], requests[index][1]
+                        );
+                    }
+                };
+                await Promise.all(Array.from(
+                    { length: Math.min(MAX_CHUNK_CONCURRENCY, requests.length) }, worker
+                ));
+            })();
+            this._inflightPromises.set(key, promise);
+            try {
+                return await promise;
+            } finally {
+                this._inflightPromises.delete(key);
+            }
         },
 
         async loadRegion(filePath, region, onChunkProgress) {
@@ -1133,6 +1271,17 @@
                 CodeRegionStore.setLoading(region.id, '正在加载…');
                 const generation = region.loadGeneration || 0;
                 const totalLinesToLoad = region.endLine - region.startLine + 1;
+
+                if (region.virtualized) {
+                    const bounds = CodeRegionController.virtualWindowBounds(region);
+                    await this.ensureVirtualWindow(
+                        filePath, region, bounds.start, bounds.end
+                    );
+                    if (region.loadGeneration === generation) {
+                        CodeRegionStore.setExpanded(region.id);
+                    }
+                    return region.lines;
+                }
 
                 if (totalLinesToLoad > NETWORK_CHUNK_LINES) {
                     // Item 2 & 3: Bounded Concurrency Chunk Streaming
@@ -1155,17 +1304,10 @@
                             if (region.loadGeneration !== generation) return;
                             const task = chunks[nextTaskIdx++];
                             try {
-                                const query = new URLSearchParams({
-                                    project: DEFAULT_PROJECT,
-                                    file: filePath,
-                                    start_line: task.start,
-                                    end_line: task.end,
-                                    scope: REVIEW_SCOPE
-                                });
-                                if (currentReportId) query.set('report_id', currentReportId);
+                                const query = codeDetailQuery(filePath, task.start, task.end);
                                 const chunkData = await requestCoverageApi(`/code-lines?${query.toString()}`, { method: 'GET' });
                                 if (region.loadGeneration !== generation) return;
-                                const chunkLines = chunkData && chunkData.data && chunkData.data.lines ? chunkData.data.lines : [];
+                                const chunkLines = responseLines(chunkData);
                                 PerformanceTelemetry.networkChunks += 1;
                                 PerformanceTelemetry.networkLines += chunkLines.length;
                                 chunkResults.set(task.index, { task, chunkLines });
@@ -1209,20 +1351,13 @@
                     }
                     return allLines;
                 } else {
-                    const query = new URLSearchParams({
-                        project: DEFAULT_PROJECT,
-                        file: filePath,
-                        start_line: region.startLine,
-                        end_line: region.endLine,
-                        scope: REVIEW_SCOPE
-                    });
-                    if (currentReportId) query.set('report_id', currentReportId);
+                    const query = codeDetailQuery(filePath, region.startLine, region.endLine);
 
                     const data = await requestCoverageApi(`/code-lines?${query.toString()}`, { method: 'GET' });
                     if (region.loadGeneration !== generation) {
                         return [];
                     }
-                    const lines = data && data.data && data.data.lines ? data.data.lines : [];
+                    const lines = responseLines(data);
                     CodeRegionStore.setLoaded(region.id, lines);
                     return lines;
                 }
@@ -1333,7 +1468,10 @@
             panel.style.left = `${targetCol}ch`;
 
             if (isMultiLine) {
-                panel.style.height = `${blockLength * 24 - 4}px`;
+                // The controls are variable-height (textarea resizing,
+                // localized fonts). Keep a minimum footprint and let the
+                // virtual row measurement account for the actual panel.
+                panel.style.minHeight = `${Math.max(20, blockLength * VIRTUAL_LINE_HEIGHT - 4)}px`;
             }
 
             // Status select
@@ -1446,7 +1584,6 @@
             const blockObj = {
                 startLine: startLineNum,
                 endLine: endLineNum,
-                lineNums: Array.from({ length: blockLength }, (_, i) => startLineNum + i),
                 length: blockLength
             };
 
@@ -1553,7 +1690,8 @@
 
         virtualWindowBounds(region, forcedStart) {
             const total = Math.max(Number(region.lineCount) || 0, (region.lines || []).length);
-            const visibleRows = Math.max(1, Math.ceil((Number(window.innerHeight) || 800) / VIRTUAL_LINE_HEIGHT));
+            const lineHeight = Math.max(16, Number(region.virtualLineHeight) || VIRTUAL_LINE_HEIGHT);
+            const visibleRows = Math.max(1, Math.ceil((Number(window.innerHeight) || 800) / lineHeight));
             if (Number.isFinite(forcedStart)) {
                 const centered = Math.floor(visibleRows / 2);
                 const start = Math.max(0, Math.min(total, Math.floor(forcedStart) - centered - VIRTUAL_OVERSCAN_LINES));
@@ -1568,7 +1706,9 @@
                 const scrollTop = Number(window.pageYOffset || window.scrollY || 0);
                 viewportStart = Math.max(0, scrollTop - (Number(rect.top) + scrollTop));
             }
-            const firstVisible = Math.floor(viewportStart / VIRTUAL_LINE_HEIGHT);
+            // Use the measured average height after review controls have been
+            // rendered. This prevents fixed-24px drift in large regions.
+            const firstVisible = Math.floor(viewportStart / lineHeight);
             const start = Math.max(0, firstVisible - VIRTUAL_OVERSCAN_LINES);
             return {
                 start,
@@ -1591,8 +1731,17 @@
             region.virtualContent.appendChild(fragment);
             region.virtualStart = bounds.start;
             region.virtualEnd = availableEnd;
-            region.virtualTopSpacer.style.height = `${bounds.start * VIRTUAL_LINE_HEIGHT}px`;
-            region.virtualBottomSpacer.style.height = `${Math.max(0, (Math.max(region.lineCount, region.lines.length) - availableEnd) * VIRTUAL_LINE_HEIGHT)}px`;
+            const visibleCount = Math.max(1, availableEnd - bounds.start);
+            const measuredHeight = Number(region.virtualContent.getBoundingClientRect
+                ? region.virtualContent.getBoundingClientRect().height : 0);
+            if (measuredHeight > 0) {
+                region.virtualLineHeight = Math.max(
+                    16, Math.min(160, measuredHeight / visibleCount)
+                );
+            }
+            const lineHeight = Math.max(16, Number(region.virtualLineHeight) || VIRTUAL_LINE_HEIGHT);
+            region.virtualTopSpacer.style.height = `${bounds.start * lineHeight}px`;
+            region.virtualBottomSpacer.style.height = `${Math.max(0, (Math.max(region.lineCount, region.lines.length) - availableEnd) * lineHeight)}px`;
             PerformanceTelemetry.virtualRenders += 1;
             PerformanceTelemetry.recordDomLineCount(region.virtualContent.children.length, true);
         },
@@ -1600,9 +1749,18 @@
         scheduleVirtualRender(region, forcedStart) {
             if (!region || !region.virtualized || region.virtualRenderPending) return;
             region.virtualRenderPending = true;
-            const render = () => {
+            const render = async () => {
                 region.virtualRenderPending = false;
-                this.renderVirtualWindow(region, forcedStart);
+                const bounds = this.virtualWindowBounds(region, forcedStart);
+                try {
+                    await CodeRegionLoader.ensureVirtualWindow(
+                        this.filePath, region, bounds.start, bounds.end
+                    );
+                    this.renderVirtualWindow(region, bounds.start);
+                } catch (error) {
+                    CodeRegionStore.setError(region.id, error.message || String(error));
+                    this.updatePlaceholderState(region);
+                }
             };
             if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
                 window.requestAnimationFrame(render);
@@ -1726,7 +1884,8 @@
                 panel.saveBtn.className = 'coverage-analysis-btn saving';
             }
             return saveReviewBlocksBatch(this.filePath, [{
-                line_numbers: panel.block.lineNums,
+                line_start: panel.block.startLine,
+                line_end: panel.block.endLine,
                 reviewer: reviewerVal,
                 status: statusVal,
                 coverage_method: methodVal,
@@ -1811,6 +1970,11 @@
             const layoutStart = typeof performance !== 'undefined' && performance.now
                 ? performance.now() : 0;
             this.filePath = layoutData.file_path || '';
+            if (layoutData.scan_id) currentScanId = String(layoutData.scan_id);
+            if (layoutData.report_id) currentReportId = String(layoutData.report_id);
+            if (layoutData.repository_name !== undefined) {
+                currentRepositoryName = String(layoutData.repository_name || '');
+            }
             this.container = preSource;
             this.installPanelDelegation(preSource);
             this.installVirtualScrollListener();
@@ -1853,7 +2017,7 @@
                         if (reg.loaded && reg.currentState === 'expanded-loaded') {
                             await this.renderRegionLines(reg);
                         } else {
-                            this.collapseRegion(reg.id, true);
+                            await this.expandRegion(reg);
                         }
                     }
                 } catch (err) {
@@ -2309,6 +2473,16 @@
             || URL_PARAMS.get('report')
             || DEFAULT_REPORT_ID
             || '';
+        const metaScanId = document.querySelector('meta[name="coverage-scan-id"]');
+        const metaRepositoryName = document.querySelector('meta[name="coverage-repository-name"]');
+        currentScanId = (metaScanId && metaScanId.content)
+            || URL_PARAMS.get('scan_id')
+            || DEFAULT_SCAN_ID
+            || '';
+        currentRepositoryName = (metaRepositoryName && metaRepositoryName.content)
+            || URL_PARAMS.get('repository_name')
+            || DEFAULT_REPOSITORY_NAME
+            || '';
 
         let filePath = (metaFilePath && metaFilePath.content) || '';
 
@@ -2336,6 +2510,8 @@
 
         console.log('[CoverageEnhance] Current file path:', filePath);
         console.log('[CoverageEnhance] Report ID:', currentReportId);
+        console.log('[CoverageEnhance] Scan ID:', currentScanId);
+        console.log('[CoverageEnhance] Repository:', currentRepositoryName);
         console.log('[CoverageEnhance] Active mode:', ACTIVE_MODE);
         console.log('[CoverageEnhance] Version:', ENHANCE_VERSION);
 
@@ -2359,33 +2535,34 @@
         // Branch by ACTIVE_MODE
         if (ACTIVE_MODE === 'lazy_collapse') {
             try {
-                const query = new URLSearchParams({
-                    project: DEFAULT_PROJECT,
-                    file: filePath,
-                    scope: REVIEW_SCOPE
-                });
-                if (currentReportId) query.set('report_id', currentReportId);
+                const query = codeDetailQuery(filePath);
 
                 const layoutResp = await requestCoverageApi(`/code-layout?${query.toString()}`, { method: 'GET' });
-                if (layoutResp && layoutResp.data) {
-                    await CodeRegionController.init(layoutResp.data, preSource);
+                if (layoutResp && layoutResp.regions) {
+                    await CodeRegionController.init(layoutResp, preSource);
                     return;
                 }
             } catch (err) {
                 console.warn('[CoverageEnhance] Failed to initialize via backend layout:', err.message);
-                // If the source was already stripped, display clear error message
-                if (preSource.children.length === 0 && (preSource.textContent || preSource.innerText || '').trim() === '') {
-                    const errBanner = document.createElement('div');
-                    errBanner.className = 'coverage-region-placeholder error';
-                    errBanner.innerHTML = `
-                        <div class="placeholder-left">
-                            <span class="placeholder-icon">⚠️</span>
-                            <span class="placeholder-text">无法加载代码布局与源码数据：${err.message}</span>
-                        </div>
-                    `;
-                    preSource.appendChild(errBanner);
-                    return;
-                }
+                // The canonical lazy-collapse mode is VNext-only. Do not
+                // silently switch to a legacy API when identity or the VNext
+                // contract is unavailable.
+                const errBanner = document.createElement('div');
+                errBanner.className = 'coverage-region-placeholder error';
+                const left = document.createElement('div');
+                left.className = 'placeholder-left';
+                const icon = document.createElement('span');
+                icon.className = 'placeholder-icon';
+                icon.textContent = '⚠️';
+                const message = document.createElement('span');
+                message.className = 'placeholder-text';
+                message.textContent = '无法加载代码布局与源码数据：' + String(err.message || err);
+                left.appendChild(icon);
+                left.appendChild(message);
+                errBanner.appendChild(left);
+                preSource.innerHTML = '';
+                preSource.appendChild(errBanner);
+                return;
             }
         }
 
@@ -2602,18 +2779,29 @@
             startItem.span.appendChild(panel);
         });
 
-        // Pull existing database records
+        // Static legacy display modes remain usable offline, but optional
+        // overlays use only the canonical paged VNext endpoint.
+        if (!currentScanId) {
+            reviewControlsReady = true;
+            updateReviewNavigation();
+            updateHeaderStatistics();
+            updateBatchToolbar();
+            return;
+        }
         const query = new URLSearchParams({
             project: DEFAULT_PROJECT,
-            file: filePath
+            scan_id: currentScanId,
+            file: filePath,
+            repository_name: currentRepositoryName,
+            page: '1',
+            page_size: '200'
         });
-        if (currentReportId) query.set('report_id', currentReportId);
 
-        requestCoverageApi(`?${query.toString()}`, { method: 'GET' })
+        requestCoverageApi(`/progress/details?${query.toString()}`, { method: 'GET' })
             .then(data => {
-                if (data && data.records) {
+                if (data && data.rows) {
                     const dbMap = new Map();
-                    data.records.forEach(rec => dbMap.set(rec.line_number, rec));
+                    data.rows.forEach(rec => dbMap.set(rec.line_number, rec));
                     panelsMap.forEach((pState, sLine) => {
                         const rec = dbMap.get(sLine);
                         if (rec) {

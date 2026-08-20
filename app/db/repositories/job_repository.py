@@ -42,13 +42,14 @@ class JobRepository(object):
             job.get("error_message") or "", job.get("data_version"),
             job.get("heartbeat_at"), job.get("created_at") or _now(),
             job.get("started_at"), job.get("finished_at"), _now(),
+            job.get("lease_owner") or "",
         )
         if existing:
             cursor = execute(connection, """
                 UPDATE coverage_background_jobs SET project_id = ?, scan_id = ?, kind = ?,
                     state = ?, progress = ?, input_payload = ?, result_path = ?,
                     error_message = ?, data_version = ?, heartbeat_at = ?, created_at = ?,
-                    started_at = ?, finished_at = ?, updated_at = ?
+                    started_at = ?, finished_at = ?, updated_at = ?, lease_owner = ?
                 WHERE job_id = ?
             """, fields + (job["job_id"],))
             cursor.close()
@@ -57,24 +58,29 @@ class JobRepository(object):
                 INSERT INTO coverage_background_jobs(
                     job_id, project_id, scan_id, kind, state, progress, input_payload,
                     result_path, error_message, data_version, heartbeat_at, created_at,
-                    started_at, finished_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    started_at, finished_at, updated_at, lease_owner
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (job["job_id"],) + fields)
             cursor.close()
         return self.get(connection, job["job_id"])
 
-    def mark_stale(self, connection, timeout_seconds: float, now=None):
+    def mark_stale(self, connection, timeout_seconds: float, now=None, lease_owner=None):
         now_value = now or datetime.utcnow()
         cutoff = now_value - timedelta(seconds=float(timeout_seconds))
         cutoff_text = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        owner_clause = ""
+        params = [cutoff_text]
+        if lease_owner:
+            owner_clause = " OR (state = 'running' AND COALESCE(lease_owner, '') <> ?)"
+            params.append(str(lease_owner))
         cursor = execute(connection, """
             UPDATE coverage_background_jobs
-            SET state = 'interrupted', error_message = 'heartbeat timeout',
+            SET state = 'interrupted', error_message = 'worker lease expired',
                 updated_at = CURRENT_TIMESTAMP, finished_at = CURRENT_TIMESTAMP
             WHERE (state = 'queued'
                    OR (state = 'running' AND (heartbeat_at IS NULL
-                       OR heartbeat_at < ?)))
-        """, (cutoff_text,))
+                       OR heartbeat_at < ?)){})
+        """.format(owner_clause), params)
         count = int(getattr(cursor, "rowcount", 0) or 0)
         cursor.close()
         return count

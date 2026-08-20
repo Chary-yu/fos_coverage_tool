@@ -42,9 +42,9 @@ def default_runtime_config(base_dir: str, project_name: str = "Gemini-NOS") -> D
         },
         "server": {"host": "0.0.0.0", "port": 9528},
         "auth": {
-            "mode": "disabled",
+            "mode": "reverse_proxy",
             "user_header": "X-Remote-User",
-            "trusted_proxy_addresses": [],
+            "trusted_proxy_addresses": ["127.0.0.1", "::1"],
             "allowed_origins": [],
         },
         "ownership": {
@@ -56,7 +56,10 @@ def default_runtime_config(base_dir: str, project_name: str = "Gemini-NOS") -> D
             "jobs_dir": "jobs",
             "registry_dir": "report-registry",
         },
-        "runtime_mode": "legacy",
+        # VNext is the canonical runtime.  Legacy remains available only
+        # through an explicit compatibility configuration/entrypoint.
+        "runtime_mode": "vnext",
+        "schema_version": 1,
         "project_name": project_name,
     }
 

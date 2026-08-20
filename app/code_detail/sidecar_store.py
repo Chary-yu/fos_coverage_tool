@@ -31,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CHUNK_SIZE = 2000
 CHUNKED_SCHEMA_VERSION = 2
+MAX_RANGE_SPAN = 10000
+MAX_TOTAL_RANGE_SPAN = 20000
+MAX_RANGE_CHUNKS = 256
+MAX_SIDECAR_LINES = 1000000
 
 class SidecarStore:
     def __init__(
@@ -124,21 +128,26 @@ class SidecarStore:
             if cached and cached[0] == signature:
                 self._metrics["metadata_cache_hits"] += 1
                 return cached[1]
-            try:
-                self._metrics["metadata_reads"] += 1
-                with open(meta_path, "r", encoding="utf-8") as stream:
-                    meta = json.load(stream)
-                if meta.get("report_id") and meta.get("report_id") != report_id:
-                    raise ValueError("sidecar report identity mismatch")
-                self._validate_chunk_inventory(cache_dir, meta)
-                meta["_root"] = os.path.realpath(os.path.dirname(cache_dir))
-                meta["_asset_identity"] = self._asset_token(meta, signature)
+            self._metrics["metadata_reads"] += 1
+        try:
+            with open(meta_path, "r", encoding="utf-8") as stream:
+                meta = json.load(stream)
+            if meta.get("report_id") and meta.get("report_id") != report_id:
+                raise ValueError("sidecar report identity mismatch")
+            self._validate_chunk_inventory(cache_dir, meta)
+            meta["_root"] = os.path.realpath(os.path.dirname(cache_dir))
+            meta["_asset_identity"] = self._asset_token(meta, signature)
+            with self._cache_lock:
+                cached = self._metadata_cache.get(cache_key)
+                if cached and cached[0] == signature:
+                    return cached[1]
                 self._metadata_cache[cache_key] = (signature, meta)
-                return meta
-            except Exception as exc:
-                logger.warning("[SidecarStore] Error reading chunk meta %s: %s", meta_path, exc)
+            return meta
+        except Exception as exc:
+            logger.warning("[SidecarStore] Error reading chunk meta %s: %s", meta_path, exc)
+            with self._cache_lock:
                 self._metadata_cache.pop(cache_key, None)
-                return None
+            return None
 
     def _load_legacy_payload(
         self,
@@ -156,30 +165,35 @@ class SidecarStore:
             if cached and cached[0] == signature:
                 self._metrics["legacy_cache_hits"] += 1
                 return cached[1]
-            try:
-                self._metrics["legacy_reads"] += 1
-                with open(legacy_path, "r", encoding="utf-8") as stream:
-                    data = json.load(stream)
-                payload = {
-                    "schema_version": 1,
-                    "project_name": data.get("project_name", ""),
-                    "file_path": data.get("file_path", ""),
-                    "total_lines": data.get("total_lines", len(data.get("lines", []))),
-                    "total_uncovered_count": data.get("total_uncovered_count", 0),
-                    "uncovered_lines": data.get("uncovered_lines") or [
-                        line.get("line_no") for line in data.get("lines", [])
-                        if line.get("coverage_state") == "uncovered"
-                    ],
-                    "function_ranges": data.get("function_ranges", []),
-                    "_lines": data.get("lines", []),
-                    "_asset_identity": self._asset_token(data, signature),
-                }
+            self._metrics["legacy_reads"] += 1
+        try:
+            with open(legacy_path, "r", encoding="utf-8") as stream:
+                data = json.load(stream)
+            payload = {
+                "schema_version": 1,
+                "project_name": data.get("project_name", ""),
+                "file_path": data.get("file_path", ""),
+                "total_lines": data.get("total_lines", len(data.get("lines", []))),
+                "total_uncovered_count": data.get("total_uncovered_count", 0),
+                "uncovered_lines": data.get("uncovered_lines") or [
+                    line.get("line_no") for line in data.get("lines", [])
+                    if line.get("coverage_state") == "uncovered"
+                ],
+                "function_ranges": data.get("function_ranges", []),
+                "_lines": data.get("lines", []),
+                "_asset_identity": self._asset_token(data, signature),
+            }
+            with self._cache_lock:
+                cached = self._legacy_cache.get(cache_key)
+                if cached and cached[0] == signature:
+                    return cached[1]
                 self._legacy_cache[cache_key] = (signature, payload)
-                return payload
-            except Exception as exc:
-                logger.warning("[SidecarStore] Error reading legacy sidecar %s: %s", legacy_path, exc)
+            return payload
+        except Exception as exc:
+            logger.warning("[SidecarStore] Error reading legacy sidecar %s: %s", legacy_path, exc)
+            with self._cache_lock:
                 self._legacy_cache.pop(cache_key, None)
-                return None
+            return None
 
     def _load_decoded_chunk(
         self,
@@ -198,18 +212,22 @@ class SidecarStore:
                 self._metrics["chunk_cache_hits"] += 1
                 self._decoded_chunk_cache.move_to_end(cache_key)
                 return cached
-            if not os.path.isfile(chunk_path) or os.path.islink(chunk_path):
-                raise FileNotFoundError("sidecar chunk is missing")
-            with open(chunk_path, "r", encoding="utf-8") as stream:
-                decoded = json.load(stream)
             self._metrics["chunk_reads"] += 1
-            if not isinstance(decoded, list):
-                raise ValueError("sidecar chunk must contain a JSON list")
+        if not os.path.isfile(chunk_path) or os.path.islink(chunk_path):
+            raise FileNotFoundError("sidecar chunk is missing")
+        with open(chunk_path, "r", encoding="utf-8") as stream:
+            decoded = json.load(stream)
+        if not isinstance(decoded, list):
+            raise ValueError("sidecar chunk must contain a JSON list")
+        with self._cache_lock:
+            cached = self._decoded_chunk_cache.get(cache_key)
+            if cached is not None:
+                return cached
             self._decoded_chunk_cache[cache_key] = decoded
             self._decoded_chunk_cache.move_to_end(cache_key)
             while len(self._decoded_chunk_cache) > self.max_cached_chunks:
                 self._decoded_chunk_cache.popitem(last=False)
-            return decoded
+        return decoded
 
     def _find_report_cache_dirs(self, report_id: str) -> List[str]:
         if (not report_id or "\\" in str(report_id)
@@ -221,7 +239,12 @@ class SidecarStore:
             # not sticky because report directories may be created after the
             # runtime has constructed its SidecarStore.
             if cached_dirs:
-                return list(cached_dirs)
+                if all(os.path.isdir(item) and not os.path.islink(item)
+                       for item in cached_dirs):
+                    return list(cached_dirs)
+                # A positive cache entry is invalid after report relocation,
+                # deletion, or replacement by a symlink. Re-resolve it.
+                self._report_cache_dirs.pop(str(report_id), None)
             self._metrics["path_resolution_reads"] += 1
         cache_dirs = []
         for s_dir in self.search_dirs:
@@ -293,6 +316,11 @@ class SidecarStore:
             normalized.append((start_line, end_line))
         if not normalized:
             return []
+        total_requested = sum(end - start + 1 for start, end in normalized)
+        if total_requested > MAX_TOTAL_RANGE_SPAN:
+            raise ValueError("requested sidecar span is too large")
+        if any(end - start + 1 > MAX_RANGE_SPAN for start, end in normalized):
+            raise ValueError("requested sidecar range is too large")
 
         cache_dirs = self._find_report_cache_dirs(report_id)
         for c_dir in cache_dirs:
@@ -307,17 +335,22 @@ class SidecarStore:
                     continue
                 try:
                     chunk_size = int(meta.get("chunk_size") or self.chunk_size)
+                    total_lines = int(meta.get("total_lines") or 0)
+                    total_chunks = int(meta.get("total_chunks") or 0)
+                    if total_lines and any(end > total_lines for _, end in normalized):
+                        raise ValueError("requested sidecar range exceeds file length")
                     needed = set()
                     for start_line, end_line in normalized:
                         needed.update(range(
                             (start_line - 1) // chunk_size,
                             (end_line - 1) // chunk_size + 1,
                         ))
+                    if len(needed) > MAX_RANGE_CHUNKS:
+                        raise ValueError("requested sidecar chunk count is too large")
                     decoded = {}
                     declared_chunks = {
                         os.path.basename(str(name)) for name in (meta.get("chunks") or [])
                     }
-                    total_chunks = int(meta.get("total_chunks") or 0)
                     for chunk_index in sorted(needed):
                         chunk_start = chunk_index * chunk_size
                         chunk_end = chunk_start + chunk_size - 1
@@ -352,6 +385,11 @@ class SidecarStore:
                         rows.sort(key=lambda line: int(line.get("line_no") or 0))
                         result.append(rows)
                     return result
+                except ValueError:
+                    # Range and chunk-count limits are request validation,
+                    # not a reason to fall through to a legacy file and turn
+                    # a bad request into an ambiguous 404.
+                    raise
                 except Exception as exc:
                     logger.warning("[SidecarStore] Error reading chunked lines %s: %s", chunk_dir, exc)
 
@@ -386,14 +424,34 @@ class SidecarStore:
     def load_full_source_context(self, report_id: str, file_path_hash: str) -> Optional[SourceContext]:
         """
         Load complete SourceContext from Chunked v2 or Legacy v1.
+
+        The public range API deliberately limits a single request so an
+        untrusted browser cannot ask the server to decode an unbounded
+        amount of JSON.  The compatibility API is different: it explicitly
+        asks for the complete source context, so split that read into bounded
+        windows instead of routing it through one oversized range request.
         """
         meta = self.load_metadata(report_id, file_path_hash)
         if not meta:
             return None
-        total_l = meta.get("total_lines", 0)
-        lines_dicts = self.load_lines_range(report_id, file_path_hash, 1, total_l)
-        if lines_dicts is None:
+        total_l = int(meta.get("total_lines") or 0)
+        if total_l < 0 or total_l > MAX_SIDECAR_LINES:
             return None
+        lines_dicts = []
+        if total_l:
+            window_start = 1
+            while window_start <= total_l:
+                window_end = min(
+                    total_l,
+                    window_start + MAX_TOTAL_RANGE_SPAN - 1,
+                )
+                window = self.load_lines_range(
+                    report_id, file_path_hash, window_start, window_end
+                )
+                if window is None:
+                    return None
+                lines_dicts.extend(window)
+                window_start = window_end + 1
         
         source_lines = [SourceLineDTO.from_dict(d) for d in lines_dicts]
         declared_hash = meta.get("content_hash")
@@ -430,7 +488,11 @@ class SidecarStore:
         
         all_lines_dict = [line.to_dict() for line in context.lines]
         total_lines = len(all_lines_dict)
+        if total_lines > MAX_SIDECAR_LINES:
+            raise ValueError("sidecar source exceeds the configured line limit")
         c_size = self.chunk_size
+        if c_size < 1 or c_size > MAX_RANGE_SPAN:
+            raise ValueError("invalid sidecar chunk size")
         total_chunks = (total_lines + c_size - 1) // c_size if total_lines > 0 else 0
         chunk_names = []
         

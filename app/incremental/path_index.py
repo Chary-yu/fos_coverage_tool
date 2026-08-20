@@ -34,14 +34,14 @@ class LCOVPathLookupIndex:
 
     def _build_single_repo_index(self, paths: List[str]) -> Dict[str, Any]:
         exact_map = {}
-        normalized_map = {}
+        normalized_map: Dict[str, Set[str]] = {}
         suffix_map: Dict[str, Set[str]] = {}
         basename_map: Dict[str, Set[str]] = {}
         
         for p in paths:
             norm = normalize_lcov_path(p)
             exact_map[p] = p
-            normalized_map[norm] = p
+            normalized_map.setdefault(norm, set()).add(p)
             
             parts = norm.split("/")
             for i in range(len(parts) - 1):
@@ -74,7 +74,10 @@ class LCOVPathLookupIndex:
         # 2. Normalized
         norm = normalize_lcov_path(query_path)
         if norm in repo_idx["normalized"]:
-            return repo_idx["normalized"][norm], "normalized"
+            candidates = repo_idx["normalized"][norm]
+            if len(candidates) == 1:
+                return next(iter(candidates)), "normalized"
+            return None, "ambiguous_normalized"
             
         # 3. Suffix
         parts = norm.split("/")

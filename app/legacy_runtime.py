@@ -5401,7 +5401,8 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
                                  render_mode="lazy_collapse", report_id="", output_dir="",
                                  source_input_file=None, can_reuse=False,
                                  incremental_reviewers_by_file=None,
-                                 function_ranges_by_file=None, metadata_resolver=None):
+                                 function_ranges_by_file=None, metadata_resolver=None,
+                                 scan_id=None, repository_name=""):
     depth = len(rel_path.split(os.sep)) - 1
     prefix = "../" * depth
 
@@ -5435,6 +5436,8 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
     report_file_path = extract_report_file_path(source_content, rel_path)
     report_file_hash = calc_file_path_hash(report_file_path)  # DB MD5
     sidecar_key = calc_sidecar_file_key(report_file_path)      # Sidecar SHA256[:32]
+    resolved_scan_id = scan_id or config.get("scan_id") or config.get("current_scan_id") or ""
+    resolved_repository_name = repository_name or config.get("repository_name") or config.get("repo_name") or ""
 
     review_line_numbers = None
     reviewers_by_line = {}
@@ -5511,6 +5514,8 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
         release_identity_meta_tags() +
         f'<meta name="coverage-project" content="{html.escape(project_name)}">\n'
         f'<meta name="coverage-report-id" content="{html.escape(report_id)}">\n'
+        f'<meta name="coverage-scan-id" content="{html.escape(str(resolved_scan_id))}">\n'
+        f'<meta name="coverage-repository-name" content="{html.escape(str(resolved_repository_name))}">\n'
         f'<meta name="coverage-file-path" content="{html.escape(report_file_path)}">\n'
         f'<meta name="coverage-render-mode" content="{html.escape(render_mode)}">\n'
         f'<meta name="coverage-review-scope" content="{html.escape(review_scope)}">\n'
@@ -5551,7 +5556,8 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
 
 def inject_coverage_report(input_dir, output_dir, project_name=None, workers=None, render_mode=None,
                            review_scope="full", incremental_lines_by_file=None, reuse_output=None,
-                           incremental_reviewers_by_file=None, function_ranges_by_file=None):
+                           incremental_reviewers_by_file=None, function_ranges_by_file=None,
+                           scan_id=None, repository_name=""):
     """
     非破坏性注入覆盖率报告：
     1. 若 output_dir 与 input_dir 不同，且未关联指纹重用，则自动复制 input_dir 至 output_dir (清除已有的 output_dir)
@@ -5567,6 +5573,8 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
     real_output_html = os.path.join(output_dir, "html") if os.path.exists(os.path.join(input_dir, "html")) else output_dir
 
     config = load_config()
+    scan_id = scan_id or config.get("scan_id") or config.get("current_scan_id") or ""
+    repository_name = repository_name or config.get("repository_name") or config.get("repo_name") or ""
     if project_name is None:
         project_name = config.get("project_name", DEFAULT_PROJECT_NAME)
     if reuse_output is None:
@@ -5738,6 +5746,8 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
                 incremental_reviewers_by_file=incremental_reviewers_by_file,
                 function_ranges_by_file=function_ranges_by_file,
                 metadata_resolver=metadata_resolver,
+                scan_id=scan_id,
+                repository_name=repository_name,
             )
             for file_path, rel_path in gcov_files
         ]
@@ -6556,6 +6566,12 @@ def build_incremental_review_site(result, input_dir, output_dir, project_name,
 
     timer = PerfTimer(f"BuildIncrementalSite[{project_name}]")
     summary = result["summary"]
+    result_repositories = result.get("repositories") or []
+    single_repository_name = ""
+    if len(result_repositories) == 1:
+        single_repository_name = str(
+            result_repositories[0].get("name") or result_repositories[0].get("repository_name") or ""
+        )
     print(
         "[Incremental] Git-added lines={changed_lines}, covered={covered}, uncovered={uncovered}, "
         "ignored={ignored}, missing={missing}".format(**summary)
@@ -6572,6 +6588,7 @@ def build_incremental_review_site(result, input_dir, output_dir, project_name,
         reuse_output=reuse_output,
         incremental_reviewers_by_file=result.get("reviewers_by_file") or {},
         function_ranges_by_file=result.get("function_ranges_by_file") or {},
+        repository_name=single_repository_name,
     )
     timer.mark("inject_coverage_report")
     real_output_html = (
@@ -6643,7 +6660,7 @@ def run_server(config_path=None):
     global db_manager
     config = load_config(config_path)
 
-    if str(config.get("runtime_mode") or "legacy").lower() == "vnext":
+    if str(config.get("runtime_mode") or "vnext").lower() == "vnext":
         from app.bootstrap import create_vnext_server
         host = config["server"]["host"]
         port = int(config["server"]["port"])

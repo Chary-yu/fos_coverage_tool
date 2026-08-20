@@ -256,6 +256,13 @@ class ProductionEvidenceManifest:
         rollback = self.data.get("rollback_evidence") or {}
         if rollback.get("status") != "PASSED" or not rollback.get("rehearsal_verified"):
             unmet.append("Forced rollback rehearsal evidence is missing")
+        before_id = rollback.get("before_release_id")
+        target_id = rollback.get("target_release_id")
+        rollback_id = rollback.get("rollback_release_id")
+        if not before_id or not target_id or not rollback_id:
+            unmet.append("Rollback evidence lacks before/target/rollback release identities")
+        elif before_id == target_id or rollback_id != before_id:
+            unmet.append("Rollback evidence does not restore the before release identity")
             
         # 7. Security Audit
         sec = self.data.get("security_audit", {})

@@ -50,12 +50,16 @@ class JobDescriptor:
         self.cancel_requested = False
 
 class BoundedJobExecutor:
+    _KNOWN_RESOURCE_CLASSES = ("database", "cpu", "disk")
+
     def __init__(
         self,
         max_workers: int = 4,
         max_queue_size: int = 100,
         db_manager=None,
         resource_limits: Optional[Dict[str, Any]] = None,
+        max_retained_jobs: int = 256,
+        global_worker_budget: Optional[int] = None,
     ):
         self.max_workers = max(1, max_workers)
         self.max_queue_size = max(1, max_queue_size)
@@ -64,7 +68,18 @@ class BoundedJobExecutor:
         self._jobs: Dict[str, JobDescriptor] = {}
         self._workers: List[threading.Thread] = []
         self._lock = threading.Lock()
+        self._capacity = threading.Condition(self._lock)
         self._shutdown_event = threading.Event()
+        self._accepting = True
+        self._active_jobs = set()
+        self.max_retained_jobs = max(16, int(max_retained_jobs))
+        # max_workers limits the default bucket. Resource buckets are
+        # intentionally isolated; an optional global budget can be enabled by
+        # deployments that need a process-wide cap as well.
+        self.global_worker_budget = (
+            max(1, int(global_worker_budget))
+            if global_worker_budget is not None else None
+        )
         self._buckets = {}
         self._resource_limits = dict(resource_limits or {})
 
@@ -83,6 +98,11 @@ class BoundedJobExecutor:
             self._create_bucket(
                 str(resource_name), max(1, int(workers)), max(1, int(queue_size))
             )
+        # VNext durable jobs use these explicit classes. Keep them available
+        # for small custom executors while still rejecting arbitrary typos in
+        # submit_job instead of silently falling back to the default queue.
+        for resource_name in self._KNOWN_RESOURCE_CLASSES:
+            self._create_bucket(resource_name, 1, 25)
         self._queue = self._buckets["default"]["queue"]
         self._start_workers()
 
@@ -118,8 +138,13 @@ class BoundedJobExecutor:
             except Empty:
                 continue
 
-            with self._lock:
-                if job.cancel_requested:
+            with self._capacity:
+                while (self.global_worker_budget is not None and
+                       len(self._active_jobs) >= self.global_worker_budget and
+                       not self._shutdown_event.is_set() and
+                       not job.cancel_requested):
+                    self._capacity.wait(timeout=0.5)
+                if job.cancel_requested or self._shutdown_event.is_set():
                     job.status = STATUS_CANCELLED
                     job.finished_at = time.time()
                     self._persist_job_state(job)
@@ -127,12 +152,13 @@ class BoundedJobExecutor:
                     continue
                 job.status = STATUS_RUNNING
                 job.started_at = time.time()
+                self._active_jobs.add(job.job_id)
                 self._persist_job_state(job)
 
             try:
                 # Execute job function
                 res = job.fn(*job.args, **job.kwargs)
-                with self._lock:
+                with self._capacity:
                     if job.cancel_requested:
                         job.status = STATUS_CANCELLED
                     else:
@@ -141,13 +167,19 @@ class BoundedJobExecutor:
                         job.progress = 1.0
                     job.finished_at = time.time()
                     self._persist_job_state(job)
+                    self._active_jobs.discard(job.job_id)
+                    self._prune_jobs_locked()
+                    self._capacity.notify_all()
             except Exception as e:
                 logger.error(f"[JobExecutor] Job {job.job_id} failed: {e}", exc_info=True)
-                with self._lock:
+                with self._capacity:
                     job.status = STATUS_FAILED
                     job.error_message = str(e)
                     job.finished_at = time.time()
                     self._persist_job_state(job)
+                    self._active_jobs.discard(job.job_id)
+                    self._prune_jobs_locked()
+                    self._capacity.notify_all()
             finally:
                 queue.task_done()
 
@@ -166,6 +198,8 @@ class BoundedJobExecutor:
         """Submit a new background job with optional duplicate reuse."""
         kwargs = kwargs or {}
         with self._lock:
+            if not self._accepting:
+                raise RuntimeError("background job executor is shutting down")
             # 1. Check duplicate reuse
             if reuse_existing:
                 for existing in self._jobs.values():
@@ -176,7 +210,7 @@ class BoundedJobExecutor:
 
             resource_class = str(resource_class or "default")
             if resource_class not in self._buckets:
-                resource_class = "default"
+                raise ValueError("unknown background resource class: {}".format(resource_class))
             bucket = self._buckets[resource_class]
             jid = job_id or f"job_{uuid.uuid4().hex[:16]}"
             job = JobDescriptor(
@@ -237,7 +271,23 @@ class BoundedJobExecutor:
                 }
                 for name, bucket in self._buckets.items()
             }
-        return {"jobs": jobs, "resources": resources}
+        return {
+            "jobs": jobs,
+            "resources": resources,
+            "global_worker_limit": self.global_worker_budget,
+            "global_active": len(self._active_jobs),
+        }
+
+    def _prune_jobs_locked(self):
+        terminal = [job for job in self._jobs.values()
+                    if job.status in (STATUS_COMPLETED, STATUS_FAILED,
+                                      STATUS_CANCELLED, STATUS_INTERRUPTED)
+                    and job.job_id not in self._active_jobs]
+        if len(terminal) <= self.max_retained_jobs:
+            return
+        terminal.sort(key=lambda item: item.finished_at or item.created_at)
+        for job in terminal[:-self.max_retained_jobs]:
+            self._jobs.pop(job.job_id, None)
 
     def _persist_job_state(self, job: JobDescriptor):
         """Save job state to DB if db_manager provided."""
@@ -266,8 +316,27 @@ class BoundedJobExecutor:
         except Exception as e:
             logger.warning(f"[JobExecutor] Error recovering jobs: {e}")
 
-    def shutdown(self, wait: bool = True):
+    def shutdown(self, wait: bool = True, timeout: Optional[float] = None):
+        self._accepting = False
         self._shutdown_event.set()
+        # Never leave queued callbacks claiming to be runnable after the
+        # executor has stopped accepting work.
+        for bucket in self._buckets.values():
+            queue = bucket["queue"]
+            while True:
+                try:
+                    job = queue.get_nowait()
+                except Empty:
+                    break
+                with self._lock:
+                    job.cancel_requested = True
+                    job.status = STATUS_CANCELLED
+                    job.finished_at = time.time()
+                    self._persist_job_state(job)
+                    self._prune_jobs_locked()
+                queue.task_done()
         if wait:
+            deadline = None if timeout is None else time.time() + float(timeout)
             for t in self._workers:
-                t.join(timeout=1.0)
+                remaining = None if deadline is None else max(0.0, deadline - time.time())
+                t.join(timeout=remaining)

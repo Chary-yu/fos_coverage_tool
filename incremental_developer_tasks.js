@@ -13,6 +13,12 @@
     var resolvedApiBase = "";
     var isRefreshing = false;
     var lastRefreshTime = 0;
+    var urlParams = null;
+    try {
+        urlParams = new URLSearchParams(window.location.search || "");
+    } catch (e) {}
+    var scanId = urlParams ? (urlParams.get("scan_id") || "") : "";
+    var repositoryName = urlParams ? (urlParams.get("repository_name") || "") : "";
 
     function getApiBaseCandidates() {
         return ["/api/coverage"];
@@ -28,6 +34,8 @@
         }
         var base = candidates[index];
         var url = base + "/incremental/unanalyzed?project=" + encodeURIComponent(projectName);
+        if (scanId) url += "&scan_id=" + encodeURIComponent(scanId);
+        if (repositoryName) url += "&repository_name=" + encodeURIComponent(repositoryName);
         return fetch(url).then(function(res) {
             if (!res.ok) throw new Error("HTTP " + res.status);
             resolvedApiBase = base;

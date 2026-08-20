@@ -190,20 +190,41 @@ class FileStateRepository(object):
             "pending_line_references": [],
         }
 
-    def pending_line_references(self, connection, scan_id: int):
-        """Return file-qualified pending physical lines for a scan."""
+    def pending_line_references(self, connection, scan_id: int, limit=None, offset=0):
+        """Return file-qualified pending physical lines for a scan.
+
+        The optional window is used by the pending-detail page. Summary and
+        developer-task callers can omit it for their existing grouped view.
+        """
         uncovered = self._UNCOVERED_SQL
         confirmed = self._CONFIRMED_SQL
-        rows = fetchall(connection, """
+        sql = """
             SELECT f.repository_name, f.file_path, l.line_number
             FROM coverage_files f
             JOIN coverage_lines l ON l.file_id = f.id
             LEFT JOIN coverage_analyses a ON a.line_id = l.id
             WHERE f.scan_id = ? AND {uncovered} AND NOT ({confirmed})
             ORDER BY f.repository_name, f.file_path, l.line_number
-        """.format(uncovered=uncovered, confirmed=confirmed), (scan_id,))
+        """.format(uncovered=uncovered, confirmed=confirmed)
+        params = [int(scan_id)]
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params.extend((max(1, int(limit)), max(0, int(offset))))
+        rows = fetchall(connection, sql, params)
         return [{
             "repository_name": row.get("repository_name") or "",
             "file_path": row.get("file_path") or "",
             "line_number": int(row["line_number"]),
         } for row in rows]
+
+    def pending_line_count(self, connection, scan_id: int):
+        uncovered = self._UNCOVERED_SQL
+        confirmed = self._CONFIRMED_SQL
+        row = fetchone(connection, """
+            SELECT COUNT(*) AS total
+            FROM coverage_files f
+            JOIN coverage_lines l ON l.file_id = f.id
+            LEFT JOIN coverage_analyses a ON a.line_id = l.id
+            WHERE f.scan_id = ? AND {uncovered} AND NOT ({confirmed})
+        """.format(uncovered=uncovered, confirmed=confirmed), (int(scan_id),))
+        return int((row or {}).get("total") or 0)

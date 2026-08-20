@@ -188,11 +188,15 @@ class UpgradeOrchestrator:
 
         upgrade_config = (runtime_config or {}).get("upgrade") or {}
         previous_release = upgrade_config.get("previous_release")
-        if previous_release is None and mode == "staging":
-            # The isolated local rehearsal runs the previous release from the
-            # same checked-out tree after file restoration.  Production must
-            # provide an explicit previous identity in its deployment config.
-            previous_release = identity
+        if not isinstance(previous_release, dict) or not previous_release:
+            # A target release must never be used as its own rollback proof.
+            # Staging and production both need an independently captured
+            # before-release identity from the previous deployment.
+            self.log("❌ Explicit previous_release identity is required for rollback evidence")
+            return False, "Explicit previous release identity required"
+        if previous_release.get("commit_sha") == identity.get("commit_sha"):
+            self.log("❌ previous_release must differ from target release")
+            return False, "Previous and target release identities are identical"
         lifecycle = UpgradeLifecycle(self.repo_root, runtime_config or {}, mode, previous_release)
         try:
             freeze_evidence = lifecycle.freeze(identity.get("commit_sha", ""))
@@ -540,6 +544,13 @@ class UpgradeOrchestrator:
                     rollback_evidence = json.load(stream)
                 if rollback_evidence.get("revision") != identity.get("commit_sha"):
                     raise RuntimeError("rollback evidence revision mismatch")
+                before_id = rollback_evidence.get("before_release_id")
+                target_id = rollback_evidence.get("target_release_id")
+                rollback_id = rollback_evidence.get("rollback_release_id")
+                if not before_id or not target_id or not rollback_id:
+                    raise RuntimeError("rollback evidence lacks release identities")
+                if before_id == target_id or rollback_id != before_id:
+                    raise RuntimeError("rollback evidence does not restore the before release")
                 rollback_evidence.setdefault("evidence_class", "staging_cutover" if mode == "staging" else "production_cutover")
                 rollback_evidence.setdefault("command", "run_rollback_rehearsal")
                 rollback_evidence.setdefault("exit_code", 0 if rollback_evidence.get("status") == "PASSED" else 1)

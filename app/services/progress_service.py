@@ -96,6 +96,30 @@ class ProgressService(object):
             key = (row.get("repository_name") or "", row.get("file_path") or "")
             grouped.setdefault(key, []).append(int(row["line_number"]))
         return [{
+            "scan_id": int(scan_id),
             "repository_name": key[0], "file_path": key[1],
             "pending_line_numbers": values,
+            "unanalyzed": len(values),
         } for key, values in grouped.items()]
+
+    def pending_page(self, connection, project_name, scan_id=None,
+                     page=1, page_size=100):
+        project = self._project(connection, project_name)
+        state = self.states.get(connection, project["id"]) or {}
+        scan_id = scan_id or state.get("current_scan_id")
+        page = max(1, int(page))
+        page_size = min(500, max(1, int(page_size)))
+        if not scan_id:
+            return {"scan_id": None, "page": page, "page_size": page_size,
+                    "total": 0, "total_pages": 0, "rows": []}
+        offset = (page - 1) * page_size
+        rows = self.file_states.pending_line_references(
+            connection, int(scan_id), limit=page_size, offset=offset
+        )
+        total = self.file_states.pending_line_count(connection, int(scan_id))
+        return {
+            "scan_id": int(scan_id), "page": page, "page_size": page_size,
+            "total": total,
+            "total_pages": (total + page_size - 1) // page_size if total else 0,
+            "rows": rows,
+        }

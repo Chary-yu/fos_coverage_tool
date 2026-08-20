@@ -11,6 +11,33 @@ from scripts.upgrade.migration_runner import create_sqlite_schema
 
 
 class VNextJobsTest(unittest.TestCase):
+    def test_executor_rejection_does_not_leave_a_queued_orphan(self):
+        class RejectingExecutor(object):
+            def submit_job(self, **kwargs):
+                raise RuntimeError("queue is full")
+
+        with tempfile.TemporaryDirectory(prefix="vnext-job-reject-") as root:
+            db_path = os.path.join(root, "jobs.db")
+            connection = sqlite3.connect(db_path)
+            create_sqlite_schema(connection)
+            connection.close()
+
+            def factory():
+                item = sqlite3.connect(db_path)
+                item.row_factory = sqlite3.Row
+                return item
+
+            service = VNextBackgroundJobService(factory, executor=RejectingExecutor())
+            with self.assertRaises(RuntimeError):
+                service.submit(1, 2, "export", 3, lambda: "never-runs")
+            connection = factory()
+            row = connection.execute(
+                "SELECT state, error_message FROM coverage_background_jobs"
+            ).fetchone()
+            connection.close()
+            self.assertEqual(row[0], "failed")
+            self.assertIn("queue is full", row[1])
+
     def test_persisted_job_survives_executor_and_recovery_marks_stale(self):
         with tempfile.TemporaryDirectory(prefix="vnext-job-") as root:
             db_path = os.path.join(root, "jobs.db")
@@ -136,6 +163,49 @@ class VNextJobsTest(unittest.TestCase):
         self.assertEqual(VNextBackgroundJobService.resource_for_kind("rebuild_progress"), "database")
         self.assertEqual(VNextBackgroundJobService.resource_for_kind("export"), "disk")
         self.assertEqual(VNextBackgroundJobService.resource_for_kind("incremental"), "cpu")
+
+    def test_resource_workers_share_one_global_execution_budget(self):
+        import threading
+
+        executor = BoundedJobExecutor(
+            max_workers=2, max_queue_size=8,
+            resource_limits={
+                "database": {"max_workers": 3, "max_queue_size": 4},
+                "cpu": {"max_workers": 3, "max_queue_size": 4},
+            },
+            global_worker_budget=2,
+        )
+        active = 0
+        maximum = 0
+        lock = threading.Lock()
+        release = threading.Event()
+
+        def work():
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            release.wait(2)
+            with lock:
+                active -= 1
+
+        try:
+            for index in range(4):
+                executor.submit_job("db-{}".format(index), "fixture", work,
+                                    resource_class="database")
+            for index in range(4):
+                executor.submit_job("cpu-{}".format(index), "fixture", work,
+                                    resource_class="cpu")
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                if executor.metrics()["global_active"] == 2:
+                    break
+                time.sleep(0.01)
+            self.assertLessEqual(maximum, 2)
+            self.assertEqual(executor.metrics()["global_worker_limit"], 2)
+        finally:
+            release.set()
+            executor.shutdown(wait=True)
 
 
 if __name__ == "__main__":

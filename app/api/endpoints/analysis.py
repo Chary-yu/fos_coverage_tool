@@ -1,3 +1,6 @@
+MAX_ANALYSIS_RECORDS = 1000
+
+
 def request(body):
     body = body or {}
     project_name = str(body.get("project_name") or "").strip()
@@ -6,4 +9,6 @@ def request(body):
     records = body.get("records") or []
     if not isinstance(records, list):
         raise ValueError("records must be a list")
+    if len(records) > MAX_ANALYSIS_RECORDS:
+        raise ValueError("records must contain at most {} items".format(MAX_ANALYSIS_RECORDS))
     return project_name, int(body["scan_id"]), records

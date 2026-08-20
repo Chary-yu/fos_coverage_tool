@@ -32,6 +32,8 @@
   let currentFileRows = [];
   let currentDetailFile = '';
   let currentDetailPage = 1;
+  let currentScanId = params.get('scan_id') || '';
+  let currentRepositoryName = params.get('repository_name') || '';
 
   document.documentElement.setAttribute('data-progress-version', PROGRESS_PAGE_VERSION);
   if (returnSummaryLink) {
@@ -236,10 +238,11 @@
   function renderDetailTable(data) {
     const rows = Array.isArray(data.rows) ? data.rows : [];
     const body = rows.length ? rows.map(row => `
-      <tr><td>${asNumber(row[2])}</td><td class="code">${escapeHtml(row[3] || '')}</td>
-      <td>${escapeHtml(row[7] || '')}</td><td>${escapeHtml(row[8] || '')}</td>
-      <td>${escapeHtml(row[9] || '')}</td><td>${escapeHtml(row[10] || '')}</td>
-      <td>${escapeHtml(row[11] || '')}</td><td>${escapeHtml(row[12] || '')}</td></tr>`).join('') : '<tr><td colspan="8">暂无详细数据</td></tr>';
+      <tr><td>${asNumber(row.line_number)}</td><td class="code">${escapeHtml(row.line_text || '')}</td>
+      <td>${escapeHtml(row.status || '')}</td><td>${escapeHtml(row.is_draft ? '草稿' : '')}</td>
+      <td>${escapeHtml(row.reviewer || row.suggested_reviewer || '')}</td>
+      <td>${escapeHtml(row.coverage_method || '')}</td><td>${escapeHtml(row.uncovered_reason || '')}</td>
+      <td>${escapeHtml(row.updated_at || '')}</td></tr>`).join('') : '<tr><td colspan="8">暂无详细数据</td></tr>';
     document.getElementById('detailTable').innerHTML = `
       <thead><tr><th>行号</th><th>代码行</th><th>填写状态</th><th>结论</th><th>责任人</th>
       <th>覆盖方法</th><th>无法覆盖原因</th><th>更新时间</th></tr></thead><tbody>${body}</tbody>`;
@@ -280,10 +283,10 @@
   function apiBaseCandidates() {
     return ['/api/coverage'];
   }
-  function fetchJsonWithTimeout(url, timeoutMs) {
+  function fetchJsonWithTimeout(url, timeoutMs, options) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    return fetch(url, { signal: controller.signal })
+    return fetch(url, Object.assign({}, options || {}, { signal: controller.signal }))
       .finally(() => clearTimeout(timer))
       .then(response => response.json().catch(() => ({})).then(payload => {
         if (!response.ok) throw new Error(payload.message || `HTTP ${response.status}`);
@@ -294,8 +297,10 @@
   function updateLinks(project, apiBase) {
     const encoded = encodeURIComponent(project);
     const base = normalizeApiBase(apiBase || resolvedApiBase || apiBaseCandidates()[0]);
-    csvLink.href = `${base}/export?type=full_progress_summary&project=${encoded}`;
-    excelLink.href = `${base}/export?type=review_excel_by_dir&project=${encoded}`;
+    csvLink.href = '#';
+    excelLink.href = '#';
+    csvLink.title = 'VNext 导出由后台任务生成 ZIP';
+    excelLink.title = 'VNext 导出由后台任务生成 ZIP';
   }
 
   const STAGE_LABELS = {
@@ -321,12 +326,12 @@
   async function waitForJob(apiBase, job, title, token) {
     let current = job;
     let pollErrors = 0;
-    while (current && current.state === 'running') {
+    while (current && (current.state === 'queued' || current.state === 'running')) {
       if (token != null && token !== activeLoadToken) throw new Error('已取消过期的页面加载');
       showJobProgress(current, title);
       await sleep(800);
       try {
-        const payload = await fetchJsonWithTimeout(`${apiBase}/jobs/status?id=${encodeURIComponent(current.id)}`, 10000);
+        const payload = await fetchJsonWithTimeout(`${apiBase}/jobs/${encodeURIComponent(current.job_id || current.id)}`, 10000);
         current = payload.job || {};
         pollErrors = 0;
       } catch (error) {
@@ -341,21 +346,21 @@
   }
 
   function renderProgressData(project, apiBase, data) {
-    const projectRows = Array.isArray(data.project) ? data.project : [];
+    const projectRows = Array.isArray(data.project) ? data.project : (data.total_uncovered != null ? [data] : []);
     const projectRow = projectRows[0] || {};
     const meta = data.meta || {};
     metric('totalUncovered', asNumber(projectRow.total_uncovered));
     metric('filledTotal', asNumber(projectRow.filled_total));
     metric('fillRate', fmtRate(projectRow.fill_rate));
     metric('confirmedRate', fmtRate(projectRow.confirmed_rate));
-    renderOwnershipStatus(data.ownership || {});
+    renderOwnershipStatus(data.ownership || { available: false, warning: 'VNext 汇总不提供旧版目录归属表。' });
     renderTeamTable(data.teams || []);
     renderTable('dirTable', data.dirs || [], 'dir_path');
     renderFileTable(data.files || []);
     if (projectRows.length === 0) {
       statusEl.innerHTML = `<span class="warning">未找到项目“${escapeHtml(project)}”的审查行索引。请在数据库可连接时重新执行 incremental 或 inject。</span>`;
     } else {
-      statusEl.innerText = `已加载 ${asNumber(meta.indexed_file_total)} 个文件的填写摘要；未传输任何逐行明细。项目：${project}，接口：${apiBase}`;
+      statusEl.innerText = `已加载 ${asNumber(data.file_count || meta.indexed_file_total)} 个文件的填写摘要；项目：${project}，接口：${apiBase}`;
     }
   }
 
@@ -378,7 +383,6 @@
     }, '填写进展');
     showConnecting();
     const connectingTimer = window.setInterval(showConnecting, 250);
-    const encodedProject = encodeURIComponent(project);
     const candidates = apiBaseCandidates();
     updateLinks(project, candidates[0]);
     let lastError = null;
@@ -387,17 +391,26 @@
       for (const apiBase of candidates) {
         try {
           connectingApi = apiBase;
-          statusEl.innerText = `正在启动文件级进度任务：${apiBase}`;
-          const payload = await fetchJsonWithTimeout(`${apiBase}/progress/start?project=${encodedProject}`, 10000);
-          if (!payload || payload.status !== 'success') throw new Error(payload && payload.message ? payload.message : '加载失败');
+          statusEl.innerText = `正在读取 VNext 进展汇总：${apiBase}`;
+          const query = new URLSearchParams({ project, scope: reviewScope });
+          if (currentScanId) query.set('scan_id', currentScanId);
+          if (currentRepositoryName) query.set('repository_name', currentRepositoryName);
+          const payload = await fetchJsonWithTimeout(`${apiBase}/progress?${query.toString()}`, 10000);
+          if (!currentScanId && payload && payload.scan_id) {
+            currentScanId = String(payload.scan_id);
+          }
+          const pendingPayload = await fetchJsonWithTimeout(
+            `${apiBase}/incremental/unanalyzed?${query.toString()}`, 10000
+          );
+          payload.files = Array.isArray(pendingPayload.files) ? pendingPayload.files : [];
           window.clearInterval(connectingTimer);
-          const completedJob = await waitForJob(apiBase, payload.job || {}, '填写进展', token);
           resolvedApiBase = apiBase;
           updateLinks(project, apiBase);
-          renderProgressData(project, apiBase, completedJob.data || {});
+          renderProgressData(project, apiBase, payload || {});
           const url = new URL(window.location.href);
           url.searchParams.set('project', project);
-          if (params.get('api')) url.searchParams.set('api', apiBase);
+          if (currentScanId) url.searchParams.set('scan_id', currentScanId);
+          if (currentRepositoryName) url.searchParams.set('repository_name', currentRepositoryName);
           window.history.replaceState(null, '', url.toString());
           return;
         } catch (error) {
@@ -428,7 +441,7 @@
     const apiBase = resolvedApiBase || apiBaseCandidates()[0];
     try {
       const payload = await fetchJsonWithTimeout(
-        `${apiBase}/details?project=${encodeURIComponent(project)}&file=${encodeURIComponent(filePath)}&page=${Math.max(1, page || 1)}&page_size=200`, 15000
+        `${apiBase}/progress/details?project=${encodeURIComponent(project)}&scan_id=${encodeURIComponent(currentScanId)}&repository_name=${encodeURIComponent(currentRepositoryName)}&file=${encodeURIComponent(filePath)}&page=${Math.max(1, page || 1)}&page_size=200`, 15000
       );
       renderDetailTable(payload.data || {});
       section.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -452,10 +465,17 @@
     try {
       for (const apiBase of apiBaseCandidates()) {
         try {
-          const payload = await fetchJsonWithTimeout(`${apiBase}/export/start?type=full_detail&project=${encodeURIComponent(project)}`, 10000);
+          const payload = await fetchJsonWithTimeout(`${apiBase}/exports`, 10000, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              project_name: project, scan_id: Number(currentScanId),
+              report_id: params.get('report_id') || '', input_payload: { requested_from: 'progress' }
+            })
+          });
           const completedJob = await waitForJob(apiBase, payload.job || {}, '详细数据导出');
           resolvedApiBase = apiBase;
-          detailDownloadLink.href = `${apiBase}/export/download?id=${encodeURIComponent(completedJob.id)}`;
+          const completedId = completedJob.job_id || completedJob.id;
+          detailDownloadLink.href = `${apiBase}/exports/${encodeURIComponent(completedId)}/download`;
           detailDownloadLink.hidden = false;
           detailDownloadLink.innerText = `下载详细 CSV（${asNumber(completedJob.row_count)} 行）`;
           statusEl.innerText = `详细 CSV 已在后台生成，共 ${asNumber(completedJob.row_count)} 行，正在开始下载。`;
@@ -479,8 +499,7 @@
     let lastError = null;
     for (const apiBase of apiBaseCandidates()) {
       try {
-        const payload = await fetchJsonWithTimeout(`${apiBase}/projects`, 10000);
-        if (!payload || payload.status !== 'success') throw new Error(payload && payload.message ? payload.message : '项目列表加载失败');
+          const payload = await fetchJsonWithTimeout(`${apiBase}/projects`, 10000);
         resolvedApiBase = apiBase;
         const projects = Array.isArray(payload.projects) ? payload.projects : [];
         projectOptions.innerHTML = projects.map(item => {

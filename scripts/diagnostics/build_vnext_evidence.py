@@ -14,6 +14,9 @@ from app.release_identity import generate_release_identity
 from scripts.diagnostics.canonical_ownership_audit import audit_canonical_ownership
 from scripts.diagnostics.runtime_legacy_dependency_audit import audit as audit_legacy
 from scripts.diagnostics.runtime_participation_audit import audit as audit_participation
+from scripts.diagnostics.frontend_vnext_api_contract_audit import audit as audit_frontend_contract
+from scripts.diagnostics.scan_immutability_audit import audit as audit_scan_immutability
+from scripts.diagnostics.active_runtime_audit import audit as audit_active_runtime
 
 
 CAPABILITIES = [
@@ -105,6 +108,9 @@ def build(repo_root):
         "canonical_ownership": audit_canonical_ownership(repo_root),
         "runtime_participation": audit_participation(),
         "runtime_legacy_dependency": audit_legacy(repo_root),
+        "frontend_vnext_api_contract": audit_frontend_contract(repo_root),
+        "scan_immutability": audit_scan_immutability(),
+        "active_runtime": audit_active_runtime(repo_root),
     }
 
 

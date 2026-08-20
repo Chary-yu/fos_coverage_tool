@@ -14,6 +14,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from app.release_identity import generate_release_identity, save_release_manifest, load_release_manifest
+from app.db.connection_pool import close_global_pool, get_global_pool
 from scripts.diagnostics.data_hash_gate import verify_data_integrity
 from scripts.maintenance.mysql_backup import perform_database_backup, compute_file_sha256
 from scripts.upgrade.schema_preflight import analyze_sql_script
@@ -133,6 +134,19 @@ class TestPhase0Baseline(unittest.TestCase):
         p3, cls3 = idx.resolve("foo.c")
         self.assertIn(cls3, ["ambiguous_suffix", "basename_only_rejected"])
         self.assertIsNone(p3)
+
+    def test_connection_pool_isolated_by_database_identity(self):
+        first = get_global_pool({"host": "db", "port": 3306,
+                                 "user": "coverage", "database": "coverage"})
+        same = get_global_pool({"host": "db", "port": 3306,
+                                "user": "coverage", "database": "coverage"})
+        candidate = get_global_pool({"host": "db", "port": 3306,
+                                     "user": "coverage", "database": "coverage_candidate"})
+        try:
+            self.assertIs(first, same)
+            self.assertIsNot(first, candidate)
+        finally:
+            close_global_pool()
 
     def test_item_28_evidence_manifest_governance(self):
         """Verify evidence manifest structure and final gate validation."""

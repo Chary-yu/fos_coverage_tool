@@ -28,6 +28,11 @@ class RuntimeConfigTest(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 load_config(os.path.join(root, "missing.json"))
 
+    def test_default_application_config_selects_canonical_vnext_runtime(self):
+        config = load_application_config(None, base_dir=os.getcwd())
+        self.assertEqual(config["runtime_mode"], "vnext")
+        self.assertEqual(config["schema_version"], 1)
+
     def test_candidate_roots_are_resolved_relative_to_their_declared_base(self):
         with tempfile.TemporaryDirectory(prefix="vnext-config-") as root:
             path = os.path.join(root, "coverage.json")

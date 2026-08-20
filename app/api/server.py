@@ -6,5 +6,9 @@ def create_server(address, handler):
     try:
         from http.server import ThreadingHTTPServer
     except ImportError:
-        ThreadingHTTPServer = HTTPServer
+        import socketserver
+
+        class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
     return ThreadingHTTPServer(address, handler)

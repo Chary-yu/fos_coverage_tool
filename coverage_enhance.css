@@ -671,6 +671,7 @@ table.source {
     width: 100% !important;
     box-sizing: border-box !important;
     position: relative !important;
+    overflow-anchor: none !important;
 }
 
 /* Region Header Bar */
@@ -916,12 +917,14 @@ table.source {
     width: 100% !important;
     clear: both !important;
     pointer-events: none !important;
+    overflow-anchor: none !important;
 }
 
 .coverage-virtual-content {
     display: block !important;
     width: 100% !important;
     clear: both !important;
+    overflow-anchor: none !important;
 }
 
 /* Toast Message */

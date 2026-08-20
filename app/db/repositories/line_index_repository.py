@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, Iterable
 
-from app.db.repositories.base import execute, fetchall, fetchone, insert_id
+from app.db.repositories.base import adapt_sql, execute, fetchall, fetchone, insert_id
 
 
 LINE_FIELDS = (
@@ -10,9 +10,29 @@ LINE_FIELDS = (
     "block_type", "function_name", "function_hash", "code_line_hash", "code_occurrence",
     "suggested_reviewer",
 )
+MAX_LOOKUP_VALUES = 500
+MAX_INSERT_VALUES = 1000
+
+
+def _chunks(values, size):
+    values = list(values or [])
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
 
 
 class LineIndexRepository(object):
+    @staticmethod
+    def _assert_file_scan_building(connection, file_id: int):
+        row = fetchone(connection, """
+            SELECT s.status FROM coverage_files f
+            JOIN coverage_scans s ON s.id = f.scan_id
+            WHERE f.id = ?
+        """, (int(file_id),))
+        if not row:
+            raise KeyError("file not found: {}".format(file_id))
+        if str(row.get("status") or "").lower() not in {
+                "building", "importing", "constructing"}:
+            raise ValueError("scan facts are sealed and immutable")
     def get_line(self, connection, file_id: int, line_number: int):
         return fetchone(connection, """
             SELECT * FROM coverage_lines WHERE file_id = ? AND line_number = ?
@@ -22,12 +42,15 @@ class LineIndexRepository(object):
         line_ids = sorted({int(line_id) for line_id in (line_ids or [])})
         if not line_ids:
             return []
-        placeholders = ", ".join("?" for _ in line_ids)
-        return fetchall(connection, """
-            SELECT l.*, f.scan_id, f.repository_name, f.file_path, f.file_path_hash
-            FROM coverage_lines l JOIN coverage_files f ON f.id = l.file_id
-            WHERE l.id IN ({})
-        """.format(placeholders), line_ids)
+        rows = []
+        for id_chunk in _chunks(line_ids, MAX_LOOKUP_VALUES):
+            placeholders = ", ".join("?" for _ in id_chunk)
+            rows.extend(fetchall(connection, """
+                SELECT l.*, f.scan_id, f.repository_name, f.file_path, f.file_path_hash
+                FROM coverage_lines l JOIN coverage_files f ON f.id = l.file_id
+                WHERE l.id IN ({})
+            """.format(placeholders), id_chunk))
+        return rows
 
     def get_by_file_numbers(self, connection, file_numbers):
         """Resolve many (file_id, line_number) pairs with one SELECT."""
@@ -35,18 +58,22 @@ class LineIndexRepository(object):
                         for file_id, line_number in (file_numbers or [])})
         if not pairs:
             return []
-        clauses = []
-        params = []
-        for file_id, line_number in pairs:
-            clauses.append("(l.file_id = ? AND l.line_number = ?)")
-            params.extend((file_id, line_number))
-        return fetchall(connection, """
-            SELECT l.*, f.scan_id, f.repository_name, f.file_path, f.file_path_hash
-            FROM coverage_lines l JOIN coverage_files f ON f.id = l.file_id
-            WHERE {}
-        """.format(" OR ".join(clauses)), params)
+        rows = []
+        for pair_chunk in _chunks(pairs, MAX_LOOKUP_VALUES):
+            clauses = []
+            params = []
+            for file_id, line_number in pair_chunk:
+                clauses.append("(l.file_id = ? AND l.line_number = ?)")
+                params.extend((file_id, line_number))
+            rows.extend(fetchall(connection, """
+                SELECT l.*, f.scan_id, f.repository_name, f.file_path, f.file_path_hash
+                FROM coverage_lines l JOIN coverage_files f ON f.id = l.file_id
+                WHERE {}
+            """.format(" OR ".join(clauses)), params))
+        return rows
 
     def upsert_line(self, connection, file_id: int, record: Dict[str, Any]):
+        self._assert_file_scan_building(connection, file_id)
         line_number = int(record.get("line_number") or 0)
         if line_number < 1:
             raise ValueError("line_number must be positive")
@@ -62,14 +89,10 @@ class LineIndexRepository(object):
             values.append(defaults.get(field) if value is None else value)
         existing = self.get_line(connection, file_id, line_number)
         if existing:
-            cursor = execute(connection, """
-                UPDATE coverage_lines SET line_text = ?, coverage_state = ?, block_start_line = ?,
-                    block_end_line = ?, block_type = ?, function_name = ?, function_hash = ?,
-                    code_line_hash = ?, code_occurrence = ?, suggested_reviewer = ?
-                WHERE id = ?
-            """, tuple(values[1:]) + (existing["id"],))
-            cursor.close()
-            return fetchone(connection, "SELECT * FROM coverage_lines WHERE id = ?", (existing["id"],))
+            current = tuple(existing.get(field) for field in LINE_FIELDS)
+            if current != tuple(values):
+                raise ValueError("physical line fact is immutable")
+            return existing
         cursor = execute(connection, """
             INSERT INTO coverage_lines(
                 file_id, line_number, line_text, coverage_state, block_start_line, block_end_line,
@@ -82,7 +105,56 @@ class LineIndexRepository(object):
         return fetchone(connection, "SELECT * FROM coverage_lines WHERE id = ?", (line_id,))
 
     def upsert_lines(self, connection, file_id: int, records: Iterable[Dict[str, Any]]):
-        return [self.upsert_line(connection, file_id, record) for record in records]
+        self._assert_file_scan_building(connection, file_id)
+        normalized = []
+        for record in records or []:
+            line_number = int(record.get("line_number") or 0)
+            if line_number < 1:
+                raise ValueError("line_number must be positive")
+            defaults = {
+                "line_text": "", "coverage_state": "unknown",
+                "block_start_line": line_number, "block_end_line": line_number,
+                "block_type": "single", "function_name": "", "function_hash": "",
+                "code_line_hash": "", "code_occurrence": 1, "suggested_reviewer": "",
+            }
+            values = [line_number]
+            for field in LINE_FIELDS[1:]:
+                value = record.get(field)
+                values.append(defaults.get(field) if value is None else value)
+            normalized.append(tuple(values))
+        if not normalized:
+            return []
+        line_numbers = [item[0] for item in normalized]
+        if len(set(line_numbers)) != len(line_numbers):
+            raise ValueError("duplicate physical line identity in batch")
+        existing = []
+        for number_chunk in _chunks(line_numbers, MAX_LOOKUP_VALUES):
+            existing.extend(fetchall(connection, """
+                SELECT * FROM coverage_lines WHERE file_id = ?
+                  AND line_number IN ({})
+            """.format(", ".join("?" for _ in number_chunk)),
+                (int(file_id),) + tuple(number_chunk)))
+        by_line = {int(row["line_number"]): row for row in existing}
+        for values in normalized:
+            row = by_line.get(values[0])
+            if row and tuple(row.get(field) for field in LINE_FIELDS) != values:
+                raise ValueError("physical line fact is immutable")
+        missing = [values for values in normalized if values[0] not in by_line]
+        if not missing:
+            return [by_line[values[0]] for values in normalized]
+        for missing_chunk in _chunks(missing, MAX_INSERT_VALUES):
+            cursor = connection.cursor()
+            try:
+                cursor.executemany(adapt_sql(connection, """
+                    INSERT INTO coverage_lines(
+                        file_id, line_number, line_text, coverage_state, block_start_line,
+                        block_end_line, block_type, function_name, function_hash,
+                        code_line_hash, code_occurrence, suggested_reviewer
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """), [(int(file_id),) + values for values in missing_chunk])
+            finally:
+                cursor.close()
+        return self.list_lines(connection, file_id)
 
     def list_lines(self, connection, file_id: int):
         return fetchall(connection, """

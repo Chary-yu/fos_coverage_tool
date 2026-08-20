@@ -2,6 +2,7 @@
 
 import os
 import time
+import logging
 
 from app.api.auth import MutationAuthorizer
 from app.api.router import Router
@@ -14,6 +15,11 @@ from app.api.endpoints import jobs as jobs_endpoint
 from app.api.endpoints import progress as progress_endpoint
 from app.api.endpoints import projects as projects_endpoint
 from app.api.endpoints import release as release_endpoint
+from app.code_detail.source_reader import compute_db_file_path_hash
+from app.db.repositories.base import fetchall, fetchone
+
+
+logger = logging.getLogger(__name__)
 
 
 class VNextApplication(object):
@@ -33,6 +39,8 @@ class VNextApplication(object):
         self.router.add("GET", r"^/api/coverage/projects$", self.projects)
         self.router.add("GET", r"^/api/coverage/projects/([^/]+)/scans$", self.scans)
         self.router.add("GET", r"^/api/coverage/progress$", self.progress)
+        self.router.add("GET", r"^/api/coverage/progress/details$", self.progress_details)
+        self.router.add("GET", r"^/api/coverage/progress/pending$", self.progress_pending)
         self.router.add("GET", r"^/api/coverage/incremental/unanalyzed$", self.unanalyzed)
         self.router.add("POST", r"^/api/coverage/incremental$", self.incremental)
         self.router.add("GET", r"^/api/coverage/incremental$", self.incremental_result)
@@ -49,6 +57,7 @@ class VNextApplication(object):
         self.router.add("POST", r"^/api/coverage/jobs$", self.create_job)
         self.router.add("POST", r"^/api/coverage/jobs/recover$", self.recover_jobs)
         self.router.add("POST", r"^/api/coverage/exports$", self.create_export)
+        self.router.add("GET", r"^/api/coverage/exports/([^/]+)/download$", self.export_download)
         self.router.add("GET", r"^/api/coverage/exports/([^/]+)$", self.export_detail)
 
     def dispatch(self, method, path, query=None, body=None, headers=None, remote_address=""):
@@ -59,23 +68,24 @@ class VNextApplication(object):
             return self.router.dispatch(
                 method, path, query, body, headers, remote_address
             )
-        except KeyError as exc:
-            return 404, {"error": "not_found", "message": str(exc)}
-        except FileNotFoundError as exc:
-            return 404, {"error": "not_found", "message": str(exc)}
-        except ValueError as exc:
-            return 400, {"error": "invalid_request", "message": str(exc)}
+        except KeyError:
+            return 404, {"error": "not_found", "message": "resource not found"}
+        except FileNotFoundError:
+            return 404, {"error": "not_found", "message": "resource not found"}
+        except ValueError:
+            return 400, {"error": "invalid_request", "message": "invalid request"}
         except PermissionError as exc:
-            message = str(exc)
+            message = "request is not authorized"
+            raw_message = str(exc)
             status = 403
             for candidate in (401, 403, 503):
-                if message.startswith("{}:".format(candidate)):
+                if raw_message.startswith("{}:".format(candidate)):
                     status = candidate
-                    message = message[len(str(candidate)) + 1:]
                     break
             return status, {"error": "forbidden", "message": message}
         except Exception as exc:
-            return 500, {"error": "internal_error", "message": str(exc)}
+            logger.exception("VNext application dispatch failed")
+            return 500, {"error": "internal_error", "message": "internal server error"}
 
     def _read_connection(self):
         return self.runtime.connection_context(read_only=True)
@@ -89,11 +99,15 @@ class VNextApplication(object):
             raise PermissionError("{}:{}".format(status, identity))
         return identity
 
+    def _require_operator(self, headers, remote_address):
+        return self._require_mutation(headers, remote_address)
+
     def health(self, query, body, headers, remote_address):
         return 200, health_endpoint.payload(self)
 
     def metrics(self, query, body, headers, remote_address):
         """Expose bounded runtime counters without including review data."""
+        self._require_operator(headers, remote_address)
         runtime = self.runtime
         payload = {
             "runtime": "vnext",
@@ -108,9 +122,11 @@ class VNextApplication(object):
         return 200, release_endpoint.payload(self)
 
     def routes(self, query, body, headers, remote_address):
+        self._require_operator(headers, remote_address)
         return 200, {"base": self.BASE, "routes": self.router.describe()}
 
     def jobs(self, query, body, headers, remote_address):
+        self._require_operator(headers, remote_address)
         project_id = query.get("project_id")
         states = query.get("state")
         if isinstance(states, str):
@@ -127,6 +143,7 @@ class VNextApplication(object):
         return 200, {"recovered": recovered}
 
     def job_detail(self, job_id, query, body, headers, remote_address):
+        self._require_operator(headers, remote_address)
         job = self.runtime.job_service.get(job_id)
         if not job:
             raise KeyError("job not found: {}".format(job_id))
@@ -175,6 +192,20 @@ class VNextApplication(object):
     def export_detail(self, job_id, query, body, headers, remote_address):
         return self.job_detail(job_id, query, body, headers, remote_address)
 
+    def export_download(self, job_id, query, body, headers, remote_address):
+        self._require_operator(headers, remote_address)
+        job = self.runtime.job_service.get(job_id)
+        if not job or job.get("kind") not in ("export", ""):
+            raise KeyError("export job not found")
+        if job.get("state") != "completed":
+            raise ValueError("export is not completed")
+        path = self.runtime.export_service.download_path(job.get("result_path"), job_id)
+        return 200, {
+            "__download__": path,
+            "filename": os.path.basename(path),
+            "content_type": "application/zip",
+        }
+
     def projects(self, query, body, headers, remote_address):
         with self._read_connection() as connection:
             return 200, {"projects": self.runtime.projects.list_projects(connection)}
@@ -192,12 +223,79 @@ class VNextApplication(object):
                 connection, project_name, int(scan_id) if scan_id else None
             )
 
+    def progress_details(self, query, body, headers, remote_address):
+        project_name = progress_endpoint.project_name(query, self.config.get("project_name") or "")
+        scan_id = query.get("scan_id")
+        file_path = str(query.get("file") or query.get("file_path") or "").strip()
+        repository_name = str(query.get("repository_name") or "").strip()
+        if not scan_id or not file_path:
+            raise ValueError("scan_id and file are required")
+        page = max(1, int(query.get("page") or 1))
+        page_size = min(200, max(1, int(query.get("page_size") or 200)))
+        project = None
+        with self._read_connection() as connection:
+            project = self.runtime.projects.get_project_by_name(connection, project_name)
+            if not project:
+                raise KeyError("project not found")
+            scan = self.runtime.projects.get_scan(connection, int(scan_id))
+            if not scan or int(scan["project_id"]) != int(project["id"]):
+                raise KeyError("scan is not bound to project")
+            file_hash = compute_db_file_path_hash(file_path, repository_name)
+            file_rows = fetchall(connection, """
+                SELECT * FROM coverage_files
+                WHERE scan_id = ? AND repository_name = ?
+                  AND (file_path_hash = ? OR file_path = ?)
+            """, (int(scan_id), repository_name, file_hash, file_path))
+            if len(file_rows) > 1:
+                raise ValueError("file path is ambiguous within the Scan identity")
+            file_row = file_rows[0] if file_rows else None
+            if not file_row:
+                raise KeyError("file identity not found")
+            total_row = fetchone(connection, """
+                SELECT COUNT(*) AS total FROM coverage_lines WHERE file_id = ?
+            """, (int(file_row["id"]),))
+            offset = (page - 1) * page_size
+            rows = fetchall(connection, """
+                SELECT l.line_number, l.line_text, l.coverage_state,
+                       l.suggested_reviewer, a.status, a.is_draft, a.reviewer,
+                       a.coverage_method, a.uncovered_reason, a.updated_at
+                FROM coverage_lines l
+                LEFT JOIN coverage_analyses a ON a.line_id = l.id
+                WHERE l.file_id = ?
+                ORDER BY l.line_number
+                LIMIT ? OFFSET ?
+            """, (int(file_row["id"]), page_size, offset))
+        total = int((total_row or {}).get("total") or 0)
+        return 200, {
+            "page": page, "page_size": page_size, "total": total,
+            "total_pages": (total + page_size - 1) // page_size if total else 0,
+            "rows": rows,
+        }
+
+    def progress_pending(self, query, body, headers, remote_address):
+        project_name = progress_endpoint.project_name(
+            query, self.config.get("project_name") or ""
+        )
+        scan_id = query.get("scan_id")
+        page = max(1, int(query.get("page") or 1))
+        page_size = min(500, max(1, int(query.get("page_size") or 100)))
+        with self._read_connection() as connection:
+            return 200, self.runtime.progress_service.pending_page(
+                connection, project_name,
+                int(scan_id) if scan_id else None,
+                page=page, page_size=page_size,
+            )
+
     def unanalyzed(self, query, body, headers, remote_address):
         project_name = progress_endpoint.project_name(query, self.config.get("project_name") or "")
         with self._read_connection() as connection:
             return 200, {
                 "project_name": project_name,
-                "files": self.runtime.progress_service.pending_by_file(connection, project_name),
+                "scan_id": int(query.get("scan_id")) if query.get("scan_id") else None,
+                "files": self.runtime.progress_service.pending_by_file(
+                    connection, project_name,
+                    int(query.get("scan_id")) if query.get("scan_id") else None,
+                ),
             }
 
     def incremental(self, query, body, headers, remote_address):
@@ -237,38 +335,41 @@ class VNextApplication(object):
         return code_detail_endpoint.identity(source)
 
     def code_layout(self, query, body, headers, remote_address):
-        scan_id, report_id, file_path = self._code_detail_args(query)
+        scan_id, report_id, repository_name, file_path = self._code_detail_args(query)
         with self._read_connection() as connection:
             return 200, self.runtime.code_detail.layout(
-                connection, scan_id, report_id, file_path
+                connection, scan_id, report_id, repository_name, file_path
             )
 
     def code_lines(self, query, body, headers, remote_address):
-        scan_id, report_id, file_path = self._code_detail_args(query)
+        scan_id, report_id, repository_name, file_path = self._code_detail_args(query)
         start_line = int(query.get("start_line") or 1)
         end_line = int(query.get("end_line") or start_line)
         with self._read_connection() as connection:
             return 200, self.runtime.code_detail.lines(
-                connection, scan_id, report_id, file_path, start_line, end_line
+                connection, scan_id, report_id, repository_name, file_path,
+                start_line, end_line
             )
 
     def code_lines_batch(self, query, body, headers, remote_address):
-        scan_id, report_id, file_path = self._code_detail_args(body)
+        scan_id, report_id, repository_name, file_path = self._code_detail_args(body)
         ranges = body.get("ranges") or []
         if not isinstance(ranges, list) or len(ranges) > 1000:
             raise ValueError("ranges must be a list with at most 1000 entries")
         if not ranges:
             return 200, {
                 "scan_id": scan_id, "report_id": report_id,
-                "file_path": file_path, "batches": [],
+                "repository_name": repository_name, "file_path": file_path,
+                "batches": [],
             }
         with self._read_connection() as connection:
             result = self.runtime.code_detail.lines_batch(
-                connection, scan_id, report_id, file_path, ranges
+                connection, scan_id, report_id, repository_name, file_path, ranges
             )
         return 200, {
             "scan_id": scan_id, "report_id": report_id,
-            "file_path": file_path, "batches": result,
+            "repository_name": repository_name, "file_path": file_path,
+            "batches": result,
         }
 
     def create_project(self, query, body, headers, remote_address):

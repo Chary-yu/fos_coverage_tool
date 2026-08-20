@@ -102,6 +102,13 @@ class VNextRuntimeTest(unittest.TestCase):
             query={"project": "fixture"},
         )
         self.assertEqual(pending["files"][0]["pending_line_numbers"], [11])
+        status, pending_page = self.application.dispatch(
+            "GET", "/api/coverage/progress/pending",
+            query={"project": "fixture", "page": "1", "page_size": "1"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(pending_page["total"], 1)
+        self.assertEqual(pending_page["rows"][0]["line_number"], 11)
         self.assertEqual(
             self.application.dispatch(
                 "GET", "/api/coverage/progress", query={"project": "fixture"}
@@ -270,6 +277,13 @@ class VNextRuntimeTest(unittest.TestCase):
                 trace = []
                 connection.set_trace_callback(trace.append)
                 batches = self.runtime.code_detail.lines_batch(
+                    connection, scan["id"], "report_batch", "src/batch.c",
+                    [(1, 1), (2, 2), (3, 4)],
+                )
+                # A second HTTP-equivalent request for the same immutable
+                # data_version reuses the overlay instead of rereading the
+                # same analysis rows.
+                self.runtime.code_detail.lines_batch(
                     connection, scan["id"], "report_batch", "src/batch.c",
                     [(1, 1), (2, 2), (3, 4)],
                 )

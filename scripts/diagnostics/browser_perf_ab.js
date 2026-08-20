@@ -14,9 +14,13 @@ const CLIENT_CSS = fs.readFileSync(
 async function runVirtualScrollWorkload(browser) {
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
   const requestLog = [];
+  let responseBytes = 0;
+  let maxResponseBytes = 0;
   const html = `<!doctype html><html><head>
     <meta name="coverage-project" content="PerfE2E">
     <meta name="coverage-report-id" content="report_perf_e2e">
+    <meta name="coverage-scan-id" content="1">
+    <meta name="coverage-repository-name" content="">
     <meta name="coverage-file-path" content="src/perf_100k.c">
     <meta name="coverage-render-mode" content="lazy_collapse">
     <meta name="coverage-review-scope" content="full">
@@ -29,8 +33,6 @@ async function runVirtualScrollWorkload(browser) {
     let payload;
     if (url.pathname === '/api/coverage/code-layout') {
       payload = {
-        status: 'success',
-        data: {
           project_name: 'PerfE2E', file_path: 'src/perf_100k.c',
           report_id: 'report_perf_e2e', total_lines: 100000,
           total_uncovered_count: 0, pending_line_count: 0,
@@ -39,7 +41,6 @@ async function runVirtualScrollWorkload(browser) {
             line_count: 100000, default_state: 'collapsed', kind: 'collapsed',
             label: '100k virtual scroll fixture'
           }]
-        }
       };
     } else if (url.pathname === '/api/coverage/code-lines') {
       const start = Number(url.searchParams.get('start_line') || 1);
@@ -57,7 +58,11 @@ async function runVirtualScrollWorkload(browser) {
     } else {
       payload = { status: 'success', data: {} };
     }
-    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(payload) });
+    const responseBody = JSON.stringify(payload);
+    const responseSize = Buffer.byteLength(responseBody, 'utf8');
+    responseBytes += responseSize;
+    maxResponseBytes = Math.max(maxResponseBytes, responseSize);
+    await route.fulfill({ status: 200, contentType: 'application/json', body: responseBody });
   });
   await page.route('http://coverage-perf.test/', async route => {
     await route.fulfill({ status: 200, contentType: 'text/html', body: html });
@@ -77,10 +82,28 @@ async function runVirtualScrollWorkload(browser) {
       await internals.CodeRegionController.expandRegion('virtual_100k');
       const region = internals.CodeRegionStore.get('virtual_100k');
       const telemetry = internals.PerformanceTelemetry.snapshot();
+      const firstVisibleAt = performance.now();
+      const firstVisible = document.querySelector('#L1') !== null;
+      let scrolledVisible = false;
+      const targetStart = performance.now();
+      window.scrollTo(0, 50000 * 24);
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        await new Promise(resolve => setTimeout(resolve, 5));
+        if (document.querySelector('[id="L50000"]') !== null) {
+          scrolledVisible = true;
+          break;
+        }
+      }
       return {
         elapsed_ms: Number((performance.now() - start).toFixed(3)),
+        time_to_first_visible_ms: Number((firstVisibleAt - start).toFixed(3)),
+        time_to_target_line_ms: scrolledVisible
+          ? Number((performance.now() - targetStart).toFixed(3)) : null,
         loaded_lines: region.lines.length,
+        loaded_line_count: region.loadedLineCount,
         virtualized: region.virtualized,
+        first_visible: firstVisible,
+        scrolled_visible: scrolledVisible,
         dom_line_count: region.virtualContent ? region.virtualContent.children.length : 0,
         telemetry
       };
@@ -88,11 +111,14 @@ async function runVirtualScrollWorkload(browser) {
     const codeLineRequests = requestLog.filter(item => item === '/api/coverage/code-lines').length;
     return {
       status: measurement.virtualized && measurement.loaded_lines === 100000 &&
-        measurement.dom_line_count < 1500 && codeLineRequests === 50 ? 'PASSED' : 'FAILED',
+        measurement.loaded_line_count < 2000 && measurement.dom_line_count < 1500 &&
+        measurement.first_visible && measurement.scrolled_visible && codeLineRequests <= 4 ? 'PASSED' : 'FAILED',
       evidence_class: 'performance_e2e',
       workload_id: 'coverage-enhance-virtual-scroll-100k-v1',
       line_count: 100000,
       request_count: codeLineRequests,
+      response_bytes: responseBytes,
+      max_response_bytes: maxResponseBytes,
       ...measurement
     };
   } finally {

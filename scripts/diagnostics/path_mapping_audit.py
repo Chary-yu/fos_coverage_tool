@@ -33,14 +33,14 @@ class PathLookupIndex:
     def __init__(self, target_paths: List[str], repo_name: str = ""):
         self.repo_name = repo_name
         self.exact_map: Dict[str, str] = {}
-        self.normalized_map: Dict[str, str] = {}
+        self.normalized_map: Dict[str, Set[str]] = {}
         self.suffix_map: Dict[str, Set[str]] = {}
         self.basename_map: Dict[str, Set[str]] = {}
         
         for p in target_paths:
             norm = normalize_path(p)
             self.exact_map[p] = p
-            self.normalized_map[norm] = p
+            self.normalized_map.setdefault(norm, set()).add(p)
             
             # Suffix index (minimum 2 segments)
             parts = norm.split("/")
@@ -68,7 +68,10 @@ class PathLookupIndex:
         # 2. Normalized
         norm = normalize_path(query_path)
         if norm in self.normalized_map:
-            return self.normalized_map[norm], "normalized"
+            candidates = self.normalized_map[norm]
+            if len(candidates) == 1:
+                return next(iter(candidates)), "normalized"
+            return None, "ambiguous_normalized"
             
         # 3. Suffix search
         parts = norm.split("/")
@@ -100,6 +103,7 @@ def audit_path_mappings(known_paths: List[str], test_queries: List[Tuple[str, st
         "normalized": 0,
         "unique_suffix": 0,
         "ambiguous_suffix": 0,
+        "ambiguous_normalized": 0,
         "basename_only_rejected": 0,
         "miss": 0,
         "violations": []
@@ -150,6 +154,7 @@ def audit_lcov_paths(known_paths: List[str], info_files: List[str]) -> Dict[str,
                 "normalized": "lcov_normalized",
                 "unique_suffix": "lcov_unique_suffix",
                 "ambiguous_suffix": "lcov_ambiguous",
+                "ambiguous_normalized": "lcov_ambiguous",
                 "basename_only_rejected": "lcov_basename_rejected",
                 "miss": "lcov_miss",
             }.get(classification, "lcov_miss")

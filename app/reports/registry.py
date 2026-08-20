@@ -17,14 +17,25 @@ class ReportRegistry(object):
 
     def register(self, report_id, directories, **metadata):
         report_id = validate_report_id(report_id)
-        directories = [os.path.realpath(path) for path in directories or []
-                       if path and os.path.isdir(path) and not os.path.islink(path)]
+        directories = [self._canonical_report_root(report_id, path) for path in directories or []]
+        directories = list(dict.fromkeys(
+            path for path in directories
+            if path and os.path.isdir(path) and not os.path.islink(path)
+        ))
         if not directories:
             return None
         os.makedirs(self.registry_dir, exist_ok=True)
         path = self._path(report_id)
         current = self.load_exact(report_id) or {}
-        merged = list(dict.fromkeys((current.get("directories") or []) + directories))
+        existing_directories = list(dict.fromkeys(current.get("directories") or []))
+        if existing_directories and set(existing_directories) != set(directories):
+            # A second root for the same Report ID is not a harmless merge:
+            # it makes physical Sidecar resolution ambiguous.  Relocation is
+            # an explicit operation and must replace the old registration.
+            if not metadata.get("replace"):
+                raise ValueError("report_id is already registered to another root")
+            existing_directories = []
+        merged = list(dict.fromkeys(existing_directories + directories))
         payload = {
             "report_id": report_id,
             "directories": merged,
@@ -50,6 +61,19 @@ class ReportRegistry(object):
             except OSError:
                 pass
         return payload
+
+    @staticmethod
+    def _canonical_report_root(report_id, path):
+        """Normalize accidental Sidecar paths back to the report root."""
+        if not path:
+            return ""
+        candidate = os.path.realpath(str(path))
+        if os.path.basename(candidate) == report_id and \
+                os.path.basename(os.path.dirname(candidate)) == ".source_cache":
+            return os.path.realpath(os.path.dirname(os.path.dirname(candidate)))
+        if os.path.basename(candidate) == ".source_cache":
+            return os.path.realpath(os.path.dirname(candidate))
+        return candidate
 
     def load_exact(self, report_id):
         report_id = validate_report_id(report_id)
@@ -114,8 +138,11 @@ class ReportRegistry(object):
             for directory in value.get("directories") or []:
                 if not os.path.isdir(directory):
                     continue
-                if value.get("sidecar_required") or os.path.isdir(
-                        os.path.join(directory, ".source_cache")):
+                # A sibling report may have created ``.source_cache`` under
+                # this root. That directory alone says nothing about this
+                # report's format; only this report's own registration flag
+                # can require a report-specific Sidecar directory.
+                if value.get("sidecar_required"):
                     sidecar = os.path.join(directory, ".source_cache", report_id)
                     if not os.path.isdir(sidecar):
                         continue
@@ -142,8 +169,7 @@ class ReportRegistry(object):
         for path in value.get("directories") or []:
             if not os.path.isdir(path):
                 continue
-            if (value.get("sidecar_required") or os.path.isdir(
-                    os.path.join(path, ".source_cache"))) and not os.path.isdir(
+            if value.get("sidecar_required") and not os.path.isdir(
                     os.path.join(path, ".source_cache", report_id)):
                 continue
             roots.append(path)

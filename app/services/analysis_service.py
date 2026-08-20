@@ -7,10 +7,12 @@ from app.db.repositories import (
     ProjectStateRepository,
 )
 from app.db.transaction import transaction
+from app.code_detail.source_reader import compute_db_file_path_hash
 
 
 CONFIRMED_STATUSES = ("可覆盖", "无法覆盖", "冗余代码")
 VALID_STATUSES = ("", "未确认") + CONFIRMED_STATUSES
+MAX_EXPANDED_ANALYSIS_LINES = 20000
 
 
 class AnalysisService(object):
@@ -49,7 +51,43 @@ class AnalysisService(object):
 
     def _resolve_records(self, connection, scan_id, records, reviewer):
         """Resolve all line identities before issuing the single bulk write."""
-        resolved = [dict(item or {}) for item in records]
+        resolved = []
+        for item in records or []:
+            item = dict(item or {})
+            ranges = item.pop("line_ranges", None)
+            if ranges is None and item.get("line_start") is not None:
+                line_start = item.pop("line_start")
+                line_end = item.pop("line_end", line_start)
+                ranges = [(line_start, line_end)]
+            if ranges is None and isinstance(item.get("line_numbers"), (list, tuple)):
+                ranges = [(line, line) for line in item.pop("line_numbers")]
+            if ranges is None and item.get("line_id") and item.get("line_number") is None:
+                resolved.append(item)
+                continue
+            if ranges is None:
+                ranges = [(item.get("line_number"), item.get("line_number"))]
+            for range_item in ranges:
+                if isinstance(range_item, dict):
+                    start_line = range_item.get("start_line")
+                    end_line = range_item.get("end_line", start_line)
+                else:
+                    start_line, end_line = range_item
+                start_line, end_line = int(start_line), int(end_line)
+                if start_line < 1 or end_line < start_line:
+                    raise ValueError("invalid analysis line range")
+                if end_line - start_line + 1 > MAX_EXPANDED_ANALYSIS_LINES:
+                    raise ValueError("analysis line range is too large")
+                for line_number in range(start_line, end_line + 1):
+                    row = dict(item)
+                    row["line_number"] = line_number
+                    resolved.append(row)
+                    if len(resolved) > MAX_EXPANDED_ANALYSIS_LINES:
+                        raise ValueError("too many analysis lines in one batch")
+        for item in resolved:
+            if not item.get("file_path_hash") and item.get("file_path"):
+                item["file_path_hash"] = compute_db_file_path_hash(
+                    item.get("file_path"), item.get("repository_name", "")
+                )
         direct_ids = {int(item["line_id"]) for item in resolved if item.get("line_id")}
         identity_requests = {
             (str(item.get("repository_name") or ""), str(item.get("file_path_hash") or ""))
@@ -62,6 +100,7 @@ class AnalysisService(object):
             connection, scan_id, identity_requests
         )
         pair_requests = set()
+        deduped = {}
         for item in resolved:
             if item.get("line_id"):
                 continue
@@ -100,7 +139,11 @@ class AnalysisService(object):
             status = item.get("status") or ""
             if status not in VALID_STATUSES:
                 raise ValueError("invalid analysis status: {}".format(status))
-        return resolved
+            # Overlapping ranges are common when a browser retries a batch.
+            # Keep the last logical record per physical line and avoid
+            # executing duplicate upserts in the same transaction.
+            deduped[int(item["line_id"])] = item
+        return list(deduped.values())
 
     @staticmethod
     def _line_by_number(connection, file_id, line_number):

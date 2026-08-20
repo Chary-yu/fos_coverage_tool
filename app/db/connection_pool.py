@@ -25,6 +25,85 @@ except ImportError:
     pymysql = None
     HAVE_PYMYSQL = False
 
+
+def _is_connection_error(error):
+    """Identify errors for which a read-only operation can be retried safely."""
+    if isinstance(error, (ConnectionError, OSError)):
+        return True
+    if HAVE_PYMYSQL:
+        try:
+            if isinstance(error, (pymysql.err.OperationalError, pymysql.err.InterfaceError)):
+                return True
+        except AttributeError:
+            pass
+    try:
+        return int(error.args[0]) in {2006, 2013, 2055}
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return False
+
+
+class _RetryingReadOnlyCursor:
+    """DB-API cursor proxy that retries one verified MySQL disconnect."""
+
+    def __init__(self, connection, raw_cursor):
+        self._connection = connection
+        self._raw_cursor = raw_cursor
+
+    def _run(self, method_name, *args, **kwargs):
+        method = getattr(self._raw_cursor, method_name)
+        try:
+            return method(*args, **kwargs)
+        except Exception as error:
+            if not _is_connection_error(error) or not self._connection._reconnect():
+                raise
+            try:
+                self._raw_cursor.close()
+            except Exception:
+                pass
+            self._raw_cursor = self._connection._new_cursor()
+            return getattr(self._raw_cursor, method_name)(*args, **kwargs)
+
+    def execute(self, *args, **kwargs):
+        return self._run("execute", *args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self._run("executemany", *args, **kwargs)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._raw_cursor, name)
+
+
+class _RetryingReadOnlyConnection:
+    """Transparent PyMySQL connection proxy used only for read-only scopes."""
+
+    def __init__(self, raw_connection, pool):
+        self._connection = raw_connection
+        self._pool = pool
+
+    def _new_cursor(self, *args, **kwargs):
+        return self._connection.cursor(*args, **kwargs)
+
+    def _reconnect(self):
+        try:
+            self._connection.ping(reconnect=True)
+            self._pool._record_metric("read_reconnects")
+            return True
+        except Exception:
+            return False
+
+    def cursor(self, *args, **kwargs):
+        return _RetryingReadOnlyCursor(self, self._new_cursor(*args, **kwargs))
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
 class PooledConnectionWrapper:
     """Wrapper around a DB-API connection tracking creation time and usage."""
     def __init__(self, raw_conn, pool: 'MySQLConnectionPool'):
@@ -53,7 +132,21 @@ class PooledConnectionWrapper:
             return False
 
     def rollback_if_dirty(self) -> None:
-        if self.read_only or not self.pool.rollback_on_return:
+        if not self.pool.rollback_on_return:
+            self.pool._record_metric("rollback_skips")
+            return
+        # read_only is only a Python-side hint. Skip cleanup only when the
+        # DB-API connection itself confirms autocommit/read-transaction
+        # semantics; ordinary PyMySQL connections use autocommit=False and
+        # must still be rolled back for transaction hygiene.
+        autocommit = False
+        if self.read_only and self.raw_conn is not None:
+            try:
+                get_autocommit = getattr(self.raw_conn, "get_autocommit", None)
+                autocommit = bool(get_autocommit()) if get_autocommit else False
+            except Exception:
+                autocommit = False
+        if self.read_only and autocommit:
             self.pool._record_metric("rollback_skips")
             return
         try:
@@ -93,6 +186,9 @@ class MySQLConnectionPool:
         self.rollback_on_return = bool(self.db_config.get(
             "rollback_on_return", rollback_on_return
         ))
+        self.retry_read_operations = bool(self.db_config.get(
+            "retry_read_operations", True
+        ))
         
         self._pool: Queue = Queue(maxsize=self.max_connections)
         self._active_count = 0
@@ -101,7 +197,8 @@ class MySQLConnectionPool:
         self._metrics = {
             "acquires": 0, "acquire_timeouts": 0, "reconnects": 0,
             "pings": 0, "ping_skips": 0, "rollbacks": 0,
-            "rollback_skips": 0,
+            "rollback_skips": 0, "read_only_rollbacks": 0,
+            "read_reconnects": 0,
         }
 
     def _record_metric(self, name: str, amount: int = 1) -> None:
@@ -193,15 +290,23 @@ class MySQLConnectionPool:
 
     @contextmanager
     def connection(self, read_only: bool = False):
-        """Acquire a connection, optionally skipping the write cleanup path.
+        """Acquire a connection and always restore transaction hygiene.
 
-        Read-only callers avoid an unnecessary rollback round-trip. Writers
-        retain the historical strict rollback-on-return safety net.
+        ``read_only`` is observational metadata for metrics; it never weakens
+        rollback-on-return because PyMySQL connections use autocommit=False.
         """
         conn_wrapper = self.borrow_connection()
         conn_wrapper.read_only = bool(read_only)
         try:
-            yield conn_wrapper.raw_conn
+            raw_connection = conn_wrapper.raw_conn
+            module_name = str(getattr(raw_connection.__class__, "__module__", ""))
+            if (read_only and self.retry_read_operations
+                    and module_name.startswith("pymysql")
+                    and hasattr(raw_connection, "cursor")
+                    and hasattr(raw_connection, "ping")):
+                yield _RetryingReadOnlyConnection(raw_connection, self)
+            else:
+                yield raw_connection
         finally:
             self.return_connection(conn_wrapper)
 
@@ -223,21 +328,78 @@ class MySQLConnectionPool:
             metrics = dict(self._metrics)
         return dict(metrics, active=active, idle=self._pool.qsize(), waiters=0)
 
+_GLOBAL_POOLS = {}
+_GLOBAL_POOL_REFS = {}
+# Kept as a compatibility alias for older diagnostics/importers.  New code
+# must use the config-keyed registry below rather than one process-global DB.
 _GLOBAL_POOL: Optional[MySQLConnectionPool] = None
 _GLOBAL_POOL_LOCK = threading.Lock()
 
+def _normalized_pool_config(db_config):
+    raw = dict(db_config or {})
+    mysql = raw.get("mysql")
+    if isinstance(mysql, dict):
+        merged = dict(mysql)
+        merged.update(raw.get("pool") or {})
+        return merged
+    return raw
+
+
+def _pool_key(db_config):
+    config = _normalized_pool_config(db_config)
+    # Include credentials in the identity so a rotated password never reuses
+    # a live connection authenticated with the previous secret.  The key is
+    # process-local and is never emitted in metrics/logs.
+    fields = (
+        "host", "port", "user", "password", "database", "charset",
+        "connect_timeout", "idle_ping_after_sec", "rollback_on_return",
+        "min_connections", "max_connections", "borrow_timeout",
+        "max_lifetime_sec",
+    )
+    return tuple((name, str(config.get(name, ""))) for name in fields)
+
+
 def get_global_pool(db_config: Optional[Dict[str, Any]] = None) -> Optional[MySQLConnectionPool]:
     global _GLOBAL_POOL
-    if _GLOBAL_POOL is not None:
+    if not db_config:
         return _GLOBAL_POOL
+    normalized = _normalized_pool_config(db_config)
+    key = _pool_key(normalized)
     with _GLOBAL_POOL_LOCK:
-        if _GLOBAL_POOL is None and db_config:
-            _GLOBAL_POOL = MySQLConnectionPool(db_config)
-    return _GLOBAL_POOL
+        pool = _GLOBAL_POOLS.get(key)
+        if pool is None or pool._is_shutdown:
+            pool = MySQLConnectionPool(normalized)
+            _GLOBAL_POOLS[key] = pool
+            _GLOBAL_POOL_REFS[key] = 0
+        _GLOBAL_POOL_REFS[key] = int(_GLOBAL_POOL_REFS.get(key, 0)) + 1
+        _GLOBAL_POOL = pool
+        return pool
+
+
+def release_global_pool(pool) -> None:
+    """Release one manager reference without closing a shared pool early."""
+    global _GLOBAL_POOL
+    if pool is None:
+        return
+    with _GLOBAL_POOL_LOCK:
+        for key, candidate in list(_GLOBAL_POOLS.items()):
+            if candidate is not pool:
+                continue
+            refs = max(0, int(_GLOBAL_POOL_REFS.get(key, 0)) - 1)
+            _GLOBAL_POOL_REFS[key] = refs
+            if refs == 0:
+                candidate.close_all()
+                _GLOBAL_POOLS.pop(key, None)
+                _GLOBAL_POOL_REFS.pop(key, None)
+                if _GLOBAL_POOL is candidate:
+                    _GLOBAL_POOL = next(iter(_GLOBAL_POOLS.values()), None)
+            break
 
 def close_global_pool() -> None:
-    global _GLOBAL_POOL
+    global _GLOBAL_POOL, _GLOBAL_POOLS, _GLOBAL_POOL_REFS
     with _GLOBAL_POOL_LOCK:
-        if _GLOBAL_POOL is not None:
-            _GLOBAL_POOL.close_all()
-            _GLOBAL_POOL = None
+        for pool in list(_GLOBAL_POOLS.values()):
+            pool.close_all()
+        _GLOBAL_POOLS = {}
+        _GLOBAL_POOL_REFS = {}
+        _GLOBAL_POOL = None

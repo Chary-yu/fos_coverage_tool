@@ -68,7 +68,9 @@ class ScanImportService(object):
             files.append({
                 "repository_name": repository_name,
                 "file_path": normalized,
-                "file_path_hash": hashlib.md5(normalized.encode("utf-8")).hexdigest(),
+                "file_path_hash": hashlib.md5(
+                    "{}\0{}".format(repository_name, normalized).encode("utf-8")
+                ).hexdigest(),
                 "source_file_name": os.path.basename(normalized),
                 "lines": line_records,
             })
@@ -118,6 +120,15 @@ class ScanImportService(object):
             elif root and path == root:
                 path = os.path.basename(path)
             return name, path
+        if len(repositories) > 1:
+            raise ValueError(
+                "LCOV path cannot be assigned uniquely to a repository: {}".format(path)
+            )
+        if len(repositories) == 1:
+            item = repositories[0] or {}
+            name = str(item.get("repository_name") or "")
+            if name:
+                return name, path
         return "", path
 
     @staticmethod

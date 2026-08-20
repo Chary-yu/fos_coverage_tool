@@ -3,6 +3,9 @@ import unittest
 
 from scripts.diagnostics.runtime_legacy_dependency_audit import audit as audit_legacy
 from scripts.diagnostics.runtime_participation_audit import audit as audit_participation
+from scripts.diagnostics.active_runtime_audit import audit as audit_active_runtime
+from scripts.diagnostics.frontend_vnext_api_contract_audit import audit as audit_frontend
+from scripts.diagnostics.scan_immutability_audit import audit as audit_immutability
 
 
 class ArchitectureAuditTest(unittest.TestCase):
@@ -24,6 +27,11 @@ class ArchitectureAuditTest(unittest.TestCase):
         self.assertEqual(result["status"], "PASSED")
         check = next(item for item in result["checks"] if item["name"] == "lcov_path_index")
         self.assertIn("app/incremental/orchestrator.py", check["paths"])
+
+    def test_active_runtime_and_frontend_contract_are_green(self):
+        self.assertEqual(audit_active_runtime(os.getcwd())["status"], "PASSED")
+        self.assertEqual(audit_frontend(os.getcwd())["status"], "PASSED")
+        self.assertEqual(audit_immutability()["status"], "PASSED")
 
 
 if __name__ == "__main__":

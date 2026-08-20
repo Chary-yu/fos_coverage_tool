@@ -168,6 +168,7 @@ CREATE TABLE IF NOT EXISTS coverage_background_jobs (
     error_message TEXT,
     data_version BIGINT NULL,
     heartbeat_at DATETIME NULL,
+    lease_owner VARCHAR(128) NOT NULL DEFAULT '',
     created_at DATETIME NOT NULL,
     started_at DATETIME NULL,
     finished_at DATETIME NULL,

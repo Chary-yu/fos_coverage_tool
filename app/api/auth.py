@@ -14,7 +14,9 @@ class MutationAuthorizer(object):
     def authorize(self, headers, remote_address):
         if writes_are_frozen(self.repo_root, self.config):
             return False, 503, "writes are frozen for upgrade"
-        mode = str(self.auth.get("mode") or "disabled").lower()
+        # A caller that bypasses the canonical config loader must not
+        # accidentally get an unauthenticated mutation surface.
+        mode = str(self.auth.get("mode") or "reverse_proxy").lower()
         origin = headers.get("Origin", "")
         allowed_origins = self.auth.get("allowed_origins") or []
         if origin and allowed_origins and origin not in allowed_origins:

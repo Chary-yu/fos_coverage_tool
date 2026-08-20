@@ -8,6 +8,13 @@ from app.db.repositories.base import adapt_sql, execute, fetchall, fetchone, is_
 ANALYSIS_FIELDS = (
     "status", "is_draft", "reviewer", "coverage_method", "uncovered_reason", "comment"
 )
+MAX_ANALYSIS_LOOKUP = 500
+
+
+def _chunks(values, size):
+    values = list(values or [])
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
 
 
 class AnalysisRepository(object):
@@ -20,6 +27,27 @@ class AnalysisRepository(object):
             JOIN coverage_lines l ON l.id = a.line_id
             WHERE l.file_id = ? ORDER BY l.line_number
         """, (file_id,))
+
+    def get_by_file_ranges(self, connection, file_id: int, ranges):
+        """Read only analysis rows intersecting requested line ranges."""
+        normalized = []
+        for start_line, end_line in ranges or []:
+            start_line, end_line = int(start_line), int(end_line)
+            if end_line >= start_line:
+                normalized.append((start_line, end_line))
+        if not normalized:
+            return []
+        clauses = []
+        params = [int(file_id)]
+        for start_line, end_line in normalized:
+            clauses.append("(l.line_number >= ? AND l.line_number <= ?)")
+            params.extend((start_line, end_line))
+        return fetchall(connection, """
+            SELECT a.*, l.line_number FROM coverage_analyses a
+            JOIN coverage_lines l ON l.id = a.line_id
+            WHERE l.file_id = ? AND ({})
+            ORDER BY l.line_number
+        """.format(" OR ".join(clauses)), params)
 
     def get_by_scan(self, connection, scan_id: int):
         return fetchall(connection, """
@@ -114,12 +142,14 @@ class AnalysisRepository(object):
             cursor.close()
 
         line_ids = [line_id for line_id, _ in normalized_records]
-        placeholders = ", ".join("?" for _ in sorted(set(line_ids)))
-        rows = fetchall(connection, """
-            SELECT a.*, l.line_number
-            FROM coverage_analyses a
-            JOIN coverage_lines l ON l.id = a.line_id
-            WHERE a.line_id IN ({})
-        """.format(placeholders), sorted(set(line_ids)))
+        rows = []
+        for id_chunk in _chunks(sorted(set(line_ids)), MAX_ANALYSIS_LOOKUP):
+            placeholders = ", ".join("?" for _ in id_chunk)
+            rows.extend(fetchall(connection, """
+                SELECT a.*, l.line_number
+                FROM coverage_analyses a
+                JOIN coverage_lines l ON l.id = a.line_id
+                WHERE a.line_id IN ({})
+            """.format(placeholders), id_chunk))
         by_line = {int(row["line_id"]): row for row in rows}
         return [by_line[int(line_id)] for line_id in line_ids if int(line_id) in by_line]

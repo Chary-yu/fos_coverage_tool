@@ -24,15 +24,28 @@ CONTROL_FLOW_RE = re.compile(r'\b(if|else|for|while|do|switch|case|default|catch
 CONFIRMED_STATUS_SET = {'可覆盖', '无法覆盖', '冗余代码'}
 
 
-def calc_sidecar_file_key(file_path: str) -> str:
-    """Compute stable SHA-256 hash (32 hex chars) of normalized file path for sidecar indexing."""
-    normalized = str(file_path or "").replace("\\", "/").strip().lstrip("/")
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
+def normalize_file_identity_path(file_path: str) -> str:
+    return str(file_path or "").replace("\\", "/").strip().lstrip("/")
 
-def compute_db_file_path_hash(file_path: str) -> str:
-    """Historical DB identity: MD5(normalized path), 32 hex characters."""
-    normalized = str(file_path or "").replace("\\", "/").strip().lstrip("/")
-    return hashlib.md5(normalized.encode("utf-8")).hexdigest()
+
+def _scoped_file_identity(file_path: str, repository_name: str = "") -> str:
+    normalized = normalize_file_identity_path(file_path)
+    repository = str(repository_name or "").strip()
+    return normalized if not repository else "{}\0{}".format(repository, normalized)
+
+
+def calc_sidecar_file_key(file_path: str, repository_name: str = "") -> str:
+    """Compute a stable sidecar key scoped by repository and normalized path."""
+    return hashlib.sha256(
+        _scoped_file_identity(file_path, repository_name).encode("utf-8")
+    ).hexdigest()[:32]
+
+
+def compute_db_file_path_hash(file_path: str, repository_name: str = "") -> str:
+    """Compute the immutable DB identity hash scoped by repository."""
+    return hashlib.md5(
+        _scoped_file_identity(file_path, repository_name).encode("utf-8")
+    ).hexdigest()
 
 # Compatibility name for old DB callers.  It must never be the sidecar key.
 compute_file_path_hash = compute_db_file_path_hash

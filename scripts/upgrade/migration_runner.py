@@ -91,8 +91,8 @@ CREATE TABLE IF NOT EXISTS coverage_background_jobs (
     job_id TEXT PRIMARY KEY, project_id INTEGER, scan_id INTEGER, kind TEXT NOT NULL,
     state TEXT NOT NULL, progress REAL NOT NULL DEFAULT 0, input_payload TEXT NOT NULL,
     result_path TEXT NOT NULL DEFAULT '', error_message TEXT, data_version INTEGER,
-    heartbeat_at TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
-    updated_at TEXT NOT NULL
+    heartbeat_at TEXT, lease_owner TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+    started_at TEXT, finished_at TEXT, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS coverage_incremental_results (
     id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL,
@@ -118,6 +118,17 @@ def _table_exists(connection, table_name):
         SELECT TABLE_NAME FROM information_schema.TABLES
         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
     """, (table_name,))
+    return bool(row)
+
+
+def _column_exists(connection, table_name, column_name):
+    if is_sqlite(connection):
+        rows = connection.execute("PRAGMA table_info({})".format(table_name)).fetchall()
+        return any(str(row[1]) == column_name for row in rows)
+    row = fetchone(connection, """
+        SELECT COLUMN_NAME FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
+    """, (table_name, column_name))
     return bool(row)
 
 
@@ -373,6 +384,14 @@ def apply_schema(connection, ddl_path, release_sha=""):
         cursor = connection.cursor()
         cursor.execute(statement)
         cursor.close()
+    if _table_exists(connection, "coverage_background_jobs") and not _column_exists(
+            connection, "coverage_background_jobs", "lease_owner"):
+        cursor = connection.cursor()
+        cursor.execute(adapt_sql(
+            connection,
+            "ALTER TABLE coverage_background_jobs ADD COLUMN lease_owner VARCHAR(128) NOT NULL DEFAULT ''",
+        ))
+        cursor.close()
     existing = fetchone(connection, """
         SELECT schema_key FROM coverage_schema_meta WHERE schema_key = ?
     """, ("coverage_vnext",))
@@ -436,10 +455,16 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None, rele
                     row for row in source["lines"] if row["project_name"] == project_name
                 ]),
             }, sort_keys=True).encode("utf-8")).hexdigest()
+            existing_scan = project_repo.get_scan_by_key(conn, scan_key)
             scan = project_repo.create_scan(
                 conn, project["id"], scan_key, "legacy_migrated", "full",
-                status="ready", legacy_migrated=1,
+                status="building", legacy_migrated=1,
             )
+            if existing_scan and str(existing_scan.get("status") or "").lower() not in {
+                    "building", "importing", "constructing"}:
+                # A completed migration is immutable.  Re-running the same
+                # semantic snapshot must be a no-op for its physical facts.
+                continue
             project_repo.upsert_repository_snapshot(
                 conn, scan["id"], "", verified=0, provenance="legacy_migration"
             )
@@ -537,6 +562,7 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None, rele
             state_repo.set_current_scan(conn, project["id"], scan["id"])
             file_state_repo.rebuild_scan(conn, scan["id"], data_version, None)
             state_repo.mark_ready(conn, project["id"], data_version)
+            project_repo.seal_scan(conn, scan["id"])
 
         project_by_name = {
             row["project_name"]: row for row in project_repo.list_projects(conn)

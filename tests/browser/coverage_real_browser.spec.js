@@ -47,6 +47,8 @@ function makeLayout(large) {
     project_name: 'BrowserFixture',
     file_path: 'src/fixture.c',
     report_id: 'report_browser_fixture',
+    scan_id: 1,
+    repository_name: '',
     total_lines: regionSize * 3,
     total_uncovered_count: regionSize * 3,
     pending_line_count: regionSize * 3,
@@ -81,6 +83,8 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
       return sendStatic(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
         <meta name="coverage-project" content="BrowserFixture">
         <meta name="coverage-report-id" content="report_browser_fixture">
+        <meta name="coverage-scan-id" content="1">
+        <meta name="coverage-repository-name" content="">
         <meta name="coverage-file-path" content="src/fixture.c">
         <meta name="coverage-render-mode" content="lazy_collapse">
         <meta name="coverage-review-scope" content="full">
@@ -121,10 +125,21 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
     }
 
     if (pathname === '/api/coverage/code-layout') {
-      return json(200, { status: 'success', data: layout });
+      return json(200, layout);
     }
     if (pathname === '/api/coverage/code-lines/batch' && req.method === 'POST') {
-      return json(200, { status: 'success', data: { ranges: [] } });
+      let body = '';
+      req.on('data', chunk => { body += chunk; });
+      req.on('end', () => {
+        const payload = JSON.parse(body || '{}');
+        const batches = (payload.ranges || []).map(range => ({
+          start_line: Number(range.start_line),
+          end_line: Number(range.end_line),
+          lines: makeLines(Number(range.start_line), Number(range.end_line), !large, savedReviewers),
+        }));
+        json(200, { scan_id: 1, report_id: 'report_browser_fixture', batches });
+      });
+      return undefined;
     }
     if (pathname === '/api/coverage/code-lines' && req.method === 'GET') {
       const start = Number(parsed.searchParams.get('start_line') || 1);
@@ -147,7 +162,7 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
         });
       }, delay);
     }
-    if (pathname === '/api/coverage/batch' && req.method === 'POST') {
+    if (pathname === '/api/coverage/analysis' && req.method === 'POST') {
       let body = '';
       req.on('data', chunk => { body += chunk; });
       req.on('end', () => {
@@ -155,9 +170,11 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
           const payload = JSON.parse(body);
           requests.push({ batch: payload });
           (payload.records || []).forEach(record => {
-            (record.line_numbers || []).forEach(lineNumber => {
-              savedReviewers.set(Number(lineNumber), record.reviewer || '');
-            });
+            const start = Number(record.line_start || record.line_number);
+            const end = Number(record.line_end || start);
+            for (let lineNumber = start; lineNumber <= end; lineNumber += 1) {
+              savedReviewers.set(lineNumber, record.reviewer || '');
+            }
           });
         } catch (_) { /* client error is asserted by HTTP status */ }
         json(200, { status: 'success', data_version: 2 });
@@ -296,7 +313,7 @@ test('real Chromium incremental reviewer suggestions split adjacent blocks and s
   }
 });
 
-test('real Chromium LRU evicts collapsed regions while preserving a reload path', async ({ page, browserName }) => {
+test('real Chromium virtualizes data and reuses cached viewport windows', async ({ page, browserName }) => {
   expect(browserName).toBe('chromium');
   const harness = await startHarness({ large: true });
   try {
@@ -307,13 +324,15 @@ test('real Chromium LRU evicts collapsed regions while preserving a reload path'
       expect(await page.locator('pre.source span[id^="L"]').count()).toBeLessThan(1500);
       await page.locator('.coverage-region-collapse-btn').nth(0).click();
     }
-    // 51k loaded lines exceed the 50k LRU budget; the oldest collapsed region
-    // is unloaded and can be fetched again from its placeholder.
+    // Collapsing removes DOM while the resident sparse data stays bounded to
+    // the viewport windows rather than all 51k source rows.
     expect(await page.locator('#L1').count()).toBe(0);
     const beforeReload = harness.requests.filter(item => item.start === 1).length;
     await page.locator('.coverage-region-placeholder').nth(0).click();
     await expect(page.locator('#L1')).toBeVisible({ timeout: 30000 });
-    expect(harness.requests.filter(item => item.start === 1).length).toBeGreaterThan(beforeReload);
+    expect(harness.requests.filter(item => item.start === 1).length).toBe(beforeReload);
+    await page.evaluate(() => window.scrollTo(0, 16000 * 24));
+    await expect(page.locator('#L16000')).toBeVisible({ timeout: 30000 });
     expect(await page.locator('pre.source span[id^="L"]').count()).toBeLessThan(1500);
   } finally {
     await stopHarness(harness);

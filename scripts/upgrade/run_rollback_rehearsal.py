@@ -35,7 +35,47 @@ def fetch_release_identity(endpoint):
     return identity
 
 
-def run(output, revision, config_path=None):
+def load_identity(value):
+    if isinstance(value, dict):
+        return dict(value)
+    if not value:
+        return None
+    with open(str(value), "r", encoding="utf-8") as stream:
+        identity = json.load(stream)
+    if not isinstance(identity, dict):
+        raise RuntimeError("release identity artifact must contain an object")
+    return identity
+
+
+def release_identity_id(identity):
+    identity = identity or {}
+    value = identity.get("commit_sha") or identity.get("build_id") or identity.get("version")
+    if not value:
+        raise RuntimeError("release identity has no stable id")
+    return str(value)
+
+
+def run(output, revision, config_path=None, before_release=None, target_release=None):
+    config = {}
+    if config_path:
+        with open(config_path, "r", encoding="utf-8") as stream:
+            config = json.load(stream)
+    upgrade_config = config.get("upgrade") or {}
+    before_release = load_identity(
+        before_release if before_release is not None else upgrade_config.get("previous_release")
+    )
+    target_release = load_identity(
+        target_release if target_release is not None else upgrade_config.get("target_release")
+    )
+    if not before_release or not target_release:
+        raise RuntimeError("real before and target release identity artifacts are required")
+    before_release_id = release_identity_id(before_release)
+    target_release_id = release_identity_id(target_release)
+    if before_release_id == target_release_id:
+        raise RuntimeError("before and target release identities must differ")
+    if str(target_release.get("commit_sha") or "") != str(revision):
+        raise RuntimeError("target release commit does not match --revision")
+
     root = tempfile.mkdtemp(prefix="coverage-rollback-rehearsal-")
     try:
         candidate = os.path.join(root, "candidate.txt")
@@ -52,11 +92,12 @@ def run(output, revision, config_path=None):
         api_before = api_after = None
         if config_path:
             import pymysql
-            with open(config_path, "r", encoding="utf-8") as stream:
-                config = json.load(stream)
             api_endpoint = ((config.get("upgrade") or {}).get("release_endpoint"))
-            if api_endpoint:
-                api_before = fetch_release_identity(api_endpoint)
+            if not api_endpoint:
+                raise RuntimeError("release_endpoint is required for rollback rehearsal")
+            api_before = fetch_release_identity(api_endpoint)
+            if release_identity_id(api_before) != target_release_id:
+                raise RuntimeError("release endpoint before identity is not the target release")
             db = config.get("mysql", config)
             db_connection = pymysql.connect(
                 host=db.get("host", "127.0.0.1"), port=int(db.get("port", 3306)),
@@ -84,20 +125,32 @@ def run(output, revision, config_path=None):
             db_unchanged, db_errors = True, []
         if api_endpoint:
             api_after = fetch_release_identity(api_endpoint)
-        api_unchanged = api_endpoint is None or api_before == api_after
+        api_identity_verified = bool(
+            api_after and release_identity_id(api_after) == before_release_id
+        )
+        rollback_release_id = release_identity_id(api_after) if api_after else ""
+        rehearsal_ok = bool(
+            changed and restored and db_unchanged and api_identity_verified
+            and rollback_release_id == before_release_id
+        )
         evidence = {
-            "status": "PASSED" if changed and restored and db_unchanged and api_unchanged else "FAILED",
-            "rehearsal_verified": bool(changed and restored and db_unchanged and api_unchanged),
+            "status": "PASSED" if rehearsal_ok else "FAILED",
+            "rehearsal_verified": rehearsal_ok,
             "revision": revision,
             "evidence_class": "staging_cutover",
             "traffic_opened": False,
             "command": "run_rollback_rehearsal",
-            "exit_code": 0 if changed and restored and db_unchanged and api_unchanged else 1,
+            "exit_code": 0 if rehearsal_ok else 1,
             "artifact_path": os.path.abspath(output),
             "api_endpoint": api_endpoint or "not_checked",
             "api_identity_before": api_before or "not_checked",
             "api_identity_after": api_after or "not_checked",
-            "api_identity_verified": api_unchanged,
+            "api_identity_verified": api_identity_verified,
+            "before_release_id": before_release_id,
+            "target_release_id": target_release_id,
+            "rollback_release_id": rollback_release_id,
+            "before_release": before_release,
+            "target_release": target_release,
             "authoritative_data_hash_before": (before_db or {}).get("tables", {}).get("coverage_analysis", {}).get("content_hash", "not_checked"),
             "authoritative_data_hash_after": (after_db or {}).get("tables", {}).get("coverage_analysis", {}).get("content_hash", "not_checked"),
             "database_integrity_errors": db_errors,
@@ -118,5 +171,7 @@ if __name__ == "__main__":
     parser.add_argument("--output", required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--config")
+    parser.add_argument("--before-release", help="JSON artifact for the real previous release")
+    parser.add_argument("--target-release", help="JSON artifact for the release being tested")
     args = parser.parse_args()
-    run(args.output, args.revision, args.config)
+    run(args.output, args.revision, args.config, args.before_release, args.target_release)

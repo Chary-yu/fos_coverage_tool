@@ -27,5 +27,7 @@
         "xlsx_path": "代码目录归属模块统计.xlsx"
     },
     "project_name":  "Gemini-NOS",
-    "render_mode": "lazy_collapse"
+    "render_mode": "lazy_collapse",
+    "runtime_mode": "vnext",
+    "schema_version": 1
 }

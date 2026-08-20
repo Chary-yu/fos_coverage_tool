@@ -127,8 +127,11 @@ class VNextRuntime(object):
                 max_workers=int(job_config.get("max_workers", 4)),
                 max_queue_size=int(job_config.get("max_queue_size", 100)),
                 resource_limits=resource_limits,
+                global_worker_budget=job_config.get("global_worker_budget"),
             ),
             heartbeat_timeout=float(job_config.get("heartbeat_timeout", 300)),
+            heartbeat_interval=float(job_config.get("heartbeat_interval", 15)),
+            lease_owner=job_config.get("lease_owner"),
         )
         self.recovered_jobs = self.job_service.recover()
         try:

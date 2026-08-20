@@ -108,5 +108,54 @@ class TestPhase2Core(unittest.TestCase):
         self.assertGreaterEqual(mock_raw.ping.call_count, 1, "stale idle connection must be checked")
         pool.close_all()
 
+    def test_item_4_read_only_mysql_disconnect_retries_once(self):
+        class FakeConnection(object):
+            __module__ = "pymysql.connections"
+
+            def __init__(self):
+                self.dead = True
+                self.ping_calls = 0
+                self.rollback_calls = 0
+
+            def ping(self, reconnect=False):
+                self.ping_calls += 1
+                self.dead = False
+
+            def cursor(self):
+                return FakeCursor(self)
+
+            def rollback(self):
+                self.rollback_calls += 1
+
+            def close(self):
+                pass
+
+        class FakeCursor(object):
+            def __init__(self, connection):
+                self.connection = connection
+                self.closed = False
+
+            def execute(self, query, params=()):
+                if self.connection.dead:
+                    raise ConnectionError("server closed the connection")
+                return 1
+
+            def close(self):
+                self.closed = True
+
+        pool = MySQLConnectionPool(
+            db_config={"idle_ping_after_sec": 60},
+            min_connections=1, max_connections=1,
+        )
+        raw = FakeConnection()
+        pool.return_connection(PooledConnectionWrapper(raw, pool))
+        with pool.connection(read_only=True) as connection:
+            cursor = connection.cursor()
+            cursor.execute("SELECT 1")
+            cursor.close()
+        self.assertEqual(raw.ping_calls, 1)
+        self.assertEqual(pool.metrics()["read_reconnects"], 1)
+        pool.close_all()
+
 if __name__ == "__main__":
     unittest.main()
