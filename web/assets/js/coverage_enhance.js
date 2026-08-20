@@ -112,26 +112,8 @@
     }
 
     function apiBaseCandidates() {
-        const candidates = [];
-        const origin = window.location.origin && window.location.origin !== 'null'
-            ? window.location.origin
-            : '';
-        if (resolvedServerUrl) {
-            candidates.push(resolvedServerUrl);
-        }
-        if (EXPLICIT_API_URL) {
-            candidates.push(EXPLICIT_API_URL);
-        }
-        candidates.push(SERVER_URL);
-        if (origin && window.location.hostname && window.location.port !== '9528') {
-            candidates.push(`${window.location.protocol}//${window.location.hostname}:9528/api/coverage`);
-        }
-        if (!origin) {
-            candidates.push('http://127.0.0.1:9528/api/coverage');
-        }
-        return uniqueApiBases(candidates);
+        return uniqueApiBases([SERVER_URL]);
     }
-
     async function requestCoverageApi(pathSuffix, options) {
         const attempted = [];
         let lastError = null;
@@ -146,7 +128,7 @@
                 const data = (contentType.includes('application/json') || typeof response.json === 'function')
                     ? await response.json()
                     : null;
-                if (response.ok && data && data.status === 'success') {
+                if (response.ok && data) {
                     resolvedServerUrl = apiBase;
                     return data;
                 }

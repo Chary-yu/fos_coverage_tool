@@ -15,57 +15,47 @@
     var lastRefreshTime = 0;
 
     function getApiBaseCandidates() {
-        var candidates = [];
-        if (window.location && window.location.search) {
-            try {
-                var p = new URLSearchParams(window.location.search);
-                var explicit = p.get("api");
-                if (explicit) candidates.push(explicit.replace(/\/+$/, ""));
-            } catch (e) {}
-        }
-        var origin = (window.location && window.location.origin && window.location.origin !== "null") ? window.location.origin : "";
-        if (origin) {
-            candidates.push(origin + "/api/coverage");
-            if (window.location.pathname && window.location.pathname.indexOf("/coverage/") === 0) {
-                candidates.push(origin + "/coverage/api/coverage");
-            }
-            if (window.location.hostname && window.location.port !== "9528") {
-                candidates.push(window.location.protocol + "//" + window.location.hostname + ":9528/api/coverage");
-            }
-        }
-        candidates.push("http://127.0.0.1:9528/api/coverage");
-        candidates.push("/api/coverage");
-        var result = [];
-        for (var c = 0; c < candidates.length; c++) {
-            var item = (candidates[c] || "").replace(/\/+$/, "");
-            if (item && result.indexOf(item) === -1) {
-                result.push(item);
-            }
-        }
-        return result;
+        return ["/api/coverage"];
     }
-
     function fetchUnanalyzedFromCandidates(candidates, index) {
-        if (index >= candidates.length) {
-            return Promise.reject(new Error("All API endpoints unavailable"));
+        if (!candidates.length || index >= candidates.length) {
+            return Promise.reject(new Error("Canonical API endpoint unavailable"));
         }
-        var base = candidates[index];
+        var base = candidates[0];
         var url = base + "/incremental/unanalyzed?project=" + encodeURIComponent(projectName);
         return fetch(url).then(function(res) {
             if (!res.ok) throw new Error("HTTP " + res.status);
             resolvedApiBase = base;
             return res.json();
-        }).catch(function(err) {
-            return fetchUnanalyzedFromCandidates(candidates, index + 1);
         });
     }
-
     function escapeHtml(str) {
         return String(str)
             .replace(/&/g, "&amp;")
             .replace(/</g, "&lt;")
             .replace(/>/g, "&gt;")
             .replace(/"/g, "&quot;");
+    }
+
+    function parseLineNumbers(value) {
+        if (Array.isArray(value)) {
+            return value.map(function(item) { return parseInt(item, 10); })
+                .filter(function(item) { return Number.isFinite(item) && item > 0; });
+        }
+        return String(value || "").split(",")
+            .map(function(item) { return parseInt(item.trim(), 10); })
+            .filter(function(item) { return Number.isFinite(item) && item > 0; });
+    }
+
+    function countOwnedPendingLines(row, pendingLines) {
+        var ownedLines = parseLineNumbers(row.getAttribute("data-owned-lines"));
+        if (!ownedLines.length || !Array.isArray(pendingLines)) return 0;
+        var pendingSet = new Set(pendingLines);
+        var count = 0;
+        for (var i = 0; i < ownedLines.length; i++) {
+            if (pendingSet.has(ownedLines[i])) count += 1;
+        }
+        return count;
     }
 
     function refreshDeveloperTasks() {
@@ -87,11 +77,14 @@
         fetchUnanalyzedFromCandidates(candidates, 0)
             .then(function(resData) {
                 isRefreshing = false;
-                if (!resData || resData.status !== "success" || !resData.data) return;
-                var files = resData.data.files || [];
+                if (!resData || (resData.status && resData.status !== "success")) return;
+                var payload = resData.data || resData;
+                var files = payload.files || [];
                 var unanalyzedMap = {};
+                var pendingLineMap = {};
                 for (var i = 0; i < files.length; i++) {
                     unanalyzedMap[files[i].file_path] = files[i].unanalyzed;
+                    pendingLineMap[files[i].file_path] = parseLineNumbers(files[i].pending_line_numbers);
                 }
 
                 var devSections = document.querySelectorAll("section[id]");
@@ -107,12 +100,22 @@
                         var fileKey = row.getAttribute("data-file-key");
                         var pageLink = row.getAttribute("data-page-link");
                         var changed = parseInt(row.getAttribute("data-changed") || "0", 10);
+                        var ownerSpecific = row.getAttribute("data-owner-specific") === "true";
                         var unanalyzedCell = row.querySelector(".js-task-unanalyzed");
                         var actionCell = row.querySelector(".js-task-action");
 
-                        var count = (fileKey && (fileKey in unanalyzedMap))
-                            ? unanalyzedMap[fileKey]
-                            : parseInt((unanalyzedCell && unanalyzedCell.textContent) ? unanalyzedCell.textContent.trim() : "0", 10);
+                        var count;
+                        if (ownerSpecific && fileKey && Object.prototype.hasOwnProperty.call(pendingLineMap, fileKey)) {
+                            // A file can belong to several developers.  The
+                            // API returns current pending line numbers; only
+                            // the intersection with this row's owned lines is
+                            // the developer's live task count.
+                            count = countOwnedPendingLines(row, pendingLineMap[fileKey]);
+                        } else if (fileKey && (fileKey in unanalyzedMap)) {
+                            count = unanalyzedMap[fileKey];
+                        } else {
+                            count = parseInt((unanalyzedCell && unanalyzedCell.textContent) ? unanalyzedCell.textContent.trim() : "0", 10);
+                        }
 
                         if (unanalyzedCell) {
                             unanalyzedCell.textContent = count;

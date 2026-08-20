@@ -19,5 +19,6 @@ CREATE TABLE IF NOT EXISTS coverage_file_state (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Derived-state readiness proof; never replaces authoritative data_version.
-ALTER TABLE coverage_project_state
-    ADD COLUMN IF NOT EXISTS file_state_version BIGINT NOT NULL DEFAULT 0;
+-- The legacy table column is added by run_upgrade.py only after its
+-- information_schema existence check. MariaDB 5.5 does not support the
+-- ADD COLUMN IF NOT EXISTS syntax reliably.

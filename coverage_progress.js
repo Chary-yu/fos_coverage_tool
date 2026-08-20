@@ -278,20 +278,8 @@
   }
 
   function apiBaseCandidates() {
-    const explicit = params.get('api');
-    const origin = window.location.origin && window.location.origin !== 'null' ? window.location.origin : '';
-    const candidates = [];
-    if (explicit) candidates.push(normalizeApiBase(explicit));
-    if (origin) {
-      candidates.push(`${origin}/api/coverage`);
-      if (window.location.pathname.startsWith('/coverage/')) candidates.push(`${origin}/coverage/api/coverage`);
-      if (window.location.port !== '9528') candidates.push(`${window.location.protocol}//${window.location.hostname}:9528/api/coverage`);
-    }
-    candidates.push('http://127.0.0.1:9528/api/coverage');
-    candidates.push('/api/coverage');
-    return unique(candidates.map(normalizeApiBase));
+    return ['/api/coverage'];
   }
-
   function fetchJsonWithTimeout(url, timeoutMs) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);

@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+import re
 from typing import Dict, Any
 
 
@@ -34,8 +35,61 @@ def audit_canonical_ownership(repo_root: str) -> Dict[str, Any]:
             if _sha(compat_path) != _sha(canonical_path):
                 violations.append("generated compatibility copy drift: {}".format(compatibility))
             else:
-                copies.append(compatibility)
-    return {"status": "PASSED" if not violations else "FAILED",
+                    copies.append(compatibility)
+    required_modules = [
+        "app/bootstrap.py",
+        "app/api/handler.py",
+        "app/api/router.py",
+        "app/api/auth.py",
+        "app/api/serialization.py",
+        "app/db/transaction.py",
+        "app/db/repositories/project_repository.py",
+        "app/db/repositories/analysis_repository.py",
+        "app/db/repositories/line_index_repository.py",
+        "app/db/repositories/project_state_repository.py",
+        "app/db/repositories/file_state_repository.py",
+        "app/db/repositories/job_repository.py",
+        "app/reports/registry.py",
+        "app/services/project_service.py",
+        "app/services/analysis_service.py",
+        "app/services/progress_service.py",
+        "scripts/upgrade/vnext_schema.sql",
+        "scripts/upgrade/migration_runner.py",
+    ]
+    missing_modules = [
+        path for path in required_modules
+        if not os.path.isfile(os.path.join(repo_root, path))
+    ]
+    transitional = []
+    root_path = os.path.join(repo_root, "enhance_coverage.py")
+    if os.path.isfile(root_path):
+        with open(root_path, "r", encoding="utf-8") as stream:
+            root_text = stream.read()
+        for name, pattern in (
+            ("root_api_handler", r"class\s+CoverageHTTPRequestHandler"),
+            ("root_database_owner", r"class\s+_LegacyDatabaseManager"),
+            ("root_report_registry_owner", r"def\s+(?:register_report_directory|load_report_registry)"),
+            ("root_job_recovery_owner", r"def\s+recover_background_jobs"),
+            ("root_incremental_owner", r"def\s+generate_(?:multi_repo_)?incremental_review"),
+        ):
+            if re.search(pattern, root_text):
+                transitional.append(name)
+    violations.extend("missing VNext canonical module: {}".format(path)
+                      for path in missing_modules)
+    status = "PASSED" if not violations and not transitional else "FAILED"
+    return {"status": status,
             "canonical_sources": sorted(mappings.values()),
             "compatibility_copies": copies, "violations": violations,
-            "is_valid": not violations}
+            "transitional_root_owners": transitional,
+            "missing_vnext_modules": missing_modules,
+            "is_valid": not violations and not transitional}
+
+
+if __name__ == "__main__":
+    import json
+    import sys
+
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+    result = audit_canonical_ownership(root)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    sys.exit(0 if result["status"] == "PASSED" else 1)

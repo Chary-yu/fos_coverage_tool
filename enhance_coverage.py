@@ -35,7 +35,11 @@ from app.jobs.bounded_executor import BoundedJobExecutor
 from app.jobs.service import BackgroundJobService
 from app.jobs.excel_streaming import export_project_coverage_streaming_zip
 from app.code_detail.sidecar_store import SidecarStore
-from app.config.runtime_config import load_runtime_config, validate_production_config
+from app.config.runtime_config import (
+    load_runtime_config,
+    normalize_candidate_paths,
+    validate_production_config,
+)
 from app.release_identity import generate_release_identity, verify_release_identity
 from app.db.connection_pool import get_global_pool
 from app.progress.service import ProgressService
@@ -2428,17 +2432,21 @@ def load_config():
             "jobs_dir": "jobs",
             "registry_dir": "report-registry"
         },
+        "runtime_mode": "legacy",
         "project_name": DEFAULT_PROJECT_NAME
     }
     configured_path = os.environ.get("COVERAGE_CONFIG_PATH") or CONFIG_PATH
     if os.path.exists(configured_path):
         try:
             with open(configured_path, 'r', encoding='utf-8-sig') as f:
-                config = load_runtime_config(configured_path, default_config)
+                config = normalize_candidate_paths(
+                    load_runtime_config(configured_path, default_config), SCRIPT_DIR
+                )
                 validate_production_config(config)
                 return config
         except Exception as e:
             print(f"[Warning] Failed to load config file: {e}. Using defaults.")
+    default_config = normalize_candidate_paths(default_config, SCRIPT_DIR)
     validate_production_config(default_config)
     return default_config
 
@@ -6612,6 +6620,25 @@ def generate_multi_repo_incremental_review(repos_config_path, info_path, input_d
 def run_server():
     global db_manager
     config = load_config()
+
+    if str(config.get("runtime_mode") or "legacy").lower() == "vnext":
+        from app.bootstrap import create_vnext_server
+        host = config["server"]["host"]
+        port = int(config["server"]["port"])
+        httpd = create_vnext_server(
+            (host, port), config, repo_root=SCRIPT_DIR
+        )
+        print("[Server] VNext runtime running on http://{}:{} ...".format(host, port))
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print("\n[Server] Shutting down VNext runtime...")
+            runtime = getattr(httpd, "vnext_runtime", None)
+            if runtime:
+                runtime.close()
+            httpd.server_close()
+            print("[Server] VNext runtime stopped.")
+        return
 
     print("[Server] Initializing MySQL Database...")
     # First, run database schema checking/creation synchronously on startup

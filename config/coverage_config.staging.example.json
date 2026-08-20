@@ -4,7 +4,7 @@
     "port": 13306,
     "user": "coverage_user",
     "password": "CHANGE_ME",
-    "database": "coverage",
+    "database": "coverage_candidate",
     "connect_timeout": 5,
     "backup_restore_database": "coverage_restore_smoke",
     "backup_restore_user": "root",
@@ -25,6 +25,9 @@
     "jobs_dir": "jobs",
     "registry_dir": "report-registry"
   },
+  "runtime_mode": "vnext",
+  "schema_version": 1,
+  "environment": "candidate",
   "upgrade": {
     "drain_timeout_sec": 30,
     "release_endpoint": "http://127.0.0.1:19528/api/coverage/release",

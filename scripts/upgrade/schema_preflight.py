@@ -10,9 +10,18 @@ import re
 from typing import List, Tuple, Dict, Any
 
 PROTECTED_TABLES = {
+    "coverage_schema_meta",
+    "coverage_projects",
+    "coverage_scans",
+    "coverage_scan_repositories",
+    "coverage_reports",
+    "coverage_files",
+    "coverage_lines",
+    "coverage_analyses",
     "coverage_analysis",
     "coverage_line_index",
     "coverage_project_state",
+    "coverage_file_state",
     "coverage_background_jobs"
 }
 
@@ -41,6 +50,12 @@ def analyze_sql_script(sql_text: str) -> Tuple[bool, List[str], List[str]]:
     for pat in FORBIDDEN_KEYWORDS:
         if re.search(pat, clean_sql, re.IGNORECASE):
             errors.append(f"Forbidden destructive command pattern detected: {pat}")
+
+    if re.search(r"\bADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\b", clean_sql, re.IGNORECASE):
+        errors.append(
+            "MariaDB 5.5 does not provide reliable ADD COLUMN IF NOT EXISTS; "
+            "use information_schema preflight before ALTER"
+        )
             
     # Check DROP TABLE on protected tables
     for tbl in PROTECTED_TABLES:
@@ -74,6 +89,32 @@ def validate_ddl_file(ddl_path: str) -> Tuple[bool, List[str], List[str]]:
         return analyze_sql_script(sql_text)
     except Exception as e:
         return False, [f"Failed to read DDL file: {e}"], []
+
+
+def ensure_column_information_schema(connection, table_name: str, column_name: str,
+                                     column_definition: str) -> bool:
+    """Add one column only after an information_schema existence check."""
+    if not re.match(r"^[A-Za-z0-9_]+$", table_name or ""):
+        raise ValueError("unsafe table name")
+    if not re.match(r"^[A-Za-z0-9_]+$", column_name or ""):
+        raise ValueError("unsafe column name")
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT COUNT(*) AS column_count
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s
+        """, (table_name, column_name))
+        row = cursor.fetchone() or {}
+        count = row.get("column_count", 0) if isinstance(row, dict) else row[0]
+        if int(count or 0):
+            return False
+        cursor.execute(
+            "ALTER TABLE {} ADD COLUMN {} {}".format(
+                table_name, column_name, column_definition
+            )
+        )
+    connection.commit()
+    return True
 
 if __name__ == "__main__":
     import sys

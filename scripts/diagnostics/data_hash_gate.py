@@ -245,3 +245,37 @@ def verify_data_integrity(pre_snapshot: Dict[str, Any], post_snapshot: Dict[str,
             
     is_valid = (len(errors) == 0)
     return is_valid, errors
+
+
+def capture_normalized_semantic_snapshot(connection, schema="legacy"):
+    """Capture comparable facts across legacy and VNext schemas.
+
+    The legacy and VNext table layouts intentionally differ. This helper
+    delegates normalization to the migration runner so a migration gate
+    compares business facts rather than same-name table bytes.
+    """
+    from scripts.upgrade.migration_runner import (
+        capture_legacy_snapshot,
+        capture_vnext_semantic_snapshot,
+    )
+    if str(schema).lower() in ("legacy", "old"):
+        return capture_legacy_snapshot(connection)
+    if str(schema).lower() in ("vnext", "candidate", "new"):
+        return capture_vnext_semantic_snapshot(connection)
+    raise ValueError("schema must be legacy or vnext")
+
+
+def verify_normalized_semantic_integrity(legacy_snapshot, vnext_snapshot):
+    """Return exact semantic equality and field-level diff evidence."""
+    if legacy_snapshot == vnext_snapshot:
+        return True, {"status": "PASSED", "differences": []}
+    differences = []
+    keys = sorted(set(legacy_snapshot) | set(vnext_snapshot))
+    for key in keys:
+        if legacy_snapshot.get(key) != vnext_snapshot.get(key):
+            differences.append({
+                "field": key,
+                "legacy": legacy_snapshot.get(key),
+                "vnext": vnext_snapshot.get(key),
+            })
+    return False, {"status": "FAILED", "differences": differences}

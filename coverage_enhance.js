@@ -112,26 +112,8 @@
     }
 
     function apiBaseCandidates() {
-        const candidates = [];
-        const origin = window.location.origin && window.location.origin !== 'null'
-            ? window.location.origin
-            : '';
-        if (resolvedServerUrl) {
-            candidates.push(resolvedServerUrl);
-        }
-        if (EXPLICIT_API_URL) {
-            candidates.push(EXPLICIT_API_URL);
-        }
-        candidates.push(SERVER_URL);
-        if (origin && window.location.hostname && window.location.port !== '9528') {
-            candidates.push(`${window.location.protocol}//${window.location.hostname}:9528/api/coverage`);
-        }
-        if (!origin) {
-            candidates.push('http://127.0.0.1:9528/api/coverage');
-        }
-        return uniqueApiBases(candidates);
+        return uniqueApiBases([SERVER_URL]);
     }
-
     async function requestCoverageApi(pathSuffix, options) {
         const attempted = [];
         let lastError = null;
@@ -146,7 +128,7 @@
                 const data = (contentType.includes('application/json') || typeof response.json === 'function')
                     ? await response.json()
                     : null;
-                if (response.ok && data && data.status === 'success') {
+                if (response.ok && data) {
                     resolvedServerUrl = apiBase;
                     return data;
                 }
@@ -1142,6 +1124,10 @@
             if (lineData.is_pending_analysis && REVIEW_SCOPE === 'incremental') {
                 lineSpan.setAttribute('data-coverage-review', 'incremental');
             }
+            const suggestedReviewer = lineData.suggested_reviewer || '';
+            if (suggestedReviewer) {
+                lineSpan.setAttribute('data-coverage-reviewer', suggestedReviewer);
+            }
 
             // Line number
             const numSpan = document.createElement('span');
@@ -1178,7 +1164,7 @@
             // Merge draft store if user had unsaved edits
             const draft = ReviewDraftStore.getDraft(startLineNum);
             const initialStatus = draft && draft.status !== undefined ? draft.status : (lineData.analysis_state || '未确认');
-            const initialReviewer = draft && draft.reviewer !== undefined ? draft.reviewer : (lineData.reviewer || '');
+            const initialReviewer = draft && draft.reviewer !== undefined ? draft.reviewer : (lineData.reviewer || lineData.suggested_reviewer || '');
             const initialMethod = draft && draft.coverage_method !== undefined ? draft.coverage_method : (lineData.coverage_method || '');
             const initialReason = draft && draft.uncovered_reason !== undefined ? draft.uncovered_reason : (lineData.uncovered_reason || '');
             const isDirty = draft && draft.isDirty !== undefined ? Boolean(draft.isDirty) : false;
@@ -2157,6 +2143,14 @@
             return /^(return|goto|break|continue)\b/.test(stripLineComment(getCodeText(item)));
         }
 
+        function getSuggestedReviewer(item) {
+            if (!item || !item.span) return '';
+            return item.span.getAttribute('data-coverage-reviewer') ||
+                (item.span.querySelector && item.span.querySelector('[data-coverage-reviewer]')
+                    ? item.span.querySelector('[data-coverage-reviewer]').getAttribute('data-coverage-reviewer')
+                    : '') || '';
+        }
+
         function isSimpleAutoGroupLine(item) {
             const text = stripLineComment(getCodeText(item))
                 .replace(/\/\*.*?\*\//g, '')
@@ -2175,6 +2169,7 @@
             if (!start) return { block: [], consumedUntil: startIndex };
             const block = [start];
             const startIsFunction = isFunctionEntryLine(start);
+            const startReviewer = getSuggestedReviewer(start);
             let consumedUntil = startIndex;
 
             for (let j = startIndex + 1; j < sourceLines.length; j++) {
@@ -2183,6 +2178,7 @@
                 if (isCoveredLine(next)) break;
 
                 if (isUncoveredLine(next)) {
+                    if (getSuggestedReviewer(next) !== startReviewer) break;
                     if (isControlFlowLine(next) || isFunctionEntryLine(next)) break;
                     if (startIsFunction && !isSimpleAutoGroupLine(next)) break;
                     if (!startIsFunction && (!isSimpleAutoGroupLine(start) || !isSimpleAutoGroupLine(next))) break;
@@ -2232,7 +2228,9 @@
                 is_block_entry: true,
                 block_start_line: startItem.lineNum,
                 block_end_line: endItem.lineNum,
-                block_type: 'single'
+                block_type: 'single',
+                suggested_reviewer: getSuggestedReviewer(startItem),
+                reviewer: getSuggestedReviewer(startItem)
             };
             const panel = CodeLineRenderer.createReviewPanel(lineDto, filePath);
             startItem.span.appendChild(panel);
@@ -2253,10 +2251,13 @@
                     panelsMap.forEach((pState, sLine) => {
                         const rec = dbMap.get(sLine);
                         if (rec) {
+                            const draft = ReviewDraftStore.getDraft(sLine);
+                            if (draft && draft.isDirty) return;
+                            const currentReviewer = getStoredPanelValue(pState, 'reviewerInput');
                             setStoredPanelValues(pState, {
                                 status: rec.status || '未确认',
                                 isDraft: rec.is_draft === true || rec.is_draft === 1,
-                                reviewerInput: rec.reviewer || '',
+                                reviewerInput: rec.reviewer || currentReviewer,
                                 methodInput: rec.coverage_method || '',
                                 reasonInput: rec.uncovered_reason || '',
                                 _origSavedConfirmed: !rec.is_draft && CONFIRMED_STATUS_SET.has(rec.status)

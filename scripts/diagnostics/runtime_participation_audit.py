@@ -34,6 +34,50 @@ def _check(name, paths, patterns):
 
 def audit():
     checks = [
+        _check("vnext_bootstrap_api", ["enhance_coverage.py", "app/bootstrap.py", "app/api/handler.py"], [
+            r"runtime_mode",
+            r"create_vnext_server",
+            r"class VNextHTTPRequestHandler",
+        ]),
+        _check("vnext_repository_transaction", [
+            "app/services/analysis_service.py",
+            "app/services/project_service.py",
+            "app/db/transaction.py",
+            "app/db/repositories/analysis_repository.py",
+        ], [
+            r"with transaction\(",
+            r"class AnalysisRepository",
+            r"class ProjectService",
+        ]),
+        _check("vnext_scan_identity", [
+            "app/services/project_service.py",
+            "app/db/repositories/project_repository.py",
+        ], [
+            r"def scan_key",
+            r"class ProjectRepository",
+            r"create_scan\(",
+        ]),
+        _check("vnext_schema_migration", [
+            "scripts/upgrade/migration_runner.py",
+            "scripts/upgrade/vnext_schema.sql",
+        ], [
+            r"def migrate_legacy",
+            r"def capture_legacy_snapshot",
+            r"coverage_scans",
+        ]),
+        _check("vnext_json_serializer", ["app/api/serialization.py", "app/api/application.py"], [
+            r"def to_jsonable",
+            r"to_jsonable",
+        ]),
+        _check("vnext_lcov_and_git", [
+            "app/incremental/lcov.py",
+            "app/incremental/blame.py",
+            "app/incremental/git_diff.py",
+        ], [
+            r"FNL:",
+            r"boundary",
+            r"def added_lines",
+        ]),
         _check("mysql_connection_pool", ["enhance_coverage.py", "app/db/manager.py"], [
             r"from app\.db\.connection_pool import get_global_pool",
             r"get_global_pool\(self\.config\)",

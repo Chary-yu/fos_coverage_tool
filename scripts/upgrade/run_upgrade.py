@@ -34,7 +34,10 @@ if _REPO_ROOT not in sys.path:
 from app.release_identity import verify_release_identity
 from scripts.diagnostics.data_hash_gate import capture_database_snapshot, verify_data_integrity
 from scripts.upgrade.evidence_manifest import ProductionEvidenceManifest
-from scripts.upgrade.schema_preflight import validate_ddl_file
+from scripts.upgrade.schema_preflight import (
+    ensure_column_information_schema,
+    validate_ddl_file,
+)
 from scripts.diagnostics.path_mapping_audit import audit_path_mappings, audit_lcov_paths
 from scripts.diagnostics.security_scanner import scan_directory
 from scripts.diagnostics.sidecar_registry_audit import audit_sidecar_and_registry
@@ -258,6 +261,12 @@ class UpgradeOrchestrator:
                 for statement in (part.strip() for part in ddl_sql.split(";") if part.strip()):
                     cursor.execute(statement)
             connection.commit()
+            ensure_column_information_schema(
+                connection,
+                "coverage_project_state",
+                "file_state_version",
+                "BIGINT NOT NULL DEFAULT 0",
+            )
             backfill_report = backfill_all_projects(connection)
         except Exception as exc:
             self.log("❌ Additive migration/backfill failed: {}".format(exc))

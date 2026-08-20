@@ -15,51 +15,20 @@
     var lastRefreshTime = 0;
 
     function getApiBaseCandidates() {
-        var candidates = [];
-        if (window.location && window.location.search) {
-            try {
-                var p = new URLSearchParams(window.location.search);
-                var explicit = p.get("api");
-                if (explicit) candidates.push(explicit.replace(/\/+$/, ""));
-            } catch (e) {}
-        }
-        var origin = (window.location && window.location.origin && window.location.origin !== "null") ? window.location.origin : "";
-        if (origin) {
-            candidates.push(origin + "/api/coverage");
-            if (window.location.pathname && window.location.pathname.indexOf("/coverage/") === 0) {
-                candidates.push(origin + "/coverage/api/coverage");
-            }
-            if (window.location.hostname && window.location.port !== "9528") {
-                candidates.push(window.location.protocol + "//" + window.location.hostname + ":9528/api/coverage");
-            }
-        }
-        candidates.push("http://127.0.0.1:9528/api/coverage");
-        candidates.push("/api/coverage");
-        var result = [];
-        for (var c = 0; c < candidates.length; c++) {
-            var item = (candidates[c] || "").replace(/\/+$/, "");
-            if (item && result.indexOf(item) === -1) {
-                result.push(item);
-            }
-        }
-        return result;
+        return ["/api/coverage"];
     }
-
     function fetchUnanalyzedFromCandidates(candidates, index) {
-        if (index >= candidates.length) {
-            return Promise.reject(new Error("All API endpoints unavailable"));
+        if (!candidates.length || index >= candidates.length) {
+            return Promise.reject(new Error("Canonical API endpoint unavailable"));
         }
-        var base = candidates[index];
+        var base = candidates[0];
         var url = base + "/incremental/unanalyzed?project=" + encodeURIComponent(projectName);
         return fetch(url).then(function(res) {
             if (!res.ok) throw new Error("HTTP " + res.status);
             resolvedApiBase = base;
             return res.json();
-        }).catch(function(err) {
-            return fetchUnanalyzedFromCandidates(candidates, index + 1);
         });
     }
-
     function escapeHtml(str) {
         return String(str)
             .replace(/&/g, "&amp;")
@@ -108,8 +77,9 @@
         fetchUnanalyzedFromCandidates(candidates, 0)
             .then(function(resData) {
                 isRefreshing = false;
-                if (!resData || resData.status !== "success" || !resData.data) return;
-                var files = resData.data.files || [];
+                if (!resData || (resData.status && resData.status !== "success")) return;
+                var payload = resData.data || resData;
+                var files = payload.files || [];
                 var unanalyzedMap = {};
                 var pendingLineMap = {};
                 for (var i = 0; i < files.length; i++) {
