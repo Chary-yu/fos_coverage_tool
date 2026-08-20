@@ -12,6 +12,10 @@ if ROOT not in sys.path:
 from app.db.repositories import LineIndexRepository, ProjectRepository
 from app.services.project_service import ProjectService
 from scripts.upgrade.migration_runner import create_sqlite_schema
+try:
+    from scripts.diagnostics.contract import with_contract
+except ModuleNotFoundError:
+    from contract import with_contract
 
 
 def audit():
@@ -55,9 +59,9 @@ def audit():
         ).fetchone()[0]
         if status not in ("ready", "sealed"):
             failures.append("scan was not sealed: {}".format(status))
-        return {"status": "PASSED" if not failures else "FAILED",
+        return with_contract({"status": "PASSED" if not failures else "FAILED",
                 "evidence_class": "runtime_audit", "scan_status": status,
-                "violations": failures}
+                "violations": failures})
     finally:
         connection.close()
 

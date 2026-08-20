@@ -11,6 +11,10 @@ import os
 import re
 import sys
 
+try:
+    from scripts.diagnostics.contract import with_contract
+except ModuleNotFoundError:  # direct ``python scripts/diagnostics/...`` execution
+    from contract import with_contract
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -118,7 +122,7 @@ def audit():
         _check("chunked_sidecar", ["app/code_detail/vnext_service.py", "app/code_detail/sidecar_store.py"], [
             r"from app\.code_detail\.sidecar_store import SidecarStore",
             r"save_chunked_sidecar\(",
-            r"load_lines_range\(",
+            r"\bload_lines_ranges\s*\(",
         ]),
         _check("release_identity_endpoint", ["app/bootstrap.py", "app/api/application.py", "app/release_identity.py"], [
             r"get_current_release_identity",
@@ -153,7 +157,7 @@ def audit():
         "provider_only": [item["name"] for item in checks if item["status"] != "RUNTIME_WIRED"],
         "checks": checks,
     }
-    return result
+    return with_contract(result)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,10 @@ class VNextCodeDetailService(object):
         self._identity_cache = OrderedDict()
         self._overlay_cache = OrderedDict()
         self._cache_lock = threading.RLock()
+        self._metrics = {
+            "overlay_db_queries": 0,
+            "overlay_db_rows": 0,
+        }
 
     @staticmethod
     def _sidecar_key(file_path, repository_name=""):
@@ -165,6 +169,9 @@ class VNextCodeDetailService(object):
             rows = self.analyses.get_by_file_ranges(connection, file_id, range_key)
         else:
             rows = self.analyses.get_by_file(connection, file_id)
+        with self._cache_lock:
+            self._metrics["overlay_db_queries"] += 1
+            self._metrics["overlay_db_rows"] += len(rows)
         overlay = {
             int(row["line_number"]): row
             for row in rows
@@ -182,6 +189,13 @@ class VNextCodeDetailService(object):
             stores = [store.cache_stats() for store in self._sidecar_stores.values()]
             identity_count = len(self._identity_cache)
             overlay_count = len(self._overlay_cache)
+            service_metrics = dict(self._metrics)
+        sidecar_metrics = {
+            "metadata_reads": sum(int(item.get("metadata_reads") or 0) for item in stores),
+            "metadata_cache_hits": sum(int(item.get("metadata_cache_hits") or 0) for item in stores),
+            "chunk_reads": sum(int(item.get("chunk_reads") or 0) for item in stores),
+            "chunk_cache_hits": sum(int(item.get("chunk_cache_hits") or 0) for item in stores),
+        }
         return {
             "identity_cache_entries": identity_count,
             "max_identity_entries": self.max_identity_entries,
@@ -190,6 +204,12 @@ class VNextCodeDetailService(object):
             "sidecar_store_count": len(self._sidecar_stores),
             "stores": stores,
             "max_sidecar_stores": self.max_sidecar_stores,
+            "overlay_db_queries": service_metrics["overlay_db_queries"],
+            "overlay_db_rows": service_metrics["overlay_db_rows"],
+            "sidecar_metadata_reads": sidecar_metrics["metadata_reads"],
+            "sidecar_metadata_cache_hits": sidecar_metrics["metadata_cache_hits"],
+            "sidecar_decode_count": sidecar_metrics["chunk_reads"],
+            "sidecar_decode_cache_hits": sidecar_metrics["chunk_cache_hits"],
         }
 
     def layout(self, connection, scan_id, report_id, repository_name="", file_path=None):

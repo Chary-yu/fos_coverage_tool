@@ -6,6 +6,11 @@ import re
 import subprocess
 import sys
 
+try:
+    from scripts.diagnostics.contract import with_contract
+except ModuleNotFoundError:
+    from contract import with_contract
+
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 ASSET = os.path.join(ROOT, "web/assets/js/coverage_enhance.js")
@@ -15,8 +20,8 @@ def audit(repo_root=ROOT):
     path = os.path.join(repo_root, "web/assets/js/coverage_enhance.js")
     violations = []
     if not os.path.isfile(path):
-        return {"status": "FAILED", "evidence_class": "contract_audit",
-                "violations": ["canonical Code Detail asset is missing"]}
+        return with_contract({"status": "FAILED", "evidence_class": "contract_audit",
+                "violations": ["canonical Code Detail asset is missing"]})
     with open(path, "r", encoding="utf-8") as stream:
         text = stream.read()
 
@@ -50,13 +55,13 @@ def audit(repo_root=ROOT):
     except (OSError, subprocess.CalledProcessError) as exc:
         syntax = "FAILED"
         violations.append("canonical JavaScript syntax check failed: {}".format(exc))
-    return {
+    return with_contract({
         "status": "PASSED" if not violations else "FAILED",
         "evidence_class": "contract_audit",
         "asset": os.path.relpath(path, repo_root),
         "syntax": syntax,
         "violations": violations,
-    }
+    })
 
 
 if __name__ == "__main__":

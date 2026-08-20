@@ -6,6 +6,11 @@ import json
 import os
 import subprocess
 
+try:
+    from scripts.diagnostics.contract import CONTRACT_VERSION
+except ModuleNotFoundError:
+    from contract import CONTRACT_VERSION
+
 
 MAPPINGS = [
     ({"app/api/*", "app/auth*", "app/jobs/*", "app/db/*", "scripts/upgrade/migration_runner.py"},
@@ -59,7 +64,8 @@ def main():
     parser.add_argument("--repo-root", default=os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
     args = parser.parse_args()
     files = changed_files(args.repo_root, args.base)
-    result = {"changed_files": files, "test_modules": select(files)}
+    result = {"contract_version": CONTRACT_VERSION,
+              "changed_files": files, "test_modules": select(files)}
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

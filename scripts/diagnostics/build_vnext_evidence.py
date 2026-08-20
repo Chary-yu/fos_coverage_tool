@@ -11,6 +11,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from app.release_identity import generate_release_identity
+from scripts.diagnostics.contract import CONTRACT_VERSION
 from scripts.diagnostics.canonical_ownership_audit import audit_canonical_ownership
 from scripts.diagnostics.runtime_legacy_dependency_audit import audit as audit_legacy
 from scripts.diagnostics.runtime_participation_audit import audit as audit_participation
@@ -100,6 +101,7 @@ def build(repo_root):
         }
     return {
         "evidence_class": "architecture_audit",
+        "contract_version": CONTRACT_VERSION,
         "revision": revision,
         "release_identity": identity,
         "schema_version": 1,

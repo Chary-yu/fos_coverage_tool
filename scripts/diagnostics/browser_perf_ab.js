@@ -99,19 +99,24 @@ async function runVirtualScrollWorkload(browser) {
         time_to_first_visible_ms: Number((firstVisibleAt - start).toFixed(3)),
         time_to_target_line_ms: scrolledVisible
           ? Number((performance.now() - targetStart).toFixed(3)) : null,
+        logical_line_count: region.lines.length,
         loaded_lines: region.lines.length,
         loaded_line_count: region.loadedLineCount,
+        resident_js_lines: region.loadedLineCount,
         virtualized: region.virtualized,
+        data_virtualized: region.virtualized && region.loadedLineCount < region.lines.length,
         first_visible: firstVisible,
         scrolled_visible: scrolledVisible,
         dom_line_count: region.virtualContent ? region.virtualContent.children.length : 0,
-        telemetry
+        telemetry,
+        telemetry_after_scroll: internals.PerformanceTelemetry.snapshot()
       };
     });
     const codeLineRequests = requestLog.filter(item => item === '/api/coverage/code-lines').length;
     return {
       status: measurement.virtualized && measurement.loaded_lines === 100000 &&
-        measurement.loaded_line_count < 2000 && measurement.dom_line_count < 1500 &&
+        measurement.data_virtualized && measurement.resident_js_lines < 2000 &&
+        measurement.dom_line_count < 1500 &&
         measurement.first_visible && measurement.scrolled_visible && codeLineRequests <= 4 ? 'PASSED' : 'FAILED',
       evidence_class: 'performance_e2e',
       workload_id: 'coverage-enhance-virtual-scroll-100k-v1',

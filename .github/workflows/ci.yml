@@ -80,8 +80,14 @@ jobs:
         run: python scripts/diagnostics/active_runtime_audit.py
       - name: Verify Scan immutability barrier
         run: python scripts/diagnostics/scan_immutability_audit.py
+      - name: Verify connection pool transaction and liveness contract
+        run: python scripts/diagnostics/connection_pool_audit.py
+      - name: Verify durable job lifecycle contract
+        run: python scripts/diagnostics/job_lifecycle_audit.py
       - name: Verify changed-path specialist mapping
         run: python scripts/diagnostics/changed_test_selection.py
+      - name: Build machine-readable VNext evidence matrix
+        run: mkdir -p .artifacts/vnext && python scripts/diagnostics/build_vnext_evidence.py .artifacts/vnext/architecture_ownership_matrix.json
 
   specialist-regression:
     name: Specialist regression suites
@@ -140,5 +146,8 @@ jobs:
           node-version: '20'
       - run: npm ci
       - run: npx playwright install --with-deps chromium
-      - run: npx playwright test
+      - name: Run required real-browser and canonical VNext HTTP suites
+        run: npx playwright test tests/browser
       - run: mkdir -p .artifacts && npm run perf:browser-ab -- .artifacts/browser_perf_ab.json
+      - name: Validate browser performance evidence boundary
+        run: python scripts/diagnostics/performance_evidence_audit.py .artifacts/browser_perf_ab.json --allow-partial

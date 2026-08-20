@@ -996,6 +996,8 @@
                     virtualEnd: 0,
                     virtualRenderPending: false,
                     virtualLineHeight: VIRTUAL_LINE_HEIGHT,
+                    virtualMeasuredHeights: new Map(),
+                    virtualHeightBreaks: [],
                     virtualRequest: null
                 };
                 this._regions.set(r.region_id, regState);
@@ -1688,10 +1690,54 @@
             region.linesEl.appendChild(bottom);
         },
 
+        rebuildVirtualHeightIndex(region) {
+            if (!region) return;
+            const base = Math.max(16, Number(region.virtualLineHeight) || VIRTUAL_LINE_HEIGHT);
+            const entries = Array.from((region.virtualMeasuredHeights || new Map()).entries())
+                .filter(([index, height]) => Number.isFinite(Number(index)) && Number.isFinite(Number(height)))
+                .map(([index, height]) => ({ index: Number(index), height: Math.max(1, Number(height)) }))
+                .sort((left, right) => left.index - right.index);
+            let cumulativeDelta = 0;
+            region.virtualHeightBreaks = entries.map(entry => {
+                cumulativeDelta += entry.height - base;
+                return { index: entry.index, cumulativeDelta };
+            });
+        },
+
+        virtualOffsetForIndex(region, index) {
+            const target = Math.max(0, Math.floor(Number(index) || 0));
+            const base = Math.max(16, Number(region.virtualLineHeight) || VIRTUAL_LINE_HEIGHT);
+            const breaks = region.virtualHeightBreaks || [];
+            let low = 0;
+            let high = breaks.length;
+            while (low < high) {
+                const middle = (low + high) >> 1;
+                if (breaks[middle].index < target) low = middle + 1;
+                else high = middle;
+            }
+            const cumulativeDelta = low > 0 ? breaks[low - 1].cumulativeDelta : 0;
+            return Math.max(0, target * base + cumulativeDelta);
+        },
+
+        virtualIndexAtOffset(region, offset) {
+            const total = Math.max(Number(region.lineCount) || 0, (region.lines || []).length);
+            if (!total) return 0;
+            const target = Math.max(0, Number(offset) || 0);
+            let low = 0;
+            let high = total;
+            while (low < high) {
+                const middle = (low + high) >> 1;
+                if (this.virtualOffsetForIndex(region, middle + 1) <= target) low = middle + 1;
+                else high = middle;
+            }
+            return Math.min(total - 1, low);
+        },
+
         virtualWindowBounds(region, forcedStart) {
             const total = Math.max(Number(region.lineCount) || 0, (region.lines || []).length);
             const lineHeight = Math.max(16, Number(region.virtualLineHeight) || VIRTUAL_LINE_HEIGHT);
-            const visibleRows = Math.max(1, Math.ceil((Number(window.innerHeight) || 800) / lineHeight));
+            const viewportHeight = Number(window.innerHeight) || 800;
+            const visibleRows = Math.max(1, Math.ceil(viewportHeight / lineHeight));
             if (Number.isFinite(forcedStart)) {
                 const centered = Math.floor(visibleRows / 2);
                 const start = Math.max(0, Math.min(total, Math.floor(forcedStart) - centered - VIRTUAL_OVERSCAN_LINES));
@@ -1706,13 +1752,15 @@
                 const scrollTop = Number(window.pageYOffset || window.scrollY || 0);
                 viewportStart = Math.max(0, scrollTop - (Number(rect.top) + scrollTop));
             }
-            // Use the measured average height after review controls have been
-            // rendered. This prevents fixed-24px drift in large regions.
-            const firstVisible = Math.floor(viewportStart / lineHeight);
+            // Use a variable-size prefix index. A resized/multi-line review
+            // row contributes its measured delta instead of poisoning every
+            // later spacer with one global average.
+            const firstVisible = this.virtualIndexAtOffset(region, viewportStart);
+            const lastVisible = this.virtualIndexAtOffset(region, viewportStart + viewportHeight);
             const start = Math.max(0, firstVisible - VIRTUAL_OVERSCAN_LINES);
             return {
                 start,
-                end: Math.min(total, start + visibleRows + (VIRTUAL_OVERSCAN_LINES * 2))
+                end: Math.min(total, lastVisible + 1 + (VIRTUAL_OVERSCAN_LINES * 2))
             };
         },
 
@@ -1723,25 +1771,45 @@
             const bounds = this.virtualWindowBounds(region, forcedStart);
             const availableEnd = Math.min(bounds.end, (region.lines || []).length);
             const fragment = document.createDocumentFragment();
+            const renderedIndexes = [];
             for (let index = bounds.start; index < availableEnd; index += 1) {
                 const line = region.lines[index];
-                if (line) fragment.appendChild(CodeLineRenderer.renderCodeLine(line, this.filePath));
+                if (line) {
+                    fragment.appendChild(CodeLineRenderer.renderCodeLine(line, this.filePath));
+                    renderedIndexes.push(index);
+                }
             }
             region.virtualContent.innerHTML = '';
             region.virtualContent.appendChild(fragment);
             region.virtualStart = bounds.start;
             region.virtualEnd = availableEnd;
-            const visibleCount = Math.max(1, availableEnd - bounds.start);
-            const measuredHeight = Number(region.virtualContent.getBoundingClientRect
-                ? region.virtualContent.getBoundingClientRect().height : 0);
-            if (measuredHeight > 0) {
-                region.virtualLineHeight = Math.max(
-                    16, Math.min(160, measuredHeight / visibleCount)
-                );
+            const measuredHeights = [];
+            Array.from(region.virtualContent.children).forEach((element, childIndex) => {
+                const height = Number(element.getBoundingClientRect
+                    ? element.getBoundingClientRect().height : 0);
+                const lineIndex = renderedIndexes[childIndex];
+                if (lineIndex === undefined || height <= 0) return;
+                region.virtualMeasuredHeights.set(lineIndex, height);
+                measuredHeights.push(height);
+            });
+            if (measuredHeights.length) {
+                // Median is robust to a tall review panel and gives
+                // unmeasured source rows a stable local estimate.
+                measuredHeights.sort((left, right) => left - right);
+                const middle = Math.floor(measuredHeights.length / 2);
+                const median = measuredHeights.length % 2
+                    ? measuredHeights[middle]
+                    : (measuredHeights[middle - 1] + measuredHeights[middle]) / 2;
+                region.virtualLineHeight = Math.max(16, Math.min(160, median));
             }
-            const lineHeight = Math.max(16, Number(region.virtualLineHeight) || VIRTUAL_LINE_HEIGHT);
-            region.virtualTopSpacer.style.height = `${bounds.start * lineHeight}px`;
-            region.virtualBottomSpacer.style.height = `${Math.max(0, (Math.max(region.lineCount, region.lines.length) - availableEnd) * lineHeight)}px`;
+            this.rebuildVirtualHeightIndex(region);
+            region.virtualTopSpacer.style.height = `${this.virtualOffsetForIndex(region, bounds.start)}px`;
+            const totalHeight = this.virtualOffsetForIndex(
+                region, Math.max(region.lineCount, region.lines.length)
+            );
+            region.virtualBottomSpacer.style.height = `${Math.max(
+                0, totalHeight - this.virtualOffsetForIndex(region, availableEnd)
+            )}px`;
             PerformanceTelemetry.virtualRenders += 1;
             PerformanceTelemetry.recordDomLineCount(region.virtualContent.children.length, true);
         },

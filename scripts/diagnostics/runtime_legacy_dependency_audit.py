@@ -5,6 +5,11 @@ import os
 import re
 import sys
 
+try:
+    from scripts.diagnostics.contract import with_contract
+except ModuleNotFoundError:
+    from contract import with_contract
+
 
 PATTERN = re.compile(
     r"^\s*(?:from|import)\s+(enhance_coverage|coverage_check|"
@@ -73,7 +78,7 @@ def audit(repo_root):
         ],
         "RETIRED": [],
     }
-    return {
+    return with_contract({
         "status": "PASSED" if not findings else "FAILED",
         "evidence_class": "architecture_audit",
         "legacy_imports": findings,
@@ -81,7 +86,7 @@ def audit(repo_root):
         "classification": classification,
         "legacy_implementations": classification["TRANSITIONAL_LEGACY"],
         "is_valid": not findings,
-    }
+    })
 
 
 if __name__ == "__main__":

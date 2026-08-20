@@ -9,6 +9,10 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from app.config.runtime_config import load_application_config
+try:
+    from scripts.diagnostics.contract import with_contract
+except ModuleNotFoundError:
+    from contract import with_contract
 
 
 def audit(repo_root=ROOT):
@@ -24,13 +28,13 @@ def audit(repo_root=ROOT):
         violations.append("Candidate database is not coverage_candidate")
     if int((candidate.get("server") or {}).get("port") or 0) != 19528:
         violations.append("Candidate server port is not 19528")
-    return {"status": "PASSED" if not violations else "FAILED",
+    return with_contract({"status": "PASSED" if not violations else "FAILED",
             "evidence_class": "configuration_audit",
             "default_runtime_mode": default.get("runtime_mode"),
             "candidate_runtime_mode": candidate.get("runtime_mode"),
             "candidate_database": (candidate.get("mysql") or {}).get("database"),
             "candidate_port": (candidate.get("server") or {}).get("port"),
-            "violations": violations}
+            "violations": violations})
 
 
 if __name__ == "__main__":

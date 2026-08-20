@@ -1277,15 +1277,17 @@ Maintainer 负责唯一 root owner 和 handoff，不重复开根因。
 - P1-01～P1-05：canonical Code Detail、analysis save、Progress/Developer/Incremental、Export download 和默认 VNext runtime 已统一到 VNext API；`server --config` 会严格加载指定配置，Candidate 配置断言为 `vnext / coverage_candidate / 19528`。
 - P1-06～P1-12：Legacy 明确标记为 `TRANSITIONAL_LEGACY`；Scan 只允许在 construction 状态写入并由 `seal_scan()` 发布；Code Detail/文件哈希带 `scan_id + repository_name`；连接池、Job lease/recovery/shutdown、批量分析和批量 ingest 已收口。
 - P1-13～P1-17：LCOV 路径歧义 fail-closed；Sidecar 与 HTTP body 有上限；诊断输出覆盖 active runtime、frontend/API contract、Scan immutability、canonical ownership；CI 依赖安装不再吞错，并强制运行 VNext、specialist 和 real-browser suites。
-- P2-01～P2-25：overlay/Sidecar LRU、数据版本失效、批量 SQL、Progress SQL 分页、资源队列、连接断连只读重试、ReportRegistry 归属、数据虚拟滚动、事件委托、changed-path 测试映射和 rollback identity 校验已实现。
+- P2-01～P2-25：overlay/Sidecar LRU、数据版本失效、批量 SQL、Progress SQL 分页、资源队列、连接断连只读重试、ReportRegistry 归属、数据虚拟滚动、事件委托、changed-path 测试映射和 rollback identity 校验已实现；虚拟滚动进一步使用实测高度前缀索引，避免可变高度 review panel 造成累计漂移。
+- Skill-P1/P2 的机器证据已收口到 `contract_version=vnext-audit-20260820.2`；新增连接池事务/断连审计、Job lease/跨 Scan 去重/优雅停机审计、canonical frontend ↔ 真实 `create_vnext_server()` HTTP + Chromium 集成，以及浏览器性能证据边界审计。
 
 ## 10.2 本地可复现证据
 
 以下证据在本次整改工作树中已执行通过：
 
 - Python：`88` 项全量测试通过，`1` 项真实 MySQL 测试因未设置 `COVERAGE_TEST_MYSQL=1` 跳过；新增 Job 入队失败、只读 MySQL 断连重试等针对性用例通过。
-- Browser：真实 Chromium `5 passed`。
-- 100k 虚拟滚动：`request_count=2`、`loaded_line_count=1268`、`dom_line_count=317`、`first_visible=true`、`scrolled_visible=true`；首屏和目标行耗时已写入性能证据。
+- Browser：真实 Chromium `6 passed`，其中新增真实 VNext HTTP 集成用例；该用例实际验证布局、`POST /code-lines/batch`、`POST /analysis`、多仓库身份和保存后的 overlay 回读。
+- 100k 虚拟滚动：最新 Chromium A/B 运行得到 `request_count=2`、`logical_line_count=100000`、`resident_js_lines=1569`、`dom_line_count=317`、`first_visible=true`、`scrolled_visible=true`；首屏/目标行耗时、响应 bytes 和滚动后 telemetry 已写入性能证据。
+- 真实 HTTP fixture 的 `/metrics` 回读验证了 `sidecar_decode_count`、`overlay_db_queries`、`overlay_db_rows` 和 `sidecar_store_count`；浏览器 A/B 文件仍明确标记 DB/RSS/p95 字段未采集，`performance_evidence_audit --allow-partial` 只允许透明报告 PARTIAL。
 - Architecture/contract：runtime participation、canonical ownership、legacy dependency、active runtime、frontend VNext API contract、Scan immutability、Sidecar registry 均通过。
 - 兼容副本：root CSS/JS 与 `web/assets` canonical SHA 一致。
 

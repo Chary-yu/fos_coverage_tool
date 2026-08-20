@@ -5,6 +5,11 @@ import os
 import re
 from typing import Dict, Any
 
+try:
+    from scripts.diagnostics.contract import with_contract
+except ModuleNotFoundError:
+    from contract import with_contract
+
 
 def _sha(path):
     h = hashlib.sha256()
@@ -110,13 +115,13 @@ def audit_canonical_ownership(repo_root: str) -> Dict[str, Any]:
     violations.extend("missing VNext canonical module: {}".format(path)
                       for path in missing_modules)
     status = "PASSED" if not violations and not transitional else "FAILED"
-    return {"status": status,
+    return with_contract({"status": status,
             "canonical_sources": sorted(mappings.values()),
             "compatibility_copies": copies, "violations": violations,
             "transitional_root_owners": transitional,
             "compatibility_shims": shim_results,
             "missing_vnext_modules": missing_modules,
-            "is_valid": not violations and not transitional}
+            "is_valid": not violations and not transitional})
 
 
 if __name__ == "__main__":
