@@ -68,6 +68,8 @@ def load_application_config(path: Optional[str] = None, base_dir: Optional[str] 
     configured_path = path or os.environ.get("COVERAGE_CONFIG_PATH")
     if configured_path and not os.path.isabs(configured_path):
         configured_path = os.path.join(base_dir, configured_path)
+    if configured_path and not os.path.isfile(configured_path):
+        raise FileNotFoundError(configured_path)
     defaults = default_runtime_config(base_dir, project_name=project_name)
     result = load_runtime_config(configured_path, defaults) if configured_path else defaults
     result = normalize_candidate_paths(result, base_dir)

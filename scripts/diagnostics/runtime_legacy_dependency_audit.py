@@ -12,6 +12,35 @@ PATTERN = re.compile(
     re.MULTILINE,
 )
 
+COMPATIBILITY_SHIMS = [
+    "enhance_coverage.py",
+    "coverage_check.py",
+    "code_detail_service.py",
+    "code_region.py",
+    "source_reader.py",
+]
+
+TRANSITIONAL_LEGACY = [
+    {
+        "path": "app/legacy_runtime.py",
+        "reason": "legacy CLI/server compatibility runtime remains available for runtime_mode=legacy",
+    },
+    {
+        "path": "app/incremental/legacy.py",
+        "reason": "legacy incremental CLI/report generation remains available for compatibility",
+    },
+]
+
+CANONICAL_ONLY = [
+    "app/bootstrap.py",
+    "app/api/application.py",
+    "app/services/project_service.py",
+    "app/services/analysis_service.py",
+    "app/services/progress_service.py",
+    "app/services/incremental_service.py",
+    "app/incremental/orchestrator.py",
+]
+
 
 def audit(repo_root):
     findings = []
@@ -29,10 +58,28 @@ def audit(repo_root):
                     "module": match.group(1),
                     "line": text[:match.start()].count("\n") + 1,
                 })
+    classification = {
+        "CANONICAL_ONLY": [
+            {"path": path, "classification": "CANONICAL_ONLY"}
+            for path in CANONICAL_ONLY
+        ],
+        "COMPATIBILITY_SHIM": [
+            {"path": path, "classification": "COMPATIBILITY_SHIM"}
+            for path in COMPATIBILITY_SHIMS
+        ],
+        "TRANSITIONAL_LEGACY": [
+            dict(item, classification="TRANSITIONAL_LEGACY")
+            for item in TRANSITIONAL_LEGACY
+        ],
+        "RETIRED": [],
+    }
     return {
         "status": "PASSED" if not findings else "FAILED",
         "evidence_class": "architecture_audit",
         "legacy_imports": findings,
+        "legacy_implementation_status": "TRANSITIONAL_LEGACY",
+        "classification": classification,
+        "legacy_implementations": classification["TRANSITIONAL_LEGACY"],
         "is_valid": not findings,
     }
 

@@ -4,9 +4,30 @@ import tempfile
 import unittest
 
 from app.config.runtime_config import load_application_config
+from app.legacy_runtime import get_arg_value, load_config
 
 
 class RuntimeConfigTest(unittest.TestCase):
+    def test_server_config_argument_selects_candidate_without_legacy_fallback(self):
+        with tempfile.TemporaryDirectory(prefix="vnext-server-config-") as root:
+            path = os.path.join(root, "candidate.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "runtime_mode": "vnext",
+                    "schema_version": 1,
+                    "mysql": {"database": "coverage_candidate"},
+                    "server": {"port": 19528},
+                }, stream)
+
+            config_arg = get_arg_value(["--config", path], "--config")
+            config = load_config(config_arg)
+
+            self.assertEqual(config["runtime_mode"], "vnext")
+            self.assertEqual(config["mysql"]["database"], "coverage_candidate")
+            self.assertEqual(config["server"]["port"], 19528)
+            with self.assertRaises(FileNotFoundError):
+                load_config(os.path.join(root, "missing.json"))
+
     def test_candidate_roots_are_resolved_relative_to_their_declared_base(self):
         with tempfile.TemporaryDirectory(prefix="vnext-config-") as root:
             path = os.path.join(root, "coverage.json")

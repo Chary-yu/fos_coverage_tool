@@ -34,6 +34,8 @@ python3 scripts/diagnostics/runtime_legacy_dependency_audit.py
 python3 scripts/diagnostics/build_vnext_evidence.py .artifacts/vnext-foundation-evidence/vnext/architecture_ownership_matrix.json
 ```
 
+`server --config <path>` 会直接加载指定配置；显式配置不存在或无效时会失败，不会回退到根目录的 `coverage_config.json`。因此上面的 staging 命令会实际使用 `coverage_candidate`、`runtime_mode=vnext` 和 19528 端口。
+
 ### WSL 本地浏览器 Demo
 
 不配置 MySQL 也可以先完整验证“填写 → 暂存/确认 → 查看进展 → 导出报表”链路：

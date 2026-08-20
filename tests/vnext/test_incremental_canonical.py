@@ -95,6 +95,93 @@ class CanonicalIncrementalTest(unittest.TestCase):
                 for item in result["files"][0]["details"]
             ))
 
+    def test_vnext_incremental_resolves_build_machine_absolute_lcov_path(self):
+        from app.incremental.orchestrator import IncrementalOrchestrator
+
+        with tempfile.TemporaryDirectory(prefix="vnext-absolute-lcov-") as root:
+            subprocess.check_call(["git", "init", "-q", root])
+            subprocess.check_call(["git", "-C", root, "config", "user.name", "Alice"])
+            subprocess.check_call([
+                "git", "-C", root, "config", "user.email", "alice@example.com"
+            ])
+            source_dir = os.path.join(root, "src")
+            os.makedirs(source_dir)
+            source_path = os.path.join(source_dir, "a.c")
+            with open(source_path, "w") as stream:
+                stream.write("int main(void) {\n    return 0;\n}\n")
+            subprocess.check_call(["git", "-C", root, "add", "."])
+            subprocess.check_call(["git", "-C", root, "commit", "-q", "-m", "old"])
+            oldgit = subprocess.check_output(
+                ["git", "-C", root, "rev-parse", "HEAD"]
+            ).decode().strip()
+            with open(source_path, "w") as stream:
+                stream.write("int main(void) {\n    int added = 1;\n    return added;\n}\n")
+            subprocess.check_call(["git", "-C", root, "add", "."])
+            subprocess.check_call(["git", "-C", root, "commit", "-q", "-m", "new"])
+            newgit = subprocess.check_output(
+                ["git", "-C", root, "rev-parse", "HEAD"]
+            ).decode().strip()
+            info_path = os.path.join(root, "coverage.info")
+            with open(info_path, "w") as stream:
+                stream.write(
+                    "TN:\n"
+                    "SF:/home/git_for_coverage/repo/src/a.c\n"
+                    "DA:2,0\n"
+                    "FNL:0,1,4\nFNA:0,1,main\n"
+                    "end_of_record\n"
+                )
+
+            result = IncrementalOrchestrator().build(
+                "fixture", root, oldgit, newgit, info_path,
+                repository_name="repo-a",
+            )
+            self.assertEqual(result["files"][0]["file_path"], "src/a.c")
+            self.assertEqual(
+                [item["line_number"] for item in result["files"][0]["details"]],
+                [2],
+            )
+
+    def test_vnext_incremental_rejects_ambiguous_absolute_lcov_paths(self):
+        from app.incremental.orchestrator import IncrementalOrchestrator
+
+        with tempfile.TemporaryDirectory(prefix="vnext-ambiguous-lcov-") as root:
+            subprocess.check_call(["git", "init", "-q", root])
+            subprocess.check_call(["git", "-C", root, "config", "user.name", "Alice"])
+            subprocess.check_call([
+                "git", "-C", root, "config", "user.email", "alice@example.com"
+            ])
+            source_dir = os.path.join(root, "src")
+            os.makedirs(source_dir)
+            source_path = os.path.join(source_dir, "a.c")
+            with open(source_path, "w") as stream:
+                stream.write("int main(void) {\n    return 0;\n}\n")
+            subprocess.check_call(["git", "-C", root, "add", "."])
+            subprocess.check_call(["git", "-C", root, "commit", "-q", "-m", "old"])
+            oldgit = subprocess.check_output(
+                ["git", "-C", root, "rev-parse", "HEAD"]
+            ).decode().strip()
+            with open(source_path, "w") as stream:
+                stream.write("int main(void) {\n    int added = 1;\n    return added;\n}\n")
+            subprocess.check_call(["git", "-C", root, "add", "."])
+            subprocess.check_call(["git", "-C", root, "commit", "-q", "-m", "new"])
+            newgit = subprocess.check_output(
+                ["git", "-C", root, "rev-parse", "HEAD"]
+            ).decode().strip()
+            info_path = os.path.join(root, "coverage.info")
+            with open(info_path, "w") as stream:
+                stream.write(
+                    "TN:\n"
+                    "SF:/build/one/repo/src/a.c\nDA:2,0\nend_of_record\n"
+                    "TN:\n"
+                    "SF:/build/two/repo/src/a.c\nDA:2,0\nend_of_record\n"
+                )
+
+            result = IncrementalOrchestrator().build(
+                "fixture", root, oldgit, newgit, info_path,
+                repository_name="repo-a",
+            )
+            self.assertEqual(result["files"], [])
+
     def test_incremental_result_is_persisted_against_immutable_scan_snapshot(self):
         with tempfile.TemporaryDirectory(prefix="vnext-incremental-db-") as root:
             subprocess.check_call(["git", "init", "-q", root])

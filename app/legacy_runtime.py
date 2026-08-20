@@ -2439,14 +2439,19 @@ def extract_line_index_records(content, fallback_path, project_name, review_line
     return records
 
 
-def load_config():
+def load_config(config_path=None):
     """Compatibility wrapper around the canonical application config loader."""
-    configured_path = os.environ.get("COVERAGE_CONFIG_PATH") or CONFIG_PATH
-    try:
+    explicit_path = config_path or os.environ.get("COVERAGE_CONFIG_PATH")
+    if explicit_path:
+        # An explicit Candidate path is a safety boundary: never silently
+        # replace it with the legacy root coverage_config.json on failure.
         return load_application_config(
-            configured_path, base_dir=SCRIPT_DIR,
+            explicit_path, base_dir=SCRIPT_DIR,
             project_name=DEFAULT_PROJECT_NAME,
         )
+    try:
+        return load_application_config(CONFIG_PATH, base_dir=SCRIPT_DIR,
+                                       project_name=DEFAULT_PROJECT_NAME)
     except Exception as error:
         print("[Warning] Failed to load config file: {}. Using defaults.".format(error))
         return load_application_config(
@@ -6634,9 +6639,9 @@ def generate_multi_repo_incremental_review(repos_config_path, info_path, input_d
     )
 
 
-def run_server():
+def run_server(config_path=None):
     global db_manager
-    config = load_config()
+    config = load_config(config_path)
 
     if str(config.get("runtime_mode") or "legacy").lower() == "vnext":
         from app.bootstrap import create_vnext_server
@@ -6699,8 +6704,8 @@ def print_help():
     print("    - --workers <N> controls parallel HTML parsing and line-index DB sync.")
     print("    - --mode <lazy_collapse|lazy|immediate> specifies the display mode (default: lazy_collapse).")
     print("    - Use --use-config-project only if you intentionally want coverage_config.json project_name.")
-    print("  python scripts/enhance_coverage.py server")
-    print("    - Start local bridge server for MySQL persistence.")
+    print("  python scripts/enhance_coverage.py server [--config <config.json>]")
+    print("    - Start the configured legacy or VNext server runtime.")
     print("  python scripts/enhance_coverage.py inherit --from <old_project> --to <new_project>")
     print("    - Reuse reviewed analysis for unchanged functions in a later project/version.")
     print("  python scripts/enhance_coverage.py incremental --project <project_name> --repo <git_repo> --oldgit <old_commit> --newgit <new_commit> --info <coverage.info|dir> --dir <lcov_html_dir> --out <output_dir>")
@@ -6762,7 +6767,12 @@ if __name__ == "__main__":
         print(f"[Main] Output (Enhanced) : {out_path}")
         inject_coverage_report(dir_path, out_path, project_name, workers, render_mode, reuse_output=reuse_output)
     elif cmd == "server":
-        run_server()
+        args = sys.argv[2:]
+        config_path = get_arg_value(args, "--config")
+        if "--config" in args and not config_path:
+            print("[Error] server --config requires a path.")
+            sys.exit(1)
+        run_server(config_path)
     elif cmd == "inherit":
         args = sys.argv[2:]
         source_project = get_arg_value(args, "--from")

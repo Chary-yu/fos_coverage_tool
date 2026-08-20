@@ -110,10 +110,10 @@ def audit():
             r"calculate_directory_signature_incremental\(",
             r"manifest_path=manifest_path",
         ]),
-        _check("lcov_path_index", ["app/incremental/legacy.py", "app/incremental/path_index.py"], [
-            r"from app\.incremental\.service import IncrementalService",
-            r"IncrementalService\(\{\"repo\": list\(coverage_data\.keys\(\)\)\}\)",
-            r"class LCOVPathLookupIndex",
+        _check("lcov_path_index", ["app/incremental/orchestrator.py", "app/incremental/path_index.py"], [
+            r"from app\.incremental\.path_index import LCOVPathLookupIndex",
+            r"LCOVPathLookupIndex\(\{repository_name: list\(lcov\.keys\(\)\)\}\)",
+            r"resolve_path\(repository_name",
         ]),
         _check("chunked_sidecar", ["app/code_detail/vnext_service.py", "app/code_detail/sidecar_store.py"], [
             r"from app\.code_detail\.sidecar_store import SidecarStore",
