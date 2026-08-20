@@ -16,6 +16,7 @@ import os
 import sys
 import json
 import logging
+import hashlib
 from typing import Dict, Any, List, Optional, Tuple
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
@@ -41,13 +42,24 @@ class SidecarStore:
                 self.search_dirs.append(abs_d)
 
     def _find_report_cache_dirs(self, report_id: str) -> List[str]:
+        if (not report_id or "\\" in str(report_id)
+                or any(part in ("", ".", "..") for part in str(report_id).split("/"))):
+            return []
         cache_dirs = []
         for s_dir in self.search_dirs:
             p1 = os.path.join(s_dir, ".source_cache", report_id)
-            if os.path.isdir(p1) and p1 not in cache_dirs:
+            p1_real = os.path.realpath(p1)
+            cache_parent = os.path.realpath(os.path.join(s_dir, ".source_cache"))
+            if (os.path.isdir(p1) and not os.path.islink(p1)
+                    and os.path.commonpath((cache_parent, p1_real)) == cache_parent
+                    and p1 not in cache_dirs):
                 cache_dirs.append(p1)
             p2 = os.path.join(s_dir, report_id, ".source_cache", report_id)
-            if os.path.isdir(p2) and p2 not in cache_dirs:
+            p2_real = os.path.realpath(p2)
+            p2_parent = os.path.realpath(os.path.join(s_dir, report_id, ".source_cache"))
+            if (os.path.isdir(p2) and not os.path.islink(p2)
+                    and os.path.commonpath((p2_parent, p2_real)) == p2_parent
+                    and p2 not in cache_dirs):
                 cache_dirs.append(p2)
         return cache_dirs
 
@@ -64,7 +76,11 @@ class SidecarStore:
             if os.path.isfile(meta_path):
                 try:
                     with open(meta_path, "r", encoding="utf-8") as f:
-                        return json.load(f)
+                        meta = json.load(f)
+                    if meta.get("report_id") and meta.get("report_id") != report_id:
+                        raise ValueError("sidecar report identity mismatch")
+                    meta["_root"] = os.path.realpath(c_dir)
+                    return meta
                 except Exception as e:
                     logger.warning(f"[SidecarStore] Error reading chunk meta {meta_path}: {e}")
 
@@ -80,8 +96,10 @@ class SidecarStore:
                         "file_path": data.get("file_path", ""),
                         "total_lines": data.get("total_lines", len(data.get("lines", []))),
                         "total_uncovered_count": data.get("total_uncovered_count", 0),
-                        "pending_lines": data.get("pending_lines", []),
-                        "confirmed_count": data.get("confirmed_count", 0),
+                        "uncovered_lines": data.get("uncovered_lines") or [
+                            l.get("line_no") for l in data.get("lines", [])
+                            if l.get("coverage_state") == "uncovered"
+                        ],
                         "function_ranges": data.get("function_ranges", [])
                     }
                 except Exception as e:
@@ -107,6 +125,13 @@ class SidecarStore:
                 try:
                     with open(meta_path, "r", encoding="utf-8") as f:
                         meta = json.load(f)
+                    if meta.get("report_id") and meta.get("report_id") != report_id:
+                        raise ValueError("sidecar report identity mismatch")
+                    declared_chunks = meta.get("chunks") or []
+                    if declared_chunks:
+                        for name in declared_chunks:
+                            if not os.path.isfile(os.path.join(chunk_dir, os.path.basename(name))):
+                                raise FileNotFoundError("sidecar chunk is missing")
                     c_size = meta.get("chunk_size", self.chunk_size)
                     start_chunk_idx = (start_line - 1) // c_size
                     end_chunk_idx = (end_line - 1) // c_size
@@ -156,6 +181,14 @@ class SidecarStore:
             return None
         
         source_lines = [SourceLineDTO.from_dict(d) for d in lines_dicts]
+        declared_hash = meta.get("content_hash")
+        if declared_hash:
+            actual_hash = hashlib.sha256(
+                json.dumps(lines_dicts, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            if actual_hash != declared_hash:
+                logger.warning("[SidecarStore] Content hash mismatch for %s/%s", report_id, file_path_hash)
+                return None
         ctx = SourceContext(
             project_name=meta.get("project_name", ""),
             file_path=meta.get("file_path", ""),
@@ -184,6 +217,7 @@ class SidecarStore:
         total_lines = len(all_lines_dict)
         c_size = self.chunk_size
         total_chunks = (total_lines + c_size - 1) // c_size if total_lines > 0 else 0
+        chunk_names = []
         
         # 1. Write chunk files
         for c_idx in range(total_chunks):
@@ -194,6 +228,7 @@ class SidecarStore:
             c_start_line = start_idx
             c_end_line = start_idx + c_size - 1
             chunk_filename = f"lines-{c_start_line:06d}-{c_end_line:06d}.json"
+            chunk_names.append(chunk_filename)
             chunk_filepath = os.path.join(cache_dir, chunk_filename)
             
             tmp_chunk = chunk_filepath + ".tmp"
@@ -212,16 +247,20 @@ class SidecarStore:
         ]
         meta = {
             "schema_version": CHUNKED_SCHEMA_VERSION,
+            "report_id": report_id,
             "project_name": context.project_name,
             "file_path": context.file_path,
             "file_path_hash": file_path_hash,
             "total_lines": total_lines,
-            "total_uncovered_count": context.total_uncovered_count,
-            "pending_lines": context.pending_lines,
-            "confirmed_count": context.confirmed_count,
+            "uncovered_lines": [l.line_no for l in context.lines if l.coverage_state == "uncovered"],
+            "static_total_uncovered_count": sum(1 for l in context.lines if l.coverage_state == "uncovered"),
             "function_ranges": func_ranges_json,
             "chunk_size": c_size,
-            "total_chunks": total_chunks
+            "total_chunks": total_chunks,
+            "chunks": chunk_names,
+            "content_hash": hashlib.sha256(
+                json.dumps(all_lines_dict, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()
         }
         meta_filepath = os.path.join(cache_dir, "meta.json")
         tmp_meta = meta_filepath + ".tmp"

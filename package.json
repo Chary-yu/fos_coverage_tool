@@ -1,0 +1,11 @@
+{
+  "name": "onesensor-coverage-browser-tests",
+  "private": true,
+  "devDependencies": {
+    "@playwright/test": "^1.45.0"
+  },
+  "scripts": {
+    "test:browser": "playwright test",
+    "perf:browser-ab": "node scripts/diagnostics/browser_perf_ab.js"
+  }
+}

@@ -15,7 +15,8 @@ from typing import Dict, Any, List, Tuple, Optional, Set
 from source_reader import (
     SourceContext,
     SourceLineDTO,
-    compute_file_path_hash,
+    calc_sidecar_file_key,
+    compute_db_file_path_hash,
     extract_c_function_ranges,
     parse_source_lines_from_gcov_html
 )
@@ -33,7 +34,11 @@ class ParsedSourceArtifact:
         self.project_name = project_name
         self.report_id = report_id
         self.file_path = file_path
-        self.file_path_hash = compute_file_path_hash(file_path)
+        # Keep the two identity contracts explicit: DB rows use the historical
+        # MD5 key, while sidecar directories use the SHA256-derived key.
+        self.db_file_path_hash = compute_db_file_path_hash(file_path)
+        self.sidecar_file_key = calc_sidecar_file_key(file_path)
+        self.file_path_hash = self.db_file_path_hash  # compatibility field
         self.source_file_name = os.path.basename(file_path)
         self.review_scope = review_scope
         

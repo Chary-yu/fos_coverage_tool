@@ -139,9 +139,9 @@ class TestPhase0Baseline(unittest.TestCase):
         pem = ProductionEvidenceManifest(repo_root=self.test_dir)
         pem.record("release_identity", {"version": "v11.7", "commit_sha": "abc1234", "build_id": "v11.7-abc1234-12345678"})
         pem.record("schema_migration", {"preflight_safe": True})
-        pem.record("data_hash_verification", {"verified": True})
+        pem.record("data_hash_verification", {"verified": True, "evidence_class": "production_database"})
         pem.record("targeted_tests", {"phase0": {"status": "PASSED"}})
-        pem.record("browser_smoke_suite", {"status": "PASSED"})
+        pem.record("browser_smoke_suite", {"status": "PASSED", "evidence_class": "real_browser"})
         pem.record("sidecar_audit", {"is_safe": True})
         pem.record("security_audit", {"is_safe": True, "critical_count": 0, "high_count": 0})
         pem.record("performance_benchmark", {
@@ -150,11 +150,14 @@ class TestPhase0Baseline(unittest.TestCase):
             "Tier_C_50k": {"status": "PASSED"},
             "Tier_D_100k": {"status": "PASSED"}
         })
-        pem.record("backup_evidence", {"status": "BACKUP_VERIFIED", "full_sql_gz_sha256": "fakehash"})
+        pem.record("backup_evidence", {"status": "BACKUP_VERIFIED", "evidence_class": "production_backup", "full_sql_gz_sha256": "fakehash"})
         
         passed, unmet = pem.validate_final_gate()
-        self.assertTrue(passed, f"Unmet: {unmet}")
-        self.assertEqual(pem.data["status"], "UPGRADE_SUCCESS")
+        # A synthetic ledger from a temp directory has no exact revision and
+        # must not certify production, even when its booleans look green.
+        self.assertFalse(passed)
+        self.assertIn("Evidence revision does not match current commit", unmet)
+        self.assertEqual(pem.data["status"], "UNMET_GATES")
 
 if __name__ == "__main__":
     unittest.main()

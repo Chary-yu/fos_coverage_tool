@@ -17,12 +17,15 @@ import subprocess
 import zipfile
 from collections import defaultdict
 from datetime import datetime
+from app.incremental.service import IncrementalService
 
 
 STATUS_COVERED = "已覆盖"
 STATUS_UNCOVERED = "未覆盖"
 STATUS_IGNORED = "无需覆盖"
 STATUS_MISSING = "覆盖信息缺失"
+
+_PATH_INDEX_CACHE = {}
 
 
 def normalize_path(path):
@@ -264,17 +267,20 @@ def resolve_coverage_file(filename, coverage_data, repo_path):
         if candidate in coverage_data:
             return candidate
 
-    # Try exact suffix match
-    suffix_key = "/" + filename
-    suffix_matches = []
-    for source_file in coverage_data:
-        if source_file.endswith(suffix_key) or filename.endswith("/" + source_file):
-            suffix_matches.append(source_file)
-            if len(suffix_matches) > 1:
-                # Ambiguous: Fail closed immediately
-                return None
-                
-    return suffix_matches[0] if len(suffix_matches) == 1 else None
+    # Build once per immutable coverage key set.  Resolution itself is O(1)
+    # for exact/normalized paths and O(path depth) for suffixes.
+    cache_key = (id(coverage_data), tuple(coverage_data.keys()))
+    index = _PATH_INDEX_CACHE.get(cache_key)
+    if index is None:
+        index = IncrementalService({"repo": list(coverage_data.keys())}).path_index
+        _PATH_INDEX_CACHE[cache_key] = index
+    resolved, match_type = index.resolve_path("repo", filename)
+    if resolved:
+        return resolved
+    # Absolute/repository-prefixed candidates are handled as normalized exact
+    # lookups before the safe suffix resolver.
+    resolved, _ = index.resolve_path("repo", repo_relative)
+    return resolved
 
 
 def load_repositories_config(config_path):

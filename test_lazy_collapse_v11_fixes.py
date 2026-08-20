@@ -330,8 +330,8 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
 
         expected_key = calc_sidecar_file_key("src/test.c")
         report_id = os.listdir(os.path.join(output_dir, ".source_cache"))[0]
-        sidecar_file = os.path.join(output_dir, ".source_cache", report_id, f"{expected_key}.source.json")
-        self.assertTrue(os.path.isfile(sidecar_file), f"Sidecar file missing at {sidecar_file}")
+        sidecar_meta = os.path.join(output_dir, ".source_cache", report_id, expected_key, "meta.json")
+        self.assertTrue(os.path.isfile(sidecar_meta), f"Chunked sidecar metadata missing at {sidecar_meta}")
 
         # CodeDetailService without explicit custom search dirs should find sidecar via report registry
         service = CodeDetailService()
@@ -417,7 +417,7 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
         with open(gcov_file, "w", encoding="utf-8") as f:
             f.write(sample_gcov_html)
 
-        with patch("enhance_coverage.save_source_sidecar", side_effect=IOError("Disk write error")):
+        with patch.object(enhance_coverage.SidecarStore, "save_chunked_sidecar", side_effect=IOError("Disk write error")):
             inject_coverage_report(
                 input_dir=input_dir,
                 output_dir=output_dir,

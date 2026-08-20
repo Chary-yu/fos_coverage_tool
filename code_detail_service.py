@@ -20,7 +20,7 @@ from source_reader import (
     SourceContext,
     SourceLineDTO,
     calc_sidecar_file_key,
-    compute_file_path_hash,
+    compute_db_file_path_hash,
     is_line_pending_analysis,
     is_valid_report_id,
     is_valid_review_scope,
@@ -29,6 +29,10 @@ from source_reader import (
     read_source_lines,
     read_source_ranges,
 )
+
+# Public compatibility name: this is the historical DB MD5 identity, never
+# the SHA-256 sidecar key.
+compute_file_path_hash = compute_db_file_path_hash
 
 logger = logging.getLogger(__name__)
 
@@ -39,12 +43,19 @@ def get_configured_registry_dir() -> str:
     if "COVERAGE_REGISTRY_DIR" in os.environ:
         return os.environ["COVERAGE_REGISTRY_DIR"]
     try:
-        cfg_path = os.path.join(SCRIPT_DIR, "coverage_config.json")
+        cfg_path = os.environ.get("COVERAGE_CONFIG_PATH") or os.path.join(SCRIPT_DIR, "coverage_config.json")
         if os.path.isfile(cfg_path):
             with open(cfg_path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             if cfg.get("report_registry_dir"):
                 return cfg["report_registry_dir"]
+            state = cfg.get("runtime_state") or {}
+            if state.get("root"):
+                root = state.get("root")
+                if not os.path.isabs(root):
+                    root = os.path.join(SCRIPT_DIR, root)
+                registry_dir = state.get("registry_dir", "report-registry")
+                return os.path.realpath(os.path.join(root, registry_dir))
     except Exception:
         pass
     if os.path.exists("/var/lib/onesensor-coverage/report-registry") or (os.path.exists("/var/lib") and os.access("/var/lib", os.W_OK)):
@@ -326,7 +337,8 @@ class CodeDetailService:
             self._prune_context_cache(now)
             return context
 
-        file_hash = compute_file_path_hash(file_path)
+        db_file_hash = compute_db_file_path_hash(file_path)
+        sidecar_file_hash = calc_sidecar_file_key(file_path)
 
         # 1. Try to load from server-side source sidecar if report_id given
         if report_id:
@@ -343,7 +355,7 @@ class CodeDetailService:
                     self._sidecar_store.add_search_dir(std_dir)
 
             # Try SidecarStore first (Chunked v2 + Legacy v1)
-            ctx = self._sidecar_store.load_full_source_context(report_id, file_hash)
+            ctx = self._sidecar_store.load_full_source_context(report_id, sidecar_file_hash)
             if ctx:
                 if self.db_manager:
                     self._refresh_analysis_records(ctx, project_name, file_path, scope)
@@ -352,7 +364,7 @@ class CodeDetailService:
                 return ctx
 
             for s_dir in dirs_to_check:
-                sidecar_ctx = load_source_sidecar(s_dir, report_id, file_hash)
+                sidecar_ctx = load_source_sidecar(s_dir, report_id, sidecar_file_hash)
                 if sidecar_ctx:
                     if self.db_manager:
                         self._refresh_analysis_records(sidecar_ctx, project_name, file_path, scope)
@@ -393,8 +405,9 @@ class CodeDetailService:
         self, context: SourceContext, project_name: str, file_path: str, review_scope: str = "full"
     ):
         """Update review state on existing lines using AnalysisOverlay."""
-        file_hash = compute_file_path_hash(file_path)
-        overlay = self.get_analysis_overlay(project_name, file_hash, file_path, review_scope)
+        db_file_hash = compute_db_file_path_hash(file_path)
+        sidecar_file_hash = calc_sidecar_file_key(file_path)
+        overlay = self.get_analysis_overlay(project_name, db_file_hash, file_path, review_scope)
         if not overlay:
             return
 
@@ -442,7 +455,8 @@ class CodeDetailService:
     ) -> Dict[str, Any]:
         """Compute the CodeRegion layout for the file (O(1) fast metadata path when sidecar exists)."""
         t_start = time.perf_counter()
-        file_hash = compute_file_path_hash(file_path)
+        db_file_hash = compute_db_file_path_hash(file_path)
+        sidecar_file_hash = calc_sidecar_file_key(file_path)
         scope = (review_scope or "full").lower()
 
         # Fast Metadata Path (Items 1 & 13)
@@ -452,9 +466,9 @@ class CodeDetailService:
                 for r_dir in registry[report_id]:
                     self._sidecar_store.add_search_dir(r_dir)
 
-            meta = self._sidecar_store.load_metadata(report_id, file_hash)
+            meta = self._sidecar_store.load_metadata(report_id, sidecar_file_hash)
             if meta:
-                overlay = self.get_analysis_overlay(project_name, file_hash, file_path, scope)
+                overlay = self.get_analysis_overlay(project_name, db_file_hash, file_path, scope)
                 
                 raw_func_ranges = meta.get("function_ranges", [])
                 func_ranges = [
@@ -464,20 +478,20 @@ class CodeDetailService:
                     for r in raw_func_ranges
                 ]
                 
-                pending_lines = list(meta.get("pending_lines", []))
-                confirmed_count = meta.get("confirmed_count", 0)
-                
-                if overlay:
-                    updated_pending = []
-                    updated_confirmed = 0
-                    for pl in pending_lines:
-                        rec = overlay.get_line_analysis(pl)
-                        if rec and rec.get("status") in {"可覆盖", "无法覆盖", "冗余代码"} and not rec.get("is_draft"):
-                            updated_confirmed += 1
-                        else:
-                            updated_pending.append(pl)
-                    pending_lines = updated_pending
-                    confirmed_count = updated_confirmed
+                # Sidecar stores static facts only.  Recompute all dynamic
+                # review state from the current overlay; never reuse an old
+                # pending/confirmed snapshot.
+                pending_lines = []
+                confirmed_count = 0
+                static_uncovered = set(meta.get("uncovered_lines", []))
+                for line_no in static_uncovered:
+                    rec = overlay.get_line_analysis(line_no) if overlay else None
+                    status = rec.get("status") if rec else "未确认"
+                    draft = bool(rec.get("is_draft")) if rec else False
+                    if (not draft) and status in {"可覆盖", "无法覆盖", "冗余代码"}:
+                        confirmed_count += 1
+                    else:
+                        pending_lines.append(line_no)
 
                 total_lines = meta.get("total_lines", 0)
                 regions = build_code_regions(
@@ -495,7 +509,7 @@ class CodeDetailService:
                     "file_path": file_path,
                     "report_id": report_id,
                     "total_lines": total_lines,
-                    "total_uncovered_count": meta.get("total_uncovered_count", len(pending_lines)),
+                    "total_uncovered_count": meta.get("static_total_uncovered_count", len(static_uncovered)),
                     "pending_line_count": len(pending_lines),
                     "confirmed_count": confirmed_count,
                     "regions": [r.to_dict() for r in regions],
@@ -561,7 +575,8 @@ class CodeDetailService:
     ) -> Dict[str, Any]:
         """Batch load line data for specified ranges or regions (Slice-based streaming)."""
         t_start = time.perf_counter()
-        file_hash = compute_file_path_hash(file_path)
+        db_file_hash = compute_db_file_path_hash(file_path)
+        sidecar_file_hash = calc_sidecar_file_key(file_path)
         scope = (review_scope or "full").lower()
         
         # 1. Determine verified ranges
@@ -600,7 +615,7 @@ class CodeDetailService:
         else:
             raise ValueError("ranges, region_ids, or load_default_expanded is required")
 
-        overlay = self.get_analysis_overlay(project_name, file_hash, file_path, scope)
+        overlay = self.get_analysis_overlay(project_name, db_file_hash, file_path, scope)
         
         # 2. Extract lines for each range
         batch_results = []
@@ -614,7 +629,7 @@ class CodeDetailService:
 
             lines_dicts = None
             if report_id and not content_override:
-                lines_dicts = self._sidecar_store.load_lines_range(report_id, file_hash, start_l, end_l)
+                lines_dicts = self._sidecar_store.load_lines_range(report_id, sidecar_file_hash, start_l, end_l)
 
             if lines_dicts is None:
                 ctx = self.get_source_context(

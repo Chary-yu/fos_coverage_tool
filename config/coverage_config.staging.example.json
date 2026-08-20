@@ -1,0 +1,44 @@
+{
+  "mysql": {
+    "host": "127.0.0.1",
+    "port": 13306,
+    "user": "coverage_user",
+    "password": "CHANGE_ME",
+    "database": "coverage",
+    "connect_timeout": 5,
+    "backup_restore_database": "coverage_restore_smoke",
+    "backup_restore_user": "root",
+    "backup_restore_password": ""
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 19528
+  },
+  "auth": {
+    "mode": "reverse_proxy",
+    "user_header": "X-Remote-User",
+    "trusted_proxy_addresses": ["127.0.0.1", "::1"],
+    "allowed_origins": ["http://127.0.0.1:19528", "http://localhost:19528"]
+  },
+  "runtime_state": {
+    "root": ".runtime-state-staging",
+    "jobs_dir": "jobs",
+    "registry_dir": "report-registry"
+  },
+  "upgrade": {
+    "drain_timeout_sec": 30,
+    "release_endpoint": "http://127.0.0.1:19528/api/coverage/release",
+    "previous_release_endpoint": "http://127.0.0.1:19528/api/coverage/release",
+    "rollback_evidence_path": ".artifacts/staging/rollback-evidence.json",
+    "path_mapping_source_paths": ["tests/fixtures/path_mapping"],
+    "path_mapping_lcov_paths": ["tests/fixtures/path_mapping/coverage.info"],
+    "commands": {
+      "freeze_traffic": ["python3", "scripts/upgrade/local_staging_control.py", "freeze", "--config", "config/coverage_config.staging.example.json", "--pid-file", ".runtime-state-staging/api.pid"],
+      "drain_jobs": ["python3", "scripts/upgrade/local_staging_control.py", "drain", "--config", "config/coverage_config.staging.example.json", "--pid-file", ".runtime-state-staging/api.pid"],
+      "stop_api": ["python3", "scripts/upgrade/local_staging_control.py", "stop", "--config", "config/coverage_config.staging.example.json", "--pid-file", ".runtime-state-staging/api.pid"],
+      "start_api": ["python3", "scripts/upgrade/local_staging_control.py", "start", "--config", "config/coverage_config.staging.example.json", "--pid-file", ".runtime-state-staging/api.pid", "--endpoint", "http://127.0.0.1:19528/api/coverage/release"],
+      "start_previous_api": ["python3", "scripts/upgrade/local_staging_control.py", "start", "--config", "config/coverage_config.staging.example.json", "--pid-file", ".runtime-state-staging/api.pid", "--endpoint", "http://127.0.0.1:19528/api/coverage/release"],
+      "open_traffic": ["python3", "scripts/upgrade/local_staging_control.py", "open", "--config", "config/coverage_config.staging.example.json", "--pid-file", ".runtime-state-staging/api.pid"]
+    }
+  }
+}

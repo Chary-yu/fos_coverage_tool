@@ -10,7 +10,18 @@
                    "host":  "127.0.0.1",
                    "port":  9528
                },
+    "auth": {
+        "mode": "reverse_proxy",
+        "user_header": "X-Remote-User",
+        "trusted_proxy_addresses": ["127.0.0.1", "::1"],
+        "allowed_origins": ["http://127.0.0.1:9528", "http://localhost:9528"]
+    },
     "worker_threads":  4,
+    "runtime_state": {
+        "root": ".runtime-state",
+        "jobs_dir": "jobs",
+        "registry_dir": "report-registry"
+    },
     "ownership": {
         "enabled": true,
         "xlsx_path": "代码目录归属模块统计.xlsx"

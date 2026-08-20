@@ -78,6 +78,7 @@ class MySQLConnectionPool:
         self._active_count = 0
         self._lock = threading.Lock()
         self._is_shutdown = False
+        self._metrics = {"acquires": 0, "acquire_timeouts": 0, "reconnects": 0}
 
     def _create_raw_connection(self):
         if not HAVE_PYMYSQL:
@@ -97,6 +98,7 @@ class MySQLConnectionPool:
         """Borrow a healthy connection from the pool."""
         if self._is_shutdown:
             raise RuntimeError("Connection pool has been shut down.")
+        self._metrics["acquires"] += 1
             
         deadline = time.time() + self.borrow_timeout
         while True:
@@ -105,6 +107,7 @@ class MySQLConnectionPool:
                 wrapper = self._pool.get_nowait()
                 # Check lifetime and liveness
                 if (time.time() - wrapper.created_at) > self.max_lifetime_sec or not wrapper.is_alive():
+                    self._metrics["reconnects"] += 1
                     wrapper.close()
                     with self._lock:
                         self._active_count -= 1
@@ -125,10 +128,12 @@ class MySQLConnectionPool:
             # 3. Wait for returned connection
             remaining = deadline - time.time()
             if remaining <= 0:
-                raise TimeoutError(f"Connection pool exhausted ({self._active_count}/{self.max_connections} active).")
+                self._metrics["acquire_timeouts"] += 1
+                raise TimeoutError("Connection pool exhausted ({}/{} active).".format(self._active_count, self.max_connections))
             try:
                 wrapper = self._pool.get(timeout=min(remaining, 0.5))
                 if (time.time() - wrapper.created_at) > self.max_lifetime_sec or not wrapper.is_alive():
+                    self._metrics["reconnects"] += 1
                     wrapper.close()
                     with self._lock:
                         self._active_count -= 1
@@ -178,6 +183,11 @@ class MySQLConnectionPool:
                 break
         with self._lock:
             self._active_count = 0
+
+    def metrics(self) -> Dict[str, int]:
+        with self._lock:
+            active = self._active_count
+        return dict(self._metrics, active=active, idle=self._pool.qsize(), waiters=0)
 
 _GLOBAL_POOL: Optional[MySQLConnectionPool] = None
 _GLOBAL_POOL_LOCK = threading.Lock()

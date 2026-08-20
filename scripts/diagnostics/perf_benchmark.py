@@ -84,6 +84,8 @@ def run_performance_suite() -> Dict[str, Any]:
     temp_dir = tempfile.mkdtemp()
     report_id = "report_benchmark_perf"
     results = {}
+    results["evidence_class"] = "synthetic_benchmark"
+    results["workload_id"] = "python-sidecar-layout-v1"
     
     tiers = [
         ("Tier_A_1k", 1000, 50, 50),

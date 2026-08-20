@@ -1690,7 +1690,7 @@
             const container = region.domContainer;
             if (!container) return;
 
-            if (!region.headerEl && (region.kind === 'analysis' || region.defaultState === 'expanded')) {
+            if (!region.headerEl) {
                 const header = document.createElement('div');
                 header.className = 'coverage-region-header';
                 const labelText = region.label ? `${region.label} · ` : '';

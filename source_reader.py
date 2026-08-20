@@ -29,8 +29,13 @@ def calc_sidecar_file_key(file_path: str) -> str:
     normalized = str(file_path or "").replace("\\", "/").strip().lstrip("/")
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
 
+def compute_db_file_path_hash(file_path: str) -> str:
+    """Historical DB identity: MD5(normalized path), 32 hex characters."""
+    normalized = str(file_path or "").replace("\\", "/").strip().lstrip("/")
+    return hashlib.md5(normalized.encode("utf-8")).hexdigest()
 
-compute_file_path_hash = calc_sidecar_file_key
+# Compatibility name for old DB callers.  It must never be the sidecar key.
+compute_file_path_hash = compute_db_file_path_hash
 
 
 def is_valid_report_id(report_id: str) -> bool:

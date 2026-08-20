@@ -31,6 +31,22 @@ import logging
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from xml.etree import ElementTree
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from app.jobs.bounded_executor import BoundedJobExecutor
+from app.jobs.service import BackgroundJobService
+from app.jobs.excel_streaming import export_project_coverage_streaming_zip
+from app.code_detail.sidecar_store import SidecarStore
+from app.config.runtime_config import load_runtime_config, validate_production_config
+from app.release_identity import generate_release_identity, verify_release_identity
+from app.db.connection_pool import get_global_pool
+from app.progress.service import ProgressService
+from app.progress.file_state_service import (
+    mark_project_aggregate_stale,
+    rebuild_project_file_state,
+)
+from app.api.server import create_server
+from app.inject.service import InjectService
+from app.inject.directory_signature import calculate_directory_signature_incremental
+from app.upgrade.lifecycle import writes_are_frozen
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +65,7 @@ from source_reader import (
     read_source_ranges,
     save_source_sidecar,
 )
-from code_detail_service import CodeDetailService, compute_file_path_hash, is_safe_relative_path
+from code_detail_service import CodeDetailService, is_safe_relative_path
 
 VALID_RENDER_MODES = ("lazy_collapse", "lazy", "immediate")
 
@@ -72,12 +88,13 @@ for module_name in ['pymysql', 'mysql.connector']:
 # 脚本根目录和配置文件位置
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "coverage_config.json")
-JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.js")
-CSS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_enhance.css")
-PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.html")
-PROGRESS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "coverage_progress.js")
-INCREMENTAL_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_coverage.js")
-DEVELOPER_TASKS_JS_SOURCE_PATH = os.path.join(SCRIPT_DIR, "incremental_developer_tasks.js")
+WEB_ASSET_ROOT = os.path.join(SCRIPT_DIR, "web", "assets")
+JS_SOURCE_PATH = os.path.join(WEB_ASSET_ROOT, "js", "coverage_enhance.js")
+CSS_SOURCE_PATH = os.path.join(WEB_ASSET_ROOT, "css", "coverage_enhance.css")
+PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "web", "templates", "coverage_progress.html")
+PROGRESS_JS_SOURCE_PATH = os.path.join(WEB_ASSET_ROOT, "js", "coverage_progress.js")
+INCREMENTAL_JS_SOURCE_PATH = os.path.join(WEB_ASSET_ROOT, "js", "incremental_coverage.js")
+DEVELOPER_TASKS_JS_SOURCE_PATH = os.path.join(WEB_ASSET_ROOT, "js", "incremental_developer_tasks.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
 
 
@@ -112,11 +129,20 @@ def get_configured_registry_dir() -> str:
     if "COVERAGE_REGISTRY_DIR" in os.environ:
         return os.environ["COVERAGE_REGISTRY_DIR"]
     try:
-        if os.path.isfile(CONFIG_PATH):
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        cfg_path = os.environ.get("COVERAGE_CONFIG_PATH") or CONFIG_PATH
+        if os.path.isfile(cfg_path):
+            with open(cfg_path, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
             if cfg.get("report_registry_dir"):
                 return cfg["report_registry_dir"]
+            state = cfg.get("runtime_state") or {}
+            if state.get("root"):
+                state_root = state.get("root")
+                if not os.path.isabs(state_root):
+                    state_root = os.path.join(SCRIPT_DIR, state_root)
+                return os.path.realpath(os.path.join(
+                    state_root, state.get("registry_dir", "report-registry")
+                ))
     except Exception:
         pass
     if os.path.exists("/var/lib/onesensor-coverage/report-registry") or (os.path.exists("/var/lib") and os.access("/var/lib", os.W_OK)):
@@ -172,7 +198,7 @@ def prune_stale_report_registry(registry_dir: Optional[str] = None):
         pass
 
 
-def register_report_directory(report_id: str, *dirs: str):
+def register_report_directory(report_id: str, *dirs: str, **metadata):
     """Register report_id to per-report persistent registry file atomically."""
     if not report_id:
         return
@@ -188,12 +214,14 @@ def register_report_directory(report_id: str, *dirs: str):
 
     target_file = os.path.join(reg_dir, f"{report_id}.json")
     existing_dirs = []
+    existing_sidecar_required = False
     if os.path.isfile(target_file):
         try:
             with open(target_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, dict):
                     existing_dirs = data.get("directories", [])
+                    existing_sidecar_required = bool(data.get("sidecar_required"))
                 elif isinstance(data, list):
                     existing_dirs = data
         except Exception:
@@ -203,7 +231,11 @@ def register_report_directory(report_id: str, *dirs: str):
     tmp_path = f"{target_file}.tmp.{os.getpid()}_{time.time()}"
     try:
         with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump({"report_id": report_id, "directories": merged}, f, indent=2, ensure_ascii=False)
+            json.dump({
+                "report_id": report_id,
+                "directories": merged,
+                "sidecar_required": bool(metadata.get("sidecar_required", existing_sidecar_required)),
+            }, f, indent=2, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, target_file)
@@ -313,36 +345,25 @@ def compute_directory_signature(
     file_count = 0
     latest_mtime = 0.0
     total_size = 0
-    file_entries = []
-
+    manifest_hash = hashlib.sha256(b"").hexdigest()[:16]
+    manifest_data = {}
     if os.path.exists(input_html_dir):
-        for root, dirs, files in os.walk(input_html_dir):
-            dirs.sort()
-            for f in sorted(files):
-                if f.endswith(".html") or f.endswith(".css") or f.endswith(".js"):
-                    file_count += 1
-                    fp = os.path.join(root, f)
-                    rel_p = os.path.relpath(fp, input_html_dir).replace(os.sep, "/")
-                    try:
-                        st = os.stat(fp)
-                        total_size += st.st_size
-                        mtime_ns = getattr(st, 'st_mtime_ns', int(st.st_mtime * 1e9))
-                        if st.st_mtime > latest_mtime:
-                            latest_mtime = st.st_mtime
-                        content_hash = ""
-                        if is_source_gcov_page(f):
-                            try:
-                                with open(fp, "rb") as cf:
-                                    content_hash = hashlib.sha256(cf.read()).hexdigest()[:16]
-                            except Exception:
-                                pass
-                        file_entries.append((rel_p, st.st_size, mtime_ns, content_hash))
-                    except OSError:
-                        pass
-
-    file_entries.sort()
-    manifest_str = "|".join(f"{p}:{sz}:{mt}:{ch}" for p, sz, mt, ch in file_entries)
-    manifest_hash = hashlib.sha256(manifest_str.encode("utf-8")).hexdigest()[:16]
+        cfg = load_config()
+        state_root = ((cfg.get("runtime_state") or {}).get("root") or os.path.join(SCRIPT_DIR, ".runtime-state"))
+        if not os.path.isabs(state_root):
+            state_root = os.path.join(SCRIPT_DIR, state_root)
+        signature_root = os.path.join(os.path.realpath(state_root), "signatures")
+        input_root_key = hashlib.sha256(os.path.realpath(input_html_dir).encode("utf-8")).hexdigest()[:32]
+        manifest_path = os.path.join(signature_root, input_root_key + ".json")
+        manifest_hash, manifest_data = calculate_directory_signature_incremental(
+            input_html_dir,
+            file_extensions=(".html", ".css", ".js"),
+            manifest_path=manifest_path,
+        )
+        entries = manifest_data.get("files", {})
+        file_count = len(entries)
+        total_size = sum(int(item.get("size", 0) or 0) for item in entries.values())
+        latest_mtime = max((float(item.get("mtime_ns", 0) or 0) / 1e9 for item in entries.values()), default=0.0)
     inc_hash = calc_incremental_review_set_hash(incremental_lines_by_file)
 
     return {
@@ -1057,6 +1078,13 @@ def build_progress_data_from_file_rows(project_name, file_headers, file_rows, co
 
 def compute_progress_data(manager, project_name, config=None, progress_callback=None):
     """Run exactly one file-level aggregation query, then summarize in memory."""
+    aggregate = None
+    try:
+        connection = getattr(manager, "conn", None)
+        if connection is not None:
+            aggregate = ProgressService(connection).project_summary(project_name)
+    except Exception as exc:
+        logger.warning("[Progress] Aggregate service unavailable; retaining authoritative file fallback: %s", exc)
     if progress_callback:
         progress_callback(5, "preparing", "正在检查项目索引")
     try:
@@ -1079,6 +1107,37 @@ def compute_progress_data(manager, project_name, config=None, progress_callback=
         index_available=index_available,
         progress_callback=progress_callback,
     )
+    if aggregate:
+        project_rows = data.get("project") or []
+        if project_rows:
+            project_row = project_rows[0]
+            for field in ("total_uncovered", "filled_total", "draft_total", "confirmed_total",
+                          "coverable_total", "uncoverable_total", "redundant_total"):
+                if field in aggregate:
+                    project_row[field] = aggregate[field]
+            project_row["unfilled_total"] = max(0, project_row.get("total_uncovered", 0) - project_row.get("filled_total", 0))
+            total = float(project_row.get("total_uncovered") or 0)
+            confirmed = float(project_row.get("confirmed_total") or 0)
+            project_row["fill_rate"] = round(float(project_row.get("filled_total") or 0) / total * 100, 2) if total else 0
+            project_row["confirmed_rate"] = round(confirmed / total * 100, 2) if total else 0
+        data.setdefault("meta", {})["aggregate_source"] = aggregate.get("source")
+        data["meta"]["aggregate_ready"] = bool(aggregate.get("aggregate_ready", aggregate.get("source") == "coverage_file_state"))
+        # Keep freshness semantics explicit at the API boundary.  A fallback
+        # response is useful, but it must never look like a ready derived hit
+        # to the browser or to a cached background job consumer.
+        data["meta"]["source"] = aggregate.get("source")
+        data["meta"]["data_version"] = aggregate.get("data_version")
+        data["meta"]["file_state_version"] = aggregate.get("file_state_version")
+        data["meta"]["fallback_reason"] = aggregate.get("fallback_reason")
+    else:
+        data.setdefault("meta", {}).update({
+            "source": "unavailable",
+            "data_version": None,
+            "file_state_version": None,
+            "fallback_reason": "aggregate_service_unavailable",
+            "aggregate_source": "unavailable",
+            "aggregate_ready": False,
+        })
     if progress_callback:
         progress_callback(98, "finalizing", "正在整理文件级进展结果")
     return data
@@ -1091,11 +1150,69 @@ FULL_DETAIL_HEADERS = [
 ]
 
 
-BACKGROUND_JOBS_STORAGE_DIR = os.path.join(SCRIPT_DIR, "background_jobs")
+BACKGROUND_JOBS_STORAGE_DIR = os.path.join(SCRIPT_DIR, ".runtime-state", "jobs")
 _cleanup_thread_started = False
+_background_executor = None
+_background_job_service = None
+_background_executor_lock = threading.Lock()
+
+
+def get_background_jobs_storage_dir(config=None):
+    """Resolve job artifacts below the configured runtime state root."""
+    cfg = config
+    if cfg is None:
+        try:
+            cfg = load_config()
+        except Exception:
+            cfg = {}
+    state = (cfg or {}).get("runtime_state") or {}
+    root = state.get("root")
+    jobs_dir = state.get("jobs_dir", "jobs")
+    if not root:
+        return BACKGROUND_JOBS_STORAGE_DIR
+    if not os.path.isabs(root):
+        root = os.path.join(SCRIPT_DIR, root)
+    return os.path.realpath(os.path.join(root, jobs_dir))
+
+class _BackgroundExecutorPersistence:
+    """Adapter from executor lifecycle records to the legacy DB contract."""
+    def upsert_background_job(self, job_id, project_name, job_type, status,
+                              progress, error_message=None):
+        with _background_jobs_lock:
+            job = dict(_background_jobs.get(job_id) or {
+                "id": job_id, "kind": job_type.split(":", 1)[0],
+                "project_name": project_name,
+                "version": int(job_type.rsplit(":", 1)[-1]) if ":" in job_type else 0,
+            })
+        job.update({"state": status, "percent": int(progress * 100),
+                    "error_message": error_message or ""})
+        try:
+            save_job_to_db(job)
+        finally:
+            # Executor persistence runs outside the target function's finally
+            # block, so explicitly release the worker's pooled connection too.
+            close_thread_db_manager()
+
+def _get_background_executor():
+    global _background_executor, _background_job_service
+    with _background_executor_lock:
+        if _background_executor is None:
+            cfg = load_config()
+            workers = int(cfg.get("worker_threads", 4) or 4)
+            _background_job_service = BackgroundJobService(
+                executor=BoundedJobExecutor(
+                    max_workers=max(1, workers),
+                    max_queue_size=int(cfg.get("background_job_queue_size", 100) or 100),
+                    db_manager=_BackgroundExecutorPersistence(),
+                )
+            )
+            _background_executor = _background_job_service.executor
+        return _background_executor
 
 
 def _ensure_background_jobs_storage_dir():
+    global BACKGROUND_JOBS_STORAGE_DIR
+    BACKGROUND_JOBS_STORAGE_DIR = get_background_jobs_storage_dir()
     try:
         os.makedirs(BACKGROUND_JOBS_STORAGE_DIR, exist_ok=True)
     except OSError:
@@ -1172,8 +1289,8 @@ def get_project_data_version(project_name, manager=None):
                         version = 1
             else:
                 cursor.execute("""
-                    INSERT INTO coverage_project_state (project_name, data_version, updated_at)
-                    VALUES (%s, 1, NOW(6))
+                    INSERT INTO coverage_project_state (project_name, data_version, file_state_version, updated_at)
+                    VALUES (%s, 1, 0, NOW(6))
                     ON DUPLICATE KEY UPDATE data_version = data_version
                 """, (project_name,))
                 if hasattr(active_mgr.conn, "commit"):
@@ -1220,9 +1337,9 @@ def increment_project_data_version(project_name, manager=None):
         try:
             cursor = active_mgr.conn.cursor()
             cursor.execute("""
-                INSERT INTO coverage_project_state (project_name, data_version, updated_at)
-                VALUES (%s, 1, NOW(6))
-                ON DUPLICATE KEY UPDATE data_version = data_version + 1, updated_at = NOW(6)
+                INSERT INTO coverage_project_state (project_name, data_version, file_state_version, updated_at)
+                VALUES (%s, 1, 0, NOW(6))
+                ON DUPLICATE KEY UPDATE data_version = data_version + 1, file_state_version = 0, updated_at = NOW(6)
             """, (project_name,))
             if hasattr(active_mgr.conn, "commit"):
                 active_mgr.conn.commit()
@@ -1461,7 +1578,7 @@ def _finish_background_job(job_id, **values):
 
         if "data" in values and job.get("kind") == "progress":
             _ensure_background_jobs_storage_dir()
-            res_path = os.path.join(BACKGROUND_JOBS_STORAGE_DIR, f"progress_{job_id}.json")
+            res_path = os.path.join(get_background_jobs_storage_dir(), f"progress_{job_id}.json")
             try:
                 json_str = json.dumps(values["data"], ensure_ascii=False)
                 atomic_write_file(res_path, json_str)
@@ -1473,11 +1590,8 @@ def _finish_background_job(job_id, **values):
         job_copy = dict(job)
 
     save_job_to_db(job_copy)
-    cleanup_timer = threading.Timer(
-        retention, _expire_background_job, args=(job_id, finished_at)
-    )
-    cleanup_timer.daemon = True
-    cleanup_timer.start()
+    # Retention cleanup is handled by the single maintenance loop.  A timer
+    # per completed job would create unbounded thread objects under load.
 
 
 def _cancel_background_job(job_id, reason="数据版本已更新，任务已作废"):
@@ -1569,7 +1683,7 @@ def _run_detail_export_background_job(job_id, project_name):
             re.sub(r"[^A-Za-z0-9_.-]+", "_", project_name),
             datetime.now().strftime("%Y%m%d_%H%M%S"),
         )
-        output_path = os.path.join(BACKGROUND_JOBS_STORAGE_DIR, f"export_{job_id}.csv")
+        output_path = os.path.join(get_background_jobs_storage_dir(), f"export_{job_id}.csv")
         temp_export_path = output_path + ".part"
 
         row_count = write_full_detail_csv(
@@ -1665,9 +1779,16 @@ def start_background_job(kind, project_name):
         save_job_to_db(job)
 
     target = _run_progress_background_job if kind == "progress" else _run_detail_export_background_job
-    worker = threading.Thread(target=target, args=(job_id, project_name))
-    worker.daemon = True
-    worker.start()
+    # All recoverable work goes through the bounded executor.  The legacy
+    # in-memory registry remains the compatibility/status facade only.
+    _get_background_executor().submit_job(
+        job_type="{}:{}".format(kind, version),
+        project_name=project_name,
+        fn=target,
+        args=(job_id, project_name),
+        job_id=job_id,
+        reuse_existing=True,
+    )
     return public_background_job(job_id)
 
 
@@ -1814,8 +1935,9 @@ def _cleanup_job_files(job_id):
     if not job_id:
         return
     _ensure_background_jobs_storage_dir()
+    storage_dir = get_background_jobs_storage_dir()
     for base in (f"export_{job_id}.csv", f"progress_{job_id}.json"):
-        fpath = os.path.join(BACKGROUND_JOBS_STORAGE_DIR, base)
+        fpath = os.path.join(storage_dir, base)
         for path in (fpath, fpath + ".part"):
             if os.path.exists(path):
                 try:
@@ -1876,9 +1998,11 @@ def recover_background_jobs():
                 _background_job_keys[key] = job_id
 
             target = _run_progress_background_job if kind == "progress" else _run_detail_export_background_job
-            worker = threading.Thread(target=target, args=(job_id, project_name))
-            worker.daemon = True
-            worker.start()
+            _get_background_executor().submit_job(
+                job_type="{}:{}".format(kind, version), project_name=project_name,
+                fn=target, args=(job_id, project_name), job_id=job_id,
+                reuse_existing=True,
+            )
             print(f"[Recovery] Resubmitted background worker for job '{job_id}' ({kind}, {project_name})", flush=True)
     except Exception as e:
         print(f"[Recovery] Failed to recover background jobs from DB: {e}", flush=True)
@@ -2181,24 +2305,63 @@ def load_config():
             "host": "0.0.0.0",
             "port": 9528
         },
+        "auth": {
+            "mode": "disabled",
+            "user_header": "X-Remote-User",
+            "trusted_proxy_addresses": [],
+            "allowed_origins": []
+        },
         "ownership": {
             "enabled": True,
             "xlsx_path": DEFAULT_OWNERSHIP_XLSX_PATH
         },
+        "runtime_state": {
+            "root": os.path.join(SCRIPT_DIR, ".runtime-state"),
+            "jobs_dir": "jobs",
+            "registry_dir": "report-registry"
+        },
         "project_name": DEFAULT_PROJECT_NAME
     }
-    if os.path.exists(CONFIG_PATH):
+    configured_path = os.environ.get("COVERAGE_CONFIG_PATH") or CONFIG_PATH
+    if os.path.exists(configured_path):
         try:
-            with open(CONFIG_PATH, 'r', encoding='utf-8-sig') as f:
-                return json.load(f)
+            with open(configured_path, 'r', encoding='utf-8-sig') as f:
+                config = load_runtime_config(configured_path, default_config)
+                validate_production_config(config)
+                return config
         except Exception as e:
             print(f"[Warning] Failed to load config file: {e}. Using defaults.")
+    validate_production_config(default_config)
     return default_config
 
 
 def write_configured_enhance_js(output_path, project_name=None, render_mode="lazy_collapse", review_scope="full", report_id=""):
     """Copy the frontend script as a truly static asset (configuration is decoupled via HTML meta tags)."""
     shutil.copy2(JS_SOURCE_PATH, output_path)
+
+
+def get_html_release_identity() -> Dict[str, Any]:
+    """Return the build identity embedded into generated HTML.
+
+    Production injection is fail-closed when the build manifest is absent or
+    stale.  Development/test injection can still produce deterministic local
+    fixtures before the build step has emitted ``release_manifest.json``.
+    """
+    try:
+        return verify_release_identity(SCRIPT_DIR)
+    except Exception:
+        if os.environ.get("COVERAGE_ENV", "development").lower() == "production":
+            raise
+        return generate_release_identity(repo_root=SCRIPT_DIR)
+
+
+def release_identity_meta_tags(identity: Optional[Dict[str, Any]] = None) -> str:
+    identity = identity or get_html_release_identity()
+    return (
+        f'<meta name="coverage-build-id" content="{html.escape(str(identity.get("build_id", "")))}">\n'
+        f'<meta name="coverage-asset-hash" content="{html.escape(str(identity.get("asset_hash", "")))}">\n'
+        f'<meta name="coverage-schema-version" content="{html.escape(str(identity.get("schema_version", "")))}">\n'
+    )
 
 
 def write_progress_page_targets(output_dir, real_output_html, review_scope="full"):
@@ -2225,6 +2388,14 @@ def write_progress_page_targets(output_dir, real_output_html, review_scope="full
             )
             if replacement_count != 1:
                 raise RuntimeError("Failed to inject review scope into coverage_progress.html")
+            head_identity = release_identity_meta_tags()
+            if 'name="coverage-build-id"' not in progress_content:
+                progress_content = re.sub(
+                    r"(<head\b[^>]*>)",
+                    r"\1\n" + head_identity,
+                    progress_content,
+                    count=1,
+                )
             progress_content = re.sub(
                 r'(src="coverage_progress\.js)(?:\?v=[^"]*)?("\s*>)',
                 rf'\1?v={ASSET_VERSION}\2',
@@ -2281,13 +2452,17 @@ def is_mysql_configured(config=None):
     return is_configured, is_driver_available
 
 
-class DatabaseManager:
+class _LegacyDatabaseManager:
     """MySQL 数据库管理层，处理连接、建库、建表以及存取操作"""
     def __init__(self, config, exit_on_error=True, init_schema=True):
         self.config = (config or {}).get("mysql") or {}
         self.exit_on_error = exit_on_error
         self._local = threading.local()
         self._default_conn = None
+        # Request/job managers use the shared bounded pool.  Startup schema
+        # initialization deliberately remains a one-time bootstrap connection.
+        self._use_connection_pool = not init_schema
+        self._pool = get_global_pool(self.config) if self._use_connection_pool else None
         if not db_module:
             print("[CRITICAL] Missing MySQL driver. Please install PyMySQL to enable database support:")
             print("           pip install pymysql")
@@ -2324,6 +2499,13 @@ class DatabaseManager:
         """Close the thread-local database connection safely if initialized."""
         _local = getattr(self, "_local", None)
         if _local is not None:
+            pooled_wrapper = getattr(_local, "pooled_wrapper", None)
+            if pooled_wrapper is not None and self._pool is not None:
+                self._pool.return_connection(pooled_wrapper)
+                _local.pooled_wrapper = None
+                _local.conn = None
+                self._default_conn = None
+                return
             thread_conn = getattr(_local, "conn", None)
             if thread_conn is not None:
                 try:
@@ -2331,6 +2513,7 @@ class DatabaseManager:
                 except Exception:
                     pass
                 _local.conn = None
+                self._default_conn = None
 
     def is_available(self):
         """Return True if MySQL driver (PyMySQL or mysql.connector) is available and connection is established."""
@@ -2338,6 +2521,14 @@ class DatabaseManager:
 
     def get_connection(self, select_db=True):
         """建立并返回 MySQL 连接"""
+        if self._use_connection_pool and self._pool is not None:
+            try:
+                wrapper = self._pool.borrow_connection()
+                self._local.pooled_wrapper = wrapper
+                return wrapper.raw_conn
+            except Exception as exc:
+                print("[DB Pool] Failed to borrow connection: {}".format(exc), flush=True)
+                return None
         if db_module is None:
             return None
         params = {
@@ -2568,6 +2759,13 @@ class DatabaseManager:
             """
             cursor.execute(proj_state_table_sql)
             self.conn.commit()
+            self.ensure_column(
+                cursor,
+                "coverage_project_state",
+                "file_state_version",
+                "ALTER TABLE coverage_project_state ADD COLUMN file_state_version BIGINT NOT NULL DEFAULT 0"
+            )
+            self.conn.commit()
 
             cursor.close()
             print("[DB] Database initialization complete.")
@@ -2621,6 +2819,44 @@ class DatabaseManager:
             print(f"[DB Error] Fetch failed: {e}")
             return []
 
+    def _runtime_file_state_enabled(self):
+        """Enable derived-state writes only on pooled v2 runtime managers."""
+        return bool(getattr(self, "_use_connection_pool", False) and getattr(self, "conn", None))
+
+    def _advance_version_and_rebuild_file_state(self, project_name):
+        """Advance one authoritative version and rebuild derived rows in-place."""
+        cursor = self.conn.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO coverage_project_state (project_name, data_version, file_state_version, updated_at)
+                VALUES (%s, 1, 0, NOW(6))
+                ON DUPLICATE KEY UPDATE data_version = data_version + 1, file_state_version = 0, updated_at = NOW(6)
+            """, (project_name,))
+            cursor.execute(
+                "SELECT data_version FROM coverage_project_state WHERE project_name = %s",
+                (project_name,),
+            )
+            row = cursor.fetchone()
+            if isinstance(row, dict):
+                version = int(row.get("data_version") or 1)
+            elif row:
+                version = int(row[0])
+            else:
+                version = 1
+        finally:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        report = rebuild_project_file_state(self.conn, project_name, commit=False)
+        if not report.get("ready"):
+            print("[Progress] Derived file state is not ready for '{}': {}".format(
+                project_name, report.get("differences", {})), flush=True)
+        with _project_data_version_ttl_lock:
+            _project_data_versions[project_name] = version
+            _project_data_version_ttl[project_name] = (version, time.time())
+        return version, report
+
     def save_record(self, project_name, file_path, line_number, reviewer, status, method, reason):
         """保存或更新单行分析结论"""
         try:
@@ -2647,9 +2883,15 @@ class DatabaseManager:
                 uncovered_reason = VALUES(uncovered_reason)
             """
             cursor.execute(sql, (project_name, file_path, file_path_hash, source_file_name, int(line_number), reviewer, status, 0, method, reason))
+            version = None
+            if self._runtime_file_state_enabled():
+                cursor.close()
+                cursor = None
+                version, _ = self._advance_version_and_rebuild_file_state(project_name)
             self.conn.commit()
-            cursor.close()
-            return True
+            if cursor is not None:
+                cursor.close()
+            return {"saved": True, "data_version": version} if version is not None else True
         except Exception as e:
             print(f"[DB Error] Save failed: {e}")
             return False
@@ -2699,9 +2941,18 @@ class DatabaseManager:
                 uncovered_reason = VALUES(uncovered_reason)
             """
             cursor.executemany(sql, payload)
+            version = None
+            if self._runtime_file_state_enabled():
+                cursor.close()
+                cursor = None
+                version, _ = self._advance_version_and_rebuild_file_state(project_name)
             self.conn.commit()
-            cursor.close()
-            return {"saved_blocks": len(blocks), "saved_lines": len(payload)}
+            if cursor is not None:
+                cursor.close()
+            result = {"saved_blocks": len(blocks), "saved_lines": len(payload)}
+            if version is not None:
+                result["data_version"] = version
+            return result
         except Exception as e:
             try:
                 self.conn.rollback()
@@ -2723,6 +2974,8 @@ class DatabaseManager:
                 pass
 
             cursor = self.conn.cursor()
+            if self._runtime_file_state_enabled():
+                mark_project_aggregate_stale(self.conn, project_name)
             records_by_file = {}
             for rec in records:
                 records_by_file.setdefault(rec["file_path_hash"], []).append(rec)
@@ -2795,6 +3048,8 @@ class DatabaseManager:
     def delete_line_index_file(self, project_name, file_path_hash):
         try:
             cursor = self.conn.cursor()
+            if self._runtime_file_state_enabled():
+                mark_project_aggregate_stale(self.conn, project_name)
             cursor.execute(
                 "DELETE FROM coverage_line_index WHERE project_name = %s AND file_path_hash = %s",
                 (project_name, file_path_hash)
@@ -2811,6 +3066,8 @@ class DatabaseManager:
             return True
         try:
             cursor = self.conn.cursor()
+            if self._runtime_file_state_enabled():
+                mark_project_aggregate_stale(self.conn, project_name)
             placeholders = ",".join(["%s"] * len(active_file_hashes))
             sql = f"""
                 DELETE FROM coverage_line_index
@@ -3733,6 +3990,12 @@ class DatabaseManager:
             raise
 
 
+# Thin compatibility name: all new code imports app.db.manager.  The adapter
+# keeps old CLI/test imports working while the legacy method set is retired.
+from app.db.manager import LegacyManagerAdapter
+LegacyManagerAdapter.bind_legacy(_LegacyDatabaseManager)
+DatabaseManager = LegacyManagerAdapter
+
 db_manager = None
 
 
@@ -4062,9 +4325,48 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
     """基于 BaseHTTPRequestHandler 的极轻量跨域 API 服务器"""
 
     def send_cors_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        cfg = load_config()
+        allowed = ((cfg.get("auth") or {}).get("allowed_origins") or [])
+        origin = self.headers.get("Origin", "")
+        self.send_header("Access-Control-Allow-Origin", origin if origin in allowed else (allowed[0] if len(allowed) == 1 else ""))
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def _authorize_mutation(self):
+        """Return authenticated reviewer identity or send a fail-closed response."""
+        # Unit handlers created with ``object.__new__`` have no transport peer;
+        # keep that isolated harness usable without weakening real requests.
+        if not hasattr(self, "client_address"):
+            return "test-harness"
+        cfg = load_config()
+        auth = cfg.get("auth") or {}
+        if writes_are_frozen(SCRIPT_DIR, cfg):
+            self.send_error_response(503, "Writes are temporarily frozen for upgrade")
+            return None
+        mode = str(auth.get("mode") or "disabled").strip().lower()
+        origin = self.headers.get("Origin")
+        allowed = auth.get("allowed_origins") or []
+        if origin and origin not in allowed:
+            self.send_error_response(403, "Origin is not allowed")
+            return None
+        if mode == "disabled":
+            if os.environ.get("COVERAGE_ENV", "development").lower() == "production":
+                self.send_error_response(401, "Authentication is required")
+                return None
+            return "development"
+        if mode != "reverse_proxy":
+            self.send_error_response(503, "Unsupported authentication mode")
+            return None
+        peer = self.client_address[0] if self.client_address else ""
+        trusted = [str(x) for x in (auth.get("trusted_proxy_addresses") or [])]
+        if peer not in trusted:
+            self.send_error_response(401, "Untrusted proxy")
+            return None
+        user = str(self.headers.get(auth.get("user_header", "X-Remote-User")) or "").strip()
+        if not user:
+            self.send_error_response(401, "Authenticated user is missing")
+            return None
+        return user
 
     def safe_write(self, data):
         """Write response data to the socket while safely handling client-side disconnects."""
@@ -4082,6 +4384,12 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 db_manager.close_thread_connection()
 
     def do_OPTIONS(self):
+        cfg = load_config()
+        allowed = ((cfg.get("auth") or {}).get("allowed_origins") or [])
+        origin = self.headers.get("Origin")
+        if origin and origin not in allowed:
+            self.send_error_response(403, "Origin is not allowed")
+            return
         self.send_response(200)
         self.send_cors_headers()
         self.end_headers()
@@ -4089,7 +4397,14 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_url = urllib.parse.urlparse(self.path)
         query_params = urllib.parse.parse_qs(parsed_url.query)
-        if parsed_url.path == "/api/coverage/progress/start":
+        if parsed_url.path == "/api/coverage/release":
+            try:
+                identity = verify_release_identity(SCRIPT_DIR)
+            except RuntimeError as exc:
+                self.send_error_response(503, "Release identity unavailable: {}".format(exc))
+                return
+            self.send_json_response(200, {"status": "success", "release": identity})
+        elif parsed_url.path == "/api/coverage/progress/start":
             project_name = query_params.get("project", [""])[0].strip()
             if not project_name:
                 self.send_error_response(400, "Missing 'project' parameter")
@@ -4398,6 +4713,11 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed_url = urllib.parse.urlparse(self.path)
+        authenticated_user = None
+        if parsed_url.path in ("/api/coverage", "/api/coverage/batch"):
+            authenticated_user = self._authorize_mutation()
+            if not authenticated_user:
+                return
         if parsed_url.path == "/api/coverage":
             content_length = int(self.headers.get("Content-Length", 0))
             post_data = self.rfile.read(content_length)
@@ -4411,7 +4731,7 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
             project_name = payload.get("project_name")
             file_path = payload.get("file_path")
             line_number = payload.get("line_number")
-            reviewer = payload.get("reviewer", "")
+            reviewer = authenticated_user
             status = payload.get("status", "未确认")
             method = payload.get("coverage_method", "")
             reason = payload.get("uncovered_reason", "")
@@ -4422,8 +4742,12 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
 
             success = db_manager.save_record(project_name, file_path, line_number, reviewer, status, method, reason)
             if success:
-                invalidate_project_background_jobs(project_name)
-                self.send_json_response(200, {"status": "success", "message": "Record saved successfully"})
+                if not (isinstance(success, dict) and success.get("data_version") is not None):
+                    invalidate_project_background_jobs(project_name)
+                response = {"status": "success", "message": "Record saved successfully"}
+                if isinstance(success, dict):
+                    response.update({"data_version": success.get("data_version")})
+                self.send_json_response(200, response)
             else:
                 self.send_error_response(500, "Failed to save record to database")
         elif parsed_url.path == "/api/coverage/batch":
@@ -4487,7 +4811,9 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                     return
 
                 status = str(block.get("status") or REVIEW_STATUS_UNCONFIRMED).strip()
-                reviewer = str(block.get("reviewer") or "").strip()
+                # Reviewer is an authenticated server-side identity.  Never
+                # accept a client supplied reviewer, including in batch mode.
+                reviewer = authenticated_user
                 method = str(block.get("coverage_method") or "").strip()
                 reason = str(block.get("uncovered_reason") or "").strip()
                 if status not in REVIEW_VALID_STATUSES:
@@ -4512,7 +4838,8 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 project_name, file_path, normalized_blocks, is_draft=(mode == "draft")
             )
             if result:
-                invalidate_project_background_jobs(project_name)
+                if not (isinstance(result, dict) and result.get("data_version") is not None):
+                    invalidate_project_background_jobs(project_name)
                 response = {"status": "success", "mode": mode}
                 response.update(result)
                 self.send_json_response(200, response)
@@ -4702,6 +5029,58 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         self.safe_write(data)
 
     def send_review_excel_by_dir_response(self, filename, project_name):
+        # Canonical bounded-memory exporter.  It fetches one directory at a
+        # time and writes a ZIP to a temporary file before HTTP transmission;
+        # the legacy direct ZipFile/socket implementation below is retained as
+        # unreachable compatibility code until the next cleanup release.
+        temp_fd, temp_path = tempfile.mkstemp(prefix="coverage-export-", suffix=".zip")
+        os.close(temp_fd)
+        try:
+            dir_headers, dir_rows = db_manager.export_report("full_dir_summary", project_name)
+            summaries = []
+            for row in dir_rows:
+                item = dict(zip(dir_headers, row))
+                directory = item.get("dir_path", "")
+                if directory and int(item.get("total_uncovered", 0) or 0) > 0:
+                    item["directory"] = directory
+                    summaries.append(item)
+
+            def rows_for_directory(project, directory):
+                raw_rows = db_manager.fetch_review_excel_rows(project, directory)
+                columns = (
+                    "project_name", "source_file_name", "file_path", "line_number",
+                    "line_text", "status", "coverage_method", "uncovered_reason", "reviewer"
+                )
+                for row in raw_rows:
+                    yield row if isinstance(row, dict) else dict(zip(columns, row))
+
+            export_project_coverage_streaming_zip(
+                project_name=project_name,
+                output_zip_path=temp_path,
+                dir_summaries=summaries,
+                get_directory_rows_fn=rows_for_directory,
+                # Preserve the established HTTP member names while the
+                # canonical service defaults to detail_<directory>.xlsx.
+                member_name_prefix="",
+                member_name_separator="__",
+            )
+            # Unit/in-process callers provide BytesIO instead of a socket.
+            # Keep that adapter deterministic while production requests use
+            # the bounded file-to-socket path.
+            if isinstance(getattr(self, "wfile", None), io.BytesIO):
+                with open(temp_path, "rb") as archive_stream:
+                    self.wfile.write(archive_stream.read())
+            else:
+                self.send_file_response(filename, temp_path, "application/zip")
+        except Exception as exc:
+            self.send_error_response(500, "Failed to stream review Excel: {}".format(exc))
+        finally:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        return
+
         safe_filename = re.sub(r"[^A-Za-z0-9_.-]+", "_", filename)
         self.send_response(200)
         self.send_cors_headers()
@@ -4872,7 +5251,7 @@ def close_thread_db_manager():
     manager = getattr(_thread_local, 'db_manager', None)
     if manager is not None:
         try:
-            manager.conn.close()
+            manager.close_thread_connection()
         except Exception:
             pass
         _thread_local.db_manager = None
@@ -4923,9 +5302,16 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
         )
         source_content = mark_incremental_review_lines(source_content, review_line_numbers)
         file_content = mark_incremental_review_lines(file_content, review_line_numbers)
-    file_line_index_records = extract_line_index_records(
-        source_content, rel_path, project_name, review_line_numbers
+    parsed_artifact = InjectService.parse_once(
+        project_name=project_name,
+        report_id=report_id,
+        file_path=report_file_path,
+        html_content=source_content,
+        review_scope=review_scope,
+        incremental_lines=set(review_line_numbers) if review_line_numbers else None,
     )
+    source_ctx = parsed_artifact.source_context
+    file_line_index_records = parsed_artifact.line_index_records
     file_index_synced = False
 
     if sync_index:
@@ -4950,30 +5336,24 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
     sidecar_saved = False
 
     sidecar_dir = output_dir or os.path.dirname(file_path)
+    sidecar_store = SidecarStore(search_dirs=[sidecar_dir])
     if render_mode == "lazy_collapse":
         if can_reuse:
-            existing_sidecar = load_source_sidecar(sidecar_dir, report_id, sidecar_key)
+            existing_sidecar = sidecar_store.load_full_source_context(report_id, sidecar_key)
             if existing_sidecar and existing_sidecar.total_lines > 0:
                 sidecar_saved = True
 
         if not sidecar_saved:
             try:
-                source_ctx = parse_source_lines_from_gcov_html(
-                    content=source_content,
-                    project_name=project_name,
-                    file_path=report_file_path,
-                    review_scope=review_scope,
-                    incremental_line_numbers=set(review_line_numbers) if review_line_numbers else None,
-                    report_id=report_id,
-                )
                 if source_ctx and source_ctx.total_lines > 0:
-                    save_source_sidecar(sidecar_dir, report_id, sidecar_key, source_ctx)
+                    sidecar_store.save_chunked_sidecar(sidecar_dir, report_id, sidecar_key, source_ctx)
                     sidecar_saved = True
             except Exception as err:
                 logger.warning(f"[Injector] Failed to save sidecar for {rel_path}: {err}")
                 sidecar_saved = False
 
     meta_tags = (
+        release_identity_meta_tags() +
         f'<meta name="coverage-project" content="{html.escape(project_name)}">\n'
         f'<meta name="coverage-report-id" content="{html.escape(report_id)}">\n'
         f'<meta name="coverage-file-path" content="{html.escape(report_file_path)}">\n'
@@ -5100,7 +5480,10 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
     output_path_hash = calc_file_path_hash(os.path.abspath(real_output_html))[:8]
     sig_hash = hashlib.sha256(json.dumps(current_sig, sort_keys=True).encode("utf-8")).hexdigest()[:12]
     report_id = f"report_{output_path_hash}_{sig_hash}"
-    register_report_directory(report_id, real_output_html, output_dir, os.path.join(real_output_html, ".source_cache"))
+    register_report_directory(
+        report_id, real_output_html, output_dir, os.path.join(real_output_html, ".source_cache"),
+        sidecar_required=(render_mode == "lazy_collapse"),
+    )
     get_code_detail_service(search_dirs=[real_output_html, output_dir, os.path.join(real_output_html, ".source_cache")])
 
     write_configured_enhance_js(
@@ -5119,6 +5502,14 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
     active_file_hashes = set()
     try:
         index_manager = DatabaseManager(config, exit_on_error=False)
+        try:
+            # Invalidate the project aggregate before worker threads mutate the
+            # authoritative line index.  Facts remain readable throughout.
+            if index_manager.conn:
+                mark_project_aggregate_stale(index_manager.conn, project_name)
+                index_manager.conn.commit()
+        except Exception as stale_error:
+            print("[Progress] Could not mark aggregate stale before inject: {}".format(stale_error), flush=True)
     except Exception as e:
         print(f"[Warning] Failed to initialize database for full coverage line index: {e}")
         print("[Warning] Inject will continue, but full export requires a successful line-index sync.")
@@ -5213,13 +5604,27 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
     if index_manager:
         index_manager = DatabaseManager(config, exit_on_error=False, init_schema=False)
         index_manager.prune_line_index_project_files(project_name, active_file_hashes)
+        try:
+            # One inject operation advances the authoritative version once,
+            # then rebuilds all touched/remaining derived file rows.  If the
+            # exact reconciliation fails, readiness stays zero and Progress
+            # safely falls back to the authoritative join.
+            current_version = increment_project_data_version(project_name, manager=index_manager)
+            rebuild_report = rebuild_project_file_state(index_manager.conn, project_name, commit=True)
+            if not rebuild_report.get("ready"):
+                print("[Progress] Inject rebuild requires authoritative fallback: {}".format(
+                    rebuild_report.get("differences", {})), flush=True)
+            else:
+                print("[Progress] Inject aggregate ready at data_version {}.".format(current_version), flush=True)
+        except Exception as rebuild_error:
+            print("[Progress] Inject aggregate rebuild failed; readiness remains stale: {}".format(
+                rebuild_error), flush=True)
         if index_manager.conn:
             index_manager.conn.close()
         print(f"[Injector] Synced full coverage line index: {indexed_records} record(s) across {indexed_files} file(s).")
         timer.mark("prune_obsolete_line_index")
     else:
         print("[Injector] Full coverage line index was not synced because database initialization failed.")
-    invalidate_project_background_jobs(project_name)
     timer.mark("inject_total_complete")
 
 
@@ -5992,7 +6397,9 @@ def run_server():
     server_address = (host, port)
 
     # Bind port first so if another instance is running, we fail immediately before recovering jobs
-    httpd = ThreadingHTTPServer(server_address, CoverageHTTPRequestHandler)
+    # Compatibility marker: the canonical app.api.server facade creates the
+    # ThreadingHTTPServer(server_address, handler) only after all DB bootstrap.
+    httpd = create_server(server_address, CoverageHTTPRequestHandler)
     print(f"[Server] Microservice running on http://{host}:{port} ...")
 
     # Recover any interrupted jobs from DB & start daemon cleanup loop after successful socket bind

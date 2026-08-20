@@ -26,13 +26,15 @@ def compute_file_sha256(filepath: str) -> str:
 
 def calculate_directory_signature_incremental(
     dir_path: str,
-    file_extensions: Tuple[str, ...] = (".gcov.html",)
+    file_extensions: Tuple[str, ...] = (".gcov.html",),
+    manifest_path: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     """
     Calculate directory signature using incremental manifest optimization.
     Returns (directory_sha256, manifest_data).
     """
-    manifest_path = os.path.join(dir_path, MANIFEST_NAME)
+    manifest_path = manifest_path or os.path.join(dir_path, MANIFEST_NAME)
+    manifest_path = os.path.realpath(manifest_path)
     cached_manifest = {}
     if os.path.isfile(manifest_path):
         try:
@@ -90,6 +92,7 @@ def calculate_directory_signature_incremental(
     }
     
     try:
+        os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
         tmp_path = manifest_path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(manifest_data, f, indent=2)

@@ -53,6 +53,10 @@ def analyze_sql_script(sql_text: str) -> Tuple[bool, List[str], List[str]]:
         alter_drop_pat = rf"\bALTER\s+TABLE\s+[`'\"]?{tbl}[`'\"]?\s+DROP\s+"
         if re.search(alter_drop_pat, clean_sql, re.IGNORECASE):
             errors.append(f"Destructive column DROP detected targeting protected table: {tbl}")
+        for operation in ("CHANGE", "MODIFY"):
+            alter_shape_pat = rf"\bALTER\s+TABLE\s+[`'\"]?{tbl}[`'\"]?[^;]*\b{operation}\b"
+            if re.search(alter_shape_pat, clean_sql, re.IGNORECASE):
+                errors.append("Protected table column shape change is not additive: {} {}".format(tbl, operation))
             
     # Check for CREATE TABLE missing IF NOT EXISTS
     create_table_matches = re.finditer(r"\bCREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS)([`'\"]?\w+[`'\"]?)", clean_sql, re.IGNORECASE)

@@ -105,7 +105,8 @@ def load_release_manifest(manifest_path: str) -> Optional[Dict[str, Any]]:
 def get_current_release_identity(repo_root: Optional[str] = None) -> Dict[str, Any]:
     """
     Get active release identity. Verifies that cached manifest matches current git HEAD commit SHA.
-    If commit SHA or asset hash has diverged, dynamically regenerates and updates manifest.
+    Runtime verification is deliberately fail-closed. Build systems must create the
+    manifest with ``save_release_manifest``; runtime never rewrites it to hide drift.
     """
     if repo_root is None:
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -113,18 +114,23 @@ def get_current_release_identity(repo_root: Optional[str] = None) -> Dict[str, A
     manifest = load_release_manifest(manifest_path)
     
     current_head = _get_git_commit_sha(repo_root)
-    if (manifest and 
-        manifest.get("commit_sha") == current_head and 
-        manifest.get("version") == DEFAULT_VERSION and
-        "asset_hash" in manifest):
-        return manifest
-        
-    identity = generate_release_identity(repo_root=repo_root, version=DEFAULT_VERSION)
-    try:
-        save_release_manifest(manifest_path, identity)
-    except Exception:
-        pass
-    return identity
+    if not manifest:
+        raise RuntimeError("release_manifest.json is missing; generate it during build")
+    expected = generate_release_identity(repo_root=repo_root, version=manifest.get("version", DEFAULT_VERSION))
+    mismatches = [key for key in ("version", "commit_sha", "asset_hash", "schema_version")
+                  if manifest.get(key) != expected.get(key)]
+    if mismatches:
+        raise RuntimeError("release identity drift: " + ", ".join(mismatches))
+    return manifest
+
+def verify_release_identity(repo_root: Optional[str] = None, target: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Verify runtime identity, optionally against an exact release target."""
+    actual = get_current_release_identity(repo_root)
+    if target:
+        for key in ("version", "commit_sha", "build_id", "asset_hash", "schema_version"):
+            if target.get(key) != actual.get(key):
+                raise RuntimeError("target release mismatch: {}".format(key))
+    return actual
 
 if __name__ == "__main__":
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

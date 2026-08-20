@@ -22,9 +22,17 @@ class TestPhase6Sidecar(unittest.TestCase):
     def setUp(self):
         self.test_dir = tempfile.mkdtemp()
         self.store = SidecarStore(search_dirs=[self.test_dir], chunk_size=50)
+        self.registry_dir = tempfile.mkdtemp()
+        self.previous_registry_dir = os.environ.get("COVERAGE_REGISTRY_DIR")
+        os.environ["COVERAGE_REGISTRY_DIR"] = self.registry_dir
 
     def tearDown(self):
+        if self.previous_registry_dir is None:
+            os.environ.pop("COVERAGE_REGISTRY_DIR", None)
+        else:
+            os.environ["COVERAGE_REGISTRY_DIR"] = self.previous_registry_dir
         shutil.rmtree(self.test_dir, ignore_errors=True)
+        shutil.rmtree(self.registry_dir, ignore_errors=True)
 
     def test_item_14_legacy_sidecar_reading(self):
         """Verify SidecarStore correctly reads legacy v1 .source.json format."""
@@ -89,6 +97,13 @@ class TestPhase6Sidecar(unittest.TestCase):
 
     def test_item_22_sidecar_audit(self):
         """Verify sidecar audit recognizes both legacy and chunked formats."""
+        for report_id in ("rep_legacy", "rep_chunked"):
+            with open(os.path.join(self.registry_dir, report_id + ".json"), "w", encoding="utf-8") as stream:
+                json.dump({
+                    "report_id": report_id,
+                    "directories": [self.test_dir],
+                    "sidecar_required": False,
+                }, stream)
         res = audit_sidecar_and_registry([self.test_dir])
         self.assertTrue(res["is_safe"])
 

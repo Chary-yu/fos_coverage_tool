@@ -16,4 +16,8 @@ CREATE TABLE IF NOT EXISTS coverage_file_state (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (project_name, file_path_hash),
     KEY idx_proj_state (project_name)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Derived-state readiness proof; never replaces authoritative data_version.
+ALTER TABLE coverage_project_state
+    ADD COLUMN IF NOT EXISTS file_state_version BIGINT NOT NULL DEFAULT 0;

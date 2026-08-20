@@ -27,8 +27,10 @@ def hash_analysis_records(cursor, chunk_size: int = 10000) -> Tuple[int, str]:
     """Compute deterministic SHA256 over business fields of coverage_analysis."""
     sql = """
         SELECT project_name, file_path_hash, line_number, 
-               COALESCE(reviewer, ''), COALESCE(status, ''), COALESCE(is_draft, 0),
-               COALESCE(coverage_method, ''), COALESCE(uncovered_reason, '')
+               COALESCE(reviewer, '') AS reviewer, COALESCE(status, '') AS status,
+               COALESCE(is_draft, 0) AS is_draft,
+               COALESCE(coverage_method, '') AS coverage_method,
+               COALESCE(uncovered_reason, '') AS uncovered_reason
         FROM coverage_analysis
         ORDER BY project_name, file_path_hash, line_number
     """
@@ -41,7 +43,8 @@ def hash_analysis_records(cursor, chunk_size: int = 10000) -> Tuple[int, str]:
             break
         for r in rows:
             count += 1
-            line = "|".join(str(val) for val in r) + "\n"
+            values = list(r.values()) if isinstance(r, dict) else r
+            line = "|".join(str(val) for val in values) + "\n"
             hasher.update(line.encode("utf-8"))
     return count, hasher.hexdigest()
 
@@ -49,9 +52,12 @@ def hash_line_index_records(cursor, chunk_size: int = 10000) -> Tuple[int, str]:
     """Compute deterministic SHA256 over business fields of coverage_line_index."""
     sql = """
         SELECT project_name, file_path_hash, line_number,
-               COALESCE(block_start_line, 0), COALESCE(block_end_line, 0),
-               COALESCE(block_type, ''), COALESCE(function_hash, ''),
-               COALESCE(code_line_hash, ''), COALESCE(code_occurrence, 0)
+               COALESCE(file_path, '') AS file_path, COALESCE(line_text, '') AS line_text,
+               COALESCE(block_start_line, 0) AS block_start_line,
+               COALESCE(block_end_line, 0) AS block_end_line,
+               COALESCE(block_type, '') AS block_type, COALESCE(function_hash, '') AS function_hash,
+               COALESCE(function_name, '') AS function_name, COALESCE(code_line_hash, '') AS code_line_hash,
+               COALESCE(code_occurrence, 0) AS code_occurrence
         FROM coverage_line_index
         ORDER BY project_name, file_path_hash, line_number
     """
@@ -64,22 +70,44 @@ def hash_line_index_records(cursor, chunk_size: int = 10000) -> Tuple[int, str]:
             break
         for r in rows:
             count += 1
-            line = "|".join(str(val) for val in r) + "\n"
+            values = list(r.values()) if isinstance(r, dict) else r
+            line = "|".join(str(val) for val in values) + "\n"
             hasher.update(line.encode("utf-8"))
     return count, hasher.hexdigest()
 
-def hash_project_state_records(cursor) -> Tuple[int, str, Dict[str, int]]:
-    """Compute deterministic SHA256 over coverage_project_state."""
-    sql = "SELECT project_name, data_version FROM coverage_project_state ORDER BY project_name"
+def hash_project_state_records(cursor) -> Tuple[int, str, Dict[str, Dict[str, int]], str]:
+    """Compute deterministic hashes over authoritative and readiness state.
+
+    ``data_version`` is the authoritative project version.  ``file_state_version``
+    is also recorded in the full hash, but is allowed to advance from stale to
+    ready during an additive backfill; the separate authoritative hash proves
+    that no project fact/version changed during that operation.
+    """
+    sql = """
+        SELECT project_name, data_version, COALESCE(file_state_version, 0)
+        FROM coverage_project_state ORDER BY project_name
+    """
     cursor.execute(sql)
-    rows = cursor.fetchall()
+    rows = []
+    while True:
+        batch = cursor.fetchmany(10000)
+        if not batch:
+            break
+        rows.extend(batch)
     hasher = hashlib.sha256()
+    authoritative_hasher = hashlib.sha256()
     states = {}
     for r in rows:
-        pname, ver = str(r[0]), int(r[1])
-        states[pname] = ver
-        hasher.update(f"{pname}|{ver}\n".encode("utf-8"))
-    return len(rows), hasher.hexdigest(), states
+        values = list(r.values()) if isinstance(r, dict) else r
+        pname, ver = str(values[0]), int(values[1])
+        file_state_version = int(values[2]) if len(values) > 2 else 0
+        states[pname] = {
+            "data_version": ver,
+            "file_state_version": file_state_version,
+        }
+        hasher.update(f"{pname}|{ver}|{file_state_version}\n".encode("utf-8"))
+        authoritative_hasher.update(f"{pname}|{ver}\n".encode("utf-8"))
+    return len(rows), hasher.hexdigest(), states, authoritative_hasher.hexdigest()
 
 def hash_background_jobs_records(cursor) -> Tuple[int, str, Dict[str, int]]:
     """Compute status distribution and deterministic SHA256 over coverage_background_jobs using real schema."""
@@ -89,13 +117,19 @@ def hash_background_jobs_records(cursor) -> Tuple[int, str, Dict[str, int]]:
         ORDER BY job_id
     """
     cursor.execute(sql)
-    rows = cursor.fetchall()
+    rows = []
+    while True:
+        batch = cursor.fetchmany(10000)
+        if not batch:
+            break
+        rows.extend(batch)
     hasher = hashlib.sha256()
     dist = {}
     for r in rows:
-        state = str(r[3])
+        values = list(r.values()) if isinstance(r, dict) else r
+        state = str(values[3])
         dist[state] = dist.get(state, 0) + 1
-        line = "|".join(str(val) for val in r) + "\n"
+        line = "|".join(str(val) for val in values) + "\n"
         hasher.update(line.encode("utf-8"))
     return len(rows), hasher.hexdigest(), dist
 
@@ -104,7 +138,7 @@ def capture_database_snapshot(connection, release_identity: Optional[Dict[str, A
     with connection.cursor() as cursor:
         analysis_count, analysis_hash = hash_analysis_records(cursor)
         index_count, index_hash = hash_line_index_records(cursor)
-        proj_count, proj_hash, proj_versions = hash_project_state_records(cursor)
+        proj_count, proj_hash, proj_versions, proj_authoritative_hash = hash_project_state_records(cursor)
         job_count, job_hash, job_status_dist = hash_background_jobs_records(cursor)
         
     snapshot = {
@@ -122,7 +156,14 @@ def capture_database_snapshot(connection, release_identity: Optional[Dict[str, A
             "coverage_project_state": {
                 "count": proj_count,
                 "content_hash": proj_hash,
-                "versions": proj_versions
+                "versions": proj_versions,
+                "authoritative_content_hash": proj_authoritative_hash,
+                "data_versions": {
+                    project: state["data_version"] for project, state in proj_versions.items()
+                },
+                "readiness_versions": {
+                    project: state["file_state_version"] for project, state in proj_versions.items()
+                },
             },
             "coverage_background_jobs": {
                 "count": job_count,
@@ -163,9 +204,44 @@ def verify_data_integrity(pre_snapshot: Dict[str, Any], post_snapshot: Dict[str,
     post_proj = post_tbls.get("coverage_project_state", {})
     pre_vers = pre_proj.get("versions", {})
     post_vers = post_proj.get("versions", {})
+    pre_data_versions = pre_proj.get("data_versions") or {
+        project: (value.get("data_version") if isinstance(value, dict) else value)
+        for project, value in pre_vers.items()
+    }
+    post_data_versions = post_proj.get("data_versions") or {
+        project: (value.get("data_version") if isinstance(value, dict) else value)
+        for project, value in post_vers.items()
+    }
     for p, ver in pre_vers.items():
         if p not in post_vers:
             errors.append(f"Project state disappeared for project: '{p}'")
+    if post_proj.get("count", 0) < pre_proj.get("count", 0):
+        errors.append("Row count decreased in coverage_project_state")
+    if pre_proj.get("authoritative_content_hash") or post_proj.get("authoritative_content_hash"):
+        if post_proj.get("authoritative_content_hash") != pre_proj.get("authoritative_content_hash"):
+            errors.append("Authoritative content hash mismatch in coverage_project_state")
+        for project, pre_version in pre_data_versions.items():
+            if post_data_versions.get(project) != pre_version:
+                errors.append("Authoritative data_version changed for project: '{}'".format(project))
+        # The full hash includes readiness.  A difference is safe only when
+        # it is the monotonic stale->ready marker for an unchanged data_version.
+        if post_proj.get("content_hash") != pre_proj.get("content_hash"):
+            pre_ready = pre_proj.get("readiness_versions", {})
+            post_ready = post_proj.get("readiness_versions", {})
+            for project, pre_version in pre_data_versions.items():
+                post_version = post_ready.get(project, 0)
+                if post_version not in (pre_ready.get(project, 0), pre_version):
+                    errors.append("Invalid file_state_version transition for project: '{}'".format(project))
+    elif post_proj.get("content_hash") != pre_proj.get("content_hash"):
+        # Backward-compatible validation for older hand-authored snapshots.
+        errors.append("Content hash mismatch in coverage_project_state")
+
+    pre_jobs = pre_tbls.get("coverage_background_jobs", {})
+    post_jobs = post_tbls.get("coverage_background_jobs", {})
+    if post_jobs.get("count", 0) < pre_jobs.get("count", 0):
+        errors.append("Row count decreased in coverage_background_jobs")
+    if post_jobs.get("content_hash") != pre_jobs.get("content_hash"):
+        errors.append("Content hash mismatch in coverage_background_jobs")
             
     is_valid = (len(errors) == 0)
     return is_valid, errors

@@ -16,6 +16,12 @@ from typing import Dict, Any, List, Generator, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# The ZIP writer intentionally processes one directory at a time.  This is the
+# hard upper bound exposed to callers and leaves room for a future two-directory
+# pipeline without allowing an unbounded list of detail futures.
+MAX_INFLIGHT_DIR_EXPORTS = 2
+DETAIL_BATCH_SIZE = 5000
+
 try:
     import openpyxl
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -98,7 +104,9 @@ def export_project_coverage_streaming_zip(
     output_zip_path: str,
     dir_summaries: List[Dict[str, Any]],
     get_directory_rows_fn, # fn(project_name, directory) -> Generator[Dict[str, Any]]
-    on_progress_fn=None
+    on_progress_fn=None,
+    member_name_prefix: str = "detail_",
+    member_name_separator: str = "_",
 ) -> str:
     """
     Stream full project export into ZIP archive with bounded memory.
@@ -109,6 +117,10 @@ def export_project_coverage_streaming_zip(
     temp_files_to_clean = []
     try:
         with zipfile.ZipFile(part_path, "w", zipfile.ZIP_DEFLATED) as zip_out:
+            zip_out.writestr(
+                "EXPORT_STARTED.txt",
+                "Directory Excel export started for project: {}\n".format(project_name),
+            )
             # 1. Directory summary
             summary_xlsx = build_directory_summary_workbook(dir_summaries)
             temp_files_to_clean.append(summary_xlsx)
@@ -118,14 +130,14 @@ def export_project_coverage_streaming_zip(
             total_dirs = len(dir_summaries)
             for idx, dinfo in enumerate(dir_summaries, start=1):
                 dpath = dinfo.get("directory", "root")
-                safe_name = dpath.strip("/").replace("/", "_") or "root"
+                safe_name = dpath.strip("/").replace("/", member_name_separator) or "root"
                 
                 # Fetch row generator
                 rows_gen = get_directory_rows_fn(project_name, dpath)
                 detail_xlsx = build_directory_detail_workbook(safe_name, rows_gen)
                 temp_files_to_clean.append(detail_xlsx)
                 
-                zip_out.write(detail_xlsx, f"detail_{safe_name}.xlsx")
+                zip_out.write(detail_xlsx, f"{member_name_prefix}{safe_name}.xlsx")
                 
                 # Immediately remove temporary XLSX from disk to free resources
                 try:
