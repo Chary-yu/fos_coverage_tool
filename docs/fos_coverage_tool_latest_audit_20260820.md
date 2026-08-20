@@ -3,8 +3,8 @@
 - 审计日期：2026-08-20
 - 仓库：`Chary-yu/fos_coverage_tool`
 - 分支：`main`
-- 固定审计 revision：`94f57cf3c358d8886b05dc3e097938a36375f193`
-- HEAD 提交：`perf: finish code detail and browser runtime optimizations`
+- 固定审计 revision：`017c2b45b70957bd13ad9e57ac08c75779be9df1`
+- HEAD 提交：`fix: close CI compatibility regressions`
 - 使用的最新 Skill 体系：
   - `fos-coverage-maintainer`（总控/路由/Skill drift）
   - `fos-coverage-change-review`（源码、VNext wiring、canonical ownership、源码安全）
@@ -12,7 +12,7 @@
   - `fos-coverage-performance-ui`（Code Detail、浏览器、请求/DB/Sidecar/缓存放大）
   - `fos-coverage-release-governance`（迁移、回滚、发布证据）
 
-> 证据边界：本次已通过 GitHub 连接器读取固定 SHA 的源码、提交、CI、测试和 Skill 资源；当前执行容器无法 DNS 访问 GitHub，因此没有把仓库 clone 到本地，也没有执行本机单测、真实 HTTP、Playwright 或生产环境检查。以下“确认问题”均可由源码直接证明；需要运行时/生产证据的项会明确标为“待运行验证”，不会按通过处理。
+> 证据边界：第 1～9 章保留初始 revision 的静态审计发现；第 10 章记录整改后的本地、真实 MariaDB disposable、Chromium 和 GitHub Actions 证据。生产 Candidate、真实生产 schema/transaction、RSS/p95、Nginx/auth 和 rollback 文件树仍不以 fixture 或源码推断为 PASS。
 
 ---
 
@@ -20,29 +20,26 @@
 
 ### 1.1 当前状态
 
-**结论：当前 revision 不应判定为 VNext Gate 1–3 完成，也不应进入 VNext 生产切换。**
+**结论：当前 revision 的代码与 CI Gate 证据已收口，但仍不应直接进入 VNext 生产切换。**
 
 最关键的结构性事实：
 
-1. `enhance_coverage.py` 虽然已缩成薄入口，但仍直接进入 `app.legacy_runtime`。
-2. `run_server()` 只有显式 `runtime_mode=vnext` 才进入 VNext；默认配置与默认 runtime config 仍是 `legacy`。
-3. canonical 前端 `web/assets/js/*` 仍主要使用 legacy API 协议；VNext API 的 URL、必填身份字段、请求体和响应结构已经变化。
-4. 因此前端真实切到 VNext 后，Code Detail 加载、分析保存、进展页、开发者任务刷新、导出等关键链路会断。
-5. VNext 新增的 Scan/Report/RepositorySnapshot 模型仍存在“Scan 创建后继续修改事实”的公共写入口，Scan immutability 尚未真正封死。
-6. 最新性能优化改善了 DOM，但仍有网络、DB overlay、JS resident data 和 Sidecar cache 的放大。
-7. CI/诊断脚本目前存在 false-green / false-red 风险，不能作为 Gate 1–3 完成的充分证据。
-8. 最新 Change Review Skill 的 4 个 audit helper 本身存在语法损坏，Skill 的文字规范比其可执行 helper 更可靠。
+1. 根 Python 入口仍保留兼容路径，`app/legacy_runtime.py` 和 `app/incremental/legacy.py` 当前准确分类为 `TRANSITIONAL_LEGACY`，尚未退休。
+2. 默认 runtime、Candidate 配置、canonical 前端 ↔ VNext API、Scan immutability、连接池和 Job lifecycle 已通过机器审计与 CI。
+3. Code Detail 批量读取、Sidecar 分窗/缓存、content override 缓存、浏览器虚拟滚动和 canonical compatibility envelope 已有本地回归与真实 Chromium 证据。
+4. 浏览器性能证据仍缺 DB/RSS/p95 跨层指标；生产 Candidate、真实 production schema/transaction、Nginx/auth 和 rollback 文件树也尚未取得。
+5. 因此当前是“代码/CI 可交付，生产切换证据未闭环”，而不是把 transitional legacy 或 fixture 证据宣称为完成。
 
 ### 1.2 Gate 判断
 
 | Gate / 领域 | 本次判断 | 原因 |
 |---|---|---|
-| Gate 1 Canonical ownership | **BLOCKED / TRANSITIONAL_LEGACY** | `app/legacy_runtime.py` 仍保留数据库、HTTP、inject、incremental、report 等业务实现；默认 CLI 仍进入它 |
-| Gate 2 Schema / semantic migration | **证据不足，不判通过** | 本次未接生产数据库和迁移环境；且 Scan immutability 仍有源码级 P1 |
-| Gate 3 UI/API/runtime migration | **FAIL / BLOCKED** | canonical 前端与 VNext API 明确不兼容 |
-| Runtime reliability | **BLOCKED** | 连接池事务清理、后台任务去重/恢复/关闭存在 P1 |
+| Gate 1 Canonical ownership | **TRANSITIONAL_LEGACY** | canonical VNext 与兼容 shim 边界通过；`app/legacy_runtime.py` 仍保留 legacy 业务实现，尚未 `RETIRED` |
+| Gate 2 Schema / semantic migration | **证据不足，不判通过** | disposable MariaDB 与迁移回归通过，但真实 Candidate/生产 schema、数据规模和 transaction/session 仍未核验 |
+| Gate 3 UI/API/runtime migration | **CODE/CI PASS** | canonical frontend、真实 VNext HTTP/Chromium、Python 3.10/3.12 和 specialist suites 通过 |
+| Runtime reliability | **CODE/CI PASS** | connection-pool、job lifecycle 审计和回归套件通过 |
 | Performance/UI | **PARTIAL** | DOM 虚拟化有效，但数据、HTTP、DB、缓存层仍有放大 |
-| Release readiness | **NOT READY** | 有未解决源码 P1，且缺真实浏览器、HTTP、MySQL、生产切换证据 |
+| Release readiness | **NOT READY** | 代码与 CI 通过，但仍缺 Candidate/生产数据、暴露面和 previous→target→rollback 证据 |
 
 ---
 
@@ -1244,13 +1241,15 @@ Maintainer 负责唯一 root owner 和 handoff，不重复开根因。
 - Chromium 中 variable-height virtual scroll 的真实漂移
 - Nginx reverse-proxy/auth 实际暴露面
 - staging rollback 是否真实恢复上一 release 文件树
-- GitHub Actions 对该 SHA 的完整 run 结果（本次连接器状态信息不足以据此宣告运行成功或失败）
+- 真实 Candidate MySQL transaction/session、生产 schema/migration、生产 job orphan inventory
+
+当前 revision `017c2b4` 的 GitHub Actions run #20 已补齐仓库级 CI 证据；仍需 Candidate/生产环境证据。
 
 这些应该由对应 specialist Skill 在后续有执行环境时补证，而不是用源码推断。
 
 ---
 
-# 9. 最终审计结论
+# 9. 初始审计结论（revision `94f57cf`）
 
 **Revision `94f57cf3c358d8886b05dc3e097938a36375f193`：**
 
@@ -1295,7 +1294,7 @@ Maintainer 负责唯一 root owner 和 handoff，不重复开根因。
 
 ## 10.3 仍需外部环境补证的项目
 
-以下项目不能由本地 disposable MariaDB、静态代码或 fixture 代替：真实 Candidate MySQL transaction/session、真实生产 schema/migration、生产 job orphan inventory、真实 50k/100k 数据集的 p95/RSS/DB rows、Nginx/auth 暴露面、真实 previous→target→rollback 文件树和 GitHub Actions run。Rollback rehearsal 现在对缺失真实 before/target identity 或 release endpoint 直接 fail-closed。
+以下项目不能由本地 disposable MariaDB、静态代码或 fixture 代替：真实 Candidate MySQL transaction/session、真实生产 schema/migration、生产 job orphan inventory、真实 50k/100k 数据集的 p95/RSS/DB rows、Nginx/auth 暴露面和真实 previous→target→rollback 文件树。Rollback rehearsal 现在对缺失真实 before/target identity 或 release endpoint 直接 fail-closed。
 
 因此整改后的准确结论是：代码与本地 Gate 证据已收口，但 VNext 生产切换仍须完成上述外部证据，不将 `TRANSITIONAL_LEGACY` 宣称为 `RETIRED`。
 
@@ -1310,3 +1309,5 @@ Maintainer 负责唯一 root owner 和 handoff，不重复开根因。
 - content override 使用稳定基础 cache key + 内容指纹元数据，重复 50k/100k HTML 不再重复解析，且保持既有缓存淘汰契约。
 
 修复后的本地验证结果：root 回归 `77 passed`，仓库测试 `89 passed, 1 skipped`，真实 Chromium `6 passed`，browser smoke `6 passed`，Python/JS 语法与 canonical 资产 SHA 校验通过；runtime participation、canonical ownership、legacy boundary、frontend contract、active runtime、Scan immutability、connection pool、job lifecycle 和 evidence matrix 审计均通过。浏览器性能审计继续按边界报告 `PARTIAL`（fixture 未采集 DB/RSS/p95），本机当前没有运行中的 MariaDB 或 Docker，因此真实 DB 与 Python 3.6 容器门禁仍以 GitHub Actions/Candidate 结果为准。
+
+GitHub Actions run [#20](https://github.com/Chary-yu/fos_coverage_tool/actions/runs/32372271864) 针对 `017c2b4` 已完成并为 `success`：Python 3.10/3.12、Python 3.6 compatibility、specialist regression、real MariaDB VNext integration、mock DOM 和 real browser E2E 全部成功；real-browser job 的性能边界审计按设计保持 `allow-partial`，不伪造 DB/RSS/p95。
