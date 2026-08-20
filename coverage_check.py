@@ -213,6 +213,9 @@ _BLAME_HEADER_RE = re.compile(
     r"^(?P<boundary>\^?)(?P<commit>[0-9a-fA-F]{7,64})\s+"
     r"(?P<original>\d+)\s+(?P<final>\d+)(?:\s+(?P<count>\d+))?$"
 )
+_BLANK_BOUNDARY_HEADER_RE = re.compile(
+    r"^ (?P<original>\d+)\s+(?P<final>\d+)(?:\s+(?P<count>\d+))?$"
+)
 
 
 def _format_blame_timestamp(timestamp, timezone_text=""):
@@ -234,9 +237,9 @@ def parse_git_blame_porcelain(blame_text, selected_line_numbers=None):
 
     Porcelain emits a header and metadata followed by one source line.  A
     header may declare several consecutive lines; the final-line number is
-    advanced for each emitted source line.  Boundary commits are represented
-    by Git as ``^<sha>``; the caret is exposed separately while the public
-    commit value remains the usable SHA.
+    advanced for each emitted source line.  Boundary commits may be marked by
+    a ``^<sha>`` header, a standalone ``boundary`` metadata line, or a blank
+    SHA when ``-b`` is enabled; all forms are exposed as ``boundary=True``.
     """
     selected = None if selected_line_numbers is None else set(
         int(number) for number in selected_line_numbers
@@ -246,6 +249,7 @@ def parse_git_blame_porcelain(blame_text, selected_line_numbers=None):
 
     for raw_line in str(blame_text or "").splitlines():
         header = _BLAME_HEADER_RE.match(raw_line)
+        blank_boundary = None if header else _BLANK_BOUNDARY_HEADER_RE.match(raw_line)
         if header:
             current = {
                 "commit": header.group("commit"),
@@ -256,8 +260,29 @@ def parse_git_blame_porcelain(blame_text, selected_line_numbers=None):
                 "metadata": {},
             }
             continue
+        if blank_boundary:
+            # ``git blame -b`` (or blame.blankBoundary=true) emits a blank
+            # object name for a boundary commit, leaving one leading space.
+            # Keep the same public semantics as the caret form while retaining
+            # an empty commit value because Git intentionally withheld the SHA.
+            current = {
+                "commit": "",
+                "boundary": True,
+                "final_line": int(blank_boundary.group("final")),
+                "line_count": int(blank_boundary.group("count") or 1),
+                "emitted": 0,
+                "metadata": {},
+            }
+            continue
 
         if current is None:
+            continue
+
+        # Root/shallow boundary commits in real line-porcelain output may
+        # carry a normal SHA header followed by this standalone marker rather
+        # than a caret-prefixed header.
+        if raw_line == "boundary":
+            current["boundary"] = True
             continue
 
         # A source line is the only porcelain line prefixed with a tab (Git's
@@ -364,76 +389,120 @@ def run_git_line_authors(repo_path, newgit, file_changes, repository_name=""):
 
 
 def _parse_lcov_function_payload(payload, tag):
-    """Parse common FN/FNL/FNA complete-range and alias forms."""
-    parts = [part.strip() for part in str(payload or "").split(",")]
-    numeric = []
-    for index, part in enumerate(parts):
-        try:
-            numeric.append((index, int(part)))
-        except (TypeError, ValueError):
-            continue
+    """Parse the version-specific LCOV function records.
 
-    if len(numeric) >= 2:
-        # Complete extensions normally use start,end,name.  Accept the
-        # equivalent start,name,end form as well because toolchains differ.
-        start_index, start_line = numeric[0]
-        if numeric[-1][0] == len(parts) - 1 and start_index != numeric[-1][0]:
-            end_index, end_line = numeric[-1]
-            name_parts = parts[:start_index] + parts[start_index + 1:end_index]
-        else:
-            end_index, end_line = numeric[1]
-            if end_index == start_index + 1:
-                name_parts = parts[end_index + 1:]
-            else:
-                name_parts = parts[start_index + 1:end_index]
+    ``FN`` is the legacy format: ``start[,end],name``.  LCOV 2.2 and newer
+    deliberately split the fields across an indexed pair:
+
+    ``FNL:index,start[,end]`` and ``FNA:index,execution_count,name``.
+
+    These records must not be parsed by looking for arbitrary numeric fields:
+    in ``FNL:0,100,200`` the function starts at line 100, not line 0, and the
+    name comes from the matching ``FNA`` record.
+    """
+    raw_payload = str(payload or "")
+
+    if tag == "FN":
+        parts = raw_payload.split(",", 2)
+        if len(parts) < 2:
+            return None
+        try:
+            start_line = int(parts[0].strip())
+        except (TypeError, ValueError):
+            return None
+        if len(parts) == 2:
+            return {
+                "record_type": "legacy_incomplete",
+                "start_line": start_line,
+                "end_line": None,
+                "name": parts[1].strip(),
+            }
+        try:
+            end_line = int(parts[1].strip())
+        except (TypeError, ValueError):
+            # A function name may contain commas; the first comma still
+            # separates the legacy start line from the name.
+            return {
+                "record_type": "legacy_incomplete",
+                "start_line": start_line,
+                "end_line": None,
+                "name": raw_payload.split(",", 1)[1].strip(),
+            }
         return {
+            "record_type": "legacy_range",
             "start_line": start_line,
             "end_line": end_line,
-            "name": ",".join(name_parts).strip(),
+            "name": parts[2].strip(),
         }
 
-    if len(numeric) == 1:
-        line_index, line_number = numeric[0]
-        name = ",".join(parts[:line_index] + parts[line_index + 1:]).strip()
-        if tag == "FN":
-            return {"start_line": line_number, "end_line": None, "name": name}
-        # FNL/FNA are treated as end-line aliases when the start is supplied
-        # by a matching FN record.  They may also be emitted as a complete
-        # range by the two-number branch above.
-        return {"start_line": None, "end_line": line_number, "name": name}
+    if tag == "FNL":
+        parts = [part.strip() for part in raw_payload.split(",")]
+        if len(parts) not in (2, 3):
+            return None
+        try:
+            index = int(parts[0])
+            start_line = int(parts[1])
+        except (TypeError, ValueError):
+            return None
+        end_line = None
+        if len(parts) == 3 and parts[2]:
+            try:
+                end_line = int(parts[2])
+            except (TypeError, ValueError):
+                return None
+        return {
+            "record_type": "modern_range",
+            "index": index,
+            "start_line": start_line,
+            "end_line": end_line,
+        }
+
+    if tag == "FNA":
+        parts = raw_payload.split(",", 2)
+        if len(parts) < 3:
+            return None
+        try:
+            index = int(parts[0].strip())
+            execution_count = int(parts[1].strip())
+        except (TypeError, ValueError):
+            return None
+        return {
+            "record_type": "modern_alias",
+            "index": index,
+            "execution_count": execution_count,
+            "name": parts[2].strip(),
+        }
 
     return None
 
 
 def _finalize_lcov_function_state(state):
-    direct_ranges = list(state.get("ranges") or [])
-    starts = list(state.get("starts") or [])
-    ends = list(state.get("ends") or [])
-    unmatched = False
+    if state.get("invalid_function_records") or state.get("legacy_incomplete"):
+        return [], False
 
-    remaining_ends = list(ends)
-    for start in starts:
-        matching_index = None
-        for index, end in enumerate(remaining_ends):
-            if end.get("name", "") == start.get("name", ""):
-                matching_index = index
-                break
-        if matching_index is None:
-            unmatched = True
-            continue
-        end = remaining_ends.pop(matching_index)
+    direct_ranges = list(state.get("ranges") or [])
+    modern_functions = state.get("modern_functions") or {}
+    modern_aliases = state.get("modern_aliases") or {}
+
+    # Every FNL record must provide a complete physical range before the
+    # metadata is trusted.  A missing end line intentionally sends the whole
+    # file back through the source parser rather than mixing partial inputs.
+    for index, function in sorted(modern_functions.items()):
+        if function.get("start_line") is None or function.get("end_line") is None:
+            return [], False
+        names = modern_aliases.get(index, [])
         direct_ranges.append({
-            "start_line": start["start_line"],
-            "end_line": end["end_line"],
-            "name": start.get("name", "") or end.get("name", ""),
+            "start_line": function["start_line"],
+            "end_line": function["end_line"],
+            "name": names[0] if names else "",
         })
 
-    if remaining_ends:
-        unmatched = True
+    # An FNA without a corresponding FNL cannot identify a physical range and
+    # is therefore also an unsafe, incomplete function record.
+    if any(index not in modern_functions for index in modern_aliases):
+        return [], False
 
     normalized = normalize_lcov_function_ranges(direct_ranges)
-    if unmatched or (starts and not normalized):
-        return [], False
     if state.get("has_function_records") and not normalized:
         return [], False
     return normalized, bool(normalized)
@@ -449,8 +518,10 @@ def _parse_lcov_info_data_internal(info_file):
         return function_states.setdefault(path, {
             "has_function_records": False,
             "ranges": [],
-            "starts": [],
-            "ends": [],
+            "legacy_incomplete": False,
+            "invalid_function_records": False,
+            "modern_functions": {},
+            "modern_aliases": {},
         })
 
     def finalize_file(path):
@@ -485,17 +556,41 @@ def _parse_lcov_info_data_internal(info_file):
                 coverage_data[current_file][line_number] = execution_count
             elif current_file and (line.startswith("FN:") or line.startswith("FNL:") or line.startswith("FNA:")):
                 tag, payload = line.split(":", 1)
-                parsed = _parse_lcov_function_payload(payload, tag)
-                if not parsed:
-                    continue
                 state = ensure_state(current_file)
                 state["has_function_records"] = True
-                if parsed.get("start_line") is not None and parsed.get("end_line") is not None:
+                parsed = _parse_lcov_function_payload(payload, tag)
+                if not parsed:
+                    state["invalid_function_records"] = True
+                    continue
+                record_type = parsed.get("record_type")
+                if record_type == "legacy_range":
                     state["ranges"].append(parsed)
-                elif parsed.get("start_line") is not None:
-                    state["starts"].append(parsed)
-                elif parsed.get("end_line") is not None:
-                    state["ends"].append(parsed)
+                elif record_type == "legacy_incomplete":
+                    state["legacy_incomplete"] = True
+                elif record_type == "modern_range":
+                    index = parsed["index"]
+                    function = state["modern_functions"].setdefault(index, {
+                        "start_line": None,
+                        "end_line": None,
+                    })
+                    if (
+                        function["start_line"] is not None and
+                        function["start_line"] != parsed["start_line"]
+                    ) or (
+                        parsed["end_line"] is not None and
+                        function["end_line"] is not None and
+                        function["end_line"] != parsed["end_line"]
+                    ):
+                        state["invalid_function_records"] = True
+                    function["start_line"] = parsed["start_line"]
+                    function["end_line"] = parsed["end_line"]
+                elif record_type == "modern_alias":
+                    index = parsed["index"]
+                    names = state["modern_aliases"].setdefault(index, [])
+                    if parsed["name"] and parsed["name"] not in names:
+                        names.append(parsed["name"])
+                else:
+                    state["invalid_function_records"] = True
             elif line == "end_of_record":
                 finalize_file(current_file)
                 current_file = None
@@ -878,6 +973,15 @@ def _developer_identity(name, email):
     return email.lower() or name.lower() or "unknown"
 
 
+def _developer_line_reference(task, line_number):
+    """Return an auditable file-qualified line reference for summaries."""
+    repository = str(task.get("repository", "") or "").strip()
+    file_path = normalize_path(task.get("file_path", ""))
+    if repository:
+        return "{}:{}:{}".format(repository, file_path, int(line_number))
+    return "{}:{}".format(file_path, int(line_number))
+
+
 def _new_precise_developer_task():
     return {
         "repository": "",
@@ -1050,10 +1154,18 @@ def build_developer_tasks(details, developer_file_changes):
             "owned_line_numbers": sorted({
                 line for item in tasks for line in item["owned_line_numbers"]
             }),
+            "owned_line_references": sorted({
+                _developer_line_reference(item, line)
+                for item in tasks for line in item["owned_line_numbers"]
+            }),
             "review_file_total": sum(1 for item in tasks if item["uncovered"]),
             "review_uncovered_total": sum(item["uncovered"] for item in tasks),
             "uncovered_line_numbers": sorted({
                 line for item in tasks for line in item["uncovered_line_numbers"]
+            }),
+            "uncovered_line_references": sorted({
+                _developer_line_reference(item, line)
+                for item in tasks for line in item["uncovered_line_numbers"]
             }),
             "commits": commits,
             "files": tasks,
@@ -1070,7 +1182,7 @@ def _lookup_file_mapping(mapping, file_path, resolver=None):
     """Resolve a path-keyed metadata map with the canonical safe index."""
     if not mapping:
         return None
-    resolver = resolver or IncrementalService({"default": list(mapping.keys())})
+    resolver = resolver or IncrementalService({})
     value, match_type = resolver.resolve_mapping_value(file_path, mapping)
     if match_type not in ("exact", "normalized", "unique_suffix"):
         return None
@@ -1102,14 +1214,13 @@ def calculate_repository_coverage(repo_path, oldgit, newgit, coverage_data, info
         else:
             line_authors_by_file = {}
 
-    line_author_resolver = (
-        IncrementalService({"default": list(line_authors_by_file.keys())})
-        if line_authors_by_file else None
-    )
-    function_range_resolver = (
-        IncrementalService({"default": list(function_ranges_data.keys())})
-        if function_ranges_data else None
-    )
+    metadata_resolver = IncrementalService({})
+    if line_authors_by_file:
+        metadata_resolver.prepare_mapping(line_authors_by_file)
+    if function_ranges_data:
+        metadata_resolver.prepare_mapping(function_ranges_data)
+    line_author_resolver = metadata_resolver if line_authors_by_file else None
+    function_range_resolver = metadata_resolver if function_ranges_data else None
 
     details = []
     counters = defaultdict(int)
@@ -1165,7 +1276,7 @@ def calculate_repository_coverage(repo_path, oldgit, newgit, coverage_data, info
                 "status": status,
                 "author_name": author_name,
                 "author_email": author_email,
-                "reviewer": suggested_reviewer,
+                "suggested_reviewer": suggested_reviewer,
                 "commit": attribution.get("commit", "") or "",
                 "committed_at": attribution.get("committed_at", "") or "",
                 "subject": attribution.get("subject", "") or "",
@@ -1405,14 +1516,14 @@ def write_result_excel(result, output_path):
     """Write incremental line details plus developer-facing task sheets."""
     details_rows = [[
         "Repository", "File", "Coverage File", "Line", "Execution Count", "Coverage",
-        "Developer", "Email", "Reviewer", "Blame Commit", "Commit Subject",
+        "Developer", "Email", "Suggested Reviewer", "Blame Commit", "Commit Subject",
     ]]
     for item in result["details"]:
         details_rows.append([
             item.get("repository", ""), item["file_path"], item.get("coverage_file", ""),
             item["line_number"], item.get("execution_count"), item["status"],
             item.get("author_name", ""), item.get("author_email", ""),
-            item.get("reviewer", ""), item.get("commit", ""), item.get("subject", ""),
+            item.get("suggested_reviewer", ""), item.get("commit", ""), item.get("subject", ""),
         ])
 
     summary = result["summary"]
@@ -1452,8 +1563,8 @@ def write_result_excel(result, output_path):
     developer_tasks = result.get("developer_tasks") or {}
     developer_rows = [[
         "Developer", "Email", "Commits", "Changed Files", "Owned Added Lines",
-        "Owned Line Numbers", "Files Need Fill", "Uncovered Lines Need Fill",
-        "Uncovered Line Numbers",
+        "Owned Line References", "Files Need Fill", "Uncovered Lines Need Fill",
+        "Uncovered Line References",
     ]]
     developer_file_rows = [[
         "Developer", "Email", "Repository", "File", "Change Types", "Commits",
@@ -1465,9 +1576,13 @@ def write_result_excel(result, output_path):
             developer.get("name", ""), developer.get("email", ""),
             developer.get("commit_total", 0), developer.get("changed_file_total", 0),
             developer.get("owned_added_lines", 0),
-            ", ".join(str(line) for line in developer.get("owned_line_numbers", [])),
+            ", ".join(str(line) for line in developer.get(
+                "owned_line_references", developer.get("owned_line_numbers", [])
+            )),
             developer.get("review_file_total", 0), developer.get("review_uncovered_total", 0),
-            ", ".join(str(line) for line in developer.get("uncovered_line_numbers", [])),
+            ", ".join(str(line) for line in developer.get(
+                "uncovered_line_references", developer.get("uncovered_line_numbers", [])
+            )),
         ])
         for file_task in developer.get("files") or []:
             commits = file_task.get("commits") or []

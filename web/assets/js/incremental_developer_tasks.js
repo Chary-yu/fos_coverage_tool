@@ -68,6 +68,27 @@
             .replace(/"/g, "&quot;");
     }
 
+    function parseLineNumbers(value) {
+        if (Array.isArray(value)) {
+            return value.map(function(item) { return parseInt(item, 10); })
+                .filter(function(item) { return Number.isFinite(item) && item > 0; });
+        }
+        return String(value || "").split(",")
+            .map(function(item) { return parseInt(item.trim(), 10); })
+            .filter(function(item) { return Number.isFinite(item) && item > 0; });
+    }
+
+    function countOwnedPendingLines(row, pendingLines) {
+        var ownedLines = parseLineNumbers(row.getAttribute("data-owned-lines"));
+        if (!ownedLines.length || !Array.isArray(pendingLines)) return 0;
+        var pendingSet = new Set(pendingLines);
+        var count = 0;
+        for (var i = 0; i < ownedLines.length; i++) {
+            if (pendingSet.has(ownedLines[i])) count += 1;
+        }
+        return count;
+    }
+
     function refreshDeveloperTasks() {
         if (!projectName || isRefreshing) return;
         var now = Date.now();
@@ -90,21 +111,15 @@
                 if (!resData || resData.status !== "success" || !resData.data) return;
                 var files = resData.data.files || [];
                 var unanalyzedMap = {};
+                var pendingLineMap = {};
                 for (var i = 0; i < files.length; i++) {
                     unanalyzedMap[files[i].file_path] = files[i].unanalyzed;
+                    pendingLineMap[files[i].file_path] = parseLineNumbers(files[i].pending_line_numbers);
                 }
 
                 var devSections = document.querySelectorAll("section[id]");
                 for (var s = 0; s < devSections.length; s++) {
                     var section = devSections[s];
-                    // Schema-v3 task rows are blame-owner specific.  The
-                    // legacy endpoint returns file-wide counts and would
-                    // overwrite one developer's exact line count with every
-                    // other developer's value, so leave those evidence rows
-                    // unchanged until an owner-aware endpoint is available.
-                    if (section.querySelector('tr[data-owner-specific="true"]')) {
-                        continue;
-                    }
                     var sectionId = section.id;
                     var fileRows = section.querySelectorAll("tbody tr[data-file-key]");
                     var devReviewFiles = 0;
@@ -115,12 +130,22 @@
                         var fileKey = row.getAttribute("data-file-key");
                         var pageLink = row.getAttribute("data-page-link");
                         var changed = parseInt(row.getAttribute("data-changed") || "0", 10);
+                        var ownerSpecific = row.getAttribute("data-owner-specific") === "true";
                         var unanalyzedCell = row.querySelector(".js-task-unanalyzed");
                         var actionCell = row.querySelector(".js-task-action");
 
-                        var count = (fileKey && (fileKey in unanalyzedMap))
-                            ? unanalyzedMap[fileKey]
-                            : parseInt((unanalyzedCell && unanalyzedCell.textContent) ? unanalyzedCell.textContent.trim() : "0", 10);
+                        var count;
+                        if (ownerSpecific && fileKey && Object.prototype.hasOwnProperty.call(pendingLineMap, fileKey)) {
+                            // A file can belong to several developers.  The
+                            // API returns current pending line numbers; only
+                            // the intersection with this row's owned lines is
+                            // the developer's live task count.
+                            count = countOwnedPendingLines(row, pendingLineMap[fileKey]);
+                        } else if (fileKey && (fileKey in unanalyzedMap)) {
+                            count = unanalyzedMap[fileKey];
+                        } else {
+                            count = parseInt((unanalyzedCell && unanalyzedCell.textContent) ? unanalyzedCell.textContent.trim() : "0", 10);
+                        }
 
                         if (unanalyzedCell) {
                             unanalyzedCell.textContent = count;

@@ -176,7 +176,7 @@ function_ranges_data=None
 4. 每条 `details` 附加：
    - `author_name`
    - `author_email`
-   - `reviewer`
+   - `suggested_reviewer`
    - `commit`
    - `committed_at`
    - `subject`
@@ -489,10 +489,14 @@ getSuggestedReviewer(item)
 显示：
 
 - 本人新增行数
-- 本人新增行号
+- 本人新增行引用（文件:行号）
 - 本人待填写行数
-- 本人待填写行号
+- 本人待填写行引用（文件:行号）
 - 相关 commit
+
+任务页实时刷新接口同时返回每个文件当前的 `pending_line_numbers`；schema-v3
+责任人行只展示“本人拥有行 ∩ 当前 pending 行”，避免多人共同修改同一文件时
+把文件级待填写数错误地覆盖到每个人。
 
 #### Excel Details
 
@@ -500,7 +504,7 @@ getSuggestedReviewer(item)
 
 - Developer
 - Email
-- Reviewer
+- Suggested Reviewer
 - Blame Commit
 - Commit Subject
 
@@ -510,8 +514,10 @@ getSuggestedReviewer(item)
 
 - Owned Added Lines
 - Owned Line Numbers
+- Owned Line References（开发人员汇总使用文件:行号）
 - Uncovered Need Fill
 - Uncovered Line Numbers
+- Uncovered Line References（开发人员汇总使用文件:行号）
 
 ## 6. 不需要做的事情
 
@@ -620,7 +626,7 @@ getSuggestedReviewer(item)
 至少覆盖：
 
 1. `git blame --line-porcelain` 正常解析；
-2. `^commit` boundary 行；
+2. `^commit`、独立 `boundary` metadata 及 blank-boundary SHA；
 3. 姓名/邮箱/subject；
 4. 连续新增行合并 `-L`；
 5. 碎片很多时整文件 blame + filter；

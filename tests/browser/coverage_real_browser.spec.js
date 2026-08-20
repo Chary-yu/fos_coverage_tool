@@ -7,6 +7,7 @@ const { URL } = require('url');
 const ROOT = path.join(__dirname, '../..');
 const CLIENT_JS = fs.readFileSync(path.join(ROOT, 'web/assets/js/coverage_enhance.js'), 'utf8');
 const CLIENT_CSS = fs.readFileSync(path.join(ROOT, 'web/assets/css/coverage_enhance.css'), 'utf8');
+const TASK_JS = fs.readFileSync(path.join(ROOT, 'web/assets/js/incremental_developer_tasks.js'), 'utf8');
 
 function makeLines(start, end, withPanels, savedReviewers) {
   const lines = [];
@@ -54,7 +55,7 @@ function makeLayout(large) {
   };
 }
 
-function createHarness({ large = false, failOnce = false } = {}) {
+function createHarness({ large = false, failOnce = false, taskPendingLines = null } = {}) {
   const layout = makeLayout(large);
   const requests = [];
   const failedRequests = [];
@@ -62,6 +63,7 @@ function createHarness({ large = false, failOnce = false } = {}) {
   let maxConcurrent = 0;
   let failureUsed = false;
   const savedReviewers = new Map();
+  let currentTaskPendingLines = taskPendingLines;
 
   const server = http.createServer((req, res) => {
     const parsed = new URL(req.url, 'http://127.0.0.1');
@@ -85,8 +87,38 @@ function createHarness({ large = false, failOnce = false } = {}) {
         <style>${CLIENT_CSS}</style><script src="/coverage_enhance.js"></script>
         </head><body><pre class="source"></pre></body></html>`, 'text/html');
     }
+    if (pathname === '/tasks.html') {
+      return sendStatic(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"></head><body>
+        <main data-project="TaskFixture">
+          <section id="developer-alice">
+            <div><strong class="js-dev-review-files">1</strong><strong class="js-dev-uncovered-lines">2</strong></div>
+            <table><tbody>
+              <tr data-file-key="src/fixture.c" data-page-link="/fixture.c.gcov.html" data-changed="2" data-owner-specific="true" data-owned-lines="1, 2">
+                <td class="js-task-unanalyzed">2</td><td class="js-task-action">填写 2 行</td>
+              </tr>
+            </tbody></table>
+          </section>
+          <table><tbody><tr data-dev-anchor="developer-alice"><td class="js-summary-review-files">1</td><td class="js-summary-uncovered-lines">2</td></tr></tbody></table>
+        </main><script>${TASK_JS}</script></body></html>`, 'text/html');
+    }
     if (pathname === '/coverage_enhance.js') return sendStatic(CLIENT_JS, 'text/javascript');
     if (pathname === '/coverage_enhance.css') return sendStatic(CLIENT_CSS, 'text/css');
+
+    if (pathname === '/api/coverage/incremental/unanalyzed') {
+      const pending = currentTaskPendingLines;
+      if (pending === null) {
+        return json(404, { status: 'error', message: 'task fixture disabled' });
+      }
+      return json(200, {
+        status: 'success',
+        data: {
+          project_name: 'TaskFixture',
+          data_version: 1,
+          total_unanalyzed: pending.length,
+          files: [{ file_path: 'src/fixture.c', unanalyzed: pending.length, pending_line_numbers: pending }],
+        },
+      });
+    }
 
     if (pathname === '/api/coverage/code-layout') {
       return json(200, { status: 'success', data: layout });
@@ -143,6 +175,7 @@ function createHarness({ large = false, failOnce = false } = {}) {
     failedRequests,
     get maxConcurrent() { return maxConcurrent; },
     get failureUsed() { return failureUsed; },
+    setTaskPendingLines(lines) { currentTaskPendingLines = lines; },
   };
 }
 
@@ -281,6 +314,27 @@ test('real Chromium LRU evicts collapsed regions while preserving a reload path'
     await expect(page.locator('#L17000')).toBeVisible({ timeout: 30000 });
     expect(harness.requests.filter(item => item.start === 1).length).toBeGreaterThan(beforeReload);
     expect(await page.locator('pre.source span[id^="L"]').evaluateAll(nodes => new Set(nodes.map(node => node.id)).size)).toBe(17000);
+  } finally {
+    await stopHarness(harness);
+  }
+});
+
+test('real Chromium developer task refresh intersects owner lines with live pending lines', async ({ page, browserName }) => {
+  expect(browserName).toBe('chromium');
+  const harness = await startHarness({ taskPendingLines: [2] });
+  try {
+    await page.goto(`${harness.baseUrl}/tasks.html`, { waitUntil: 'networkidle' });
+    const row = page.locator('tr[data-owner-specific="true"]');
+    await expect(row.locator('.js-task-unanalyzed')).toHaveText('1');
+    await expect(page.locator('.js-dev-uncovered-lines')).toHaveText('1');
+    await expect(page.locator('.js-summary-uncovered-lines')).toHaveText('1');
+
+    harness.setTaskPendingLines([]);
+    await page.waitForTimeout(2200);
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await expect(row.locator('.js-task-unanalyzed')).toHaveText('0', { timeout: 10000 });
+    await expect(page.locator('.js-dev-uncovered-lines')).toHaveText('0');
+    await expect(row.locator('.js-task-action')).toContainText('已全部填写完成');
   } finally {
     await stopHarness(harness);
   }

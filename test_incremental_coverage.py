@@ -550,6 +550,34 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         self.assertIn('<script src="incremental_developer_tasks.js?v=', page_html)
         self.assertTrue(os.path.exists(os.path.join(self.output_dir, "incremental_developer_tasks.js")))
 
+    def test_developer_task_page_emits_owner_line_set_for_live_intersection(self):
+        os.makedirs(self.output_dir)
+        result = {
+            "developer_tasks": {"developers": [{
+                "name": "Alice", "email": "alice@example.com",
+                "commit_total": 1, "changed_file_total": 1,
+                "owned_added_lines": 2, "owned_line_references": ["repo-a:src/main.c:10", "repo-a:src/main.c:11"],
+                "review_file_total": 1, "review_uncovered_total": 2,
+                "uncovered_line_references": ["repo-a:src/main.c:10", "repo-a:src/main.c:11"],
+                "files": [{
+                    "repository": "repo-a", "file_path": "src/main.c", "review_file_path": "src/main.c",
+                    "change_types": ["M"], "commits": [],
+                    "owned_added_lines": 2, "owned_line_numbers": [10, 11],
+                    "covered": 0, "uncovered": 2, "uncovered_need_fill_line_numbers": [10, 11],
+                    "missing": 0,
+                }],
+            }]},
+        }
+        enhance_coverage.write_incremental_developer_tasks_page(
+            self.output_dir, "owner_live_test", result
+        )
+        with open(os.path.join(self.output_dir, "incremental_developer_tasks.html"), "r", encoding="utf-8") as page:
+            page_html = page.read()
+        self.assertIn('data-owner-specific="true"', page_html)
+        self.assertIn('data-owned-lines="10, 11"', page_html)
+        self.assertIn("repo-a:src/main.c:10", page_html)
+        self.assertIn("本人新增行引用", page_html)
+
     def test_developer_tasks_js_content_and_event_listeners(self):
         js_path = enhance_coverage.DEVELOPER_TASKS_JS_SOURCE_PATH
         self.assertTrue(os.path.exists(js_path))
@@ -567,6 +595,9 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         self.assertIn('.js-task-action', js_content)
         self.assertIn('.js-dev-review-files', js_content)
         self.assertIn('.js-dev-uncovered-lines', js_content)
+        self.assertIn('pending_line_numbers', js_content)
+        self.assertIn('countOwnedPendingLines', js_content)
+        self.assertIn('data-owned-lines', js_content)
 
     def test_url_search_param_parsing_and_history_replace_state_in_incremental_js(self):
         js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH
@@ -736,6 +767,32 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
             self.assertEqual(sent_data["body"]["data"]["project_name"], "FOS_V6R2")
             self.assertEqual(sent_data["body"]["data"]["data_version"], 42)
             self.assertEqual(sent_data["body"]["data"]["total_unanalyzed"], 3)
+
+    def test_api_incremental_unanalyzed_includes_pending_line_numbers(self):
+        counts = {"src/a.c": 2}
+        with enhance_coverage._incremental_unanalyzed_cache_lock:
+            enhance_coverage._incremental_unanalyzed_cache["FOS_V6R2_PENDING"] = {
+                "version": 42,
+                "data": counts,
+                "pending_line_numbers": {"src/a.c": [10, 12]},
+            }
+        try:
+            with unittest.mock.patch.object(enhance_coverage, "is_mysql_configured", return_value=(True, True)), \
+                 unittest.mock.patch.object(enhance_coverage, "get_incremental_unanalyzed_counts", return_value=(counts, 42)):
+                handler = unittest.mock.MagicMock()
+                handler.path = "/api/coverage/incremental/unanalyzed?project=FOS_V6R2_PENDING"
+                sent_data = {}
+                handler.send_json_response = lambda status_code, data: sent_data.update(
+                    {"code": status_code, "body": data}
+                )
+                enhance_coverage.CoverageHTTPRequestHandler.do_GET(handler)
+                self.assertEqual(
+                    sent_data["body"]["data"]["files"][0]["pending_line_numbers"],
+                    [10, 12],
+                )
+        finally:
+            with enhance_coverage._incremental_unanalyzed_cache_lock:
+                enhance_coverage._incremental_unanalyzed_cache.pop("FOS_V6R2_PENDING", None)
 
     def test_api_incremental_unanalyzed_db_failure(self):
         """Test 7: Verify GET /api/coverage/incremental/unanalyzed returns 500 when DB query fails."""

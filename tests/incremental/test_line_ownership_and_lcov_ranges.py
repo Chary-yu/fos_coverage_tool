@@ -32,7 +32,7 @@ class TestLineOwnershipAndLCOVRanges(unittest.TestCase):
         return path
 
     def test_blame_porcelain_parses_metadata_boundary_and_selected_lines(self):
-        text = """^abc1234 1 10 2
+        text = """^abcdef0123456789abcdef0123456789abcdef01 1 10 2
 author Alice Example
 author-mail <alice@example.com>
 author-time 1700000000
@@ -53,11 +53,40 @@ filename src/a.c
         parsed = coverage_check.parse_git_blame_porcelain(text, {10, 11, 12})
         self.assertEqual(parsed[10]["author_name"], "Alice Example")
         self.assertEqual(parsed[10]["author_email"], "alice@example.com")
-        self.assertEqual(parsed[10]["commit"], "abc1234")
+        self.assertEqual(parsed[10]["commit"], "abcdef0123456789abcdef0123456789abcdef01")
         self.assertTrue(parsed[10]["boundary"])
-        self.assertEqual(parsed[11]["commit"], "abc1234")
+        self.assertEqual(parsed[11]["commit"], "abcdef0123456789abcdef0123456789abcdef01")
         self.assertEqual(parsed[12]["author_name"], "Bob")
         self.assertEqual(parsed[12]["subject"], "second subject")
+
+    def test_blame_porcelain_accepts_blank_boundary_sha_from_git_b(self):
+        text = """ 1 1
+author Root
+author-mail <root@example.com>
+author-time 1700000000
+author-tz +0000
+summary root subject
+filename src/a.c
+\troot line
+"""
+        parsed = coverage_check.parse_git_blame_porcelain(text, {1})
+        self.assertEqual(parsed[1]["commit"], "")
+        self.assertTrue(parsed[1]["boundary"])
+
+    def test_blame_porcelain_accepts_real_standalone_boundary_metadata(self):
+        text = """abcdef0123456789abcdef0123456789abcdef01 1 1
+author Root
+author-mail <root@example.com>
+author-time 1700000000
+author-tz +0000
+summary root subject
+boundary
+filename src/a.c
+\troot line
+"""
+        parsed = coverage_check.parse_git_blame_porcelain(text, {1})
+        self.assertEqual(parsed[1]["commit"], "abcdef0123456789abcdef0123456789abcdef01")
+        self.assertTrue(parsed[1]["boundary"])
 
     @mock.patch("coverage_check._run_git_blame")
     def test_run_git_line_authors_coalesces_ranges_and_pins_newgit(self, mock_blame):
@@ -142,12 +171,35 @@ filename src/a.c
         )
         self.assertEqual(result["schema_version"], 3)
         self.assertEqual(result["details"][1]["author_email"], "alice@example.com")
-        self.assertEqual(result["details"][2]["reviewer"], "Bob")
+        self.assertEqual(result["details"][2]["suggested_reviewer"], "Bob")
         self.assertEqual(result["reviewers_by_file"]["src/a.c"], {"11": "Alice", "12": "Bob"})
         developers = {item["email"]: item for item in result["developer_tasks"]["developers"]}
         self.assertEqual(developers["alice@example.com"]["files"][0]["owned_line_numbers"], [10, 11])
         self.assertEqual(developers["alice@example.com"]["files"][0]["uncovered_line_numbers"], [11])
         self.assertEqual(developers["bob@example.com"]["files"][0]["uncovered_line_numbers"], [12])
+
+    def test_developer_summary_line_references_keep_file_identity(self):
+        details = [
+            {
+                "repository": "repo-a", "file_path": "foo.c", "line_number": 10,
+                "status": coverage_check.STATUS_UNCOVERED,
+                "author_name": "Alice", "author_email": "alice@example.com",
+            },
+            {
+                "repository": "repo-a", "file_path": "bar.c", "line_number": 10,
+                "status": coverage_check.STATUS_UNCOVERED,
+                "author_name": "Alice", "author_email": "alice@example.com",
+            },
+        ]
+        developer = coverage_check.build_developer_tasks(details, {})["developers"][0]
+        self.assertEqual(
+            developer["owned_line_references"],
+            ["repo-a:bar.c:10", "repo-a:foo.c:10"],
+        )
+        self.assertEqual(
+            developer["uncovered_line_references"],
+            ["repo-a:bar.c:10", "repo-a:foo.c:10"],
+        )
 
     def test_shared_path_resolver_is_ambiguous_fail_closed(self):
         service = IncrementalService({
@@ -168,6 +220,13 @@ filename src/a.c
         )
         self.assertIsNone(value)
         self.assertEqual(match_type, "basename_only_rejected")
+
+    def test_shared_metadata_index_is_reused_for_repeated_resolves(self):
+        mapping = {"/repo/src/a.c": [1], "/repo/src/b.c": [2]}
+        service = IncrementalService({})
+        self.assertEqual(service.resolve_mapping_value("src/a.c", mapping)[0], [1])
+        self.assertEqual(service.resolve_mapping_value("src/b.c", mapping)[0], [2])
+        self.assertEqual(len(service._mapping_indexes), 1)
 
     def test_multi_repository_same_relative_path_keeps_line_ownership_isolated(self):
         repo_a = os.path.join(self.temp_dir, "repo-a")
@@ -194,12 +253,15 @@ filename src/a.c
                 repositories, "fixture.info", line_authors_by_repo=authors
             )
         detail_by_repo = {item["repository"]: item for item in result["details"]}
-        self.assertEqual(detail_by_repo["repo-a"]["reviewer"], "Alice")
-        self.assertEqual(detail_by_repo["repo-b"]["reviewer"], "Bob")
+        self.assertEqual(detail_by_repo["repo-a"]["suggested_reviewer"], "Alice")
+        self.assertEqual(detail_by_repo["repo-b"]["suggested_reviewer"], "Bob")
 
     def test_lcov_complete_aliases_legacy_fallback_and_crossing_ranges(self):
         complete = self._write_info(
-            "SF:src/a.c\nFN:2,5,foo\nFNL:6,8,bar\nFNA:baz,10,12\nDA:2,1\nend_of_record\n"
+            "SF:src/a.c\nFN:2,5,foo\n"
+            "FNL:0,6,8\nFNA:0,1,bar\n"
+            "FNL:1,10,12\nFNA:1,0,baz\n"
+            "DA:2,1\nend_of_record\n"
         )
         _, ranges = coverage_check.parse_lcov_info_data(complete)
         self.assertEqual(
@@ -216,6 +278,13 @@ filename src/a.c
         self.assertEqual(legacy_ranges, {})
         os.remove(legacy)
 
+        incomplete_modern = self._write_info(
+            "SF:src/a.c\nFNL:0,100\nFNA:0,5,foo\nDA:100,0\nend_of_record\n"
+        )
+        _, incomplete_ranges = coverage_check.parse_lcov_info_data(incomplete_modern)
+        self.assertEqual(incomplete_ranges, {})
+        os.remove(incomplete_modern)
+
         crossing = coverage_check.normalize_lcov_function_ranges([
             {"start_line": 1, "end_line": 5, "name": "a"},
             {"start_line": 4, "end_line": 8, "name": "b"},
@@ -228,12 +297,12 @@ filename src/a.c
         with open(first, "w", encoding="utf-8") as stream:
             stream.write("SF:src/a.c\nFN:1,3,one\nDA:1,1\nend_of_record\n")
         with open(second, "w", encoding="utf-8") as stream:
-            stream.write("SF:src/a.c\nFNA:two,5,7\nDA:2,0\nend_of_record\n")
+            stream.write("SF:src/a.c\nFNL:0,5,7\nFNA:0,2,two\nDA:2,0\nend_of_record\n")
         _, ranges, _ = coverage_check.load_lcov_info_with_functions(self.temp_dir)
         self.assertEqual(len(ranges["src/a.c"]), 2)
 
         with open(second, "w", encoding="utf-8") as stream:
-            stream.write("SF:src/a.c\nFNA:two,2,5\nDA:2,0\nend_of_record\n")
+            stream.write("SF:src/a.c\nFNL:0,2,5\nFNA:0,2,two\nDA:2,0\nend_of_record\n")
         _, conflict_ranges, _ = coverage_check.load_lcov_info_with_functions(self.temp_dir)
         self.assertNotIn("src/a.c", conflict_ranges)
 

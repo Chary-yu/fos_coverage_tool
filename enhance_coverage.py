@@ -517,17 +517,17 @@ def normalize_review_source_path(file_path):
     return normalized
 
 
-def get_incremental_lines_for_report(report_file_path, incremental_lines_by_file):
+def get_incremental_lines_for_report(report_file_path, incremental_lines_by_file, resolver=None):
     """Return selected Git-added lines through the canonical path index."""
     value, _ = resolve_incremental_metadata_for_report(
-        report_file_path, incremental_lines_by_file
+        report_file_path, incremental_lines_by_file, resolver=resolver
     )
     return set(value or [])
 
 
-def resolve_incremental_metadata_for_report(report_file_path, metadata_by_file):
-    """Resolve any incremental metadata map with one shared fail-closed index."""
-    service = IncrementalService({"default": list((metadata_by_file or {}).keys())})
+def resolve_incremental_metadata_for_report(report_file_path, metadata_by_file, resolver=None):
+    """Resolve metadata with a caller-owned, reusable fail-closed index."""
+    service = resolver or IncrementalService({})
     value, match_type = service.resolve_mapping_value(
         normalize_review_source_path(report_file_path), metadata_by_file or {}
     )
@@ -536,13 +536,17 @@ def resolve_incremental_metadata_for_report(report_file_path, metadata_by_file):
     return value, match_type
 
 
-def get_incremental_reviewers_for_report(report_file_path, reviewers_by_file):
-    value, _ = resolve_incremental_metadata_for_report(report_file_path, reviewers_by_file)
+def get_incremental_reviewers_for_report(report_file_path, reviewers_by_file, resolver=None):
+    value, _ = resolve_incremental_metadata_for_report(
+        report_file_path, reviewers_by_file, resolver=resolver
+    )
     return value if isinstance(value, dict) else {}
 
 
-def get_function_ranges_for_report(report_file_path, function_ranges_by_file):
-    value, _ = resolve_incremental_metadata_for_report(report_file_path, function_ranges_by_file)
+def get_function_ranges_for_report(report_file_path, function_ranges_by_file, resolver=None):
+    value, _ = resolve_incremental_metadata_for_report(
+        report_file_path, function_ranges_by_file, resolver=resolver
+    )
     return value if isinstance(value, list) else []
 
 
@@ -4784,9 +4788,23 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                 return
             try:
                 counts_map, ver = get_incremental_unanalyzed_counts(project_name, config=cfg)
+                with _incremental_unanalyzed_cache_lock:
+                    cached_snapshot = _incremental_unanalyzed_cache.get(project_name) or {}
+                    pending_lines_map = (
+                        cached_snapshot.get("pending_line_numbers", {})
+                        if cached_snapshot.get("version") == ver else {}
+                    )
+                all_file_paths = sorted(set(counts_map) | set(pending_lines_map))
                 file_list = [
-                    {"file_path": fpath, "unanalyzed": count}
-                    for fpath, count in counts_map.items()
+                    {
+                        "file_path": fpath,
+                        "unanalyzed": int(counts_map.get(fpath, 0) or 0),
+                        "pending_line_numbers": sorted(set(
+                            int(line) for line in (pending_lines_map.get(fpath) or [])
+                            if int(line) > 0
+                        )),
+                    }
+                    for fpath in all_file_paths
                 ]
                 total = sum(counts_map.values())
                 self.send_json_response(200, {
@@ -5366,7 +5384,7 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
                                  render_mode="lazy_collapse", report_id="", output_dir="",
                                  source_input_file=None, can_reuse=False,
                                  incremental_reviewers_by_file=None,
-                                 function_ranges_by_file=None):
+                                 function_ranges_by_file=None, metadata_resolver=None):
     depth = len(rel_path.split(os.sep)) - 1
     prefix = "../" * depth
 
@@ -5406,13 +5424,13 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
     known_function_ranges = []
     if review_scope == "incremental":
         review_line_numbers = get_incremental_lines_for_report(
-            report_file_path, incremental_lines_by_file or {}
+            report_file_path, incremental_lines_by_file or {}, resolver=metadata_resolver
         )
         reviewers_by_line = get_incremental_reviewers_for_report(
-            report_file_path, incremental_reviewers_by_file or {}
+            report_file_path, incremental_reviewers_by_file or {}, resolver=metadata_resolver
         )
         known_function_ranges = get_function_ranges_for_report(
-            report_file_path, function_ranges_by_file or {}
+            report_file_path, function_ranges_by_file or {}, resolver=metadata_resolver
         )
         source_content = mark_incremental_review_lines(
             source_content, review_line_numbers, reviewers_by_line
@@ -5638,7 +5656,13 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
         print("[Warning] Inject will continue, but full export requires a successful line-index sync.")
 
     target_rel_paths = None
+    metadata_resolver = IncrementalService({})
     if review_scope == "incremental" and incremental_lines_by_file:
+        # Build all immutable metadata indexes once before worker threads start;
+        # every source file then reuses these same three indexes.
+        metadata_resolver.prepare_mapping(incremental_lines_by_file)
+        metadata_resolver.prepare_mapping(incremental_reviewers_by_file or {})
+        metadata_resolver.prepare_mapping(function_ranges_by_file or {})
         report_pages = find_report_page_links(real_output_html)
         target_rel_paths = set()
         for src_path in incremental_lines_by_file.keys():
@@ -5696,6 +5720,7 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
                 can_reuse=can_reuse,
                 incremental_reviewers_by_file=incremental_reviewers_by_file,
                 function_ranges_by_file=function_ranges_by_file,
+                metadata_resolver=metadata_resolver,
             )
             for file_path, rel_path in gcov_files
         ]
@@ -5799,8 +5824,12 @@ _incremental_unanalyzed_cache = {}
 _incremental_unanalyzed_cache_lock = threading.Lock()
 
 
-def query_incremental_unanalyzed_counts(db_mgr, project_name, config=None):
+def query_incremental_unanalyzed_counts(db_mgr, project_name, config=None, include_pending_lines=False):
     """Query DB for unanalyzed line counts per normalized file path.
+
+    When ``include_pending_lines`` is true, the result is ``(counts, lines)``
+    where ``lines`` maps each file to its current pending line numbers.  The
+    default return value remains the historical counts-only mapping.
     Does NOT rely on Connection context manager (__enter__) for legacy PyMySQL compatibility.
     Raises exception on database failure if MySQL is configured.
     """
@@ -5829,27 +5858,58 @@ def query_incremental_unanalyzed_counts(db_mgr, project_name, config=None):
 
     cursor = conn.cursor()
     unanalyzed_by_file = {}
+    pending_lines_by_file = {}
     try:
         sql = """
             SELECT MAX(i.file_path) AS file_path,
-                   SUM(CASE WHEN a.id IS NULL OR COALESCE(a.is_draft, 0) = 1 OR a.status = %s THEN 1 ELSE 0 END) AS unanalyzed_total
+                   i.line_number AS line_number,
+                   CASE WHEN a.id IS NULL OR COALESCE(a.is_draft, 0) = 1 OR a.status = %s THEN 1 ELSE 0 END AS is_unanalyzed
             FROM coverage_line_index i
             LEFT JOIN coverage_analysis a
               ON i.project_name = a.project_name
              AND i.file_path_hash = a.file_path_hash
              AND i.line_number = a.line_number
             WHERE i.project_name = %s
-            GROUP BY i.project_name, i.file_path_hash
+            GROUP BY i.project_name, i.file_path_hash, i.line_number
         """
         cursor.execute(sql, ("未确认", project_name))
         rows = cursor.fetchall() or []
+
+        def is_pending(value):
+            if isinstance(value, bool):
+                return value
+            try:
+                return int(value) == 1
+            except (TypeError, ValueError):
+                return str(value or "").strip().lower() in ("true", "yes", "pending")
+
         for row in rows:
             if not row:
                 continue
-            if isinstance(row, dict):
-                fpath = row.get("file_path", "")
-                count = row.get("unanalyzed_total", 0)
+            count = None
+            line_number = None
+            pending = None
+            if isinstance(row, dict) or hasattr(row, "keys"):
+                try:
+                    fpath = row.get("file_path", "") if isinstance(row, dict) else row["file_path"]
+                    count = row.get("unanalyzed_total") if isinstance(row, dict) else (
+                        row["unanalyzed_total"] if "unanalyzed_total" in row.keys() else None
+                    )
+                    line_number = row.get("line_number") if isinstance(row, dict) else (
+                        row["line_number"] if "line_number" in row.keys() else None
+                    )
+                    pending = row.get("is_unanalyzed") if isinstance(row, dict) else (
+                        row["is_unanalyzed"] if "is_unanalyzed" in row.keys() else None
+                    )
+                except (KeyError, IndexError, TypeError):
+                    continue
+            elif isinstance(row, (list, tuple)) and len(row) >= 3:
+                fpath = row[0]
+                line_number = row[1]
+                pending = row[2]
             elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                # Compatibility with test doubles and older adapters that
+                # still return one aggregated (file, count) row.
                 fpath = row[0]
                 count = row[1]
             elif hasattr(row, "__getitem__"):
@@ -5861,7 +5921,24 @@ def query_incremental_unanalyzed_counts(db_mgr, project_name, config=None):
             else:
                 continue
             if fpath:
-                unanalyzed_by_file[_normalize_ownership_path(fpath)] = int(count or 0)
+                file_key = _normalize_ownership_path(fpath)
+                unanalyzed_by_file.setdefault(file_key, 0)
+                if line_number is not None:
+                    try:
+                        line_number = int(line_number)
+                    except (TypeError, ValueError):
+                        line_number = None
+                if line_number is not None:
+                    if is_pending(pending):
+                        unanalyzed_by_file[file_key] += 1
+                        pending_lines_by_file.setdefault(file_key, []).append(line_number)
+                elif count is not None:
+                    unanalyzed_by_file[file_key] += int(count or 0)
+
+        for file_key, line_numbers in pending_lines_by_file.items():
+            pending_lines_by_file[file_key] = sorted(set(line_numbers))
+        if include_pending_lines:
+            return unanalyzed_by_file, pending_lines_by_file
         return unanalyzed_by_file
     except Exception as err:
         if is_configured:
@@ -5888,12 +5965,22 @@ def get_incremental_unanalyzed_counts(project_name, db_mgr=None, config=None):
         if cached and cached.get("version") == current_ver:
             return cached["data"], current_ver
 
-    counts_map = query_incremental_unanalyzed_counts(db_mgr, project_name, config=config)
+    query_result = query_incremental_unanalyzed_counts(
+        db_mgr, project_name, config=config, include_pending_lines=True
+    )
+    if isinstance(query_result, tuple) and len(query_result) == 2:
+        counts_map, pending_lines_by_file = query_result
+    else:
+        # Preserve compatibility with callers/tests that replace the old
+        # counts-only query function.
+        counts_map = query_result
+        pending_lines_by_file = {}
 
     with _incremental_unanalyzed_cache_lock:
         _incremental_unanalyzed_cache[project_name] = {
             "version": current_ver,
             "data": counts_map,
+            "pending_line_numbers": pending_lines_by_file,
         }
 
     return counts_map, current_ver
@@ -6285,9 +6372,13 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
                 developer.get("changed_file_total", 0), developer.get("owned_added_lines", sum(
                     item.get("changed", 0) for item in developer.get("files", [])
                 )),
-                escaped(", ".join(str(line) for line in developer.get("owned_line_numbers", []))),
+                escaped(", ".join(str(line) for line in developer.get(
+                    "owned_line_references", developer.get("owned_line_numbers", [])
+                ))),
                 developer.get("review_file_total", 0), developer.get("review_uncovered_total", 0),
-                escaped(", ".join(str(line) for line in developer.get("uncovered_line_numbers", []))),
+                escaped(", ".join(str(line) for line in developer.get(
+                    "uncovered_line_references", developer.get("uncovered_line_numbers", [])
+                ))),
             )
         )
 
@@ -6317,6 +6408,7 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
             uncovered = file_task.get("uncovered", 0)
             changed = file_task.get("owned_added_lines", file_task.get("changed", 0))
             owned_line_numbers = ", ".join(str(line) for line in file_task.get("owned_line_numbers", []))
+            owner_specific = "owned_line_numbers" in file_task
             uncovered_line_numbers = ", ".join(str(line) for line in file_task.get(
                 "uncovered_need_fill_line_numbers", file_task.get("uncovered_line_numbers", [])
             ))
@@ -6333,11 +6425,13 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
                 action = '<span class="muted">本次提交未产生新增代码行</span>'
 
             file_rows.append(
-                '<tr data-file-key="{}" data-page-link="{}" data-changed="{}" data-owner-specific="true"><td>{}</td><td>{}</td><td>{}</td><td>{}</td>'
+                '<tr data-file-key="{}" data-page-link="{}" data-changed="{}" data-owner-specific="{}" data-owned-lines="{}"><td>{}</td><td>{}</td><td>{}</td><td>{}</td>'
                 '<td>{}</td><td>{}</td><td>{}</td><td class="js-task-unanalyzed" data-sort-value="{}">{}</td><td>{}</td><td>{}</td><td class="js-task-action">{}</td></tr>'.format(
                     escaped(file_key),
                     escaped(page_link or ""),
                     changed,
+                    "true" if owner_specific else "false",
+                    escaped(owned_line_numbers),
                     escaped(file_task.get("repository", "") or "-"), source_cell,
                     escaped(", ".join(file_task.get("change_types") or [])), commit_text,
                     changed, escaped(owned_line_numbers), file_task.get("covered", 0),
@@ -6410,7 +6504,7 @@ td a:hover{{text-decoration:underline}}
     <a href="incremental_coverage.xlsx">📈 下载 Excel</a>
   </div>
 </div>
-<section><h2>👥 人员概览</h2><div class="table-wrap"><table><thead><tr><th>开发人员</th><th>提交数</th><th>提交文件</th><th>本人新增行</th><th>本人新增行号</th><th>需填写文件</th><th>本人待填写行</th><th>本人待填写行号</th></tr></thead><tbody>{summary_rows}</tbody></table></div></section>
+<section><h2>👥 人员概览</h2><div class="table-wrap"><table><thead><tr><th>开发人员</th><th>提交数</th><th>提交文件</th><th>本人新增行</th><th>本人新增行引用</th><th>需填写文件</th><th>本人待填写行</th><th>本人待填写行引用</th></tr></thead><tbody>{summary_rows}</tbody></table></div></section>
 <aside class="muted" style="margin:12px 0 20px;text-align:center">说明：按 newgit 最终代码的 Git blame“姓名 + 邮箱”区分人员；多人提交同一文件时，每个开发人员只统计自己拥有的新增行，待填写行号可追溯到对应文件。</aside>
 {sections}
 </main><script src="incremental_developer_tasks.js?v={version_tag}"></script></body></html>""".format(
