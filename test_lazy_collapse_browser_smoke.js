@@ -237,6 +237,7 @@ async function runSmokeTests() {
     const mockHtml = `<!DOCTYPE html><html><head>
 <meta name="coverage-project" content="SmokeProj">
 <meta name="coverage-report-id" content="report_smoke_1">
+<meta name="coverage-scan-id" content="scan_smoke_1">
 <meta name="coverage-file-path" content="src/smoke_test.c">
 <meta name="coverage-render-mode" content="lazy_collapse">
 <meta name="coverage-review-scope" content="full">
@@ -479,10 +480,13 @@ async function runSmokeTests() {
                     data: {
                         project_name: "SmokeProj5",
                         file_path: "src/smoke_lru.c",
-                        total_lines: 60000,
+                        // Keep this fixture below the virtual-scroll
+                        // threshold so it measures line-cache eviction rather
+                        // than the sparse virtual window policy.
+                        total_lines: 8000,
                         regions: [
-                            { region_id: "lru_1", start_line: 1, end_line: 30000, default_state: "collapsed", kind: "collapsed", line_count: 30000 },
-                            { region_id: "lru_2", start_line: 30001, end_line: 60000, default_state: "collapsed", kind: "collapsed", line_count: 30000 }
+                            { region_id: "lru_1", start_line: 1, end_line: 4000, default_state: "collapsed", kind: "collapsed", line_count: 4000 },
+                            { region_id: "lru_2", start_line: 4001, end_line: 8000, default_state: "collapsed", kind: "collapsed", line_count: 4000 }
                         ]
                     }
                 })
@@ -515,13 +519,13 @@ async function runSmokeTests() {
     }
 
     const { CodeRegionStore: store5, CodeRegionController: ctrl5, ReviewDraftStore: draftStore5, RegionLineLRUCache: lru5 } = ctx5.window.__COVERAGE_ENHANCE_INTERNALS__;
-    lru5.MAX_CACHED_LINES = 35000; // Set small budget for test
+    lru5.MAX_CACHED_LINES = 4500; // Set small budget for test
 
     // 1. Expand lru_1 and save draft edit
     await ctrl5.expandRegion("lru_1");
     const lruReg1 = store5.get("lru_1");
     assert.strictEqual(lruReg1.loaded, true);
-    assert.strictEqual(lruReg1.lines.length, 30000);
+    assert.strictEqual(lruReg1.lines.length, 4000);
 
     draftStore5.setDraft(1, { reviewer: "LRUTester", status: "可覆盖", uncovered_reason: "Survives LRU" });
 
@@ -529,7 +533,7 @@ async function runSmokeTests() {
     ctrl5.collapseRegion("lru_1");
     assert.strictEqual(lruReg1.currentState, "collapsed-loaded");
 
-    // 3. Expand lru_2 (30000 lines) -> exceeds budget 35000 -> evicts collapsed lru_1
+    // 3. Expand lru_2 (4000 lines) -> exceeds budget 4500 -> evicts collapsed lru_1
     await ctrl5.expandRegion("lru_2");
     const lruReg2 = store5.get("lru_2");
     assert.strictEqual(lruReg2.loaded, true);
@@ -543,7 +547,7 @@ async function runSmokeTests() {
     // 4. Re-expand lru_1
     await ctrl5.expandRegion("lru_1");
     assert.strictEqual(lruReg1.loaded, true, "lru_1 must reload on re-expansion");
-    assert.strictEqual(lruReg1.lines.length, 30000);
+    assert.strictEqual(lruReg1.lines.length, 4000);
     console.log("✔ [Smoke Test 5 Passed] LRU evicted collapsed region cleanly and preserved draft state across re-expansion.");
 
     // =========================================================================

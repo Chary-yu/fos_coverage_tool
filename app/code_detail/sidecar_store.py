@@ -411,11 +411,38 @@ class SidecarStore:
         report_id: str,
         file_path_hash: str,
         start_line: int,
-        end_line: int
+        end_line: int,
+        allow_large: bool = False,
     ) -> Optional[List[Dict[str, Any]]]:
         """
         Load only the lines covering [start_line, end_line] without reading full file if chunked.
+
+        Public range requests stay bounded by ``MAX_TOTAL_RANGE_SPAN``.  The
+        compatibility service can pass ``allow_large`` only after resolving a
+        verified layout region; even then the read is split into bounded
+        windows so a single call never asks the JSON decoder to materialize an
+        unbounded range.
         """
+        start_line, end_line = int(start_line), int(end_line)
+        span = end_line - start_line + 1
+        if allow_large and span > MAX_RANGE_SPAN:
+            if start_line < 1 or end_line < start_line or span > MAX_SIDECAR_LINES:
+                raise ValueError("requested sidecar span is too large")
+            lines = []
+            window_start = start_line
+            while window_start <= end_line:
+                window_end = min(
+                    end_line,
+                    window_start + min(MAX_TOTAL_RANGE_SPAN, MAX_RANGE_SPAN) - 1,
+                )
+                window = self.load_lines_ranges(
+                    report_id, file_path_hash, [(window_start, window_end)]
+                )
+                if window is None:
+                    return None
+                lines.extend(window[0])
+                window_start = window_end + 1
+            return lines
         batches = self.load_lines_ranges(
             report_id, file_path_hash, [(start_line, end_line)]
         )

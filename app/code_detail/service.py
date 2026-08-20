@@ -130,6 +130,11 @@ class CodeDetailService:
         self.search_dirs = [os.path.abspath(d) for d in all_dirs if os.path.isdir(d)]
         self.review_scope = review_scope
         self._context_cache: Dict[Tuple[str, str, str, str], Tuple[float, SourceContext]] = {}
+        # Keep the public/base cache key stable for existing callers while
+        # recording whether that entry came from an immutable content override
+        # or from disk/Sidecar.  The fingerprint prevents a changed override
+        # from reusing stale parsed HTML without multiplying cache entries.
+        self._context_cache_sources: Dict[Tuple[str, str, str, str], Optional[str]] = {}
         self._overlay_cache = AnalysisOverlayCache()
         self._sidecar_store = SidecarStore(search_dirs=self.search_dirs)
         self._cache_ttl_sec = 60.0
@@ -147,6 +152,7 @@ class CodeDetailService:
         ]
         for k in expired_keys:
             self._context_cache.pop(k, None)
+            self._context_cache_sources.pop(k, None)
 
         # 2. Enforce maximum capacity (entries count and total lines sum) by evicting oldest entries
         total_lines_sum = sum(ctx.total_lines for _, ctx in self._context_cache.values())
@@ -156,11 +162,13 @@ class CodeDetailService:
                 if len(self._context_cache) <= self._max_cache_entries and total_lines_sum <= self._max_cache_total_lines:
                     break
                 self._context_cache.pop(k, None)
+                self._context_cache_sources.pop(k, None)
                 total_lines_sum -= ctx.total_lines
 
     def clear_context_cache(self):
         """Explicitly clear in-memory context cache."""
         self._context_cache.clear()
+        self._context_cache_sources.clear()
 
     def add_search_dir(self, directory: str):
         if directory and os.path.isdir(directory):
@@ -267,18 +275,38 @@ class CodeDetailService:
         if not is_valid_review_scope(scope):
             raise ValueError(f"Invalid review_scope: '{scope}'")
 
-        cache_key = (project_name, report_id or "", file_path, scope)
+        base_cache_key = (project_name, report_id or "", file_path, scope)
+        # Content overrides are used by the legacy benchmark and by callers
+        # that provide an immutable in-memory report.  They used to bypass the
+        # context cache entirely, causing every layout request to re-parse the
+        # same 50k/100k-line HTML.  Track a content fingerprint beside the
+        # stable cache key so repeated requests reuse the parsed context while
+        # a changed override still invalidates safely.
+        cache_key = base_cache_key
+        content_fingerprint = None
+        if content_override is not None:
+            content_fingerprint = hashlib.sha256(
+                str(content_override).encode("utf-8", errors="ignore")
+            ).hexdigest()
         now = time.time()
         self._prune_context_cache(now)
 
-        if not content_override and cache_key in self._context_cache:
+        if cache_key in self._context_cache:
             ts, cached_ctx = self._context_cache[cache_key]
-            if now - ts < self._cache_ttl_sec:
+            cached_source = self._context_cache_sources.get(cache_key)
+            source_matches = (
+                cached_source == content_fingerprint
+                if content_override is not None
+                else cached_source is None
+            )
+            if source_matches and now - ts < self._cache_ttl_sec:
                 # Update access timestamp for LRU
                 self._context_cache[cache_key] = (now, cached_ctx)
                 if self.db_manager:
                     self._refresh_analysis_records(cached_ctx, project_name, file_path, scope)
                 return cached_ctx
+            self._context_cache.pop(cache_key, None)
+            self._context_cache_sources.pop(cache_key, None)
 
         # Fetch analysis records from DB if available
         analysis_records = []
@@ -299,6 +327,7 @@ class CodeDetailService:
                 report_id=report_id,
             )
             self._context_cache[cache_key] = (now, context)
+            self._context_cache_sources[cache_key] = content_fingerprint
             self._prune_context_cache(now)
             return context
 
@@ -332,6 +361,7 @@ class CodeDetailService:
                     if self.db_manager:
                         self._refresh_analysis_records(ctx, project_name, file_path, scope)
                     self._context_cache[cache_key] = (now, ctx)
+                    self._context_cache_sources[cache_key] = None
                     self._prune_context_cache(now)
                     return ctx
 
@@ -341,6 +371,7 @@ class CodeDetailService:
                         if self.db_manager:
                             self._refresh_analysis_records(sidecar_ctx, project_name, file_path, scope)
                         self._context_cache[cache_key] = (now, sidecar_ctx)
+                        self._context_cache_sources[cache_key] = None
                         self._prune_context_cache(now)
                         return sidecar_ctx
 
@@ -363,6 +394,7 @@ class CodeDetailService:
                     report_id=report_id,
                 )
                 self._context_cache[cache_key] = (now, context)
+                self._context_cache_sources[cache_key] = None
                 self._prune_context_cache(now)
                 return context
             except Exception as e:
@@ -613,7 +645,8 @@ class CodeDetailService:
             if report_id and not content_override:
                 for sidecar_file_hash in sidecar_file_hashes:
                     lines_dicts = self._sidecar_store.load_lines_range(
-                        report_id, sidecar_file_hash, start_l, end_l
+                        report_id, sidecar_file_hash, start_l, end_l,
+                        allow_large=is_verified_default_batch,
                     )
                     if lines_dicts is not None:
                         break

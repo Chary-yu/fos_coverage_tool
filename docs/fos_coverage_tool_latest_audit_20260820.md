@@ -1298,3 +1298,15 @@ Maintainer 负责唯一 root owner 和 handoff，不重复开根因。
 以下项目不能由本地 disposable MariaDB、静态代码或 fixture 代替：真实 Candidate MySQL transaction/session、真实生产 schema/migration、生产 job orphan inventory、真实 50k/100k 数据集的 p95/RSS/DB rows、Nginx/auth 暴露面、真实 previous→target→rollback 文件树和 GitHub Actions run。Rollback rehearsal 现在对缺失真实 before/target identity 或 release endpoint 直接 fail-closed。
 
 因此整改后的准确结论是：代码与本地 Gate 证据已收口，但 VNext 生产切换仍须完成上述外部证据，不将 `TRANSITIONAL_LEGACY` 宣称为 `RETIRED`。
+
+## 10.4 CI 失败回归与本轮修复（2026-08-20）
+
+上一轮 `bed9bcd` 的 GitHub Actions 运行暴露了 5 个真实回归：verified 默认区域超过 Sidecar 单次读取上限、旧 Registry 条目清理、canonical JS 对成功响应 envelope 和 `ranges` 字段的兼容、mock DOM 身份元数据缺失，以及 50k/100k 基准重复解析 content override。对应修复已落实：
+
+- verified Sidecar 大范围读取按 `MAX_RANGE_SPAN` 分窗，公共任意 range 仍保持上限；
+- Registry 对无版本历史条目恢复 `.source_cache/<report_id>` 校验，同时不让显式 `sidecar_required=false` 被其他 report 污染；
+- canonical/root JS 统一解包旧成功 envelope，并同时消费 VNext `ranges` 与历史 `batches`；不完整 batch 保持缺失区域折叠可重试，避免恢复成逐区域请求；
+- mock DOM fixture 补齐 `scan_id`，LRU 用例改为低于虚拟滚动阈值的独立缓存场景；
+- content override 使用稳定基础 cache key + 内容指纹元数据，重复 50k/100k HTML 不再重复解析，且保持既有缓存淘汰契约。
+
+修复后的本地验证结果：root 回归 `77 passed`，仓库测试 `89 passed, 1 skipped`，真实 Chromium `6 passed`，browser smoke `6 passed`，Python/JS 语法与 canonical 资产 SHA 校验通过；runtime participation、canonical ownership、legacy boundary、frontend contract、active runtime、Scan immutability、connection pool、job lifecycle 和 evidence matrix 审计均通过。浏览器性能审计继续按边界报告 `PARTIAL`（fixture 未采集 DB/RSS/p95），本机当前没有运行中的 MariaDB 或 Docker，因此真实 DB 与 Python 3.6 容器门禁仍以 GitHub Actions/Candidate 结果为准。

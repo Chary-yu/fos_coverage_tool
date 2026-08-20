@@ -272,6 +272,15 @@
                 if (!response.ok) PerformanceTelemetry.apiFailures += 1;
                 if (response.ok && data) {
                     resolvedServerUrl = apiBase;
+                    // Compatibility transports (including older injected
+                    // pages) may wrap the canonical payload in
+                    // {status: "success", data: ...}.  Normalize that
+                    // envelope once so layout, batch and line consumers all
+                    // see the same VNext contract.
+                    if (data.status === 'success' && data.data &&
+                        typeof data.data === 'object') {
+                        return data.data;
+                    }
                     return data;
                 }
                 const message = data && data.message
@@ -1171,9 +1180,15 @@
                 })
             });
 
-            if (data && Array.isArray(data.batches)) {
+            // The VNext endpoint names the collection ``ranges``; older
+            // compatibility transports used ``batches``.  Accept both after
+            // requestCoverageApi has normalized the outer success envelope.
+            const responseRanges = data && Array.isArray(data.ranges)
+                ? data.ranges
+                : (data && Array.isArray(data.batches) ? data.batches : null);
+            if (responseRanges) {
                 const rangeMap = new Map();
-                data.batches.forEach((r, index) => {
+                responseRanges.forEach((r, index) => {
                     const fallback = batchRegions[index];
                     const start = r.start_line !== undefined ? r.start_line : fallback.startLine;
                     const end = r.end_line !== undefined ? r.end_line : fallback.endLine;
@@ -2084,6 +2099,14 @@
                     for (const reg of defaultExpanded) {
                         if (reg.loaded && reg.currentState === 'expanded-loaded') {
                             await this.renderRegionLines(reg);
+                        } else if (reg.currentState === 'collapsed-unloaded') {
+                            // A partial/empty batch response is a recoverable
+                            // contract mismatch.  Keep the missing region
+                            // interactive but collapsed; expanding it here
+                            // would immediately reintroduce the per-region
+                            // fallback request that batching was meant to
+                            // avoid.
+                            this.updatePlaceholderState(reg);
                         } else {
                             await this.expandRegion(reg);
                         }
@@ -2113,6 +2136,9 @@
         createPlaceholderElement(region) {
             const el = document.createElement('div');
             el.className = 'coverage-region-placeholder';
+            // Make the visible default explicit for lightweight DOM shims as
+            // well as real browsers (where an unset display resolves to '').
+            el.style.display = '';
             el.dataset.regionId = region.id;
 
             if (region.kind === 'analysis') {

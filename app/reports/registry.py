@@ -129,6 +129,24 @@ class ReportRegistry(object):
                 pass
         return result
 
+    @staticmethod
+    def _requires_sidecar(value, directory, report_id):
+        """Honor explicit VNext metadata while preserving old registry files.
+
+        VNext registrations always write ``sidecar_required``.  Historical
+        per-report registry files predate that field and expected a root that
+        contains ``.source_cache`` to contain that report's own cache.  Keep
+        that compatibility rule only for the unversioned shape; an explicit
+        ``false`` remains a valid static/legacy root and is not contaminated by
+        a sibling report's cache.
+        """
+        if value.get("sidecar_required"):
+            return True
+        return (
+            "sidecar_required" not in value
+            and os.path.isdir(os.path.join(directory, ".source_cache"))
+        )
+
     def prune(self):
         removed = []
         if not os.path.isdir(self.registry_dir):
@@ -142,7 +160,7 @@ class ReportRegistry(object):
                 # this root. That directory alone says nothing about this
                 # report's format; only this report's own registration flag
                 # can require a report-specific Sidecar directory.
-                if value.get("sidecar_required"):
+                if self._requires_sidecar(value, directory, report_id):
                     sidecar = os.path.join(directory, ".source_cache", report_id)
                     if not os.path.isdir(sidecar):
                         continue
@@ -169,7 +187,7 @@ class ReportRegistry(object):
         for path in value.get("directories") or []:
             if not os.path.isdir(path):
                 continue
-            if value.get("sidecar_required") and not os.path.isdir(
+            if self._requires_sidecar(value, path, report_id) and not os.path.isdir(
                     os.path.join(path, ".source_cache", report_id)):
                 continue
             roots.append(path)

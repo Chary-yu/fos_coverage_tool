@@ -148,15 +148,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.6'
       - name: Compile changed runtime modules
         run: |
-          find app scripts -type f -name '*.py' -print0 | xargs -0 python -m py_compile
-          python -m py_compile source_reader.py code_detail_service.py coverage_check.py enhance_coverage.py
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace python:3.6 \
+            bash -lc "find app scripts -type f -name '*.py' -print0 | xargs -0 python -m py_compile && python -m py_compile source_reader.py code_detail_service.py coverage_check.py enhance_coverage.py"
       - name: Run compatibility-focused tests
-        run: python -m unittest tests.code_detail.test_phase2_core tests.incremental.test_phase5_inject_path -v
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace python:3.6 \
+            python -m unittest tests.code_detail.test_phase2_core tests.incremental.test_phase5_inject_path -v
 
   mock-dom-regression:
     name: Mock DOM regression (not browser evidence)
