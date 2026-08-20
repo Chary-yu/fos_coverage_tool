@@ -108,12 +108,25 @@ class VNextRuntime(object):
         if not os.path.isabs(export_root):
             export_root = os.path.join(self.repo_root, export_root)
         job_config = self.config.get("jobs") or {}
+        resource_limits = job_config.get("resource_limits")
+        if resource_limits is None:
+            worker_count = max(1, int(job_config.get("max_workers", 4)))
+            queue_size = max(1, int(job_config.get("max_queue_size", 100)))
+            resource_limits = {
+                "database": {"max_workers": max(1, min(2, worker_count)),
+                              "max_queue_size": max(1, min(queue_size, 25))},
+                "cpu": {"max_workers": worker_count,
+                        "max_queue_size": max(1, min(queue_size, 50))},
+                "disk": {"max_workers": max(1, min(2, worker_count)),
+                         "max_queue_size": max(1, min(queue_size, 25))},
+            }
         self.job_service = VNextBackgroundJobService(
             self._job_connection,
             repository=self.job_repository,
             executor=BoundedJobExecutor(
                 max_workers=int(job_config.get("max_workers", 4)),
                 max_queue_size=int(job_config.get("max_queue_size", 100)),
+                resource_limits=resource_limits,
             ),
             heartbeat_timeout=float(job_config.get("heartbeat_timeout", 300)),
         )
@@ -127,7 +140,7 @@ class VNextRuntime(object):
         )
 
     @contextmanager
-    def connection_context(self):
+    def connection_context(self, read_only: bool = False):
         if self._connection is not None:
             yield self._connection
             return
@@ -142,7 +155,7 @@ class VNextRuntime(object):
             return
         if self.database_manager is None:
             raise RuntimeError("VNext database manager is not configured")
-        with self.database_manager.connection() as connection:
+        with self.database_manager.connection(read_only=read_only) as connection:
             yield connection
 
     def _job_connection(self):

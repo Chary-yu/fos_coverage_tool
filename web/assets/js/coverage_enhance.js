@@ -41,6 +41,9 @@
     const NETWORK_CHUNK_LINES = 2000;
     const RENDER_BATCH_LINES = 250;
     const MAX_CHUNK_CONCURRENCY = 3;
+    const VIRTUAL_SCROLL_THRESHOLD = 5000;
+    const VIRTUAL_OVERSCAN_LINES = 300;
+    const VIRTUAL_LINE_HEIGHT = 24;
     const PROGRESS_UPDATE_STORAGE_KEY = 'coverage-review-progress-updated';
 
     // 控制流分支关键字侦测正则 (边界隔离)
@@ -56,12 +59,123 @@
     let currentFilePath = '';
     let dirtyPanelStartLines = new Set();
     let panelsMap = new Map(); // startLine -> panelState
+    let panelLineNumbers = [];
     let batchToolbarState = null;
     let reviewControlsReady = false;
     let totalUncovered = 0;
     let blocks = [];
     let foldBars = [];
     let isFoldedModeActive = false;
+
+    const PerformanceTelemetry = {
+        apiRequests: 0,
+        apiFailures: 0,
+        networkChunks: 0,
+        networkLines: 0,
+        virtualRenders: 0,
+        virtualDomLines: 0,
+        maxDomLines: 0,
+        layoutStart: 0,
+        layoutMs: 0,
+        reset() {
+            this.apiRequests = 0;
+            this.apiFailures = 0;
+            this.networkChunks = 0;
+            this.networkLines = 0;
+            this.virtualRenders = 0;
+            this.virtualDomLines = 0;
+            this.maxDomLines = 0;
+            this.layoutStart = 0;
+            this.layoutMs = 0;
+        },
+        recordDomLineCount(count, virtualized) {
+            const value = Number(count) || 0;
+            this.maxDomLines = Math.max(this.maxDomLines, value);
+            if (virtualized) {
+                this.virtualDomLines = value;
+            }
+        },
+        snapshot() {
+            return {
+                api_requests: this.apiRequests,
+                api_failures: this.apiFailures,
+                network_chunks: this.networkChunks,
+                network_lines: this.networkLines,
+                virtual_renders: this.virtualRenders,
+                virtual_dom_lines: this.virtualDomLines,
+                max_dom_lines: this.maxDomLines,
+                layout_ms: this.layoutMs
+            };
+        }
+    };
+
+    function insertPanelLineNumber(lineNumber) {
+        const value = Number(lineNumber);
+        if (!Number.isFinite(value) || panelLineNumbers.indexOf(value) !== -1) return;
+        let low = 0;
+        let high = panelLineNumbers.length;
+        while (low < high) {
+            const middle = (low + high) >> 1;
+            if (panelLineNumbers[middle] < value) low = middle + 1;
+            else high = middle;
+        }
+        panelLineNumbers.splice(low, 0, value);
+    }
+
+    function initialPanelValues(lineData, startLineNum) {
+        const draft = ReviewDraftStore.getDraft(startLineNum);
+        return {
+            status: draft && draft.status !== undefined
+                ? draft.status : (lineData.analysis_state || '未确认'),
+            reviewerInput: draft && draft.reviewer !== undefined
+                ? draft.reviewer : (lineData.reviewer || lineData.suggested_reviewer || ''),
+            methodInput: draft && draft.coverage_method !== undefined
+                ? draft.coverage_method : (lineData.coverage_method || ''),
+            reasonInput: draft && draft.uncovered_reason !== undefined
+                ? draft.uncovered_reason : (lineData.uncovered_reason || ''),
+            isDirty: draft && draft.isDirty !== undefined ? Boolean(draft.isDirty) : false,
+            isDraft: draft && draft.isDraft !== undefined
+                ? Boolean(draft.isDraft) : Boolean(lineData.is_draft),
+            _origSavedConfirmed: !lineData.is_draft
+                && CONFIRMED_STATUS_SET.has(lineData.analysis_state)
+        };
+    }
+
+    function registerReviewPanelMetadata(lineData) {
+        if (!lineData || !lineData.is_block_entry) return null;
+        const startLineNum = Number(lineData.block_start_line || lineData.line_no);
+        const endLineNum = Number(lineData.block_end_line || lineData.line_no);
+        let panelState = panelsMap.get(startLineNum);
+        if (!panelState) {
+            panelState = {
+                select: null, reviewerInput: null, methodInput: null,
+                reasonInput: null, saveBtn: null, previousBtn: null,
+                nextBtn: null, block: {
+                    startLine: startLineNum, endLine: endLineNum,
+                    lineNums: Array.from(
+                        { length: Math.max(1, endLineNum - startLineNum + 1) },
+                        (_, i) => startLineNum + i
+                    ),
+                    length: Math.max(1, endLineNum - startLineNum + 1)
+                },
+                lineNum: startLineNum,
+                expanded: false,
+                values: initialPanelValues(lineData, startLineNum)
+            };
+            panelsMap.set(startLineNum, panelState);
+            insertPanelLineNumber(startLineNum);
+            if (panelState.values.isDirty) dirtyPanelStartLines.add(startLineNum);
+        } else {
+            panelState.block.startLine = startLineNum;
+            panelState.block.endLine = endLineNum;
+            panelState.block.lineNums = Array.from(
+                { length: Math.max(1, endLineNum - startLineNum + 1) },
+                (_, i) => startLineNum + i
+            );
+            panelState.block.length = panelState.block.lineNums.length;
+        }
+        return panelState;
+    }
 
     // =========================================================================
     // 1. ReviewDraftStore: 独立编辑状态存储 (保证收起/展开不丢失未保存编辑)
@@ -123,6 +237,7 @@
             const url = `${apiBase}${pathSuffix || ''}`;
             attempted.push(url);
             try {
+                PerformanceTelemetry.apiRequests += 1;
                 const response = await fetch(url, options || {});
                 const contentType = (response.headers && typeof response.headers.get === 'function'
                     ? response.headers.get('Content-Type')
@@ -130,6 +245,7 @@
                 const data = (contentType.includes('application/json') || typeof response.json === 'function')
                     ? await response.json()
                     : null;
+                if (!response.ok) PerformanceTelemetry.apiFailures += 1;
                 if (response.ok && data) {
                     resolvedServerUrl = apiBase;
                     return data;
@@ -144,6 +260,9 @@
                 lastError.coverageApiResponse = true;
                 throw lastError;
             } catch (error) {
+                if (!(error && error.coverageApiResponse)) {
+                    PerformanceTelemetry.apiFailures += 1;
+                }
                 lastError = error;
                 if (error && error.coverageApiResponse) {
                     throw error;
@@ -281,13 +400,13 @@
     }
 
     function updateReviewNavigation() {
-        const sortedPanels = Array.from(panelsMap.entries()).sort((a, b) => a[0] - b[0]);
-        sortedPanels.forEach(([lineNum, panel], idx) => {
+        panelLineNumbers.forEach((lineNum, idx) => {
+            const panel = panelsMap.get(lineNum);
             if (panel.previousBtn) {
                 panel.previousBtn.disabled = idx === 0;
             }
             if (panel.nextBtn) {
-                panel.nextBtn.disabled = idx === sortedPanels.length - 1;
+                panel.nextBtn.disabled = idx === panelLineNumbers.length - 1;
             }
         });
     }
@@ -308,6 +427,12 @@
             }
             if (typeof CodeRegionStore !== 'undefined' && CodeRegionStore.findByLine) {
                 const region = CodeRegionStore.findByLine(lineNum);
+                if (region && region.virtualized && typeof CodeRegionController !== 'undefined') {
+                    CodeRegionController.revealLine(region, lineNum).then(() => {
+                        window.setTimeout(() => focusReviewPanel(panel), 0);
+                    });
+                    return;
+                }
                 if (region && region.placeholderEl && region.placeholderEl.isConnected) {
                     region.placeholderEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 }
@@ -316,21 +441,20 @@
     }
 
     function navigateReviewPanel(currentLineNum, direction) {
-        const sortedLines = Array.from(panelsMap.keys()).sort((a, b) => a - b);
-        const currentIndex = sortedLines.indexOf(Number(currentLineNum));
+        const currentIndex = panelLineNumbers.indexOf(Number(currentLineNum));
         if (currentIndex === -1) return;
         const targetIndex = currentIndex + direction;
-        if (targetIndex >= 0 && targetIndex < sortedLines.length) {
-            const targetPanel = panelsMap.get(sortedLines[targetIndex]);
+        if (targetIndex >= 0 && targetIndex < panelLineNumbers.length) {
+            const targetPanel = panelsMap.get(panelLineNumbers[targetIndex]);
             focusReviewPanel(targetPanel);
         }
     }
 
     function findPreviousFilledPanel(currentLineNum) {
-        const sorted = Array.from(panelsMap.entries())
-            .filter(([l]) => l < currentLineNum)
-            .sort((a, b) => b[0] - a[0]);
-        for (const [, panel] of sorted) {
+        for (let i = panelLineNumbers.length - 1; i >= 0; i -= 1) {
+            const lineNum = panelLineNumbers[i];
+            if (lineNum >= currentLineNum) continue;
+            const panel = panelsMap.get(lineNum);
             const status = getStoredPanelValue(panel, 'status');
             const reviewer = getStoredPanelValue(panel, 'reviewerInput');
             if ((status && status !== '未确认') || reviewer) {
@@ -341,15 +465,14 @@
     }
 
     function findPreviousFilledPanelEntry(currentLineNum) {
-        const sorted = Array.from(panelsMap.entries())
-            .filter(([l]) => l < currentLineNum)
-            .sort((a, b) => b[0] - a[0]);
-        for (const entry of sorted) {
-            const panel = entry[1];
+        for (let i = panelLineNumbers.length - 1; i >= 0; i -= 1) {
+            const lineNum = panelLineNumbers[i];
+            if (lineNum >= currentLineNum) continue;
+            const panel = panelsMap.get(lineNum);
             const status = getStoredPanelValue(panel, 'status');
             const reviewer = getStoredPanelValue(panel, 'reviewerInput');
             if ((status && status !== '未确认') || reviewer) {
-                return entry;
+                return [lineNum, panel];
             }
         }
         return null;
@@ -553,9 +676,8 @@
         confirmBtn.title = '校验当前文件内已修改的控件后批量确认提交';
 
         locateBtn.addEventListener('click', function() {
-            const pendingEntry = Array.from(panelsMap.entries())
-                .sort((left, right) => left[0] - right[0])
-                .find(entry => isPanelAwaitingReview(entry[1]));
+            const pendingLine = panelLineNumbers.find(lineNum => isPanelAwaitingReview(panelsMap.get(lineNum)));
+            const pendingEntry = pendingLine === undefined ? null : [pendingLine, panelsMap.get(pendingLine)];
             if (!pendingEntry) {
                 alert('当前已展开区域没有待填写的控件。');
                 return;
@@ -808,6 +930,10 @@
             this._fileMeta.totalLines = layoutData.total_lines || 0;
             this._fileMeta.filePath = layoutData.file_path || '';
             this._fileMeta.projectName = layoutData.project_name || DEFAULT_PROJECT;
+            panelsMap.clear();
+            panelLineNumbers = [];
+            dirtyPanelStartLines.clear();
+            PerformanceTelemetry.reset();
 
             (layoutData.regions || []).forEach(r => {
                 const regState = {
@@ -827,7 +953,14 @@
                     placeholderEl: null,
                     linesEl: null,
                     headerEl: null,
-                    loadGeneration: 0
+                    loadGeneration: 0,
+                    virtualized: false,
+                    virtualTopSpacer: null,
+                    virtualContent: null,
+                    virtualBottomSpacer: null,
+                    virtualStart: 0,
+                    virtualEnd: 0,
+                    virtualRenderPending: false
                 };
                 this._regions.set(r.region_id, regState);
             });
@@ -862,6 +995,7 @@
                 r.lines = lines;
                 r.error = null;
                 r.currentState = 'expanded-loaded';
+                (lines || []).forEach(registerReviewPanelMetadata);
                 if (typeof RegionLineLRUCache !== 'undefined' && RegionLineLRUCache.touch) {
                     RegionLineLRUCache.touch(regionId, (lines || []).length);
                     RegionLineLRUCache.evictIfOverBudget();
@@ -1032,6 +1166,8 @@
                                 const chunkData = await requestCoverageApi(`/code-lines?${query.toString()}`, { method: 'GET' });
                                 if (region.loadGeneration !== generation) return;
                                 const chunkLines = chunkData && chunkData.data && chunkData.data.lines ? chunkData.data.lines : [];
+                                PerformanceTelemetry.networkChunks += 1;
+                                PerformanceTelemetry.networkLines += chunkLines.length;
                                 chunkResults.set(task.index, { task, chunkLines });
                             } catch (err) {
                                 fetchError = err;
@@ -1162,21 +1298,34 @@
             const endLineNum = lineData.block_end_line || lineData.line_no;
             const blockLength = endLineNum - startLineNum + 1;
             const isMultiLine = blockLength > 1;
+            const existingPanelState = registerReviewPanelMetadata(lineData);
 
             // Merge draft store if user had unsaved edits
             const draft = ReviewDraftStore.getDraft(startLineNum);
-            const initialStatus = draft && draft.status !== undefined ? draft.status : (lineData.analysis_state || '未确认');
-            const initialReviewer = draft && draft.reviewer !== undefined ? draft.reviewer : (lineData.reviewer || lineData.suggested_reviewer || '');
-            const initialMethod = draft && draft.coverage_method !== undefined ? draft.coverage_method : (lineData.coverage_method || '');
-            const initialReason = draft && draft.uncovered_reason !== undefined ? draft.uncovered_reason : (lineData.uncovered_reason || '');
-            const isDirty = draft && draft.isDirty !== undefined ? Boolean(draft.isDirty) : false;
-            const isDraft = draft && draft.isDraft !== undefined ? Boolean(draft.isDraft) : Boolean(lineData.is_draft);
+            const existingValues = existingPanelState && existingPanelState.values
+                ? existingPanelState.values : initialPanelValues(lineData, startLineNum);
+            const initialStatus = draft && draft.status !== undefined ? draft.status
+                : (existingValues.status !== undefined ? existingValues.status : (lineData.analysis_state || '未确认'));
+            const initialReviewer = draft && draft.reviewer !== undefined ? draft.reviewer
+                : (existingValues.reviewerInput !== undefined ? existingValues.reviewerInput
+                    : (lineData.reviewer || lineData.suggested_reviewer || ''));
+            const initialMethod = draft && draft.coverage_method !== undefined ? draft.coverage_method
+                : (existingValues.methodInput !== undefined ? existingValues.methodInput : (lineData.coverage_method || ''));
+            const initialReason = draft && draft.uncovered_reason !== undefined ? draft.uncovered_reason
+                : (existingValues.reasonInput !== undefined ? existingValues.reasonInput : (lineData.uncovered_reason || ''));
+            const isDirty = draft && draft.isDirty !== undefined ? Boolean(draft.isDirty)
+                : Boolean(existingValues.isDirty);
+            const isDraft = draft && draft.isDraft !== undefined ? Boolean(draft.isDraft)
+                : Boolean(existingValues.isDraft);
             const isConfirmed = !isDraft && CONFIRMED_STATUS_SET.has(initialStatus);
-            const origSavedConfirmed = !lineData.is_draft && CONFIRMED_STATUS_SET.has(lineData.analysis_state);
+            const origSavedConfirmed = existingValues._origSavedConfirmed !== undefined
+                ? existingValues._origSavedConfirmed
+                : (!lineData.is_draft && CONFIRMED_STATUS_SET.has(lineData.analysis_state));
 
             const panel = document.createElement('span');
             panel.className = 'coverage-analysis-panel' + (isMultiLine ? ' multiline' : '');
             panel.setAttribute('contenteditable', 'false');
+            panel.setAttribute('data-panel-start-line', String(startLineNum));
 
             // Align to right column
             const codeLen = (lineData.source || '').length;
@@ -1190,6 +1339,7 @@
             // Status select
             const select = document.createElement('select');
             select.className = 'coverage-analysis-select';
+            select.setAttribute('data-panel-action', 'status');
             STATUS_OPTIONS.forEach(opt => {
                 const option = document.createElement('option');
                 option.value = opt;
@@ -1204,12 +1354,14 @@
             previousBtn.type = 'button';
             previousBtn.innerText = '上一个';
             previousBtn.setAttribute('aria-label', '跳转到上一个可填写控件');
+            previousBtn.setAttribute('data-panel-action', 'previous');
 
             const nextBtn = document.createElement('button');
             nextBtn.className = 'coverage-navigation-btn';
             nextBtn.type = 'button';
             nextBtn.innerText = '下一个';
             nextBtn.setAttribute('aria-label', '跳转到下一个可填写控件');
+            nextBtn.setAttribute('data-panel-action', 'next');
 
             // Inherit buttons
             const inheritBtn = document.createElement('button');
@@ -1217,12 +1369,14 @@
             inheritBtn.type = 'button';
             inheritBtn.innerText = '继承';
             inheritBtn.title = '继承上一条已填写的分析结果';
+            inheritBtn.setAttribute('data-panel-action', 'inherit');
 
             const batchInheritBtn = document.createElement('button');
             batchInheritBtn.className = 'coverage-inherit-btn batch';
             batchInheritBtn.type = 'button';
             batchInheritBtn.innerText = '批量继承';
             batchInheritBtn.title = '从上方最近已填写控件继承到它之后至当前控件的整段内容';
+            batchInheritBtn.setAttribute('data-panel-action', 'batch-inherit');
 
             // Reviewer input
             const reviewerInput = document.createElement('input');
@@ -1230,12 +1384,14 @@
             reviewerInput.className = 'coverage-analysis-input reviewer-input';
             reviewerInput.placeholder = '确认人';
             reviewerInput.value = initialReviewer;
+            reviewerInput.setAttribute('data-panel-action', 'reviewer');
 
             // Method textarea
             const methodInput = document.createElement('textarea');
             methodInput.className = 'coverage-analysis-input' + (isMultiLine ? ' multiline' : '');
             methodInput.placeholder = '条件覆盖方法';
             methodInput.value = initialMethod;
+            methodInput.setAttribute('data-panel-action', 'method');
             const methodGrip = createResizeGrip(methodInput);
 
             // Reason textarea
@@ -1243,6 +1399,7 @@
             reasonInput.className = 'coverage-analysis-input' + (isMultiLine ? ' multiline' : '');
             reasonInput.placeholder = '无条件覆盖原因';
             reasonInput.value = initialReason;
+            reasonInput.setAttribute('data-panel-action', 'reason');
             const reasonGrip = createResizeGrip(reasonInput);
 
             // Multi-line Badge
@@ -1257,6 +1414,8 @@
             // Save button
             const saveBtn = document.createElement('button');
             saveBtn.className = 'coverage-analysis-btn';
+            saveBtn.type = 'button';
+            saveBtn.setAttribute('data-panel-action', 'save');
             if (isDirty) {
                 saveBtn.innerText = 'Save';
                 saveBtn.className = 'coverage-analysis-btn';
@@ -1291,7 +1450,7 @@
                 length: blockLength
             };
 
-            const panelState = {
+            const panelState = existingPanelState || {
                 select,
                 reviewerInput,
                 methodInput,
@@ -1312,165 +1471,29 @@
                     _origSavedConfirmed: origSavedConfirmed
                 }
             };
-
+            panelState.select = select;
+            panelState.reviewerInput = reviewerInput;
+            panelState.methodInput = methodInput;
+            panelState.reasonInput = reasonInput;
+            panelState.saveBtn = saveBtn;
+            panelState.previousBtn = previousBtn;
+            panelState.nextBtn = nextBtn;
+            panelState.block = blockObj;
+            panelState.lineNum = startLineNum;
+            panelState.expanded = true;
+            panelState.values = Object.assign({}, panelState.values || {}, {
+                status: initialStatus,
+                reviewerInput: initialReviewer,
+                methodInput: initialMethod,
+                reasonInput: initialReason,
+                isDirty: isDirty,
+                isDraft: isDraft,
+                _origSavedConfirmed: origSavedConfirmed
+            });
             panelsMap.set(startLineNum, panelState);
             if (isDirty) {
                 dirtyPanelStartLines.add(startLineNum);
             }
-
-            // Event Listeners
-            saveBtn.addEventListener('click', function(e) {
-                e.preventDefault();
-                e.stopPropagation();
-
-                const reviewerVal = reviewerInput.value.trim();
-                const statusVal = select.value;
-                const methodVal = methodInput.value.trim();
-                const reasonVal = reasonInput.value.trim();
-
-                if (statusVal === '未确认') {
-                    alert(`[校验失败]：请将第一列状态变更为“可覆盖”或“无法覆盖”！`);
-                    select.focus();
-                    return;
-                }
-                if (!reviewerVal) {
-                    alert(`[校验失败]：请输入第二列确认人！`);
-                    reviewerInput.focus();
-                    return;
-                }
-                if (!methodVal && !reasonVal) {
-                    alert(`[校验失败]：“条件覆盖方法”与“无条件覆盖原因”必须填写其中之一！`);
-                    methodInput.focus();
-                    return;
-                }
-
-                saveBtn.innerText = 'Saving...';
-                saveBtn.className = 'coverage-analysis-btn saving';
-
-                saveReviewBlocksBatch(filePath, [{
-                    line_numbers: blockObj.lineNums,
-                    reviewer: reviewerVal,
-                    status: statusVal,
-                    coverage_method: methodVal,
-                    uncovered_reason: reasonVal
-                }], 'confirm').then(() => {
-                    setStoredPanelValues(panelState, {
-                        status: statusVal,
-                        reviewerInput: reviewerVal,
-                        methodInput: methodVal,
-                        reasonInput: reasonVal,
-                        isDraft: false,
-                        isDirty: false,
-                        _origSavedConfirmed: true
-                    });
-                    ReviewDraftStore.setDraft(startLineNum, {
-                        reviewer: reviewerVal,
-                        status: statusVal,
-                        coverage_method: methodVal,
-                        uncovered_reason: reasonVal,
-                        isDraft: false,
-                        isDirty: false
-                    });
-                    clearPanelDirty(startLineNum, false);
-                    saveBtn.innerText = '已确认';
-                    saveBtn.className = 'coverage-analysis-btn saved';
-                    notifyProgressChanged();
-                    updateHeaderStatistics();
-                    showToast(`第 ${startLineNum}-${endLineNum} 行分析已确认保存`);
-                }).catch(err => {
-                    console.error('[CoverageEnhance] Single block save failed:', err);
-                    saveBtn.innerText = 'Error';
-                    saveBtn.className = 'coverage-analysis-btn error';
-                    saveBtn.title = `保存失败: ${err.message}`;
-                    window.setTimeout(() => markPanelDirty(startLineNum), 3000);
-                });
-            });
-
-            inheritBtn.addEventListener('click', function(e) {
-                e.preventDefault();
-                e.stopPropagation();
-                const previous = findPreviousFilledPanel(startLineNum);
-                if (!previous) {
-                    alert('没有找到上一条已填写的分析结果。');
-                    return;
-                }
-                const currentPanel = panelsMap.get(startLineNum);
-                setStoredPanelValues(currentPanel, {
-                    status: getStoredPanelValue(previous, 'status') || '未确认',
-                    reviewerInput: getStoredPanelValue(previous, 'reviewerInput'),
-                    methodInput: getStoredPanelValue(previous, 'methodInput'),
-                    reasonInput: getStoredPanelValue(previous, 'reasonInput'),
-                    isDirty: true
-                });
-                saveBtn.innerText = 'Save';
-                saveBtn.className = 'coverage-analysis-btn';
-                markPanelDirty(startLineNum);
-            });
-
-            batchInheritBtn.addEventListener('click', function(e) {
-                e.preventDefault();
-                e.stopPropagation();
-                const sourceEntry = findPreviousFilledPanelEntry(startLineNum);
-                if (!sourceEntry) {
-                    alert('没有找到可作为批量继承来源的上一条已填写结果。');
-                    return;
-                }
-                const sourceLineNum = sourceEntry[0];
-                const sourcePanel = sourceEntry[1];
-                const inheritedValues = {
-                    status: getStoredPanelValue(sourcePanel, 'status') || '未确认',
-                    reviewerInput: getStoredPanelValue(sourcePanel, 'reviewerInput'),
-                    methodInput: getStoredPanelValue(sourcePanel, 'methodInput'),
-                    reasonInput: getStoredPanelValue(sourcePanel, 'reasonInput'),
-                    isDirty: true
-                };
-                const targetEntries = Array.from(panelsMap.entries())
-                    .filter(([lineNum]) => lineNum > sourceLineNum && lineNum <= startLineNum)
-                    .sort((a, b) => a[0] - b[0]);
-
-                targetEntries.forEach(([lineNum, targetPanel]) => {
-                    setStoredPanelValues(targetPanel, inheritedValues);
-                    if (targetPanel.saveBtn) {
-                        targetPanel.saveBtn.innerText = 'Save';
-                        targetPanel.saveBtn.className = 'coverage-analysis-btn';
-                    }
-                    markPanelDirty(lineNum);
-                });
-                alert(`已从第 ${sourceLineNum} 行批量继承到 ${targetEntries.length} 个控件，请点击“暂存草稿”或“确认提交”写入数据库。`);
-            });
-
-            previousBtn.addEventListener('click', function(e) {
-                e.preventDefault();
-                e.stopPropagation();
-                navigateReviewPanel(startLineNum, -1);
-            });
-
-            nextBtn.addEventListener('click', function(e) {
-                e.preventDefault();
-                e.stopPropagation();
-                navigateReviewPanel(startLineNum, 1);
-            });
-
-            select.addEventListener('change', function() {
-                if (saveBtn.className.includes('saved')) {
-                    saveBtn.innerText = 'Save';
-                    saveBtn.className = 'coverage-analysis-btn';
-                }
-                setStoredPanelValues(panelState, { status: select.value, isDirty: true });
-                markPanelDirty(startLineNum);
-            });
-
-            [reviewerInput, methodInput, reasonInput].forEach(input => {
-                input.addEventListener('input', function() {
-                    setStoredPanelValues(panelState, {
-                        reviewerInput: reviewerInput.value,
-                        methodInput: methodInput.value,
-                        reasonInput: reasonInput.value,
-                        isDirty: true
-                    });
-                    markPanelDirty(startLineNum);
-                });
-            });
 
             return panel;
         }
@@ -1483,10 +1506,314 @@
         filePath: '',
         container: null,
         toolbarEl: null,
+        _panelDelegationRoot: null,
+        _virtualListenerInstalled: false,
+
+        installPanelDelegation(container) {
+            if (!container || this._panelDelegationRoot === container) return;
+            this._panelDelegationRoot = container;
+            container.addEventListener('click', event => this.handlePanelClick(event));
+            container.addEventListener('change', event => this.handlePanelChange(event));
+            container.addEventListener('input', event => this.handlePanelInput(event));
+        },
+
+        installVirtualScrollListener() {
+            if (this._virtualListenerInstalled || typeof window === 'undefined' || !window.addEventListener) return;
+            this._virtualListenerInstalled = true;
+            const refresh = () => {
+                CodeRegionStore.getAll().forEach(region => {
+                    if (region.virtualized && region.linesEl && region.loaded) {
+                        this.scheduleVirtualRender(region);
+                    }
+                });
+            };
+            window.addEventListener('scroll', refresh, { passive: true });
+            window.addEventListener('resize', refresh);
+        },
+
+        ensureVirtualScaffold(region) {
+            if (!region.linesEl || !region.virtualized) return;
+            if (region.virtualTopSpacer && region.virtualContent && region.virtualBottomSpacer) return;
+            region.linesEl.innerHTML = '';
+            const top = document.createElement('div');
+            top.className = 'coverage-virtual-spacer';
+            top.setAttribute('aria-hidden', 'true');
+            const content = document.createElement('div');
+            content.className = 'coverage-virtual-content';
+            const bottom = document.createElement('div');
+            bottom.className = 'coverage-virtual-spacer';
+            bottom.setAttribute('aria-hidden', 'true');
+            region.virtualTopSpacer = top;
+            region.virtualContent = content;
+            region.virtualBottomSpacer = bottom;
+            region.linesEl.appendChild(top);
+            region.linesEl.appendChild(content);
+            region.linesEl.appendChild(bottom);
+        },
+
+        virtualWindowBounds(region, forcedStart) {
+            const total = Math.max(Number(region.lineCount) || 0, (region.lines || []).length);
+            const visibleRows = Math.max(1, Math.ceil((Number(window.innerHeight) || 800) / VIRTUAL_LINE_HEIGHT));
+            if (Number.isFinite(forcedStart)) {
+                const centered = Math.floor(visibleRows / 2);
+                const start = Math.max(0, Math.min(total, Math.floor(forcedStart) - centered - VIRTUAL_OVERSCAN_LINES));
+                return {
+                    start,
+                    end: Math.min(total, start + visibleRows + (VIRTUAL_OVERSCAN_LINES * 2))
+                };
+            }
+            let viewportStart = 0;
+            if (region.linesEl && region.linesEl.getBoundingClientRect) {
+                const rect = region.linesEl.getBoundingClientRect();
+                const scrollTop = Number(window.pageYOffset || window.scrollY || 0);
+                viewportStart = Math.max(0, scrollTop - (Number(rect.top) + scrollTop));
+            }
+            const firstVisible = Math.floor(viewportStart / VIRTUAL_LINE_HEIGHT);
+            const start = Math.max(0, firstVisible - VIRTUAL_OVERSCAN_LINES);
+            return {
+                start,
+                end: Math.min(total, start + visibleRows + (VIRTUAL_OVERSCAN_LINES * 2))
+            };
+        },
+
+        renderVirtualWindow(region, forcedStart) {
+            if (!region || !region.virtualized || !region.linesEl) return;
+            this.ensureVirtualScaffold(region);
+            if (!region.virtualContent) return;
+            const bounds = this.virtualWindowBounds(region, forcedStart);
+            const availableEnd = Math.min(bounds.end, (region.lines || []).length);
+            const fragment = document.createDocumentFragment();
+            for (let index = bounds.start; index < availableEnd; index += 1) {
+                const line = region.lines[index];
+                if (line) fragment.appendChild(CodeLineRenderer.renderCodeLine(line, this.filePath));
+            }
+            region.virtualContent.innerHTML = '';
+            region.virtualContent.appendChild(fragment);
+            region.virtualStart = bounds.start;
+            region.virtualEnd = availableEnd;
+            region.virtualTopSpacer.style.height = `${bounds.start * VIRTUAL_LINE_HEIGHT}px`;
+            region.virtualBottomSpacer.style.height = `${Math.max(0, (Math.max(region.lineCount, region.lines.length) - availableEnd) * VIRTUAL_LINE_HEIGHT)}px`;
+            PerformanceTelemetry.virtualRenders += 1;
+            PerformanceTelemetry.recordDomLineCount(region.virtualContent.children.length, true);
+        },
+
+        scheduleVirtualRender(region, forcedStart) {
+            if (!region || !region.virtualized || region.virtualRenderPending) return;
+            region.virtualRenderPending = true;
+            const render = () => {
+                region.virtualRenderPending = false;
+                this.renderVirtualWindow(region, forcedStart);
+            };
+            if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+                window.requestAnimationFrame(render);
+            } else {
+                setTimeout(render, 0);
+            }
+        },
+
+        async revealLine(region, lineNum) {
+            if (!region) return;
+            if (!region.loaded) await this.expandRegion(region.id);
+            if (region.virtualized) {
+                this.renderVirtualWindow(region, Number(lineNum) - Number(region.startLine));
+            }
+            const targetLine = document.getElementById(`L${lineNum}`);
+            if (targetLine && targetLine.scrollIntoView) {
+                targetLine.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                targetLine.style.background = '#fff8c5';
+                setTimeout(() => targetLine.style.background = '', 2000);
+            }
+        },
+
+        delegatedPanelTarget(target, root) {
+            let current = target;
+            while (current && current !== root) {
+                if (current.dataset && current.dataset.panelStartLine) {
+                    return current;
+                }
+                current = current.parentNode;
+            }
+            return null;
+        },
+
+        delegatedActionTarget(target, root) {
+            let current = target;
+            while (current && current !== root) {
+                if (current.dataset && current.dataset.panelAction) {
+                    return current;
+                }
+                current = current.parentNode;
+            }
+            return null;
+        },
+
+        panelForEvent(event) {
+            const panelEl = this.delegatedPanelTarget(event.target, this._panelDelegationRoot);
+            if (!panelEl) return null;
+            return panelsMap.get(Number(panelEl.dataset.panelStartLine));
+        },
+
+        handlePanelClick(event) {
+            const actionEl = this.delegatedActionTarget(event.target, this._panelDelegationRoot);
+            if (!actionEl) return;
+            const action = actionEl.dataset.panelAction;
+            const panel = this.panelForEvent(event);
+            if (!panel) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (action === 'save') this.savePanel(panel);
+            else if (action === 'previous') navigateReviewPanel(panel.lineNum, -1);
+            else if (action === 'next') navigateReviewPanel(panel.lineNum, 1);
+            else if (action === 'inherit') this.inheritPanel(panel);
+            else if (action === 'batch-inherit') this.batchInheritPanel(panel);
+        },
+
+        handlePanelChange(event) {
+            const actionEl = this.delegatedActionTarget(event.target, this._panelDelegationRoot);
+            if (!actionEl || actionEl.dataset.panelAction !== 'status') return;
+            const panel = this.panelForEvent(event);
+            if (!panel) return;
+            if (panel.saveBtn && String(panel.saveBtn.className).includes('saved')) {
+                panel.saveBtn.innerText = 'Save';
+                panel.saveBtn.className = 'coverage-analysis-btn';
+            }
+            setStoredPanelValues(panel, {
+                status: panel.select ? panel.select.value : event.target.value,
+                isDirty: true
+            });
+            markPanelDirty(panel.lineNum);
+        },
+
+        handlePanelInput(event) {
+            const actionEl = this.delegatedActionTarget(event.target, this._panelDelegationRoot);
+            if (!actionEl || !['reviewer', 'method', 'reason'].includes(actionEl.dataset.panelAction)) return;
+            const panel = this.panelForEvent(event);
+            if (!panel) return;
+            setStoredPanelValues(panel, {
+                reviewerInput: panel.reviewerInput ? panel.reviewerInput.value : '',
+                methodInput: panel.methodInput ? panel.methodInput.value : '',
+                reasonInput: panel.reasonInput ? panel.reasonInput.value : '',
+                isDirty: true
+            });
+            markPanelDirty(panel.lineNum);
+        },
+
+        savePanel(panel) {
+            const reviewerVal = getStoredPanelValue(panel, 'reviewerInput').trim();
+            const statusVal = getStoredPanelValue(panel, 'status');
+            const methodVal = getStoredPanelValue(panel, 'methodInput').trim();
+            const reasonVal = getStoredPanelValue(panel, 'reasonInput').trim();
+            const fail = message => {
+                if (typeof alert === 'function') alert(message);
+            };
+            if (statusVal === '未确认') {
+                fail('[校验失败]：请将第一列状态变更为“可覆盖”或“无法覆盖”！');
+                if (panel.select) panel.select.focus();
+                return;
+            }
+            if (!reviewerVal) {
+                fail('[校验失败]：请输入第二列确认人！');
+                if (panel.reviewerInput) panel.reviewerInput.focus();
+                return;
+            }
+            if (!methodVal && !reasonVal) {
+                fail('[校验失败]：“条件覆盖方法”与“无条件覆盖原因”必须填写其中之一！');
+                if (panel.methodInput) panel.methodInput.focus();
+                return;
+            }
+            if (panel.saveBtn) {
+                panel.saveBtn.innerText = 'Saving...';
+                panel.saveBtn.className = 'coverage-analysis-btn saving';
+            }
+            return saveReviewBlocksBatch(this.filePath, [{
+                line_numbers: panel.block.lineNums,
+                reviewer: reviewerVal,
+                status: statusVal,
+                coverage_method: methodVal,
+                uncovered_reason: reasonVal
+            }], 'confirm').then(() => {
+                setStoredPanelValues(panel, {
+                    status: statusVal, reviewerInput: reviewerVal,
+                    methodInput: methodVal, reasonInput: reasonVal,
+                    isDraft: false, isDirty: false, _origSavedConfirmed: true
+                });
+                clearPanelDirty(panel.lineNum, false);
+                if (panel.saveBtn) {
+                    panel.saveBtn.innerText = '已确认';
+                    panel.saveBtn.className = 'coverage-analysis-btn saved';
+                }
+                notifyProgressChanged();
+                updateHeaderStatistics();
+                showToast(`第 ${panel.block.startLine}-${panel.block.endLine} 行分析已确认保存`);
+            }).catch(err => {
+                console.error('[CoverageEnhance] Single block save failed:', err);
+                if (panel.saveBtn) {
+                    panel.saveBtn.innerText = 'Error';
+                    panel.saveBtn.className = 'coverage-analysis-btn error';
+                    panel.saveBtn.title = `保存失败: ${err.message}`;
+                }
+                window.setTimeout(() => markPanelDirty(panel.lineNum), 3000);
+            });
+        },
+
+        inheritPanel(panel) {
+            const previous = findPreviousFilledPanel(panel.lineNum);
+            if (!previous) {
+                if (typeof alert === 'function') alert('没有找到上一条已填写的分析结果。');
+                return;
+            }
+            setStoredPanelValues(panel, {
+                status: getStoredPanelValue(previous, 'status') || '未确认',
+                reviewerInput: getStoredPanelValue(previous, 'reviewerInput'),
+                methodInput: getStoredPanelValue(previous, 'methodInput'),
+                reasonInput: getStoredPanelValue(previous, 'reasonInput'),
+                isDirty: true
+            });
+            if (panel.saveBtn) {
+                panel.saveBtn.innerText = 'Save';
+                panel.saveBtn.className = 'coverage-analysis-btn';
+            }
+            markPanelDirty(panel.lineNum);
+        },
+
+        batchInheritPanel(panel) {
+            const sourceEntry = findPreviousFilledPanelEntry(panel.lineNum);
+            if (!sourceEntry) {
+                if (typeof alert === 'function') alert('没有找到可作为批量继承来源的上一条已填写结果。');
+                return;
+            }
+            const sourceLineNum = sourceEntry[0];
+            const sourcePanel = sourceEntry[1];
+            const inheritedValues = {
+                status: getStoredPanelValue(sourcePanel, 'status') || '未确认',
+                reviewerInput: getStoredPanelValue(sourcePanel, 'reviewerInput'),
+                methodInput: getStoredPanelValue(sourcePanel, 'methodInput'),
+                reasonInput: getStoredPanelValue(sourcePanel, 'reasonInput'),
+                isDirty: true
+            };
+            const targetEntries = panelLineNumbers
+                .filter(lineNum => lineNum > sourceLineNum && lineNum <= panel.lineNum)
+                .map(lineNum => [lineNum, panelsMap.get(lineNum)]);
+            targetEntries.forEach(([lineNum, targetPanel]) => {
+                setStoredPanelValues(targetPanel, inheritedValues);
+                if (targetPanel.saveBtn) {
+                    targetPanel.saveBtn.innerText = 'Save';
+                    targetPanel.saveBtn.className = 'coverage-analysis-btn';
+                }
+                markPanelDirty(lineNum);
+            });
+            if (typeof alert === 'function') {
+                alert(`已从第 ${sourceLineNum} 行批量继承到 ${targetEntries.length} 个控件，请点击“暂存草稿”或“确认提交”写入数据库。`);
+            }
+        },
 
         async init(layoutData, preSource) {
+            const layoutStart = typeof performance !== 'undefined' && performance.now
+                ? performance.now() : 0;
             this.filePath = layoutData.file_path || '';
             this.container = preSource;
+            this.installPanelDelegation(preSource);
+            this.installVirtualScrollListener();
             CodeRegionStore.init(layoutData);
 
             // Calculate initial total uncovered from layout
@@ -1545,6 +1872,10 @@
 
             // Handle anchor navigation if present in URL (e.g. #L42)
             this.handleHashAnchor();
+            if (layoutStart) {
+                PerformanceTelemetry.layoutStart = layoutStart;
+                PerformanceTelemetry.layoutMs = Number((performance.now() - layoutStart).toFixed(3));
+            }
         },
 
         createPlaceholderElement(region) {
@@ -1664,6 +1995,11 @@
                 });
 
                 if (region.loadGeneration === currentGen && region.currentState !== 'collapsed-unloaded' && region.currentState !== 'collapsed-loaded') {
+                    // Non-chunked ranges are loaded directly by the loader and
+                    // therefore have no streaming callback to populate the DOM.
+                    if (region.loaded && !region.virtualized && region.linesEl && !region.linesEl.children.length) {
+                        await this.renderRegionLines(region);
+                    }
                     await this.finalizeRegionLoaded(region);
                 }
             } catch (err) {
@@ -1708,11 +2044,23 @@
                 container.appendChild(linesContainer);
             } else if (options.reset) {
                 region.linesEl.innerHTML = '';
+                region.virtualTopSpacer = null;
+                region.virtualContent = null;
+                region.virtualBottomSpacer = null;
             }
+            region.virtualized = (Number(region.lineCount) || 0) >= VIRTUAL_SCROLL_THRESHOLD;
+            if (region.virtualized) this.ensureVirtualScaffold(region);
         },
 
         async appendChunkLines(region, chunkLines) {
             if (!region.linesEl || !chunkLines || !chunkLines.length) return;
+            if (region.virtualized) {
+                if (!region.virtualContent || !region.virtualContent.children.length) {
+                    this.renderVirtualWindow(region);
+                }
+                await yieldToBrowser();
+                return;
+            }
             const fragment = document.createDocumentFragment();
             for (const line of chunkLines) {
                 fragment.appendChild(CodeLineRenderer.renderCodeLine(line, this.filePath));
@@ -1729,6 +2077,7 @@
                 region.placeholderEl.style.display = 'none';
             }
             CodeRegionStore.setExpanded(region.id);
+            if (region.virtualized) this.renderVirtualWindow(region);
             updateReviewNavigation();
             updateHeaderStatistics();
         },
@@ -1749,6 +2098,10 @@
                 region.headerEl.remove();
                 region.headerEl = null;
             }
+            region.virtualTopSpacer = null;
+            region.virtualContent = null;
+            region.virtualBottomSpacer = null;
+            region.virtualRenderPending = false;
 
             CodeRegionStore.setCollapsed(region.id);
 
@@ -1775,7 +2128,12 @@
             }
 
             this.prepareRegionLinesContainer(region);
-            await this.renderLinesInBatches(region.lines, region.linesEl);
+            if (region.virtualized) {
+                this.renderVirtualWindow(region);
+            } else {
+                await this.renderLinesInBatches(region.lines, region.linesEl);
+                PerformanceTelemetry.recordDomLineCount(region.linesEl.children.length, false);
+            }
             await this.finalizeRegionLoaded(region);
         },
 
@@ -1927,9 +2285,13 @@
                     targetLine.scrollIntoView({ behavior: 'smooth', block: 'center' });
                     targetLine.style.background = '#fff8c5';
                     setTimeout(() => targetLine.style.background = '', 2000);
+                } else if (region.virtualized) {
+                    this.revealLine(region, lineNum);
                 }
             } else if (region.placeholderEl) {
-                region.placeholderEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                if (region.placeholderEl.scrollIntoView) {
+                    region.placeholderEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                }
             }
         }
     };
@@ -1970,6 +2332,7 @@
             }
         }
         currentFilePath = filePath;
+        CodeRegionController.filePath = filePath;
 
         console.log('[CoverageEnhance] Current file path:', filePath);
         console.log('[CoverageEnhance] Report ID:', currentReportId);
@@ -1991,6 +2354,7 @@
 
         createModeToggler();
         createBatchToolbar(filePath);
+        CodeRegionController.installPanelDelegation(preSource);
 
         // Branch by ACTIVE_MODE
         if (ACTIVE_MODE === 'lazy_collapse') {
@@ -2288,7 +2652,8 @@
             CodeRegionLoader,
             CodeLineRenderer,
             CodeRegionController,
-            RegionLineLRUCache
+            RegionLineLRUCache,
+            PerformanceTelemetry
         };
     }
 })();

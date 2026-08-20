@@ -816,6 +816,7 @@ class TestLazyCollapseV11Fixes(unittest.TestCase):
         )
         self.assertEqual(len(batch["ranges"]), num_fns)
         self.assertTrue(batch["perf"]["verified_default_batch"])
+        self.assertEqual(batch["perf"]["source_context_loads"], 1)
 
     def test_28_cpp_function_parser_edge_cases(self):
         """P2-4: Verify C++ function parser handles templates, multiline return types, operator(), and attributes."""

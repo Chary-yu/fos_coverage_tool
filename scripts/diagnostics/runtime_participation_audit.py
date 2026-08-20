@@ -80,7 +80,7 @@ def audit():
         ]),
         _check("mysql_connection_pool", ["app/bootstrap.py", "app/db/manager.py", "app/db/connection_pool.py"], [
             r"DatabaseManager\(config\)",
-            r"get_global_pool\(self\.config\)",
+            r"get_global_pool\((?:self\.config|pool_config)\)",
             r"class MySQLConnectionPool",
         ]),
         _check("bounded_background_executor", ["app/bootstrap.py", "app/jobs/service.py"], [

@@ -909,6 +909,21 @@ table.source {
     box-sizing: border-box !important;
 }
 
+/* Keep the logical height of very large regions while retaining only the
+ * viewport window (plus overscan) as real line DOM. */
+.coverage-virtual-spacer {
+    display: block !important;
+    width: 100% !important;
+    clear: both !important;
+    pointer-events: none !important;
+}
+
+.coverage-virtual-content {
+    display: block !important;
+    width: 100% !important;
+    clear: both !important;
+}
+
 /* Toast Message */
 .coverage-toast {
     position: fixed !important;
@@ -929,6 +944,5 @@ table.source {
     from { opacity: 0; transform: translate(-50%, 10px); }
     to { opacity: 1; transform: translate(-50%, 0); }
 }
-
 
 

@@ -16,10 +16,12 @@ class BackgroundJobService:
         self.store = store
         self.heartbeat_timeout = heartbeat_timeout
 
-    def submit(self, kind: str, project: str, version: int, fn: Callable, args=(), kwargs=None):
+    def submit(self, kind: str, project: str, version: int, fn: Callable, args=(), kwargs=None,
+               resource_class: str = "default"):
         return self.executor.submit_job(
             job_type="{}:{}".format(kind, version), project_name=project,
             fn=fn, args=args, kwargs=kwargs or {}, reuse_existing=True,
+            resource_class=resource_class,
         )
 
     def recover(self):
@@ -62,7 +64,7 @@ class VNextBackgroundJobService(object):
                 close()
 
     def submit(self, project_id, scan_id, kind, data_version, callback,
-               input_payload=None, job_id=None):
+               input_payload=None, job_id=None, resource_class=None):
         connection = self.connection_factory()
         try:
             active = self.repository.find_active(
@@ -112,8 +114,20 @@ class VNextBackgroundJobService(object):
             fn=run,
             job_id=job_id,
             reuse_existing=True,
+            resource_class=resource_class or self.resource_for_kind(kind),
         )
         return persisted
+
+    @staticmethod
+    def resource_for_kind(kind):
+        return {
+            "rebuild_progress": "database",
+            "export": "disk",
+            "incremental": "cpu",
+        }.get(str(kind or ""), "default")
+
+    def metrics(self):
+        return self.executor.metrics()
 
     def recover(self, heartbeat_timeout=None):
         connection = self.connection_factory()

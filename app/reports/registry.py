@@ -114,7 +114,8 @@ class ReportRegistry(object):
             for directory in value.get("directories") or []:
                 if not os.path.isdir(directory):
                     continue
-                if value.get("sidecar_required"):
+                if value.get("sidecar_required") or os.path.isdir(
+                        os.path.join(directory, ".source_cache")):
                     sidecar = os.path.join(directory, ".source_cache", report_id)
                     if not os.path.isdir(sidecar):
                         continue
@@ -141,7 +142,8 @@ class ReportRegistry(object):
         for path in value.get("directories") or []:
             if not os.path.isdir(path):
                 continue
-            if value.get("sidecar_required") and not os.path.isdir(
+            if (value.get("sidecar_required") or os.path.isdir(
+                    os.path.join(path, ".source_cache"))) and not os.path.isdir(
                     os.path.join(path, ".source_cache", report_id)):
                 continue
             roots.append(path)

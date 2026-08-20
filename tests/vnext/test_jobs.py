@@ -95,6 +95,48 @@ class VNextJobsTest(unittest.TestCase):
             finally:
                 runtime.close()
 
+    def test_resource_classes_keep_cpu_work_from_waiting_on_database_work(self):
+        """Disk/DB-bound queues have independent workers and observable limits."""
+        import threading
+
+        executor = BoundedJobExecutor(
+            max_workers=1,
+            max_queue_size=2,
+            resource_limits={
+                "database": {"max_workers": 1, "max_queue_size": 2},
+                "cpu": {"max_workers": 1, "max_queue_size": 2},
+            },
+        )
+        database_started = threading.Event()
+        release_database = threading.Event()
+        cpu_finished = threading.Event()
+
+        def database_job():
+            database_started.set()
+            release_database.wait(2)
+
+        def cpu_job():
+            cpu_finished.set()
+
+        try:
+            database = executor.submit_job(
+                "rebuild", "fixture", database_job, resource_class="database"
+            )
+            self.assertTrue(database_started.wait(1))
+            executor.submit_job("incremental", "fixture", cpu_job, resource_class="cpu")
+            self.assertTrue(cpu_finished.wait(1), "CPU queue must not wait for DB queue")
+            metrics = executor.metrics()
+            self.assertEqual(metrics["resources"]["database"]["workers"], 1)
+            self.assertEqual(metrics["resources"]["cpu"]["workers"], 1)
+            self.assertEqual(database.resource_class, "database")
+        finally:
+            release_database.set()
+            executor.shutdown(wait=True)
+
+        self.assertEqual(VNextBackgroundJobService.resource_for_kind("rebuild_progress"), "database")
+        self.assertEqual(VNextBackgroundJobService.resource_for_kind("export"), "disk")
+        self.assertEqual(VNextBackgroundJobService.resource_for_kind("incremental"), "cpu")
+
 
 if __name__ == "__main__":
     unittest.main()

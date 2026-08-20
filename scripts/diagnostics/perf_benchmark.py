@@ -132,6 +132,7 @@ def run_performance_suite() -> Dict[str, Any]:
                 "region_count": len(layout.get("regions", [])),
                 "layout_latency_ms": avg_layout_ms,
                 "chunk_slice_latency_ms": avg_chunk_ms,
+                "sidecar_cache_stats": service._sidecar_store.cache_stats(),
                 "status": "PASSED" if avg_layout_ms < 50.0 else "WARNING"
             }
             

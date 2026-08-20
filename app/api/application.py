@@ -28,6 +28,7 @@ class VNextApplication(object):
 
     def _register_routes(self):
         self.router.add("GET", r"^/api/coverage/health$", self.health)
+        self.router.add("GET", r"^/api/coverage/metrics$", self.metrics)
         self.router.add("GET", r"^/api/coverage/release$", self.release)
         self.router.add("GET", r"^/api/coverage/projects$", self.projects)
         self.router.add("GET", r"^/api/coverage/projects/([^/]+)/scans$", self.scans)
@@ -77,7 +78,10 @@ class VNextApplication(object):
             return 500, {"error": "internal_error", "message": str(exc)}
 
     def _read_connection(self):
-        return self.runtime.connection_context()
+        return self.runtime.connection_context(read_only=True)
+
+    def _write_connection(self):
+        return self.runtime.connection_context(read_only=False)
 
     def _require_mutation(self, headers, remote_address):
         allowed, status, identity = self.authorizer.authorize(headers, remote_address)
@@ -87,6 +91,18 @@ class VNextApplication(object):
 
     def health(self, query, body, headers, remote_address):
         return 200, health_endpoint.payload(self)
+
+    def metrics(self, query, body, headers, remote_address):
+        """Expose bounded runtime counters without including review data."""
+        runtime = self.runtime
+        payload = {
+            "runtime": "vnext",
+            "code_detail": runtime.code_detail.metrics(),
+            "jobs": runtime.job_service.metrics(),
+        }
+        if runtime.database_manager is not None:
+            payload["db_pool"] = runtime.database_manager.health()
+        return 200, payload
 
     def release(self, query, body, headers, remote_address):
         return 200, release_endpoint.payload(self)
@@ -127,7 +143,7 @@ class VNextApplication(object):
             state = self.runtime.states.get(connection, int(scan["project_id"])) or {}
         if kind == "rebuild_progress":
             def callback():
-                with self._read_connection() as callback_connection:
+                with self._write_connection() as callback_connection:
                     self.runtime.progress_service.rebuild(
                         callback_connection, project["project_name"], int(scan_id)
                     )
@@ -187,7 +203,7 @@ class VNextApplication(object):
     def incremental(self, query, body, headers, remote_address):
         self._require_mutation(headers, remote_address)
         project_name = incremental_endpoint.request(body)
-        with self._read_connection() as connection:
+        with self._write_connection() as connection:
             result = self.runtime.incremental_service.build_and_persist(
                 connection, project_name, int(body["scan_id"]), body["repo_path"],
                 body["oldgit"], body["newgit"], body["info_path"],
@@ -258,14 +274,14 @@ class VNextApplication(object):
     def create_project(self, query, body, headers, remote_address):
         self._require_mutation(headers, remote_address)
         project_name = projects_endpoint.project_name(body)
-        with self._read_connection() as connection:
+        with self._write_connection() as connection:
             row = self.runtime.project_service.ensure_project(connection, project_name)
             return 201, {"project": row}
 
     def create_scan(self, query, body, headers, remote_address):
         self._require_mutation(headers, remote_address)
         project_name = projects_endpoint.project_name(body)
-        with self._read_connection() as connection:
+        with self._write_connection() as connection:
             if body.get("info_path"):
                 result = self.runtime.scan_import_service.import_info(
                     connection, project_name, body["info_path"],
@@ -288,7 +304,7 @@ class VNextApplication(object):
     def save_analysis(self, query, body, headers, remote_address):
         identity = self._require_mutation(headers, remote_address)
         project_name, scan_id, records = analysis_endpoint.request(body)
-        with self._read_connection() as connection:
+        with self._write_connection() as connection:
             result = self.runtime.analysis_service.save(
                 connection, project_name, scan_id, records,
                 reviewer=body.get("reviewer") or identity,
@@ -300,7 +316,7 @@ class VNextApplication(object):
         project_name = str(body.get("project_name") or "").strip()
         if not project_name:
             raise ValueError("project_name is required")
-        with self._read_connection() as connection:
+        with self._write_connection() as connection:
             return 200, self.runtime.progress_service.rebuild(
                 connection, project_name, body.get("scan_id")
             )

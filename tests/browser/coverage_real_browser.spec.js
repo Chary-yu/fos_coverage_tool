@@ -274,7 +274,7 @@ test('real Chromium incremental reviewer suggestions split adjacent blocks and s
     await expect(page.locator('#L600')).toBeVisible({ timeout: 15000 });
 
     const panels = page.locator('.coverage-analysis-panel');
-    await expect(panels).toHaveCount(8);
+    await expect(panels).toHaveCount(7);
     await expect(panels.nth(0).locator('input.reviewer-input')).toHaveValue('Alice');
     await expect(panels.nth(1).locator('input.reviewer-input')).toHaveValue('Bob');
     await expect(page.locator('#L1')).toHaveAttribute('data-coverage-reviewer', 'Alice');
@@ -303,7 +303,8 @@ test('real Chromium LRU evicts collapsed regions while preserving a reload path'
     await page.goto(`${harness.baseUrl}/fixture.c.gcov.html`, { waitUntil: 'networkidle' });
     for (let index = 0; index < 3; index += 1) {
       await page.locator('.coverage-region-placeholder').nth(index).click();
-      await expect(page.locator(`#L${(index + 1) * 17000}`)).toBeVisible({ timeout: 30000 });
+      await expect(page.locator(`#L${index * 17000 + 1}`)).toBeVisible({ timeout: 30000 });
+      expect(await page.locator('pre.source span[id^="L"]').count()).toBeLessThan(1500);
       await page.locator('.coverage-region-collapse-btn').nth(0).click();
     }
     // 51k loaded lines exceed the 50k LRU budget; the oldest collapsed region
@@ -311,9 +312,9 @@ test('real Chromium LRU evicts collapsed regions while preserving a reload path'
     expect(await page.locator('#L1').count()).toBe(0);
     const beforeReload = harness.requests.filter(item => item.start === 1).length;
     await page.locator('.coverage-region-placeholder').nth(0).click();
-    await expect(page.locator('#L17000')).toBeVisible({ timeout: 30000 });
+    await expect(page.locator('#L1')).toBeVisible({ timeout: 30000 });
     expect(harness.requests.filter(item => item.start === 1).length).toBeGreaterThan(beforeReload);
-    expect(await page.locator('pre.source span[id^="L"]').evaluateAll(nodes => new Set(nodes.map(node => node.id)).size)).toBe(17000);
+    expect(await page.locator('pre.source span[id^="L"]').count()).toBeLessThan(1500);
   } finally {
     await stopHarness(harness);
   }

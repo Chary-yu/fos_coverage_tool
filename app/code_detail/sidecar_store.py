@@ -48,12 +48,36 @@ class SidecarStore:
         self._metadata_cache: Dict[Tuple[str, str, str], Tuple[Tuple[int, int], Dict[str, Any]]] = {}
         self._legacy_cache: Dict[Tuple[str, str, str], Tuple[Tuple[int, int], Dict[str, Any]]] = {}
         self._decoded_chunk_cache = OrderedDict()
+        self._report_cache_dirs = {}
+        self._metrics = {
+            "metadata_reads": 0, "metadata_cache_hits": 0,
+            "legacy_reads": 0, "legacy_cache_hits": 0,
+            "chunk_reads": 0, "chunk_cache_hits": 0,
+            "path_resolution_reads": 0,
+        }
 
     def add_search_dir(self, directory: str):
         if directory and os.path.isdir(directory):
             abs_d = os.path.abspath(directory)
             if abs_d not in self.search_dirs:
                 self.search_dirs.append(abs_d)
+                with self._cache_lock:
+                    self._report_cache_dirs.clear()
+
+    def _inc_metric(self, name: str) -> None:
+        with self._cache_lock:
+            self._metrics[name] = self._metrics.get(name, 0) + 1
+
+    def cache_stats(self) -> Dict[str, Any]:
+        with self._cache_lock:
+            result = dict(self._metrics)
+            result.update({
+                "metadata_entries": len(self._metadata_cache),
+                "legacy_entries": len(self._legacy_cache),
+                "decoded_chunk_entries": len(self._decoded_chunk_cache),
+                "report_directory_entries": len(self._report_cache_dirs),
+            })
+        return result
 
     @staticmethod
     def _stat_signature(path: str) -> Optional[Tuple[int, int]]:
@@ -98,8 +122,10 @@ class SidecarStore:
         with self._cache_lock:
             cached = self._metadata_cache.get(cache_key)
             if cached and cached[0] == signature:
+                self._metrics["metadata_cache_hits"] += 1
                 return cached[1]
             try:
+                self._metrics["metadata_reads"] += 1
                 with open(meta_path, "r", encoding="utf-8") as stream:
                     meta = json.load(stream)
                 if meta.get("report_id") and meta.get("report_id") != report_id:
@@ -128,8 +154,10 @@ class SidecarStore:
         with self._cache_lock:
             cached = self._legacy_cache.get(cache_key)
             if cached and cached[0] == signature:
+                self._metrics["legacy_cache_hits"] += 1
                 return cached[1]
             try:
+                self._metrics["legacy_reads"] += 1
                 with open(legacy_path, "r", encoding="utf-8") as stream:
                     data = json.load(stream)
                 payload = {
@@ -167,12 +195,14 @@ class SidecarStore:
         with self._cache_lock:
             cached = self._decoded_chunk_cache.get(cache_key)
             if cached is not None:
+                self._metrics["chunk_cache_hits"] += 1
                 self._decoded_chunk_cache.move_to_end(cache_key)
                 return cached
             if not os.path.isfile(chunk_path) or os.path.islink(chunk_path):
                 raise FileNotFoundError("sidecar chunk is missing")
             with open(chunk_path, "r", encoding="utf-8") as stream:
                 decoded = json.load(stream)
+            self._metrics["chunk_reads"] += 1
             if not isinstance(decoded, list):
                 raise ValueError("sidecar chunk must contain a JSON list")
             self._decoded_chunk_cache[cache_key] = decoded
@@ -185,6 +215,14 @@ class SidecarStore:
         if (not report_id or "\\" in str(report_id)
                 or any(part in ("", ".", "..") for part in str(report_id).split("/"))):
             return []
+        with self._cache_lock:
+            cached_dirs = self._report_cache_dirs.get(str(report_id))
+            # Keep positive resolutions hot.  A negative lookup is deliberately
+            # not sticky because report directories may be created after the
+            # runtime has constructed its SidecarStore.
+            if cached_dirs:
+                return list(cached_dirs)
+            self._metrics["path_resolution_reads"] += 1
         cache_dirs = []
         for s_dir in self.search_dirs:
             p1 = os.path.join(s_dir, ".source_cache", report_id)
@@ -204,6 +242,11 @@ class SidecarStore:
                     and os.path.commonpath((p2_parent, p2_real)) == p2_parent
                     and p2 not in cache_dirs):
                 cache_dirs.append(p2)
+        with self._cache_lock:
+            if cache_dirs:
+                self._report_cache_dirs[str(report_id)] = tuple(cache_dirs)
+            else:
+                self._report_cache_dirs.pop(str(report_id), None)
         return cache_dirs
 
     def load_metadata(self, report_id: str, file_path_hash: str) -> Optional[Dict[str, Any]]:

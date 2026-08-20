@@ -32,22 +32,34 @@ class PooledConnectionWrapper:
         self.pool = pool
         self.created_at = time.time()
         self.last_used_at = time.time()
+        self.last_returned_at = time.time()
         self.is_closed = False
+        self.read_only = False
 
-    def is_alive(self) -> bool:
+    def is_alive(self, force_ping: bool = False) -> bool:
         if self.is_closed or not self.raw_conn:
             return False
+        idle_for = time.time() - self.last_returned_at
+        ping_after = self.pool.idle_ping_after_sec
+        if not force_ping and idle_for < ping_after:
+            self.pool._record_metric("ping_skips")
+            return True
         try:
             if hasattr(self.raw_conn, "ping"):
                 self.raw_conn.ping(reconnect=True)
+                self.pool._record_metric("pings")
             return True
         except Exception:
             return False
 
     def rollback_if_dirty(self) -> None:
+        if self.read_only or not self.pool.rollback_on_return:
+            self.pool._record_metric("rollback_skips")
+            return
         try:
             if self.raw_conn and hasattr(self.raw_conn, "rollback"):
                 self.raw_conn.rollback()
+                self.pool._record_metric("rollbacks")
         except Exception as e:
             logger.warning(f"Error rolling back connection on pool return: {e}")
 
@@ -66,19 +78,40 @@ class MySQLConnectionPool:
         min_connections: int = 2,
         max_connections: int = 10,
         borrow_timeout: float = 10.0,
-        max_lifetime_sec: float = 1800.0
+        max_lifetime_sec: float = 1800.0,
+        idle_ping_after_sec: float = 60.0,
+        rollback_on_return: bool = True,
     ):
         self.db_config = dict(db_config or {})
         self.min_connections = max(1, min_connections)
         self.max_connections = max(self.min_connections, max_connections)
         self.borrow_timeout = borrow_timeout
         self.max_lifetime_sec = max_lifetime_sec
+        self.idle_ping_after_sec = max(0.0, float(
+            self.db_config.get("idle_ping_after_sec", idle_ping_after_sec)
+        ))
+        self.rollback_on_return = bool(self.db_config.get(
+            "rollback_on_return", rollback_on_return
+        ))
         
         self._pool: Queue = Queue(maxsize=self.max_connections)
         self._active_count = 0
         self._lock = threading.Lock()
         self._is_shutdown = False
-        self._metrics = {"acquires": 0, "acquire_timeouts": 0, "reconnects": 0}
+        self._metrics = {
+            "acquires": 0, "acquire_timeouts": 0, "reconnects": 0,
+            "pings": 0, "ping_skips": 0, "rollbacks": 0,
+            "rollback_skips": 0,
+        }
+
+    def _record_metric(self, name: str, amount: int = 1) -> None:
+        with self._lock:
+            self._metrics[name] = self._metrics.get(name, 0) + int(amount)
+
+    def _discard_wrapper(self, wrapper: PooledConnectionWrapper) -> None:
+        wrapper.close()
+        with self._lock:
+            self._active_count = max(0, self._active_count - 1)
 
     def _create_raw_connection(self):
         if not HAVE_PYMYSQL:
@@ -98,7 +131,7 @@ class MySQLConnectionPool:
         """Borrow a healthy connection from the pool."""
         if self._is_shutdown:
             raise RuntimeError("Connection pool has been shut down.")
-        self._metrics["acquires"] += 1
+        self._record_metric("acquires")
             
         deadline = time.time() + self.borrow_timeout
         while True:
@@ -107,12 +140,11 @@ class MySQLConnectionPool:
                 wrapper = self._pool.get_nowait()
                 # Check lifetime and liveness
                 if (time.time() - wrapper.created_at) > self.max_lifetime_sec or not wrapper.is_alive():
-                    self._metrics["reconnects"] += 1
-                    wrapper.close()
-                    with self._lock:
-                        self._active_count -= 1
+                    self._record_metric("reconnects")
+                    self._discard_wrapper(wrapper)
                     continue
                 wrapper.last_used_at = time.time()
+                wrapper.read_only = False
                 return wrapper
             except Empty:
                 pass
@@ -128,17 +160,16 @@ class MySQLConnectionPool:
             # 3. Wait for returned connection
             remaining = deadline - time.time()
             if remaining <= 0:
-                self._metrics["acquire_timeouts"] += 1
+                self._record_metric("acquire_timeouts")
                 raise TimeoutError("Connection pool exhausted ({}/{} active).".format(self._active_count, self.max_connections))
             try:
                 wrapper = self._pool.get(timeout=min(remaining, 0.5))
                 if (time.time() - wrapper.created_at) > self.max_lifetime_sec or not wrapper.is_alive():
-                    self._metrics["reconnects"] += 1
-                    wrapper.close()
-                    with self._lock:
-                        self._active_count -= 1
+                    self._record_metric("reconnects")
+                    self._discard_wrapper(wrapper)
                     continue
                 wrapper.last_used_at = time.time()
+                wrapper.read_only = False
                 return wrapper
             except Empty:
                 continue
@@ -149,24 +180,26 @@ class MySQLConnectionPool:
             return
             
         if self._is_shutdown:
-            wrapper.close()
-            with self._lock:
-                self._active_count -= 1
+            self._discard_wrapper(wrapper)
             return
             
         wrapper.rollback_if_dirty()
+        wrapper.last_returned_at = time.time()
         try:
             self._pool.put_nowait(wrapper)
         except Exception:
             # Queue full, close it
-            wrapper.close()
-            with self._lock:
-                self._active_count -= 1
+            self._discard_wrapper(wrapper)
 
     @contextmanager
-    def connection(self):
-        """Context manager for acquiring and safely returning connection."""
+    def connection(self, read_only: bool = False):
+        """Acquire a connection, optionally skipping the write cleanup path.
+
+        Read-only callers avoid an unnecessary rollback round-trip. Writers
+        retain the historical strict rollback-on-return safety net.
+        """
         conn_wrapper = self.borrow_connection()
+        conn_wrapper.read_only = bool(read_only)
         try:
             yield conn_wrapper.raw_conn
         finally:
@@ -179,15 +212,16 @@ class MySQLConnectionPool:
             try:
                 wrapper = self._pool.get_nowait()
                 wrapper.close()
+                with self._lock:
+                    self._active_count = max(0, self._active_count - 1)
             except Empty:
                 break
-        with self._lock:
-            self._active_count = 0
 
     def metrics(self) -> Dict[str, int]:
         with self._lock:
             active = self._active_count
-        return dict(self._metrics, active=active, idle=self._pool.qsize(), waiters=0)
+            metrics = dict(self._metrics)
+        return dict(metrics, active=active, idle=self._pool.qsize(), waiters=0)
 
 _GLOBAL_POOL: Optional[MySQLConnectionPool] = None
 _GLOBAL_POOL_LOCK = threading.Lock()

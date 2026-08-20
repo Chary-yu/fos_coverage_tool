@@ -16,13 +16,15 @@ class DatabaseManager:
     def __init__(self, config: Optional[Dict[str, Any]] = None, pool=None):
         cfg = (config or {}).get("mysql", config or {})
         self.config = dict(cfg)
-        self.pool = pool or get_global_pool(self.config)
+        pool_config = dict(self.config)
+        pool_config.update((self.config.get("pool") or {}))
+        self.pool = pool or get_global_pool(pool_config)
         if self.pool is None:
             raise RuntimeError("database pool is not configured")
 
     @contextmanager
-    def connection(self):
-        with self.pool.connection() as conn:
+    def connection(self, read_only: bool = False):
+        with self.pool.connection(read_only=read_only) as conn:
             yield conn
 
     def close(self):

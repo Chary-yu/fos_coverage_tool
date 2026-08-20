@@ -82,5 +82,31 @@ class TestPhase2Core(unittest.TestCase):
         pool.close_all()
         self.assertTrue(pool._is_shutdown)
 
+    def test_item_4_read_only_return_skips_ping_and_rollback_until_stale(self):
+        """Read requests avoid cleanup round-trips, stale idle connections still ping."""
+        pool = MySQLConnectionPool(
+            db_config={"host": "127.0.0.1", "database": "test"},
+            min_connections=1,
+            max_connections=1,
+            idle_ping_after_sec=60,
+        )
+        mock_raw = MagicMock()
+        wrapper = PooledConnectionWrapper(mock_raw, pool)
+        pool.return_connection(wrapper)
+
+        with pool.connection(read_only=True) as connection:
+            self.assertIs(connection, mock_raw)
+        self.assertEqual(mock_raw.rollback.call_count, 1, "only the initial writer return rolls back")
+        self.assertEqual(mock_raw.ping.call_count, 0, "fresh idle connection should not ping")
+        self.assertGreaterEqual(pool.metrics()["ping_skips"], 1)
+        self.assertGreaterEqual(pool.metrics()["rollback_skips"], 1)
+
+        borrowed = pool.borrow_connection()
+        pool.return_connection(borrowed)
+        borrowed.last_returned_at = time.time() - 61
+        pool.borrow_connection()
+        self.assertGreaterEqual(mock_raw.ping.call_count, 1, "stale idle connection must be checked")
+        pool.close_all()
+
 if __name__ == "__main__":
     unittest.main()

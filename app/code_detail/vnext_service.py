@@ -76,6 +76,16 @@ class VNextCodeDetailService(object):
             for row in self.analyses.get_by_file(connection, file_id)
         }
 
+    def metrics(self):
+        """Expose bounded SidecarStore cache counters for diagnostics."""
+        stores = {}
+        for key, store in list(self._sidecar_stores.items()):
+            stores["{}|{}".format(key[0], key[1])] = store.cache_stats()
+        return {
+            "sidecar_store_count": len(self._sidecar_stores),
+            "stores": stores,
+        }
+
     def layout(self, connection, scan_id, report_id, file_path):
         report, file_row, key, sidecar = self._identity(connection, scan_id, report_id, file_path)
         meta = sidecar.load_metadata(report_id, key)

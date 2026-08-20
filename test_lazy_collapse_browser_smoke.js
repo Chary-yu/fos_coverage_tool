@@ -546,6 +546,61 @@ async function runSmokeTests() {
     assert.strictEqual(lruReg1.lines.length, 30000);
     console.log("✔ [Smoke Test 5 Passed] LRU evicted collapsed region cleanly and preserved draft state across re-expansion.");
 
+    // =========================================================================
+    // Smoke Test 6: Very large expanded regions retain only a virtual window
+    // =========================================================================
+    console.log("[Smoke Test 6] Verifying virtual scrolling bounds DOM for 10k lines...");
+    const virtualLineCount = 10000;
+    const fetchMock6 = async (url) => {
+        if (url.includes("/code-layout")) {
+            return {
+                ok: true,
+                json: async () => ({
+                    status: "success",
+                    data: {
+                        project_name: "SmokeVirtual",
+                        file_path: "src/smoke_virtual.c",
+                        total_lines: virtualLineCount,
+                        regions: [{
+                            region_id: "virtual_10k", start_line: 1,
+                            end_line: virtualLineCount, default_state: "collapsed",
+                            kind: "collapsed", line_count: virtualLineCount
+                        }]
+                    }
+                })
+            };
+        }
+        if (url.includes("/code-lines?")) {
+            const urlObj = new URL(url, "http://localhost:8000");
+            const start = parseInt(urlObj.searchParams.get("start_line"), 10);
+            const end = parseInt(urlObj.searchParams.get("end_line"), 10);
+            const lines = [];
+            for (let i = start; i <= end; i++) {
+                lines.push({ line_no: i, source: `int virtual_${i};`, coverage_state: "covered" });
+            }
+            return { ok: true, json: async () => ({ status: "success", data: { lines } }) };
+        }
+        return { ok: true, json: async () => ({ status: "success", data: {} }) };
+    };
+    const env6 = createDOMEnvironment(mockHtml, fetchMock6);
+    const ctx6 = vm.createContext(env6.window);
+    ctx6.window = env6.window;
+    ctx6.document = env6.document;
+    ctx6.URL = URL;
+    ctx6.URLSearchParams = URLSearchParams;
+    ctx6.fetch = fetchMock6;
+    vm.runInContext(jsSource, ctx6);
+    for (const h of (env6.events["DOMContentLoaded"] || [])) await h();
+    const { CodeRegionStore: store6, CodeRegionController: ctrl6, PerformanceTelemetry: telemetry6 } = ctx6.window.__COVERAGE_ENHANCE_INTERNALS__;
+    await ctrl6.expandRegion("virtual_10k");
+    const virtualRegion = store6.get("virtual_10k");
+    assert.strictEqual(virtualRegion.loaded, true);
+    assert.strictEqual(virtualRegion.virtualized, true);
+    assert.ok(virtualRegion.virtualContent.children.length < 1500,
+        `Virtual region should keep a bounded DOM window, got ${virtualRegion.virtualContent.children.length}`);
+    assert.ok(telemetry6.snapshot().max_dom_lines < 1500);
+    console.log("✔ [Smoke Test 6 Passed] 10k-line expansion kept a bounded virtual DOM window.");
+
     console.log('=== All Browser Smoke Tests Passed Successfully ===');
 }
 

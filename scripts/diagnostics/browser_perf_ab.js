@@ -4,6 +4,102 @@ const fs = require('fs');
 const path = require('path');
 const { chromium } = require('@playwright/test');
 
+const CLIENT_JS = fs.readFileSync(
+  path.join(process.cwd(), 'web/assets/js/coverage_enhance.js'), 'utf8'
+);
+const CLIENT_CSS = fs.readFileSync(
+  path.join(process.cwd(), 'web/assets/css/coverage_enhance.css'), 'utf8'
+);
+
+async function runVirtualScrollWorkload(browser) {
+  const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  const requestLog = [];
+  const html = `<!doctype html><html><head>
+    <meta name="coverage-project" content="PerfE2E">
+    <meta name="coverage-report-id" content="report_perf_e2e">
+    <meta name="coverage-file-path" content="src/perf_100k.c">
+    <meta name="coverage-render-mode" content="lazy_collapse">
+    <meta name="coverage-review-scope" content="full">
+    <style>${CLIENT_CSS}</style>
+    </head><body><pre class="source"></pre></body></html>`;
+  await page.route('**/api/coverage/**', async route => {
+    const request = route.request();
+    const url = new URL(request.url());
+    requestLog.push(url.pathname);
+    let payload;
+    if (url.pathname === '/api/coverage/code-layout') {
+      payload = {
+        status: 'success',
+        data: {
+          project_name: 'PerfE2E', file_path: 'src/perf_100k.c',
+          report_id: 'report_perf_e2e', total_lines: 100000,
+          total_uncovered_count: 0, pending_line_count: 0,
+          regions: [{
+            region_id: 'virtual_100k', start_line: 1, end_line: 100000,
+            line_count: 100000, default_state: 'collapsed', kind: 'collapsed',
+            label: '100k virtual scroll fixture'
+          }]
+        }
+      };
+    } else if (url.pathname === '/api/coverage/code-lines') {
+      const start = Number(url.searchParams.get('start_line') || 1);
+      const end = Number(url.searchParams.get('end_line') || start);
+      const lines = [];
+      for (let lineNo = start; lineNo <= end; lineNo += 1) {
+        lines.push({
+          line_no: lineNo,
+          source: `int perf_line_${lineNo} = ${lineNo};`,
+          coverage_state: 'covered',
+          is_pending_analysis: false
+        });
+      }
+      payload = { status: 'success', data: { start_line: start, end_line: end, lines } };
+    } else {
+      payload = { status: 'success', data: {} };
+    }
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(payload) });
+  });
+  await page.route('http://coverage-perf.test/', async route => {
+    await route.fulfill({ status: 200, contentType: 'text/html', body: html });
+  });
+
+  try {
+    await page.goto('http://coverage-perf.test/', { waitUntil: 'domcontentloaded' });
+    await page.addScriptTag({ content: CLIENT_JS });
+    await page.evaluate(() => document.dispatchEvent(new Event('DOMContentLoaded')));
+    await page.waitForFunction(() => {
+      const internals = window.__COVERAGE_ENHANCE_INTERNALS__;
+      return internals && internals.CodeRegionStore.get('virtual_100k');
+    });
+    const measurement = await page.evaluate(async () => {
+      const internals = window.__COVERAGE_ENHANCE_INTERNALS__;
+      const start = performance.now();
+      await internals.CodeRegionController.expandRegion('virtual_100k');
+      const region = internals.CodeRegionStore.get('virtual_100k');
+      const telemetry = internals.PerformanceTelemetry.snapshot();
+      return {
+        elapsed_ms: Number((performance.now() - start).toFixed(3)),
+        loaded_lines: region.lines.length,
+        virtualized: region.virtualized,
+        dom_line_count: region.virtualContent ? region.virtualContent.children.length : 0,
+        telemetry
+      };
+    });
+    const codeLineRequests = requestLog.filter(item => item === '/api/coverage/code-lines').length;
+    return {
+      status: measurement.virtualized && measurement.loaded_lines === 100000 &&
+        measurement.dom_line_count < 1500 && codeLineRequests === 50 ? 'PASSED' : 'FAILED',
+      evidence_class: 'performance_e2e',
+      workload_id: 'coverage-enhance-virtual-scroll-100k-v1',
+      line_count: 100000,
+      request_count: codeLineRequests,
+      ...measurement
+    };
+  } finally {
+    await page.close();
+  }
+}
+
 async function main() {
   const output = process.argv[2] || path.join(process.cwd(), 'browser_perf_ab.json');
   const browser = await chromium.launch({ headless: true });
@@ -52,6 +148,18 @@ async function main() {
       result.candidate_ms = result.Tier_B_10k.candidate_ms;
       return result;
     });
+    try {
+      result.coverage_virtual_scroll_100k = await runVirtualScrollWorkload(browser);
+    } catch (error) {
+      result.coverage_virtual_scroll_100k = {
+        status: 'FAILED', evidence_class: 'performance_e2e',
+        workload_id: 'coverage-enhance-virtual-scroll-100k-v1',
+        error: error && error.message ? error.message : String(error)
+      };
+    }
+    if (result.coverage_virtual_scroll_100k.status !== 'PASSED') {
+      result.status = 'FAILED';
+    }
     fs.writeFileSync(output, JSON.stringify(result, null, 2));
     process.stdout.write(JSON.stringify(result) + '\n');
     if (result.status !== 'PASSED') process.exitCode = 1;

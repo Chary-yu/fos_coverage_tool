@@ -29,7 +29,8 @@ class JobDescriptor:
         fn: Callable,
         args: tuple = (),
         kwargs: dict = None,
-        metadata: dict = None
+        metadata: dict = None,
+        resource_class: str = "default",
     ):
         self.job_id = job_id
         self.job_type = job_type
@@ -38,6 +39,7 @@ class JobDescriptor:
         self.args = args or ()
         self.kwargs = kwargs or {}
         self.metadata = metadata or {}
+        self.resource_class = resource_class or "default"
         self.status = STATUS_QUEUED
         self.progress: float = 0.0
         self.result: Any = None
@@ -52,30 +54,67 @@ class BoundedJobExecutor:
         self,
         max_workers: int = 4,
         max_queue_size: int = 100,
-        db_manager=None
+        db_manager=None,
+        resource_limits: Optional[Dict[str, Any]] = None,
     ):
         self.max_workers = max(1, max_workers)
         self.max_queue_size = max(1, max_queue_size)
         self.db_manager = db_manager
         
-        self._queue: Queue = Queue(maxsize=self.max_queue_size)
         self._jobs: Dict[str, JobDescriptor] = {}
         self._workers: List[threading.Thread] = []
         self._lock = threading.Lock()
         self._shutdown_event = threading.Event()
-        
+        self._buckets = {}
+        self._resource_limits = dict(resource_limits or {})
+
+        # Keep the historical default queue for callers that do not opt into
+        # resource classes. Configured resource classes get independent
+        # queues/workers so a disk-heavy export cannot consume DB workers.
+        self._create_bucket("default", self.max_workers, self.max_queue_size)
+        for resource_name, raw_limit in self._resource_limits.items():
+            if str(resource_name) == "default":
+                continue
+            if isinstance(raw_limit, dict):
+                workers = raw_limit.get("max_workers", raw_limit.get("workers", 1))
+                queue_size = raw_limit.get("max_queue_size", raw_limit.get("queue_size", 25))
+            else:
+                workers, queue_size = raw_limit, 25
+            self._create_bucket(
+                str(resource_name), max(1, int(workers)), max(1, int(queue_size))
+            )
+        self._queue = self._buckets["default"]["queue"]
         self._start_workers()
 
-    def _start_workers(self):
-        for i in range(self.max_workers):
-            t = threading.Thread(target=self._worker_loop, name=f"CoverageJobWorker-{i}", daemon=True)
-            t.start()
-            self._workers.append(t)
+    def _create_bucket(self, name: str, workers: int, queue_size: int) -> None:
+        if name in self._buckets:
+            return
+        self._buckets[name] = {
+            "queue": Queue(maxsize=queue_size),
+            "max_workers": max(1, int(workers)),
+            "max_queue_size": max(1, int(queue_size)),
+            "workers": [],
+        }
 
-    def _worker_loop(self):
+    def _start_workers(self):
+        for resource_name, bucket in self._buckets.items():
+            for i in range(bucket["max_workers"]):
+                suffix = "-{}".format(i)
+                name = "CoverageJobWorker-{}{}".format(resource_name, suffix)
+                t = threading.Thread(
+                    target=self._worker_loop,
+                    args=(resource_name, bucket["queue"]),
+                    name=name,
+                    daemon=True,
+                )
+                t.start()
+                bucket["workers"].append(t)
+                self._workers.append(t)
+
+    def _worker_loop(self, resource_name: str, queue: Queue):
         while not self._shutdown_event.is_set():
             try:
-                job = self._queue.get(timeout=0.5)
+                job = queue.get(timeout=0.5)
             except Empty:
                 continue
 
@@ -84,7 +123,7 @@ class BoundedJobExecutor:
                     job.status = STATUS_CANCELLED
                     job.finished_at = time.time()
                     self._persist_job_state(job)
-                    self._queue.task_done()
+                    queue.task_done()
                     continue
                 job.status = STATUS_RUNNING
                 job.started_at = time.time()
@@ -110,7 +149,7 @@ class BoundedJobExecutor:
                     job.finished_at = time.time()
                     self._persist_job_state(job)
             finally:
-                self._queue.task_done()
+                queue.task_done()
 
     def submit_job(
         self,
@@ -120,7 +159,9 @@ class BoundedJobExecutor:
         args: tuple = (),
         kwargs: dict = None,
         job_id: Optional[str] = None,
-        reuse_existing: bool = True
+        reuse_existing: bool = True,
+        metadata: Optional[dict] = None,
+        resource_class: str = "default",
     ) -> JobDescriptor:
         """Submit a new background job with optional duplicate reuse."""
         kwargs = kwargs or {}
@@ -133,6 +174,10 @@ class BoundedJobExecutor:
                         existing.status in (STATUS_QUEUED, STATUS_RUNNING)):
                         return existing
 
+            resource_class = str(resource_class or "default")
+            if resource_class not in self._buckets:
+                resource_class = "default"
+            bucket = self._buckets[resource_class]
             jid = job_id or f"job_{uuid.uuid4().hex[:16]}"
             job = JobDescriptor(
                 job_id=jid,
@@ -140,16 +185,22 @@ class BoundedJobExecutor:
                 project_name=project_name,
                 fn=fn,
                 args=args,
-                kwargs=kwargs
+                kwargs=kwargs,
+                metadata=metadata,
+                resource_class=resource_class,
             )
             
             try:
-                self._queue.put_nowait(job)
+                bucket["queue"].put_nowait(job)
                 self._jobs[jid] = job
                 self._persist_job_state(job)
                 return job
             except Full:
-                raise RuntimeError(f"Background job queue is full ({self.max_queue_size} pending jobs).")
+                raise RuntimeError(
+                    "Background job queue is full for resource '{}' ({} pending jobs).".format(
+                        resource_class, bucket["max_queue_size"]
+                    )
+                )
 
     def cancel_job(self, job_id: str) -> bool:
         """Request job cancellation."""
@@ -169,6 +220,24 @@ class BoundedJobExecutor:
     def get_job(self, job_id: str) -> Optional[JobDescriptor]:
         with self._lock:
             return self._jobs.get(job_id)
+
+    def metrics(self) -> Dict[str, Any]:
+        """Return queue/worker counts split by resource class."""
+        with self._lock:
+            jobs = len(self._jobs)
+            resources = {
+                name: {
+                    "workers": bucket["max_workers"],
+                    "queue_capacity": bucket["max_queue_size"],
+                    "queued": bucket["queue"].qsize(),
+                    "active": sum(
+                        1 for job in self._jobs.values()
+                        if job.resource_class == name and job.status == STATUS_RUNNING
+                    ),
+                }
+                for name, bucket in self._buckets.items()
+            }
+        return {"jobs": jobs, "resources": resources}
 
     def _persist_job_state(self, job: JobDescriptor):
         """Save job state to DB if db_manager provided."""

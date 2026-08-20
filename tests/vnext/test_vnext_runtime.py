@@ -35,6 +35,13 @@ class VNextRuntimeTest(unittest.TestCase):
         self.runtime.close()
         self.connection.close()
 
+    def test_runtime_metrics_expose_cache_and_resource_counters(self):
+        status, payload = self.application.dispatch("GET", "/api/coverage/metrics")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["runtime"], "vnext")
+        self.assertIn("resources", payload["jobs"])
+        self.assertIn("code_detail", payload)
+
     def test_scan_analysis_freshness_and_report_identity(self):
         status, body = self.application.dispatch(
             "POST", "/api/coverage/projects", body={"project_name": "fixture"}
@@ -297,8 +304,14 @@ class VNextRuntimeTest(unittest.TestCase):
                     "report_cache", key, [(1, 2), (3, 4)]
                 )
                 self.assertEqual(load.call_count, 2, "meta + one physical chunk")
-            self.assertEqual([[line["line_no"] for line in rows] for rows in first], [[1, 2], [3, 4]])
-            self.assertEqual([[line["line_no"] for line in rows] for rows in second], [[1, 2], [3, 4]])
+            stats = store.cache_stats()
+            self.assertEqual(stats["metadata_reads"], 1)
+            self.assertGreaterEqual(stats["metadata_cache_hits"], 1)
+            self.assertEqual(stats["chunk_reads"], 1)
+            self.assertGreaterEqual(stats["chunk_cache_hits"], 1)
+            self.assertEqual(stats["path_resolution_reads"], 1)
+        self.assertEqual([[line["line_no"] for line in rows] for rows in first], [[1, 2], [3, 4]])
+        self.assertEqual([[line["line_no"] for line in rows] for rows in second], [[1, 2], [3, 4]])
 
 
 if __name__ == "__main__":

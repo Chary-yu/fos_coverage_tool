@@ -303,7 +303,13 @@ class CodeDetailService:
             return context
 
         db_file_hash = compute_db_file_path_hash(file_path)
-        sidecar_file_hash = calc_sidecar_file_key(file_path)
+        sidecar_file_hashes = [calc_sidecar_file_key(file_path)]
+        # V1 compatibility sidecars created by older callers used the DB
+        # identity hash.  Prefer the canonical SHA-256 key, but keep the
+        # legacy key as a read-only fallback so report isolation is preserved
+        # during migration.
+        if db_file_hash not in sidecar_file_hashes:
+            sidecar_file_hashes.append(db_file_hash)
 
         # 1. Try to load from server-side source sidecar if report_id given
         if report_id:
@@ -320,22 +326,23 @@ class CodeDetailService:
                     self._sidecar_store.add_search_dir(std_dir)
 
             # Try SidecarStore first (Chunked v2 + Legacy v1)
-            ctx = self._sidecar_store.load_full_source_context(report_id, sidecar_file_hash)
-            if ctx:
-                if self.db_manager:
-                    self._refresh_analysis_records(ctx, project_name, file_path, scope)
-                self._context_cache[cache_key] = (now, ctx)
-                self._prune_context_cache(now)
-                return ctx
-
-            for s_dir in dirs_to_check:
-                sidecar_ctx = load_source_sidecar(s_dir, report_id, sidecar_file_hash)
-                if sidecar_ctx:
+            for sidecar_file_hash in sidecar_file_hashes:
+                ctx = self._sidecar_store.load_full_source_context(report_id, sidecar_file_hash)
+                if ctx:
                     if self.db_manager:
-                        self._refresh_analysis_records(sidecar_ctx, project_name, file_path, scope)
-                    self._context_cache[cache_key] = (now, sidecar_ctx)
+                        self._refresh_analysis_records(ctx, project_name, file_path, scope)
+                    self._context_cache[cache_key] = (now, ctx)
                     self._prune_context_cache(now)
-                    return sidecar_ctx
+                    return ctx
+
+                for s_dir in dirs_to_check:
+                    sidecar_ctx = load_source_sidecar(s_dir, report_id, sidecar_file_hash)
+                    if sidecar_ctx:
+                        if self.db_manager:
+                            self._refresh_analysis_records(sidecar_ctx, project_name, file_path, scope)
+                        self._context_cache[cache_key] = (now, sidecar_ctx)
+                        self._prune_context_cache(now)
+                        return sidecar_ctx
 
             raise FileNotFoundError(
                 f"Source context sidecar missing or unavailable for project='{project_name}', file='{file_path}', report_id='{report_id}'"
@@ -421,7 +428,9 @@ class CodeDetailService:
         """Compute the CodeRegion layout for the file (O(1) fast metadata path when sidecar exists)."""
         t_start = time.perf_counter()
         db_file_hash = compute_db_file_path_hash(file_path)
-        sidecar_file_hash = calc_sidecar_file_key(file_path)
+        sidecar_file_hashes = [calc_sidecar_file_key(file_path)]
+        if db_file_hash not in sidecar_file_hashes:
+            sidecar_file_hashes.append(db_file_hash)
         scope = (review_scope or "full").lower()
 
         # Fast Metadata Path (Items 1 & 13)
@@ -431,7 +440,11 @@ class CodeDetailService:
                 for r_dir in registry[report_id]:
                     self._sidecar_store.add_search_dir(r_dir)
 
-            meta = self._sidecar_store.load_metadata(report_id, sidecar_file_hash)
+            meta = None
+            for sidecar_file_hash in sidecar_file_hashes:
+                meta = self._sidecar_store.load_metadata(report_id, sidecar_file_hash)
+                if meta:
+                    break
             if meta:
                 overlay = self.get_analysis_overlay(project_name, db_file_hash, file_path, scope)
 
@@ -541,7 +554,9 @@ class CodeDetailService:
         """Batch load line data for specified ranges or regions (Slice-based streaming)."""
         t_start = time.perf_counter()
         db_file_hash = compute_db_file_path_hash(file_path)
-        sidecar_file_hash = calc_sidecar_file_key(file_path)
+        sidecar_file_hashes = [calc_sidecar_file_key(file_path)]
+        if db_file_hash not in sidecar_file_hashes:
+            sidecar_file_hashes.append(db_file_hash)
         scope = (review_scope or "full").lower()
 
         # 1. Determine verified ranges
@@ -585,6 +600,8 @@ class CodeDetailService:
         # 2. Extract lines for each range
         batch_results = []
         total_returned_lines = 0
+        fallback_line_map = None
+        fallback_context_loads = 0
 
         for rng in verified_ranges:
             start_l = rng.get("start_line", 1)
@@ -594,18 +611,35 @@ class CodeDetailService:
 
             lines_dicts = None
             if report_id and not content_override:
-                lines_dicts = self._sidecar_store.load_lines_range(report_id, sidecar_file_hash, start_l, end_l)
+                for sidecar_file_hash in sidecar_file_hashes:
+                    lines_dicts = self._sidecar_store.load_lines_range(
+                        report_id, sidecar_file_hash, start_l, end_l
+                    )
+                    if lines_dicts is not None:
+                        break
 
             if lines_dicts is None:
-                ctx = self.get_source_context(
-                    project_name=project_name,
-                    file_path=file_path,
-                    report_id=report_id,
-                    review_scope=scope,
-                    content_override=content_override,
-                )
-                lines_slice = [l for l in ctx.lines if start_l <= l.line_no <= end_l]
-                lines_dicts = [l.to_dict() for l in lines_slice]
+                # A verified default batch can contain thousands of disjoint
+                # regions.  Parse/index the fallback source once, then slice
+                # by line number; repeatedly scanning ctx.lines turns this
+                # path into O(number_of_ranges * total_source_lines).
+                if fallback_line_map is None:
+                    ctx = self.get_source_context(
+                        project_name=project_name,
+                        file_path=file_path,
+                        report_id=report_id,
+                        review_scope=scope,
+                        content_override=content_override,
+                    )
+                    fallback_line_map = {
+                        int(line.line_no): line.to_dict() for line in ctx.lines
+                    }
+                    fallback_context_loads += 1
+                lines_dicts = [
+                    dict(fallback_line_map[line_number])
+                    for line_number in range(int(start_l), int(end_l) + 1)
+                    if line_number in fallback_line_map
+                ]
 
             if overlay:
                 for ld in lines_dicts:
@@ -649,6 +683,7 @@ class CodeDetailService:
                 "total_lines_loaded": total_returned_lines,
                 "verified_default_batch": is_verified_default_batch,
                 "range_count": len(batch_results),
+                "source_context_loads": fallback_context_loads,
             },
         }
 
