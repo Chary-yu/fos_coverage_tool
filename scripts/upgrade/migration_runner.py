@@ -535,8 +535,7 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None, rele
                 conn, project["id"], current_scan_id=scan["id"], data_version=data_version
             )
             state_repo.set_current_scan(conn, project["id"], scan["id"])
-            file_rows = project_repo.iter_files(conn, scan["id"])
-            file_state_repo.rebuild_scan(conn, scan["id"], data_version, file_rows)
+            file_state_repo.rebuild_scan(conn, scan["id"], data_version, None)
             state_repo.mark_ready(conn, project["id"], data_version)
 
         project_by_name = {

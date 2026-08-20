@@ -160,6 +160,28 @@ class ProjectRepository(object):
             WHERE scan_id = ? AND repository_name = ? AND file_path_hash = ?
         """, (scan_id, repository_name or "", file_path_hash))
 
+    def get_files_by_identities(self, connection, scan_id: int, identities):
+        """Resolve many immutable file identities with one SELECT."""
+        identities = list({
+            (str(repository_name or ""), str(file_path_hash or ""))
+            for repository_name, file_path_hash in (identities or [])
+        })
+        if not identities:
+            return {}
+        clauses = []
+        params = [int(scan_id)]
+        for repository_name, file_path_hash in identities:
+            clauses.append("(repository_name = ? AND file_path_hash = ?)")
+            params.extend((repository_name, file_path_hash))
+        rows = fetchall(connection, """
+            SELECT * FROM coverage_files
+            WHERE scan_id = ? AND ({})
+        """.format(" OR ".join(clauses)), params)
+        return {
+            (str(row.get("repository_name") or ""), str(row.get("file_path_hash") or "")): row
+            for row in rows
+        }
+
     def ensure_file(self, connection, scan_id: int, repository_name: str, file_path_hash: str,
                     file_path: str, source_file_name: str = ""):
         existing = self.get_file(connection, scan_id, repository_name, file_path_hash)

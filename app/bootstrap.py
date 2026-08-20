@@ -95,7 +95,9 @@ class VNextRuntime(object):
             self.project_service, report_registry=self.report_registry,
             allowed_info_roots=input_roots, allowed_report_roots=report_roots,
         )
-        self.analysis_service = AnalysisService(self.analyses, self.projects, self.states)
+        self.analysis_service = AnalysisService(
+            self.analyses, self.projects, self.states, self.lines
+        )
         self.progress_service = ProgressService(self.file_states, self.projects, self.states)
         self.incremental_service = IncrementalReportService(
             self.projects, self.incremental_results

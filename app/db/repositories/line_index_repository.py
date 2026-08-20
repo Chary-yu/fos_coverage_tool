@@ -18,6 +18,34 @@ class LineIndexRepository(object):
             SELECT * FROM coverage_lines WHERE file_id = ? AND line_number = ?
         """, (file_id, line_number))
 
+    def get_by_ids(self, connection, line_ids):
+        line_ids = sorted({int(line_id) for line_id in (line_ids or [])})
+        if not line_ids:
+            return []
+        placeholders = ", ".join("?" for _ in line_ids)
+        return fetchall(connection, """
+            SELECT l.*, f.scan_id, f.repository_name, f.file_path, f.file_path_hash
+            FROM coverage_lines l JOIN coverage_files f ON f.id = l.file_id
+            WHERE l.id IN ({})
+        """.format(placeholders), line_ids)
+
+    def get_by_file_numbers(self, connection, file_numbers):
+        """Resolve many (file_id, line_number) pairs with one SELECT."""
+        pairs = sorted({(int(file_id), int(line_number))
+                        for file_id, line_number in (file_numbers or [])})
+        if not pairs:
+            return []
+        clauses = []
+        params = []
+        for file_id, line_number in pairs:
+            clauses.append("(l.file_id = ? AND l.line_number = ?)")
+            params.extend((file_id, line_number))
+        return fetchall(connection, """
+            SELECT l.*, f.scan_id, f.repository_name, f.file_path, f.file_path_hash
+            FROM coverage_lines l JOIN coverage_files f ON f.id = l.file_id
+            WHERE {}
+        """.format(" OR ".join(clauses)), params)
+
     def upsert_line(self, connection, file_id: int, record: Dict[str, Any]):
         line_number = int(record.get("line_number") or 0)
         if line_number < 1:

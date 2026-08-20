@@ -36,9 +36,11 @@ class ProgressService(object):
             and int(state.get("data_version") or 0) > 0
         )
         if ready:
-            rows = self._file_state_rows(connection, scan_id)
-            if rows:
-                return self._aggregate_file_states(connection, project_name, scan_id, state, rows)
+            aggregate = self.file_states.scan_aggregate(connection, scan_id)
+            if aggregate and int(aggregate.get("file_count") or 0) > 0:
+                return self._aggregate_file_state_summary(
+                    project_name, scan_id, state, aggregate
+                )
         result = self.file_states.scan_summary_from_facts(connection, scan_id)
         result.update({
             "project_name": project_name,
@@ -49,29 +51,23 @@ class ProgressService(object):
         return result
 
     @staticmethod
-    def _file_state_rows(connection, scan_id):
-        from app.db.repositories.base import fetchall
-        return fetchall(connection, """
-            SELECT * FROM coverage_file_state WHERE scan_id = ? ORDER BY file_id
-        """, (scan_id,))
-
-    def _aggregate_file_states(self, connection, project_name, scan_id, state, rows):
-        pending = self.file_states.pending_line_references(connection, scan_id)
+    def _aggregate_file_state_summary(project_name, scan_id, state, aggregate):
         return {
             "project_name": project_name, "scan_id": scan_id,
             "source": "coverage_file_state",
             "data_version": int(state.get("data_version") or 0),
             "file_state_version": int(state.get("file_state_version") or 0),
-            "total_uncovered": sum(int(row.get("total_uncovered") or 0) for row in rows),
-            "filled_total": sum(int(row.get("filled_total") or 0) for row in rows),
-            "draft_total": sum(int(row.get("draft_total") or 0) for row in rows),
-            "confirmed_total": sum(int(row.get("confirmed_total") or 0) for row in rows),
-            "pending_total": sum(int(row.get("pending_total") or 0) for row in rows),
-            "pending_line_references": [
-                "{}:{}:{}".format(
-                    item["repository_name"], item["file_path"], item["line_number"]
-                ) for item in pending
-            ],
+            "file_count": int(aggregate.get("file_count") or 0),
+            "total_lines": int(aggregate.get("total_lines") or 0),
+            "total_uncovered": int(aggregate.get("total_uncovered") or 0),
+            "filled_total": int(aggregate.get("filled_total") or 0),
+            "draft_total": int(aggregate.get("draft_total") or 0),
+            "confirmed_total": int(aggregate.get("confirmed_total") or 0),
+            "pending_total": int(aggregate.get("pending_total") or 0),
+            # Pending references are intentionally served by the separate
+            # /incremental/unanalyzed endpoint so the progress homepage stays
+            # an O(1) aggregate query.
+            "pending_line_references": [],
         }
 
     def rebuild(self, connection, project_name, scan_id=None):
@@ -81,9 +77,8 @@ class ProgressService(object):
         if not scan_id:
             return self.summary(connection, project_name, scan_id)
         with transaction(connection) as conn:
-            file_rows = self.projects.iter_files(conn, scan_id)
             self.file_states.rebuild_scan(
-                conn, scan_id, int(state.get("data_version") or 0), file_rows
+                conn, scan_id, int(state.get("data_version") or 0), None
             )
             self.states.mark_ready(conn, project["id"], int(state.get("data_version") or 0))
         return self.summary(connection, project_name, scan_id)

@@ -2,7 +2,7 @@
 
 from typing import Any, Dict, Iterable
 
-from app.db.repositories.base import execute, fetchall, fetchone
+from app.db.repositories.base import adapt_sql, execute, fetchall, fetchone, is_sqlite
 
 
 ANALYSIS_FIELDS = (
@@ -60,4 +60,66 @@ class AnalysisRepository(object):
         return self.get_by_line(connection, line_id)
 
     def upsert_many(self, connection, records: Iterable[Dict[str, Any]]):
-        return [self.upsert(connection, int(record["line_id"]), record) for record in records]
+        """Bulk upsert analysis facts with one executemany and one readback."""
+        normalized_records = []
+        for record in records or []:
+            values = {
+                "status": record.get("status") or "",
+                "is_draft": int(bool(record.get("is_draft", record.get("draft", False)))),
+                "reviewer": record.get("reviewer") or "",
+                "coverage_method": record.get("coverage_method", record.get("method", "")) or "",
+                "uncovered_reason": record.get("uncovered_reason", record.get("reason", "")) or "",
+                "comment": record.get("comment", "") or "",
+            }
+            normalized_records.append((int(record["line_id"]), values))
+        if not normalized_records:
+            return []
+
+        if is_sqlite(connection):
+            conflict_sql = """
+                ON CONFLICT(line_id) DO UPDATE SET
+                    status = excluded.status,
+                    is_draft = excluded.is_draft,
+                    reviewer = excluded.reviewer,
+                    coverage_method = excluded.coverage_method,
+                    uncovered_reason = excluded.uncovered_reason,
+                    comment = excluded.comment,
+                    updated_at = excluded.updated_at
+            """
+        else:
+            conflict_sql = """
+                ON DUPLICATE KEY UPDATE
+                    status = VALUES(status),
+                    is_draft = VALUES(is_draft),
+                    reviewer = VALUES(reviewer),
+                    coverage_method = VALUES(coverage_method),
+                    uncovered_reason = VALUES(uncovered_reason),
+                    comment = VALUES(comment),
+                    updated_at = VALUES(updated_at)
+            """
+        sql = """
+            INSERT INTO coverage_analyses(
+                line_id, status, is_draft, reviewer, coverage_method,
+                uncovered_reason, comment, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        """ + conflict_sql
+        params = [
+            (line_id,) + tuple(values[field] for field in ANALYSIS_FIELDS)
+            for line_id, values in normalized_records
+        ]
+        cursor = connection.cursor()
+        try:
+            cursor.executemany(adapt_sql(connection, sql), params)
+        finally:
+            cursor.close()
+
+        line_ids = [line_id for line_id, _ in normalized_records]
+        placeholders = ", ".join("?" for _ in sorted(set(line_ids)))
+        rows = fetchall(connection, """
+            SELECT a.*, l.line_number
+            FROM coverage_analyses a
+            JOIN coverage_lines l ON l.id = a.line_id
+            WHERE a.line_id IN ({})
+        """.format(placeholders), sorted(set(line_ids)))
+        by_line = {int(row["line_id"]): row for row in rows}
+        return [by_line[int(line_id)] for line_id in line_ids if int(line_id) in by_line]

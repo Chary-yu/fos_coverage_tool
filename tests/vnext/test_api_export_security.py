@@ -146,10 +146,50 @@ class VNextApiExportSecurityTest(unittest.TestCase):
                     self.connection, "export-project", scan["id"],
                     output_path=os.path.join(output_root, "..", "escape.zip"),
                 )
-            with self.assertRaises(KeyError):
-                ExportService(project_repo.projects, output_root).export_scan(
-                    self.connection, "export-project", scan["id"], "wrong-report",
-                )
+                with self.assertRaises(KeyError):
+                    ExportService(project_repo.projects, output_root).export_scan(
+                        self.connection, "export-project", scan["id"], "wrong-report",
+                    )
+
+    def test_analysis_save_resolves_and_upserts_records_in_bulk(self):
+        project_repo = ProjectService()
+        scan = project_repo.create_scan_and_ingest(
+            self.connection, "bulk-analysis", [{
+                "repository_name": "repo-a",
+                "file_path": "src/bulk.c",
+                "file_path_hash": "b" * 32,
+                "lines": [
+                    {"line_number": 10, "coverage_state": "uncovered"},
+                    {"line_number": 11, "coverage_state": "uncovered"},
+                    {"line_number": 12, "coverage_state": "uncovered"},
+                ],
+            }], info_sha256="c" * 64,
+        )
+        records = [{
+            "repository_name": "repo-a", "file_path_hash": "b" * 32,
+            "line_number": line_number, "status": "可覆盖",
+        } for line_number in (10, 11, 12)]
+        trace = []
+        self.connection.set_trace_callback(trace.append)
+        result = AnalysisService().save(
+            self.connection, "bulk-analysis", scan["id"], records, reviewer="alice"
+        )
+        self.connection.set_trace_callback(None)
+
+        self.assertEqual(result["saved"], 3)
+        self.assertFalse(
+            any("SELECT * FROM coverage_analyses WHERE line_id" in statement
+                for statement in trace),
+            "bulk save must not read each analysis row individually",
+        )
+        self.assertEqual(
+            len([statement for statement in trace if "FROM coverage_analyses a" in statement]),
+            1,
+        )
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM coverage_analyses").fetchone()[0],
+            3,
+        )
 
     def test_sidecar_symlink_is_rejected(self):
         with tempfile.TemporaryDirectory(prefix="vnext-sidecar-") as root:

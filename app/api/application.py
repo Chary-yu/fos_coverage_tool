@@ -241,14 +241,15 @@ class VNextApplication(object):
         ranges = body.get("ranges") or []
         if not isinstance(ranges, list) or len(ranges) > 1000:
             raise ValueError("ranges must be a list with at most 1000 entries")
-        result = []
+        if not ranges:
+            return 200, {
+                "scan_id": scan_id, "report_id": report_id,
+                "file_path": file_path, "batches": [],
+            }
         with self._read_connection() as connection:
-            for item in ranges:
-                result.append(self.runtime.code_detail.lines(
-                    connection, scan_id, report_id, file_path,
-                    int(item.get("start_line") or 1),
-                    int(item.get("end_line") or 1),
-                ))
+            result = self.runtime.code_detail.lines_batch(
+                connection, scan_id, report_id, file_path, ranges
+            )
         return 200, {
             "scan_id": scan_id, "report_id": report_id,
             "file_path": file_path, "batches": result,

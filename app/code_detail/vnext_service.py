@@ -17,6 +17,10 @@ class VNextCodeDetailService(object):
         self.projects = project_repo
         self.analyses = analysis_repo
         self.registry = report_registry
+        # A runtime serves many ranges from the same immutable report. Keep
+        # one SidecarStore per report root/asset so metadata and decoded
+        # physical chunks can be reused across HTTP requests.
+        self._sidecar_stores = {}
 
     @staticmethod
     def _sidecar_key(file_path):
@@ -56,9 +60,15 @@ class VNextCodeDetailService(object):
         report_root = registry_root or declared_root
         if not report_root:
             raise FileNotFoundError("report root is unavailable")
-        return report, file_row, self._sidecar_key(file_path), SidecarStore(
-            search_dirs=[report_root]
-        )
+        store_key = (report_root, str(report.get("asset_identity") or ""))
+        sidecar = self._sidecar_stores.get(store_key)
+        if sidecar is None:
+            sidecar = SidecarStore(
+                search_dirs=[report_root],
+                asset_identity=report.get("asset_identity") or "",
+            )
+            self._sidecar_stores[store_key] = sidecar
+        return report, file_row, self._sidecar_key(file_path), sidecar
 
     def _overlay(self, connection, file_id):
         return {
@@ -106,26 +116,47 @@ class VNextCodeDetailService(object):
         }
 
     def lines(self, connection, scan_id, report_id, file_path, start_line, end_line):
+        return self.lines_batch(
+            connection, scan_id, report_id, file_path,
+            [(int(start_line), int(end_line))],
+        )[0]
+
+    def lines_batch(self, connection, scan_id, report_id, file_path, ranges):
+        """Resolve identity/overlay once and split shared sidecar chunks per range."""
+        if not ranges:
+            return []
         report, file_row, key, sidecar = self._identity(connection, scan_id, report_id, file_path)
-        if int(start_line) < 1 or int(end_line) < int(start_line):
-            raise ValueError("invalid line range")
-        rows = sidecar.load_lines_range(
-            report_id, key, int(start_line), int(end_line)
-        )
-        if rows is None:
+        normalized = []
+        for item in ranges or []:
+            if isinstance(item, dict):
+                start_line = item.get("start_line") or 1
+                end_line = item.get("end_line") or start_line
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                start_line, end_line = item
+            else:
+                raise ValueError("each line range must contain start_line and end_line")
+            start_line, end_line = int(start_line), int(end_line)
+            if start_line < 1 or end_line < start_line:
+                raise ValueError("invalid line range")
+            normalized.append((start_line, end_line))
+        rows_batches = sidecar.load_lines_ranges(report_id, key, normalized)
+        if rows_batches is None:
             raise FileNotFoundError("report sidecar lines are unavailable")
         overlay = self._overlay(connection, file_row["id"])
-        result = []
-        for row in rows:
-            item = dict(row)
-            analysis = overlay.get(int(item.get("line_no") or item.get("line_number") or 0))
-            if analysis:
-                item["analysis"] = analysis
-            result.append(item)
-        return {
-            "scan_id": int(scan_id), "report_id": report_id, "file_path": file_path,
-            "lines": result,
-        }
+        batches = []
+        for rows in rows_batches:
+            result = []
+            for row in rows:
+                item = dict(row)
+                analysis = overlay.get(int(item.get("line_no") or item.get("line_number") or 0))
+                if analysis:
+                    item["analysis"] = analysis
+                result.append(item)
+            batches.append({
+                "scan_id": int(scan_id), "report_id": report_id, "file_path": file_path,
+                "lines": result,
+            })
+        return batches
 
     @staticmethod
     def _project_id(connection, scan_id):

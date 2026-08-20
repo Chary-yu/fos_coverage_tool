@@ -193,6 +193,7 @@ async function runSmokeTests() {
     // Test 1: Chunk Failure & Retry does NOT duplicate DOM code lines
     // -------------------------------------------------------------------------
     console.log('[Smoke Test 1] Verifying Chunk Failure Retry does not duplicate DOM lines...');
+    const networkChunkLines = 2000;
     let failChunk2 = true;
     const fetchMock1 = async (url, opts) => {
         if (url.includes('/code-layout')) {
@@ -203,9 +204,9 @@ async function runSmokeTests() {
                     data: {
                         project_name: 'SmokeProj',
                         file_path: 'src/smoke_test.c',
-                        total_lines: 1000,
+                        total_lines: networkChunkLines * 2,
                         regions: [
-                            { region_id: 'reg_1', start_line: 1, end_line: 1000, default_state: 'collapsed', kind: 'collapsed', line_count: 1000 }
+                            { region_id: 'reg_1', start_line: 1, end_line: networkChunkLines * 2, default_state: 'collapsed', kind: 'collapsed', line_count: networkChunkLines * 2 }
                         ]
                     }
                 })
@@ -216,8 +217,8 @@ async function runSmokeTests() {
             const start = parseInt(urlObj.searchParams.get('start_line'), 10);
             const end = parseInt(urlObj.searchParams.get('end_line'), 10);
 
-            // Simulate failure on chunk 2 (start == 501) on the first attempt
-            if (start === 501 && failChunk2) {
+            // Simulate failure on chunk 2 (start == 2001) on the first attempt
+            if (start === networkChunkLines + 1 && failChunk2) {
                 throw new Error('Simulated Network Failure on Chunk 2');
             }
 
@@ -269,9 +270,9 @@ async function runSmokeTests() {
         assert.strictEqual(reg1.currentState, 'error');
     }
 
-    // Lines container had partial chunk 1 lines (500 lines)
+    // Lines container had partial chunk 1 lines.
     assert.ok(reg1.linesEl);
-    assert.strictEqual(reg1.linesEl.children.length, 500);
+    assert.strictEqual(reg1.linesEl.children.length, networkChunkLines);
 
     // Now Retry: allow chunk 2 and expandRegion again
     console.log('[Smoke Test 1] Retrying expansion after error...');
@@ -279,8 +280,8 @@ async function runSmokeTests() {
     await CodeRegionController.expandRegion('reg_1');
     assert.strictEqual(reg1.currentState, 'expanded-loaded');
 
-    // Verify DOM lines count is EXACTLY 1000 (NOT 500 + 1000 = 1500!)
-    assert.strictEqual(reg1.linesEl.children.length, 1000, `Expected exactly 1000 DOM lines on retry, got ${reg1.linesEl.children.length}`);
+    // Verify DOM lines count is EXACTLY 4000 (not partial + full duplicate).
+    assert.strictEqual(reg1.linesEl.children.length, networkChunkLines * 2, `Expected exactly ${networkChunkLines * 2} DOM lines on retry, got ${reg1.linesEl.children.length}`);
     console.log('✔ [Smoke Test 1 Passed] No duplicate lines after retry.');
 
     // -------------------------------------------------------------------------

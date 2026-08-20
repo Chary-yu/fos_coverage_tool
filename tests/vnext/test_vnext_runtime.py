@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 import urllib.request
+from unittest import mock
 from decimal import Decimal
 from datetime import datetime
 
@@ -102,11 +103,20 @@ class VNextRuntimeTest(unittest.TestCase):
         )
 
         self.runtime.progress_service.rebuild(self.connection, "fixture", scan_id)
+        progress_trace = []
+        self.connection.set_trace_callback(progress_trace.append)
         summary = self.application.dispatch(
             "GET", "/api/coverage/progress", query={"project": "fixture"}
         )[1]
+        self.connection.set_trace_callback(None)
         self.assertEqual(summary["source"], "coverage_file_state")
         self.assertEqual(summary["pending_total"], 1)
+        self.assertFalse(
+            any("SELECT * FROM coverage_file_state" in statement for statement in progress_trace)
+        )
+        self.assertFalse(
+            any("FROM coverage_lines" in statement for statement in progress_trace)
+        )
         report = self.connection.execute(
             "SELECT scan_id FROM coverage_reports WHERE report_id = ?",
             ("report_fixture",),
@@ -216,6 +226,79 @@ class VNextRuntimeTest(unittest.TestCase):
                     self.runtime.code_detail.layout(
                         connection, scan["id"], "report_other", "src/detail.c"
                     )
+
+    def test_code_detail_batch_resolves_overlay_once(self):
+        with tempfile.TemporaryDirectory(prefix="vnext-batch-report-") as report_root:
+            key = calc_sidecar_file_key("src/batch.c")
+            context = SourceContext(
+                "batch", "src/batch.c", [
+                    SourceLineDTO(1, "one();", coverage_state="uncovered"),
+                    SourceLineDTO(2, "two();", coverage_state="uncovered"),
+                    SourceLineDTO(3, "three();", coverage_state="covered"),
+                    SourceLineDTO(4, "four();", coverage_state="covered"),
+                ], report_id="report_batch",
+            )
+            SidecarStore([report_root], chunk_size=2).save_chunked_sidecar(
+                report_root, "report_batch", key, context
+            )
+            self.runtime.report_registry.register(
+                "report_batch", [report_root], sidecar_required=True
+            )
+            with self.runtime.connection_context() as connection:
+                scan = self.runtime.project_service.create_scan(
+                    connection, "batch", info_sha256="b" * 64,
+                    report={"report_id": "report_batch", "report_root": report_root},
+                )
+                self.runtime.project_service.ingest_files(
+                    connection, scan["id"], [{
+                        "file_path": "src/batch.c", "file_path_hash": "" * 0,
+                        "lines": [
+                            {"line_number": 1, "coverage_state": "uncovered"},
+                            {"line_number": 2, "coverage_state": "uncovered"},
+                            {"line_number": 3, "coverage_state": "covered"},
+                            {"line_number": 4, "coverage_state": "covered"},
+                        ],
+                    }],
+                )
+                trace = []
+                connection.set_trace_callback(trace.append)
+                batches = self.runtime.code_detail.lines_batch(
+                    connection, scan["id"], "report_batch", "src/batch.c",
+                    [(1, 1), (2, 2), (3, 4)],
+                )
+                connection.set_trace_callback(None)
+
+            self.assertEqual([len(item["lines"]) for item in batches], [1, 1, 2])
+            analysis_reads = [
+                statement for statement in trace
+                if "FROM coverage_analyses" in statement
+            ]
+            self.assertEqual(
+                len(analysis_reads), 1,
+                "batch code detail should load the file overlay once",
+            )
+
+    def test_sidecar_shared_physical_chunk_is_decoded_once(self):
+        with tempfile.TemporaryDirectory(prefix="vnext-sidecar-cache-") as root:
+            store = SidecarStore([root], chunk_size=4)
+            context = SourceContext(
+                "cache", "src/cache.c", [
+                    SourceLineDTO(i, "line{}".format(i), coverage_state="covered")
+                    for i in range(1, 9)
+                ], report_id="report_cache",
+            )
+            key = calc_sidecar_file_key("src/cache.c")
+            store.save_chunked_sidecar(root, "report_cache", key, context)
+            with mock.patch("app.code_detail.sidecar_store.json.load", wraps=json.load) as load:
+                first = store.load_lines_ranges(
+                    "report_cache", key, [(1, 2), (3, 4)]
+                )
+                second = store.load_lines_ranges(
+                    "report_cache", key, [(1, 2), (3, 4)]
+                )
+                self.assertEqual(load.call_count, 2, "meta + one physical chunk")
+            self.assertEqual([[line["line_no"] for line in rows] for rows in first], [[1, 2], [3, 4]])
+            self.assertEqual([[line["line_no"] for line in rows] for rows in second], [[1, 2], [3, 4]])
 
 
 if __name__ == "__main__":

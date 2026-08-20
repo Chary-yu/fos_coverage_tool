@@ -36,7 +36,9 @@
     const STATUS_OPTIONS = ['未确认', '可覆盖', '无法覆盖', '冗余代码'];
     const CONFIRMED_STATUS_SET = new Set(['可覆盖', '无法覆盖', '冗余代码']);
     const RENDER_BATCH_SIZE = 250;
-    const NETWORK_CHUNK_LINES = 500;
+    // Match the server-side Sidecar physical chunk size. DOM rendering remains
+    // independently bounded by RENDER_BATCH_SIZE/RENDER_BATCH_LINES.
+    const NETWORK_CHUNK_LINES = 2000;
     const RENDER_BATCH_LINES = 250;
     const MAX_CHUNK_CONCURRENCY = 3;
     const PROGRESS_UPDATE_STORAGE_KEY = 'coverage-review-progress-updated';
