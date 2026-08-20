@@ -97,6 +97,14 @@
                 var devSections = document.querySelectorAll("section[id]");
                 for (var s = 0; s < devSections.length; s++) {
                     var section = devSections[s];
+                    // Schema-v3 task rows are blame-owner specific.  The
+                    // legacy endpoint returns file-wide counts and would
+                    // overwrite one developer's exact line count with every
+                    // other developer's value, so leave those evidence rows
+                    // unchanged until an owner-aware endpoint is available.
+                    if (section.querySelector('tr[data-owner-specific="true"]')) {
+                        continue;
+                    }
                     var sectionId = section.id;
                     var fileRows = section.querySelectorAll("tbody tr[data-file-key]");
                     var devReviewFiles = 0;

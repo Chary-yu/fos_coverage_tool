@@ -46,6 +46,7 @@ from app.progress.file_state_service import (
 from app.api.server import create_server
 from app.inject.service import InjectService
 from app.inject.directory_signature import calculate_directory_signature_incremental
+from app.incremental.service import IncrementalService
 from app.upgrade.lifecycle import writes_are_frozen
 
 logger = logging.getLogger(__name__)
@@ -334,12 +335,43 @@ def calc_incremental_review_set_hash(incremental_lines_by_file: Optional[Dict[st
     return hashlib.sha256(dumped.encode("utf-8")).hexdigest()[:16]
 
 
+def _canonical_incremental_metadata(value):
+    if isinstance(value, dict):
+        return {
+            str(key): _canonical_incremental_metadata(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple, set)):
+        items = [_canonical_incremental_metadata(item) for item in value]
+        return sorted(items, key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True))
+    if hasattr(value, "to_dict"):
+        return _canonical_incremental_metadata(value.to_dict())
+    if hasattr(value, "start_line") and hasattr(value, "end_line"):
+        return {
+            "start_line": int(value.start_line),
+            "end_line": int(value.end_line),
+            "name": str(getattr(value, "name", "") or ""),
+        }
+    return value
+
+
+def calc_incremental_metadata_hash(metadata_by_file: Optional[Dict[str, Any]]) -> str:
+    """Hash a path-keyed incremental metadata map deterministically."""
+    if not metadata_by_file:
+        return ""
+    canonical = _canonical_incremental_metadata(metadata_by_file)
+    dumped = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(dumped.encode("utf-8")).hexdigest()[:16]
+
+
 def compute_directory_signature(
     input_html_dir,
     project_name=None,
     review_scope=None,
     render_mode=None,
     incremental_lines_by_file=None,
+    incremental_reviewers_by_file=None,
+    function_ranges_by_file=None,
 ):
     """Compute a comprehensive directory signature (manifest hash, count, max mtime, size, project, scope, mode, incremental set) for input HTML reports."""
     file_count = 0
@@ -365,6 +397,8 @@ def compute_directory_signature(
         total_size = sum(int(item.get("size", 0) or 0) for item in entries.values())
         latest_mtime = max((float(item.get("mtime_ns", 0) or 0) / 1e9 for item in entries.values()), default=0.0)
     inc_hash = calc_incremental_review_set_hash(incremental_lines_by_file)
+    reviewer_hash = calc_incremental_metadata_hash(incremental_reviewers_by_file)
+    function_range_hash = calc_incremental_metadata_hash(function_ranges_by_file)
 
     return {
         "project_name": str(project_name or ""),
@@ -376,6 +410,8 @@ def compute_directory_signature(
         "manifest_hash": manifest_hash,
         "tool_version": ASSET_VERSION,
         "incremental_review_set_hash": inc_hash,
+        "incremental_reviewer_set_hash": reviewer_hash,
+        "function_range_set_hash": function_range_hash,
     }
 REVIEW_STATUS_UNCONFIRMED = "未确认"
 REVIEW_CONFIRMED_STATUSES = ("可覆盖", "无法覆盖", "冗余代码")
@@ -482,20 +518,32 @@ def normalize_review_source_path(file_path):
 
 
 def get_incremental_lines_for_report(report_file_path, incremental_lines_by_file):
-    """Return selected Git-added lines for a report source path.
+    """Return selected Git-added lines through the canonical path index."""
+    value, _ = resolve_incremental_metadata_for_report(
+        report_file_path, incremental_lines_by_file
+    )
+    return set(value or [])
 
-    LCOV report titles can contain an absolute source path while Git diff paths are
-    repository-relative. A suffix match is useful in that case, but only when it is
-    unique so same-named files never receive another file's form controls.
-    """
-    report_file_path = normalize_review_source_path(report_file_path)
-    if report_file_path in incremental_lines_by_file:
-        return set(incremental_lines_by_file[report_file_path])
-    matches = [
-        lines for source_file, lines in incremental_lines_by_file.items()
-        if report_file_path.endswith("/" + source_file) or source_file.endswith("/" + report_file_path)
-    ]
-    return set(matches[0]) if len(matches) == 1 else set()
+
+def resolve_incremental_metadata_for_report(report_file_path, metadata_by_file):
+    """Resolve any incremental metadata map with one shared fail-closed index."""
+    service = IncrementalService({"default": list((metadata_by_file or {}).keys())})
+    value, match_type = service.resolve_mapping_value(
+        normalize_review_source_path(report_file_path), metadata_by_file or {}
+    )
+    if match_type not in ("exact", "normalized", "unique_suffix"):
+        return None, match_type
+    return value, match_type
+
+
+def get_incremental_reviewers_for_report(report_file_path, reviewers_by_file):
+    value, _ = resolve_incremental_metadata_for_report(report_file_path, reviewers_by_file)
+    return value if isinstance(value, dict) else {}
+
+
+def get_function_ranges_for_report(report_file_path, function_ranges_by_file):
+    value, _ = resolve_incremental_metadata_for_report(report_file_path, function_ranges_by_file)
+    return value if isinstance(value, list) else []
 
 
 def get_source_file_name(file_path):
@@ -1334,6 +1382,7 @@ def increment_project_data_version(project_name, manager=None):
     new_version = None
     db_err = None
     if active_mgr and active_mgr.conn:
+        cursor = None
         try:
             cursor = active_mgr.conn.cursor()
             cursor.execute("""
@@ -1359,6 +1408,43 @@ def increment_project_data_version(project_name, manager=None):
                         new_version = None
         except Exception as e:
             db_err = e
+            # Older installations (and SQLite-compatible test adapters) may
+            # still expose coverage_project_state without the derived
+            # file_state_version column.  The authoritative data_version
+            # remains usable; retry the narrow legacy statement without
+            # changing the schema or reviewer semantics.
+            try:
+                if cursor is not None and hasattr(cursor, "close"):
+                    cursor.close()
+            except Exception:
+                pass
+            try:
+                legacy_cursor = active_mgr.conn.cursor()
+                legacy_initial_version = int(_project_data_versions.get(project_name, 0) or 0) + 1
+                legacy_cursor.execute("""
+                    INSERT INTO coverage_project_state (project_name, data_version, updated_at)
+                    VALUES (%s, %s, NOW(6))
+                    ON DUPLICATE KEY UPDATE data_version = data_version + 1, updated_at = NOW(6)
+                """, (project_name, legacy_initial_version))
+                if hasattr(active_mgr.conn, "commit"):
+                    active_mgr.conn.commit()
+                legacy_cursor.execute(
+                    "SELECT data_version FROM coverage_project_state WHERE project_name = %s",
+                    (project_name,),
+                )
+                legacy_row = legacy_cursor.fetchone()
+                if hasattr(legacy_cursor, "close"):
+                    legacy_cursor.close()
+                if legacy_row is not None:
+                    if isinstance(legacy_row, dict):
+                        new_version = legacy_row.get("data_version", 1)
+                    elif isinstance(legacy_row, (tuple, list)):
+                        new_version = legacy_row[0]
+                    else:
+                        new_version = int(legacy_row[0])
+                    db_err = None
+            except Exception as legacy_error:
+                db_err = legacy_error
         finally:
             if owned and active_mgr.conn:
                 try:
@@ -2138,7 +2224,7 @@ def extract_report_file_path(content, fallback_path):
     return fallback_path.replace(os.sep, '/').replace('.gcov.html', '')
 
 
-def mark_incremental_review_lines(content, selected_line_numbers):
+def mark_incremental_review_lines(content, selected_line_numbers, reviewers_by_line=None):
     """Mark only selected source lines as editable in an LCOV HTML page.
 
     Both genhtml layouts seen in the field are handled: modern ``id=L42`` rows and
@@ -2146,18 +2232,36 @@ def mark_incremental_review_lines(content, selected_line_numbers):
     removed, which makes re-running an in-place incremental injection deterministic.
     """
     content = re.sub(r'\sdata-coverage-review=(["\']).*?\1', '', content, flags=re.I)
+    content = re.sub(r'\sdata-coverage-reviewer=(["\']).*?\1', '', content, flags=re.I)
     selected_line_numbers = set(selected_line_numbers or [])
     if not selected_line_numbers:
         return content
 
+    def reviewer_value(line_number):
+        value = (reviewers_by_line or {}).get(line_number)
+        if value is None:
+            value = (reviewers_by_line or {}).get(str(line_number))
+        if isinstance(value, dict):
+            value = value.get("reviewer") or value.get("author_name") or ""
+        return str(value or "").strip()
+
+    def marker_attributes(line_number):
+        reviewer = reviewer_value(line_number)
+        marker = ' data-coverage-review="incremental"'
+        if reviewer:
+            marker += ' data-coverage-reviewer="{}"'.format(
+                html.escape(reviewer, quote=True)
+            )
+        return marker
+
     def add_modern_marker(match):
         line_number = int(match.group(2))
-        return match.group(1) + (' data-coverage-review="incremental"' if line_number in selected_line_numbers else '') + match.group(3)
+        return match.group(1) + (marker_attributes(line_number) if line_number in selected_line_numbers else '') + match.group(3)
 
     def add_legacy_marker(match):
         line_number = int(match.group("line_number"))
         return match.group("prefix") + (
-            ' data-coverage-review="incremental"' if line_number in selected_line_numbers else ''
+            marker_attributes(line_number) if line_number in selected_line_numbers else ''
         ) + match.group("closing")
 
     modern_line_pattern = re.compile(r'(<span\b[^>]*\bid=["\']L(\d+)["\'][^>]*)(>)', re.I)
@@ -5260,7 +5364,9 @@ def close_thread_db_manager():
 def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync_index=True,
                                  review_scope="full", incremental_lines_by_file=None,
                                  render_mode="lazy_collapse", report_id="", output_dir="",
-                                 source_input_file=None, can_reuse=False):
+                                 source_input_file=None, can_reuse=False,
+                                 incremental_reviewers_by_file=None,
+                                 function_ranges_by_file=None):
     depth = len(rel_path.split(os.sep)) - 1
     prefix = "../" * depth
 
@@ -5296,12 +5402,24 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
     sidecar_key = calc_sidecar_file_key(report_file_path)      # Sidecar SHA256[:32]
 
     review_line_numbers = None
+    reviewers_by_line = {}
+    known_function_ranges = []
     if review_scope == "incremental":
         review_line_numbers = get_incremental_lines_for_report(
             report_file_path, incremental_lines_by_file or {}
         )
-        source_content = mark_incremental_review_lines(source_content, review_line_numbers)
-        file_content = mark_incremental_review_lines(file_content, review_line_numbers)
+        reviewers_by_line = get_incremental_reviewers_for_report(
+            report_file_path, incremental_reviewers_by_file or {}
+        )
+        known_function_ranges = get_function_ranges_for_report(
+            report_file_path, function_ranges_by_file or {}
+        )
+        source_content = mark_incremental_review_lines(
+            source_content, review_line_numbers, reviewers_by_line
+        )
+        file_content = mark_incremental_review_lines(
+            file_content, review_line_numbers, reviewers_by_line
+        )
     parsed_artifact = InjectService.parse_once(
         project_name=project_name,
         report_id=report_id,
@@ -5309,6 +5427,8 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
         html_content=source_content,
         review_scope=review_scope,
         incremental_lines=set(review_line_numbers) if review_line_numbers else None,
+        suggested_reviewers_by_line=reviewers_by_line,
+        known_function_ranges=known_function_ranges or None,
     )
     source_ctx = parsed_artifact.source_context
     file_line_index_records = parsed_artifact.line_index_records
@@ -5395,7 +5515,8 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
 
 
 def inject_coverage_report(input_dir, output_dir, project_name=None, workers=None, render_mode=None,
-                           review_scope="full", incremental_lines_by_file=None, reuse_output=None):
+                           review_scope="full", incremental_lines_by_file=None, reuse_output=None,
+                           incremental_reviewers_by_file=None, function_ranges_by_file=None):
     """
     非破坏性注入覆盖率报告：
     1. 若 output_dir 与 input_dir 不同，且未关联指纹重用，则自动复制 input_dir 至 output_dir (清除已有的 output_dir)
@@ -5437,6 +5558,8 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
         review_scope=review_scope,
         render_mode=render_mode,
         incremental_lines_by_file=incremental_lines_by_file,
+        incremental_reviewers_by_file=incremental_reviewers_by_file,
+        function_ranges_by_file=function_ranges_by_file,
     )
     can_reuse = False
 
@@ -5571,6 +5694,8 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
                 output_dir=real_output_html,
                 source_input_file=os.path.join(real_input_html, rel_path) if input_dir != output_dir else None,
                 can_reuse=can_reuse,
+                incremental_reviewers_by_file=incremental_reviewers_by_file,
+                function_ranges_by_file=function_ranges_by_file,
             )
             for file_path, rel_path in gcov_files
         ]
@@ -6155,10 +6280,14 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
         email = escaped(developer.get("email", ""))
         display_name = name if not email else "{} &lt;{}&gt;".format(name, email)
         summary_rows.append(
-            '<tr data-dev-anchor="{}"><td><a href="#{}">{}</a></td><td>{}</td><td>{}</td><td class="js-summary-review-files">{}</td><td class="js-summary-uncovered-lines">{}</td></tr>'.format(
+            '<tr data-dev-anchor="{}"><td><a href="#{}">{}</a></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td class="js-summary-review-files">{}</td><td class="js-summary-uncovered-lines">{}</td><td>{}</td></tr>'.format(
                 anchor, anchor, display_name, developer.get("commit_total", 0),
-                developer.get("changed_file_total", 0), developer.get("review_file_total", 0),
-                developer.get("review_uncovered_total", 0),
+                developer.get("changed_file_total", 0), developer.get("owned_added_lines", sum(
+                    item.get("changed", 0) for item in developer.get("files", [])
+                )),
+                escaped(", ".join(str(line) for line in developer.get("owned_line_numbers", []))),
+                developer.get("review_file_total", 0), developer.get("review_uncovered_total", 0),
+                escaped(", ".join(str(line) for line in developer.get("uncovered_line_numbers", []))),
             )
         )
 
@@ -6186,7 +6315,11 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
             ) or "-"
 
             uncovered = file_task.get("uncovered", 0)
-            changed = file_task.get("changed", 0)
+            changed = file_task.get("owned_added_lines", file_task.get("changed", 0))
+            owned_line_numbers = ", ".join(str(line) for line in file_task.get("owned_line_numbers", []))
+            uncovered_line_numbers = ", ".join(str(line) for line in file_task.get(
+                "uncovered_need_fill_line_numbers", file_task.get("uncovered_line_numbers", [])
+            ))
             if uncovered:
                 if page_link:
                     action = '<a class="fill-link" href="{}">填写 {} 行</a>'.format(
@@ -6200,25 +6333,26 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
                 action = '<span class="muted">本次提交未产生新增代码行</span>'
 
             file_rows.append(
-                '<tr data-file-key="{}" data-page-link="{}" data-changed="{}"><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td>'
-                '<td>{}</td><td class="js-task-unanalyzed" data-sort-value="{}">{}</td><td>{}</td><td class="js-task-action">{}</td></tr>'.format(
+                '<tr data-file-key="{}" data-page-link="{}" data-changed="{}" data-owner-specific="true"><td>{}</td><td>{}</td><td>{}</td><td>{}</td>'
+                '<td>{}</td><td>{}</td><td>{}</td><td class="js-task-unanalyzed" data-sort-value="{}">{}</td><td>{}</td><td>{}</td><td class="js-task-action">{}</td></tr>'.format(
                     escaped(file_key),
                     escaped(page_link or ""),
                     changed,
                     escaped(file_task.get("repository", "") or "-"), source_cell,
                     escaped(", ".join(file_task.get("change_types") or [])), commit_text,
-                    changed, file_task.get("covered", 0), uncovered, uncovered,
+                    changed, escaped(owned_line_numbers), file_task.get("covered", 0),
+                    uncovered, uncovered, escaped(uncovered_line_numbers),
                     file_task.get("missing", 0), action,
                 )
             )
         if not file_rows:
-            file_rows.append('<tr><td colspan="9">此开发人员没有可展示的提交文件。</td></tr>')
+            file_rows.append('<tr><td colspan="11">此开发人员没有可展示的提交文件。</td></tr>')
         developer_sections.append(
             '<section id="{}"><h2>👤 {}</h2><div class="person-stats"><span class="stat-pill">提交 <strong>{}</strong> 个</span>'
             '<span class="stat-pill">提交文件 <strong>{}</strong> 个</span><span class="stat-pill">需填写文件 <strong class="js-dev-review-files">{}</strong> 个</span>'
             '<span class="stat-pill warn js-dev-uncovered-pill">待填写 <strong class="js-dev-uncovered-lines">{}</strong> 行</span></div><div class="table-wrap"><table>'
             '<thead><tr><th>仓库</th><th>提交文件</th><th>变更类型</th><th>关联提交</th>'
-            '<th>新增行</th><th>已覆盖</th><th>待填写</th><th>覆盖信息缺失</th><th>操作</th></tr></thead>'
+            '<th>本人新增行</th><th>本人新增行号</th><th>已覆盖</th><th>待填写</th><th>待填写行号</th><th>覆盖信息缺失</th><th>操作</th></tr></thead>'
             '<tbody>{}</tbody></table></div></section>'.format(
                 anchor, display_name, developer.get("commit_total", 0),
                 developer.get("changed_file_total", 0), developer.get("review_file_total", 0),
@@ -6227,7 +6361,7 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
         )
 
     summary_table_rows = "".join(summary_rows) or (
-        '<tr><td colspan="5">未找到此 Git 范围内可映射的提交作者。</td></tr>'
+        '<tr><td colspan="8">未找到此 Git 范围内可映射的提交作者。</td></tr>'
     )
     sections_html = "".join(developer_sections) or (
         '<section><h2>暂无开发人员任务</h2><p>请确认提交范围内存在 Git commit，且当前执行用户可读取仓库历史。</p></section>'
@@ -6276,8 +6410,8 @@ td a:hover{{text-decoration:underline}}
     <a href="incremental_coverage.xlsx">📈 下载 Excel</a>
   </div>
 </div>
-<section><h2>👥 人员概览</h2><div class="table-wrap"><table><thead><tr><th>开发人员</th><th>提交数</th><th>提交文件</th><th>需填写文件</th><th>待填写行</th></tr></thead><tbody>{summary_rows}</tbody></table></div></section>
-<aside class="muted" style="margin:12px 0 20px;text-align:center">说明：按 Git author 的“姓名 + 邮箱”区分人员。多人提交同一文件时，文件会同时出现在每位相关开发人员的清单中；“待填写”仅统计本次 Git diff 中 LCOV 未覆盖的新增行。</aside>
+<section><h2>👥 人员概览</h2><div class="table-wrap"><table><thead><tr><th>开发人员</th><th>提交数</th><th>提交文件</th><th>本人新增行</th><th>本人新增行号</th><th>需填写文件</th><th>本人待填写行</th><th>本人待填写行号</th></tr></thead><tbody>{summary_rows}</tbody></table></div></section>
+<aside class="muted" style="margin:12px 0 20px;text-align:center">说明：按 newgit 最终代码的 Git blame“姓名 + 邮箱”区分人员；多人提交同一文件时，每个开发人员只统计自己拥有的新增行，待填写行号可追溯到对应文件。</aside>
 {sections}
 </main><script src="incremental_developer_tasks.js?v={version_tag}"></script></body></html>""".format(
         project=escaped(project_name),
@@ -6312,6 +6446,8 @@ def build_incremental_review_site(result, input_dir, output_dir, project_name,
         review_scope="incremental",
         incremental_lines_by_file=result.get("review_lines_by_file") or result["uncovered_lines_by_file"],
         reuse_output=reuse_output,
+        incremental_reviewers_by_file=result.get("reviewers_by_file") or {},
+        function_ranges_by_file=result.get("function_ranges_by_file") or {},
     )
     timer.mark("inject_coverage_report")
     real_output_html = (

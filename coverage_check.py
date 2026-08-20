@@ -16,7 +16,7 @@ import re
 import subprocess
 import zipfile
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from app.incremental.service import IncrementalService
 
 
@@ -26,6 +26,7 @@ STATUS_IGNORED = "无需覆盖"
 STATUS_MISSING = "覆盖信息缺失"
 
 _PATH_INDEX_CACHE = {}
+MAX_BLAME_RANGES_PER_FILE = 24
 
 
 def normalize_path(path):
@@ -190,18 +191,288 @@ def parse_diff(diff_file):
         return parse_diff_text(handle.read())
 
 
-def parse_lcov_info(info_file):
-    """Parse one LCOV .info file into ``{source_file: {line: execution_count}}``."""
+def _coalesce_line_ranges(line_numbers):
+    """Return sorted contiguous ``(start, end)`` ranges for line numbers."""
+    values = sorted(set(int(number) for number in (line_numbers or []) if int(number) > 0))
+    if not values:
+        return []
+
+    ranges = []
+    start = previous = values[0]
+    for value in values[1:]:
+        if value == previous + 1:
+            previous = value
+            continue
+        ranges.append((start, previous))
+        start = previous = value
+    ranges.append((start, previous))
+    return ranges
+
+
+_BLAME_HEADER_RE = re.compile(
+    r"^(?P<boundary>\^?)(?P<commit>[0-9a-fA-F]{7,64})\s+"
+    r"(?P<original>\d+)\s+(?P<final>\d+)(?:\s+(?P<count>\d+))?$"
+)
+
+
+def _format_blame_timestamp(timestamp, timezone_text=""):
+    """Convert porcelain epoch metadata to a stable ISO-8601 string."""
+    try:
+        offset_text = str(timezone_text or "+0000")
+        sign = -1 if offset_text.startswith("-") else 1
+        digits = offset_text.lstrip("+-")
+        hours = int(digits[:2] or 0)
+        minutes = int(digits[2:4] or 0)
+        tz = timezone(sign * timedelta(hours=hours, minutes=minutes))
+        return datetime.fromtimestamp(int(timestamp), tz).strftime("%Y-%m-%dT%H:%M:%S%z")
+    except (TypeError, ValueError, OverflowError, OSError):
+        return str(timestamp or "")
+
+
+def parse_git_blame_porcelain(blame_text, selected_line_numbers=None):
+    """Parse ``git blame --line-porcelain`` into final-line ownership.
+
+    Porcelain emits a header and metadata followed by one source line.  A
+    header may declare several consecutive lines; the final-line number is
+    advanced for each emitted source line.  Boundary commits are represented
+    by Git as ``^<sha>``; the caret is exposed separately while the public
+    commit value remains the usable SHA.
+    """
+    selected = None if selected_line_numbers is None else set(
+        int(number) for number in selected_line_numbers
+    )
+    result = {}
+    current = None
+
+    for raw_line in str(blame_text or "").splitlines():
+        header = _BLAME_HEADER_RE.match(raw_line)
+        if header:
+            current = {
+                "commit": header.group("commit"),
+                "boundary": bool(header.group("boundary")),
+                "final_line": int(header.group("final")),
+                "line_count": int(header.group("count") or 1),
+                "emitted": 0,
+                "metadata": {},
+            }
+            continue
+
+        if current is None:
+            continue
+
+        # A source line is the only porcelain line prefixed with a tab (Git's
+        # documented form) or four spaces (some wrappers re-indent output).
+        if raw_line.startswith("\t") or raw_line.startswith("    "):
+            line_number = current["final_line"] + current["emitted"]
+            metadata = current["metadata"]
+            if selected is None or line_number in selected:
+                email = str(metadata.get("author-mail", "") or "").strip()
+                if email.startswith("<") and email.endswith(">"):
+                    email = email[1:-1]
+                result[line_number] = {
+                    "author_name": str(metadata.get("author", "") or "").strip(),
+                    "author_email": email,
+                    "commit": current["commit"],
+                    "boundary": current["boundary"],
+                    "committed_at": _format_blame_timestamp(
+                        metadata.get("author-time", ""),
+                        metadata.get("author-tz", "+0000"),
+                    ),
+                    "subject": str(metadata.get("summary", "") or "").strip(),
+                }
+            current["emitted"] += 1
+            if current["emitted"] >= current["line_count"]:
+                current = None
+            continue
+
+        # Metadata values are allowed to contain spaces.  Unknown keys are
+        # retained so future Git porcelain fields do not break parsing.
+        if " " in raw_line:
+            key, value = raw_line.split(" ", 1)
+            current["metadata"][key] = value
+
+    return result
+
+
+def _run_git_blame(repo_path, newgit, file_path, start_line=None, end_line=None):
+    command = ["git", "blame", "--line-porcelain"]
+    if start_line is not None and end_line is not None:
+        command.extend(["-L", "{},{}".format(start_line, end_line)])
+    command.extend([newgit, "--", normalize_path(file_path)])
+    proc = subprocess.Popen(
+        command,
+        cwd=repo_path,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout, stderr = proc.communicate()
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", "replace")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    if proc.returncode != 0:
+        message = stderr.strip() or "git blame failed"
+        raise RuntimeError(
+            "git blame {} {} failed for {}: {}".format(
+                newgit, "-L {},{}".format(start_line, end_line)
+                if start_line is not None else "whole-file", file_path, message
+            )
+        )
+    return stdout
+
+
+def run_git_line_authors(repo_path, newgit, file_changes, repository_name=""):
+    """Attribute only final added lines to ``newgit`` using pinned blame.
+
+    A file normally uses one blame process per coalesced range.  Highly
+    fragmented additions use one whole-file process followed by an explicit
+    line filter to avoid process explosion.  Missing requested lines are a
+    hard error: production must not silently fall back to a file-level author.
+    """
+    result = {}
+    for raw_file_path, raw_line_numbers in sorted((file_changes or {}).items()):
+        file_path = normalize_path(raw_file_path)
+        selected = set(int(number) for number in raw_line_numbers or [] if int(number) > 0)
+        if not file_path or not selected:
+            continue
+
+        ranges = _coalesce_line_ranges(selected)
+        if len(ranges) > MAX_BLAME_RANGES_PER_FILE:
+            blame_text = _run_git_blame(repo_path, newgit, file_path)
+            parsed = parse_git_blame_porcelain(blame_text, selected)
+        else:
+            parsed = {}
+            for start_line, end_line in ranges:
+                blame_text = _run_git_blame(
+                    repo_path, newgit, file_path, start_line, end_line
+                )
+                parsed.update(parse_git_blame_porcelain(
+                    blame_text, set(range(start_line, end_line + 1))
+                ))
+
+        missing = sorted(selected.difference(parsed))
+        if missing:
+            raise RuntimeError(
+                "git blame returned no attribution for {} line(s) in {} at {}: {}".format(
+                    len(missing), file_path, newgit, missing[:20]
+                )
+            )
+        for attribution in parsed.values():
+            attribution["repository"] = repository_name
+        result[file_path] = parsed
+    return result
+
+
+def _parse_lcov_function_payload(payload, tag):
+    """Parse common FN/FNL/FNA complete-range and alias forms."""
+    parts = [part.strip() for part in str(payload or "").split(",")]
+    numeric = []
+    for index, part in enumerate(parts):
+        try:
+            numeric.append((index, int(part)))
+        except (TypeError, ValueError):
+            continue
+
+    if len(numeric) >= 2:
+        # Complete extensions normally use start,end,name.  Accept the
+        # equivalent start,name,end form as well because toolchains differ.
+        start_index, start_line = numeric[0]
+        if numeric[-1][0] == len(parts) - 1 and start_index != numeric[-1][0]:
+            end_index, end_line = numeric[-1]
+            name_parts = parts[:start_index] + parts[start_index + 1:end_index]
+        else:
+            end_index, end_line = numeric[1]
+            if end_index == start_index + 1:
+                name_parts = parts[end_index + 1:]
+            else:
+                name_parts = parts[start_index + 1:end_index]
+        return {
+            "start_line": start_line,
+            "end_line": end_line,
+            "name": ",".join(name_parts).strip(),
+        }
+
+    if len(numeric) == 1:
+        line_index, line_number = numeric[0]
+        name = ",".join(parts[:line_index] + parts[line_index + 1:]).strip()
+        if tag == "FN":
+            return {"start_line": line_number, "end_line": None, "name": name}
+        # FNL/FNA are treated as end-line aliases when the start is supplied
+        # by a matching FN record.  They may also be emitted as a complete
+        # range by the two-number branch above.
+        return {"start_line": None, "end_line": line_number, "name": name}
+
+    return None
+
+
+def _finalize_lcov_function_state(state):
+    direct_ranges = list(state.get("ranges") or [])
+    starts = list(state.get("starts") or [])
+    ends = list(state.get("ends") or [])
+    unmatched = False
+
+    remaining_ends = list(ends)
+    for start in starts:
+        matching_index = None
+        for index, end in enumerate(remaining_ends):
+            if end.get("name", "") == start.get("name", ""):
+                matching_index = index
+                break
+        if matching_index is None:
+            unmatched = True
+            continue
+        end = remaining_ends.pop(matching_index)
+        direct_ranges.append({
+            "start_line": start["start_line"],
+            "end_line": end["end_line"],
+            "name": start.get("name", "") or end.get("name", ""),
+        })
+
+    if remaining_ends:
+        unmatched = True
+
+    normalized = normalize_lcov_function_ranges(direct_ranges)
+    if unmatched or (starts and not normalized):
+        return [], False
+    if state.get("has_function_records") and not normalized:
+        return [], False
+    return normalized, bool(normalized)
+
+
+def _parse_lcov_info_data_internal(info_file):
     coverage_data = {}
+    function_ranges = {}
+    function_states = {}
     current_file = None
+
+    def ensure_state(path):
+        return function_states.setdefault(path, {
+            "has_function_records": False,
+            "ranges": [],
+            "starts": [],
+            "ends": [],
+        })
+
+    def finalize_file(path):
+        if not path or path not in function_states:
+            return
+        ranges, trusted = _finalize_lcov_function_state(function_states[path])
+        if trusted:
+            function_ranges[path] = ranges
+        else:
+            function_ranges.pop(path, None)
+
     with open(info_file, "r", encoding="utf-8", errors="replace") as handle:
         for raw_line in handle:
             line = raw_line.strip()
             if line.startswith("SF:"):
+                if current_file:
+                    finalize_file(current_file)
                 normalized = normalize_path(line[3:])
                 if is_valid_source_file(normalized):
                     current_file = normalized
                     coverage_data.setdefault(current_file, {})
+                    ensure_state(current_file)
                 else:
                     current_file = None
             elif line.startswith("DA:") and current_file:
@@ -212,8 +483,101 @@ def parse_lcov_info(info_file):
                 except (IndexError, ValueError):
                     continue
                 coverage_data[current_file][line_number] = execution_count
+            elif current_file and (line.startswith("FN:") or line.startswith("FNL:") or line.startswith("FNA:")):
+                tag, payload = line.split(":", 1)
+                parsed = _parse_lcov_function_payload(payload, tag)
+                if not parsed:
+                    continue
+                state = ensure_state(current_file)
+                state["has_function_records"] = True
+                if parsed.get("start_line") is not None and parsed.get("end_line") is not None:
+                    state["ranges"].append(parsed)
+                elif parsed.get("start_line") is not None:
+                    state["starts"].append(parsed)
+                elif parsed.get("end_line") is not None:
+                    state["ends"].append(parsed)
             elif line == "end_of_record":
+                finalize_file(current_file)
                 current_file = None
+
+    if current_file:
+        finalize_file(current_file)
+    return coverage_data, function_ranges, function_states
+
+
+def normalize_lcov_function_ranges(ranges, total_lines=None):
+    """Normalize and validate complete LCOV function ranges.
+
+    Nested ranges are compiler aliases and collapse to the outer physical
+    function.  Truly crossing ranges are unsafe and return an empty list so
+    callers can use the source parser fallback.
+    """
+    normalized = []
+    for raw in ranges or []:
+        if isinstance(raw, dict):
+            start = raw.get("start_line")
+            end = raw.get("end_line")
+            name = raw.get("name")
+        elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            start, end = raw[0], raw[1]
+            name = raw[2] if len(raw) > 2 else ""
+        else:
+            start = getattr(raw, "start_line", None)
+            end = getattr(raw, "end_line", None)
+            name = getattr(raw, "name", "")
+        try:
+            start = int(start)
+            end = int(end)
+        except (TypeError, ValueError):
+            return []
+        if start < 1 or end < start or (total_lines is not None and end > int(total_lines)):
+            return []
+        normalized.append({
+            "start_line": start,
+            "end_line": end,
+            "name": str(name or "").strip(),
+        })
+
+    if not normalized:
+        return []
+
+    # Same physical range with different aliases is represented once.
+    by_geometry = {}
+    for item in normalized:
+        key = (item["start_line"], item["end_line"])
+        previous = by_geometry.get(key)
+        if previous is None or (not previous.get("name") and item.get("name")):
+            by_geometry[key] = item
+
+    ordered = sorted(
+        by_geometry.values(),
+        key=lambda item: (item["start_line"], -item["end_line"]),
+    )
+    outermost = []
+    for item in ordered:
+        contained = False
+        for existing in outermost:
+            if (existing["start_line"] <= item["start_line"] and
+                    item["end_line"] <= existing["end_line"]):
+                contained = True
+                break
+            if (item["start_line"] < existing["start_line"] <= item["end_line"] < existing["end_line"] or
+                    existing["start_line"] < item["start_line"] <= existing["end_line"] < item["end_line"]):
+                return []
+        if not contained:
+            outermost.append(item)
+    return outermost
+
+
+def parse_lcov_info_data(info_file):
+    """Parse LCOV coverage and trusted complete function ranges."""
+    coverage_data, function_ranges, _ = _parse_lcov_info_data_internal(info_file)
+    return coverage_data, function_ranges
+
+
+def parse_lcov_info(info_file):
+    """Parse one LCOV .info file into ``{source_file: {line: execution_count}}``."""
+    coverage_data, _ = parse_lcov_info_data(info_file)
     return coverage_data
 
 
@@ -243,6 +607,37 @@ def load_lcov_info(info_path):
             for line_number, execution_count in lines.items():
                 target_lines[line_number] = target_lines.get(line_number, 0) + execution_count
     return merged, info_files
+
+
+def load_lcov_info_with_functions(info_path):
+    """Load coverage and merge only files with trusted complete ranges."""
+    merged, function_ranges = {}, {}
+    invalid_function_files = set()
+    info_files = find_info_files(info_path)
+    for info_file in info_files:
+        coverage_data, ranges, states = _parse_lcov_info_data_internal(info_file)
+        for file_path, lines in coverage_data.items():
+            target_lines = merged.setdefault(file_path, {})
+            for line_number, execution_count in lines.items():
+                target_lines[line_number] = target_lines.get(line_number, 0) + execution_count
+        for file_path, state in states.items():
+            if not state.get("has_function_records"):
+                continue
+            if file_path not in ranges:
+                invalid_function_files.add(file_path)
+            else:
+                function_ranges.setdefault(file_path, []).extend(ranges[file_path])
+
+    for file_path in list(function_ranges):
+        if file_path in invalid_function_files:
+            function_ranges.pop(file_path, None)
+            continue
+        normalized = normalize_lcov_function_ranges(function_ranges[file_path])
+        if normalized:
+            function_ranges[file_path] = normalized
+        else:
+            function_ranges.pop(file_path, None)
+    return merged, function_ranges, info_files
 
 
 def merge_info_files(info_path):
@@ -348,7 +743,7 @@ def build_summary(counters):
     }
 
 
-def build_developer_tasks(details, developer_file_changes):
+def _build_legacy_developer_tasks(details, developer_file_changes):
     """Join Git authors with the coverage summary for each changed file.
 
     The coverage result is calculated from the final diff, while Git history is
@@ -477,8 +872,214 @@ def build_developer_tasks(details, developer_file_changes):
     return {"developers": result_developers}
 
 
+def _developer_identity(name, email):
+    email = str(email or "").strip()
+    name = str(name or "").strip()
+    return email.lower() or name.lower() or "unknown"
+
+
+def _new_precise_developer_task():
+    return {
+        "repository": "",
+        "file_path": "",
+        "review_file_path": "",
+        "change_types": set(),
+        "commits": {},
+        "owned_line_numbers": set(),
+        "covered_line_numbers": set(),
+        "uncovered_line_numbers": set(),
+        "ignored_line_numbers": set(),
+        "missing_line_numbers": set(),
+    }
+
+
+def build_developer_tasks(details, developer_file_changes):
+    """Aggregate developer tasks from final-line attribution when available.
+
+    New schema-v3 details carry one author per added line.  That path counts
+    only the lines owned by the developer.  The legacy file-level aggregation
+    remains available for callers that pass pre-v3 details without attribution.
+    """
+    has_attribution = any(
+        item.get("author_name") or item.get("author_email") or item.get("commit")
+        for item in (details or [])
+    )
+    if not has_attribution:
+        return _build_legacy_developer_tasks(details, developer_file_changes)
+
+    developers = {}
+
+    def ensure_developer(name, email):
+        identity = _developer_identity(name, email)
+        developer = developers.setdefault(identity, {
+            "name": str(name or "Unknown"),
+            "email": str(email or ""),
+            "commits": {},
+            "files": {},
+        })
+        if not developer["email"] and email:
+            developer["email"] = str(email)
+        if developer["name"] == "Unknown" and name:
+            developer["name"] = str(name)
+        return identity, developer
+
+    def ensure_file_task(developer, repository, file_path, review_file_path=""):
+        key = (repository, normalize_path(file_path))
+        task = developer["files"].setdefault(key, _new_precise_developer_task())
+        task["repository"] = repository
+        task["file_path"] = normalize_path(file_path)
+        task["review_file_path"] = review_file_path or task["review_file_path"] or task["file_path"]
+        return task
+
+    for item in details or []:
+        name = item.get("author_name") or "Unknown"
+        email = item.get("author_email") or ""
+        identity, developer = ensure_developer(name, email)
+        repository = item.get("repository", "") or ""
+        file_path = normalize_path(item.get("file_path", ""))
+        if not file_path:
+            continue
+        task = ensure_file_task(
+            developer, repository, file_path,
+            item.get("review_file_path") or item.get("coverage_file") or file_path,
+        )
+        line_number = int(item.get("line_number", 0) or 0)
+        if line_number > 0:
+            task["owned_line_numbers"].add(line_number)
+            status = item.get("status")
+            if status == STATUS_COVERED:
+                task["covered_line_numbers"].add(line_number)
+            elif status == STATUS_UNCOVERED:
+                task["uncovered_line_numbers"].add(line_number)
+            elif status == STATUS_IGNORED:
+                task["ignored_line_numbers"].add(line_number)
+            elif status == STATUS_MISSING:
+                task["missing_line_numbers"].add(line_number)
+
+        commit_id = item.get("commit") or ""
+        if commit_id:
+            commit_data = {
+                "repository": repository,
+                "commit": commit_id,
+                "committed_at": item.get("committed_at") or "",
+                "subject": item.get("subject") or "",
+            }
+            developer["commits"]["{}:{}".format(repository, commit_id)] = commit_data
+            task["commits"][commit_id] = dict(commit_data)
+
+    # Add commit/change metadata from git log without assigning those commits'
+    # unrelated lines to the developer.  This preserves traceability while the
+    # line counters remain strictly blame-owned.
+    for change in developer_file_changes or []:
+        identity, developer = ensure_developer(
+            change.get("author_name") or "Unknown",
+            change.get("author_email") or "",
+        )
+        repository = change.get("repository", "") or ""
+        file_path = normalize_path(change.get("file_path", ""))
+        if not file_path:
+            continue
+        task = developer["files"].get((repository, file_path))
+        if task is None and not has_attribution:
+            task = ensure_file_task(developer, repository, file_path)
+        if task is None:
+            continue
+        change_type = change.get("change_type") or ""
+        if change_type:
+            task["change_types"].add(change_type)
+        commit_id = change.get("commit") or ""
+        if commit_id:
+            commit_data = {
+                "repository": repository,
+                "commit": commit_id,
+                "committed_at": change.get("committed_at") or "",
+                "subject": change.get("subject") or "",
+            }
+            developer["commits"]["{}:{}".format(repository, commit_id)] = commit_data
+            task["commits"][commit_id] = {
+                key: value for key, value in commit_data.items() if key != "repository"
+            }
+
+    result_developers = []
+    for developer in developers.values():
+        tasks = []
+        for task_data in developer["files"].values():
+            owned = sorted(task_data["owned_line_numbers"])
+            covered = sorted(task_data["covered_line_numbers"])
+            uncovered = sorted(task_data["uncovered_line_numbers"])
+            ignored = sorted(task_data["ignored_line_numbers"])
+            missing = sorted(task_data["missing_line_numbers"])
+            tasks.append({
+                "repository": task_data["repository"],
+                "file_path": task_data["file_path"],
+                "review_file_path": task_data["review_file_path"],
+                "change_types": sorted(task_data["change_types"]),
+                "commits": sorted(
+                    task_data["commits"].values(),
+                    key=lambda item: (item.get("committed_at", ""), item.get("commit", "")),
+                    reverse=True,
+                ),
+                "owned_added_lines": len(owned),
+                "owned_line_numbers": owned,
+                "changed": len(owned),
+                "covered": len(covered),
+                "uncovered": len(uncovered),
+                "uncovered_need_fill": len(uncovered),
+                "uncovered_line_numbers": uncovered,
+                "uncovered_need_fill_line_numbers": uncovered,
+                "ignored": len(ignored),
+                "missing": len(missing),
+                "ignored_line_numbers": ignored,
+                "missing_line_numbers": missing,
+            })
+        tasks.sort(key=lambda item: (
+            -item["uncovered"], -item["owned_added_lines"],
+            item["repository"], item["file_path"],
+        ))
+        commits = sorted(
+            developer["commits"].values(),
+            key=lambda item: (item.get("committed_at", ""), item.get("commit", "")),
+            reverse=True,
+        )
+        result_developers.append({
+            "name": developer["name"],
+            "email": developer["email"],
+            "commit_total": len(commits),
+            "changed_file_total": len(tasks),
+            "owned_added_lines": sum(item["owned_added_lines"] for item in tasks),
+            "owned_line_numbers": sorted({
+                line for item in tasks for line in item["owned_line_numbers"]
+            }),
+            "review_file_total": sum(1 for item in tasks if item["uncovered"]),
+            "review_uncovered_total": sum(item["uncovered"] for item in tasks),
+            "uncovered_line_numbers": sorted({
+                line for item in tasks for line in item["uncovered_line_numbers"]
+            }),
+            "commits": commits,
+            "files": tasks,
+        })
+
+    result_developers.sort(key=lambda item: (
+        -item["review_uncovered_total"], -item["owned_added_lines"],
+        item["name"].lower(), item["email"].lower(),
+    ))
+    return {"developers": result_developers}
+
+
+def _lookup_file_mapping(mapping, file_path, resolver=None):
+    """Resolve a path-keyed metadata map with the canonical safe index."""
+    if not mapping:
+        return None
+    resolver = resolver or IncrementalService({"default": list(mapping.keys())})
+    value, match_type = resolver.resolve_mapping_value(file_path, mapping)
+    if match_type not in ("exact", "normalized", "unique_suffix"):
+        return None
+    return value
+
+
 def calculate_repository_coverage(repo_path, oldgit, newgit, coverage_data, info_files,
-                                  diff_text=None, repository_name="", developer_file_changes=None):
+                                  diff_text=None, repository_name="", developer_file_changes=None,
+                                  line_authors_by_file=None, function_ranges_data=None):
     """Calculate one repository against already-loaded LCOV data."""
     repo_path = os.path.abspath(repo_path)
     if diff_text is None:
@@ -489,13 +1090,51 @@ def calculate_repository_coverage(repo_path, oldgit, newgit, coverage_data, info
         )
     changes = parse_diff_text(diff_text)
 
+    if line_authors_by_file is None:
+        # A real Git repository must always use blame pinned to newgit.  The
+        # explicit empty developer-change input is retained for legacy/import
+        # callers that classify an already supplied diff without a .git dir.
+        has_git_metadata = os.path.exists(os.path.join(repo_path, ".git"))
+        if changes and has_git_metadata:
+            line_authors_by_file = run_git_line_authors(
+                repo_path, newgit, changes, repository_name
+            )
+        else:
+            line_authors_by_file = {}
+
+    line_author_resolver = (
+        IncrementalService({"default": list(line_authors_by_file.keys())})
+        if line_authors_by_file else None
+    )
+    function_range_resolver = (
+        IncrementalService({"default": list(function_ranges_data.keys())})
+        if function_ranges_data else None
+    )
+
     details = []
     counters = defaultdict(int)
     uncovered_lines_by_file = defaultdict(list)
     review_lines_by_file = defaultdict(list)
+    reviewers_by_file = defaultdict(dict)
+    trusted_function_ranges_by_file = {}
     for filename in sorted(changes):
         coverage_file = resolve_coverage_file(filename, coverage_data, repo_path)
         line_data = coverage_data.get(coverage_file, {}) if coverage_file else None
+        author_map = _lookup_file_mapping(
+            line_authors_by_file, filename, line_author_resolver
+        ) or {}
+        function_ranges = None
+        if coverage_file and function_ranges_data:
+            function_ranges = _lookup_file_mapping(
+                function_ranges_data, coverage_file, function_range_resolver
+            )
+            if function_ranges is None:
+                function_ranges = _lookup_file_mapping(
+                    function_ranges_data, filename, function_range_resolver
+                )
+            normalized_ranges = normalize_lcov_function_ranges(function_ranges)
+            if normalized_ranges:
+                trusted_function_ranges_by_file[coverage_file] = normalized_ranges
         for line_number in sorted(set(changes[filename])):
             execution_count = None
             if line_data is None:
@@ -506,11 +1145,17 @@ def calculate_repository_coverage(repo_path, oldgit, newgit, coverage_data, info
                 execution_count = line_data[line_number]
                 status = STATUS_COVERED if execution_count > 0 else STATUS_UNCOVERED
             counters[status] += 1
+            attribution = author_map.get(line_number) or author_map.get(str(line_number)) or {}
+            author_name = str(attribution.get("author_name", "") or "").strip()
+            author_email = str(attribution.get("author_email", "") or "").strip()
+            suggested_reviewer = author_name
             if status == STATUS_UNCOVERED:
                 uncovered_lines_by_file[filename].append(line_number)
                 review_file_path = coverage_file or normalize_path(os.path.join(repo_path, filename))
                 review_lines_by_file[review_file_path].append(line_number)
-            details.append({
+                if suggested_reviewer:
+                    reviewers_by_file[review_file_path][str(line_number)] = suggested_reviewer
+            detail = {
                 "repository": repository_name,
                 "file_path": filename,
                 "coverage_file": coverage_file or "",
@@ -518,10 +1163,17 @@ def calculate_repository_coverage(repo_path, oldgit, newgit, coverage_data, info
                 "line_number": line_number,
                 "execution_count": execution_count,
                 "status": status,
-            })
+                "author_name": author_name,
+                "author_email": author_email,
+                "reviewer": suggested_reviewer,
+                "commit": attribution.get("commit", "") or "",
+                "committed_at": attribution.get("committed_at", "") or "",
+                "subject": attribution.get("subject", "") or "",
+            }
+            details.append(detail)
 
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "repo_path": repo_path,
         "oldgit": oldgit,
@@ -535,22 +1187,31 @@ def calculate_repository_coverage(repo_path, oldgit, newgit, coverage_data, info
         "review_lines_by_file": {
             filename: sorted(lines) for filename, lines in sorted(review_lines_by_file.items())
         },
+        "reviewers_by_file": {
+            filename: {str(line): reviewer for line, reviewer in sorted(reviewers.items(), key=lambda item: int(item[0]))}
+            for filename, reviewers in sorted(reviewers_by_file.items())
+        },
+        "function_ranges_by_file": {
+            filename: ranges for filename, ranges in sorted(trusted_function_ranges_by_file.items())
+        },
         "developer_file_changes": developer_file_changes,
         "developer_tasks": build_developer_tasks(details, developer_file_changes),
     }
 
 
 def calculate_incremental_coverage(repo_path, oldgit, newgit, info_path, diff_text=None,
-                                   developer_file_changes=None):
+                                   developer_file_changes=None, line_authors_by_file=None):
     """Calculate coverage of Git-added lines in one repository."""
-    coverage_data, info_files = load_lcov_info(info_path)
+    coverage_data, function_ranges_data, info_files = load_lcov_info_with_functions(info_path)
     return calculate_repository_coverage(
         repo_path, oldgit, newgit, coverage_data, info_files, diff_text,
         developer_file_changes=developer_file_changes,
+        line_authors_by_file=line_authors_by_file,
+        function_ranges_data=function_ranges_data,
     )
 
 
-def calculate_multi_repo_incremental_coverage(repositories, info_path):
+def calculate_multi_repo_incremental_coverage(repositories, info_path, line_authors_by_repo=None):
     """Calculate one combined incremental report for several independent Git repos.
 
     A multi-repo LCOV file must use absolute ``SF:`` paths. Without that identity,
@@ -559,11 +1220,13 @@ def calculate_multi_repo_incremental_coverage(repositories, info_path):
     """
     if not repositories:
         raise ValueError("至少需要一个 Git 仓库")
-    coverage_data, info_files = load_lcov_info(info_path)
+    coverage_data, function_ranges_data, info_files = load_lcov_info_with_functions(info_path)
     details = []
     counters = defaultdict(int)
     raw_uncovered_lines = {}
     review_lines_by_file = defaultdict(list)
+    reviewers_by_file = defaultdict(dict)
+    function_ranges_by_file = {}
     repository_summaries = []
     developer_file_changes = []
 
@@ -577,6 +1240,8 @@ def calculate_multi_repo_incremental_coverage(repositories, info_path):
             coverage_data,
             info_files,
             repository_name=name,
+            line_authors_by_file=(line_authors_by_repo or {}).get(name),
+            function_ranges_data=function_ranges_data,
         )
         for item in result["details"]:
             coverage_file = item.get("coverage_file")
@@ -592,6 +1257,9 @@ def calculate_multi_repo_incremental_coverage(repositories, info_path):
             raw_uncovered_lines["{}:{}".format(name, file_path)] = lines
         for file_path, lines in result["review_lines_by_file"].items():
             review_lines_by_file[file_path].extend(lines)
+        for file_path, reviewers in (result.get("reviewers_by_file") or {}).items():
+            reviewers_by_file[file_path].update(reviewers)
+        function_ranges_by_file.update(result.get("function_ranges_by_file") or {})
         repository_summaries.append({
             "name": name,
             "path": repo_path,
@@ -601,7 +1269,7 @@ def calculate_multi_repo_incremental_coverage(repositories, info_path):
         })
 
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "repo_path": "",
         "oldgit": "multiple",
@@ -613,6 +1281,18 @@ def calculate_multi_repo_incremental_coverage(repositories, info_path):
         "uncovered_lines_by_file": raw_uncovered_lines,
         "review_lines_by_file": {
             filename: sorted(set(lines)) for filename, lines in sorted(review_lines_by_file.items())
+        },
+        "reviewers_by_file": {
+            filename: {
+                str(line): reviewer
+                for line, reviewer in sorted(
+                    reviewers.items(), key=lambda item: int(item[0])
+                )
+            }
+            for filename, reviewers in sorted(reviewers_by_file.items())
+        },
+        "function_ranges_by_file": {
+            filename: ranges for filename, ranges in sorted(function_ranges_by_file.items())
         },
         "developer_file_changes": developer_file_changes,
         "developer_tasks": build_developer_tasks(details, developer_file_changes),
@@ -723,11 +1403,16 @@ def _build_simple_xlsx(sheet_defs):
 
 def write_result_excel(result, output_path):
     """Write incremental line details plus developer-facing task sheets."""
-    details_rows = [["Repository", "File", "Coverage File", "Line", "Execution Count", "Coverage"]]
+    details_rows = [[
+        "Repository", "File", "Coverage File", "Line", "Execution Count", "Coverage",
+        "Developer", "Email", "Reviewer", "Blame Commit", "Commit Subject",
+    ]]
     for item in result["details"]:
         details_rows.append([
             item.get("repository", ""), item["file_path"], item.get("coverage_file", ""),
             item["line_number"], item.get("execution_count"), item["status"],
+            item.get("author_name", ""), item.get("author_email", ""),
+            item.get("reviewer", ""), item.get("commit", ""), item.get("subject", ""),
         ])
 
     summary = result["summary"]
@@ -766,19 +1451,23 @@ def write_result_excel(result, output_path):
 
     developer_tasks = result.get("developer_tasks") or {}
     developer_rows = [[
-        "Developer", "Email", "Commits", "Changed Files", "Files Need Fill",
-        "Uncovered Lines Need Fill",
+        "Developer", "Email", "Commits", "Changed Files", "Owned Added Lines",
+        "Owned Line Numbers", "Files Need Fill", "Uncovered Lines Need Fill",
+        "Uncovered Line Numbers",
     ]]
     developer_file_rows = [[
         "Developer", "Email", "Repository", "File", "Change Types", "Commits",
-        "Changed Lines", "Covered", "Uncovered Need Fill", "Ignored", "Coverage Missing",
-        "Commit Subjects",
+        "Owned Added Lines", "Owned Line Numbers", "Covered", "Uncovered Need Fill",
+        "Uncovered Line Numbers", "Ignored", "Coverage Missing", "Commit Subjects",
     ]]
     for developer in developer_tasks.get("developers") or []:
         developer_rows.append([
             developer.get("name", ""), developer.get("email", ""),
             developer.get("commit_total", 0), developer.get("changed_file_total", 0),
+            developer.get("owned_added_lines", 0),
+            ", ".join(str(line) for line in developer.get("owned_line_numbers", [])),
             developer.get("review_file_total", 0), developer.get("review_uncovered_total", 0),
+            ", ".join(str(line) for line in developer.get("uncovered_line_numbers", [])),
         ])
         for file_task in developer.get("files") or []:
             commits = file_task.get("commits") or []
@@ -787,9 +1476,11 @@ def write_result_excel(result, output_path):
                 file_task.get("repository", ""), file_task.get("file_path", ""),
                 ", ".join(file_task.get("change_types") or []),
                 ", ".join(item.get("commit", "")[:12] for item in commits),
-                file_task.get("changed", 0), file_task.get("covered", 0),
-                file_task.get("uncovered", 0), file_task.get("ignored", 0),
-                file_task.get("missing", 0),
+                file_task.get("owned_added_lines", file_task.get("changed", 0)),
+                ", ".join(str(line) for line in file_task.get("owned_line_numbers", [])),
+                file_task.get("covered", 0), file_task.get("uncovered_need_fill", file_task.get("uncovered", 0)),
+                ", ".join(str(line) for line in file_task.get("uncovered_need_fill_line_numbers", file_task.get("uncovered_line_numbers", []))),
+                file_task.get("ignored", 0), file_task.get("missing", 0),
                 " | ".join(item.get("subject", "") for item in commits),
             ])
     sheet_defs.extend([

@@ -29,7 +29,9 @@ class ParsedSourceArtifact:
         file_path: str,
         html_content: str,
         review_scope: str = "full",
-        incremental_lines: Optional[Set[int]] = None
+        incremental_lines: Optional[Set[int]] = None,
+        suggested_reviewers_by_line: Optional[Dict[Any, Any]] = None,
+        known_function_ranges: Optional[List[Any]] = None,
     ):
         self.project_name = project_name
         self.report_id = report_id
@@ -49,7 +51,9 @@ class ParsedSourceArtifact:
             file_path=file_path,
             review_scope=review_scope,
             incremental_line_numbers=incremental_lines,
-            report_id=report_id
+            report_id=report_id,
+            suggested_reviewers_by_line=suggested_reviewers_by_line,
+            known_function_ranges=known_function_ranges,
         )
         
         self.source_lines = self.source_context.lines
@@ -98,7 +102,9 @@ def parse_gcov_source_once(
     file_path: str,
     html_content: str,
     review_scope: str = "full",
-    incremental_lines: Optional[Set[int]] = None
+    incremental_lines: Optional[Set[int]] = None,
+    suggested_reviewers_by_line: Optional[Dict[Any, Any]] = None,
+    known_function_ranges: Optional[List[Any]] = None,
 ) -> ParsedSourceArtifact:
     """Convenience factory for single-pass artifact generation."""
     return ParsedSourceArtifact(
@@ -107,5 +113,7 @@ def parse_gcov_source_once(
         file_path=file_path,
         html_content=html_content,
         review_scope=review_scope,
-        incremental_lines=incremental_lines
+        incremental_lines=incremental_lines,
+        suggested_reviewers_by_line=suggested_reviewers_by_line,
+        known_function_ranges=known_function_ranges,
     )

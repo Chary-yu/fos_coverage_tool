@@ -226,6 +226,7 @@ class SourceLineDTO:
         block_type: str = "single",
         function_name: str = "",
         is_block_entry: bool = False,
+        suggested_reviewer: str = "",
     ):
         self.line_no = int(line_no)
         self.source = str(source)
@@ -233,6 +234,9 @@ class SourceLineDTO:
         self.coverage_state = str(coverage_state)
         self.analysis_state = str(analysis_state)
         self.is_pending_analysis = bool(is_pending_analysis)
+        # Static Git blame suggestion.  This is intentionally separate from
+        # ``reviewer`` because the latter is the user/database fact.
+        self.suggested_reviewer = str(suggested_reviewer or "")
         self.reviewer = str(reviewer or "")
         self.coverage_method = str(coverage_method or "")
         self.uncovered_reason = str(uncovered_reason or "")
@@ -251,6 +255,7 @@ class SourceLineDTO:
             "coverage_state": self.coverage_state,
             "analysis_state": self.analysis_state,
             "is_pending_analysis": self.is_pending_analysis,
+            "suggested_reviewer": self.suggested_reviewer,
             "reviewer": self.reviewer,
             "coverage_method": self.coverage_method,
             "uncovered_reason": self.uncovered_reason,
@@ -271,6 +276,7 @@ class SourceLineDTO:
             coverage_state=data.get("coverage_state", "ignored"),
             analysis_state=data.get("analysis_state", "未确认"),
             is_pending_analysis=data.get("is_pending_analysis", False),
+            suggested_reviewer=data.get("suggested_reviewer", ""),
             reviewer=data.get("reviewer", ""),
             coverage_method=data.get("coverage_method", ""),
             uncovered_reason=data.get("uncovered_reason", ""),
@@ -300,7 +306,20 @@ class SourceContext:
         self.project_name = project_name
         self.file_path = file_path
         self.lines = lines
-        self.function_ranges = function_ranges or []
+        self.function_ranges = []
+        for raw_range in function_ranges or []:
+            if isinstance(raw_range, FunctionRange):
+                self.function_ranges.append(raw_range)
+            elif isinstance(raw_range, dict):
+                self.function_ranges.append(FunctionRange(
+                    raw_range.get("start_line", 0),
+                    raw_range.get("end_line", 0),
+                    raw_range.get("name"),
+                ))
+            elif isinstance(raw_range, (list, tuple)) and len(raw_range) >= 2:
+                self.function_ranges.append(FunctionRange(
+                    raw_range[0], raw_range[1], raw_range[2] if len(raw_range) > 2 else None
+                ))
         self.pending_lines = pending_lines or []
         self.total_uncovered_count = total_uncovered_count or sum(
             1 for line in lines if line.coverage_state == "uncovered"
@@ -574,6 +593,89 @@ def extract_c_function_ranges(raw_lines: List[dict]) -> List[FunctionRange]:
     return functions
 
 
+def _validated_known_function_ranges(known_function_ranges, total_lines: int):
+    """Return trusted LCOV ranges or ``None`` to request source fallback."""
+    if not known_function_ranges:
+        return None
+
+    ranges = []
+    for raw_range in known_function_ranges:
+        try:
+            if isinstance(raw_range, FunctionRange):
+                start = raw_range.start_line
+                end = raw_range.end_line
+                name = raw_range.name
+            elif isinstance(raw_range, dict):
+                start = int(raw_range.get("start_line"))
+                end = int(raw_range.get("end_line"))
+                name = raw_range.get("name")
+            elif isinstance(raw_range, (list, tuple)) and len(raw_range) >= 2:
+                start = int(raw_range[0])
+                end = int(raw_range[1])
+                name = raw_range[2] if len(raw_range) > 2 else None
+            else:
+                return None
+        except (TypeError, ValueError):
+            return None
+        if start < 1 or start > end or end > total_lines:
+            return None
+        ranges.append(FunctionRange(start, end, name))
+
+    if not ranges:
+        return None
+
+    # Remove exact aliases and nested compiler-generated ranges while
+    # rejecting true crossings that would create ambiguous line ownership.
+    deduped = {}
+    for item in ranges:
+        key = (item.start_line, item.end_line)
+        previous = deduped.get(key)
+        if previous is None or (not previous.name and item.name):
+            deduped[key] = item
+    ordered = sorted(deduped.values(), key=lambda item: (item.start_line, -item.end_line))
+    outermost = []
+    for item in ordered:
+        is_nested = False
+        for existing in outermost:
+            if existing.start_line <= item.start_line and item.end_line <= existing.end_line:
+                is_nested = True
+                break
+            if (item.start_line < existing.start_line <= item.end_line < existing.end_line or
+                    existing.start_line < item.start_line <= existing.end_line < item.end_line):
+                return None
+        if not is_nested:
+            outermost.append(item)
+    return outermost or None
+
+
+_SUGGESTED_REVIEWER_RE = re.compile(
+    r'\bdata-coverage-reviewer\s*=\s*(["\'])(.*?)\1', re.I | re.S
+)
+
+
+def _extract_suggested_reviewer(raw_tag: str) -> str:
+    match = _SUGGESTED_REVIEWER_RE.search(raw_tag or "")
+    return html.unescape(match.group(2)).strip() if match else ""
+
+
+def _suggested_reviewer_for_line(reviewers_by_line, line_number: int, fallback: str = "") -> str:
+    if reviewers_by_line:
+        value = reviewers_by_line.get(line_number)
+        if value is None:
+            value = reviewers_by_line.get(str(line_number))
+        if isinstance(value, dict):
+            value = value.get("reviewer") or value.get("author_name") or ""
+        if value is not None:
+            return str(value or "").strip()
+    return str(fallback or "").strip()
+
+
+def _effective_reviewer_for_line(item: Dict[str, Any], analysis_map: Dict[int, Dict[str, Any]]) -> str:
+    """Return the reviewer that the current block will actually display."""
+    record = analysis_map.get(item.get("line_no")) or {}
+    return str(record.get("reviewer") or item.get("suggested_reviewer") or "").strip()
+
+
 def parse_source_lines_from_gcov_html(
     content: str,
     project_name: str = "",
@@ -582,6 +684,8 @@ def parse_source_lines_from_gcov_html(
     review_scope: str = "full",
     incremental_line_numbers: Optional[Set[int]] = None,
     report_id: str = "",
+    suggested_reviewers_by_line: Optional[Dict[Any, Any]] = None,
+    known_function_ranges: Optional[List[Any]] = None,
 ) -> SourceContext:
     r"""
     Parse an LCOV HTML report (.gcov.html) into a structured SourceContext.
@@ -614,6 +718,9 @@ def parse_source_lines_from_gcov_html(
             is_inc = 'data-coverage-review="incremental"' in full_tag or (
                 incremental_line_numbers is not None and line_no in incremental_line_numbers
             )
+            suggested_reviewer = _suggested_reviewer_for_line(
+                suggested_reviewers_by_line, line_no, _extract_suggested_reviewer(full_tag)
+            )
 
             cov_state = "uncovered" if is_uncov else ("covered" if is_cov else "ignored")
 
@@ -624,6 +731,7 @@ def parse_source_lines_from_gcov_html(
                 "coverage_state": cov_state,
                 "is_uncovered": is_uncov,
                 "is_incremental": is_inc,
+                "suggested_reviewer": suggested_reviewer,
             })
     elif '<span class="lineNum">' in content:
         legacy_pattern = re.compile(r'<span class="lineNum">\s*(\d+)\s*</span>(.*?)(?=<span class="lineNum">|</pre>)', re.S)
@@ -638,6 +746,9 @@ def parse_source_lines_from_gcov_html(
             is_inc = 'data-coverage-review="incremental"' in tail or (
                 incremental_line_numbers is not None and line_no in incremental_line_numbers
             )
+            suggested_reviewer = _suggested_reviewer_for_line(
+                suggested_reviewers_by_line, line_no, _extract_suggested_reviewer(tail)
+            )
 
             cov_state = "uncovered" if is_uncov else ("covered" if is_cov else "ignored")
 
@@ -648,6 +759,7 @@ def parse_source_lines_from_gcov_html(
                 "coverage_state": cov_state,
                 "is_uncovered": is_uncov,
                 "is_incremental": is_inc,
+                "suggested_reviewer": suggested_reviewer,
             })
     else:
         # Check if this is stripped HTML or empty page
@@ -665,20 +777,39 @@ def parse_source_lines_from_gcov_html(
                     "coverage_state": "ignored",
                     "is_uncovered": False,
                     "is_incremental": False,
+                    "suggested_reviewer": _suggested_reviewer_for_line(
+                        suggested_reviewers_by_line, idx, ""
+                    ),
                 })
 
     # Ensure continuous 1..N
     raw_lines.sort(key=lambda item: item["line_no"])
 
-    # Extract accurate function ranges via brace-aware parser
-    function_ranges = extract_c_function_ranges(raw_lines)
+    # A complete, validated LCOV range is authoritative for this parse.  Any
+    # incomplete/invalid/conflicting input deliberately falls back to the
+    # existing brace-aware source parser.
+    function_ranges = _validated_known_function_ranges(
+        known_function_ranges, max((item["line_no"] for item in raw_lines), default=0)
+    ) if known_function_ranges is not None else None
+    if function_ranges is None:
+        function_ranges = extract_c_function_ranges(raw_lines)
 
-    # Attach function_name to lines efficiently O(N)
-    line_map = {item["line_no"]: item for item in raw_lines}
-    for fn in function_ranges:
-        for l_num in range(fn.start_line, fn.end_line + 1):
-            if l_num in line_map:
-                line_map[l_num]["function_name"] = fn.name
+    # Attach function_name with one sorted pointer sweep: O(lines + functions).
+    sorted_functions = sorted(
+        function_ranges, key=lambda fn: (fn.start_line, fn.end_line)
+    )
+    function_index = 0
+    for item in raw_lines:
+        line_no = item["line_no"]
+        while (
+            function_index + 1 < len(sorted_functions)
+            and sorted_functions[function_index + 1].start_line <= line_no
+        ):
+            function_index += 1
+        if sorted_functions:
+            current_function = sorted_functions[function_index]
+            if current_function.start_line <= line_no <= current_function.end_line:
+                item["function_name"] = current_function.name
 
     # Group uncovered lines into basic blocks
     block_map = {}  # line_no -> (block_start_line, block_end_line, block_type, is_block_entry)
@@ -700,6 +831,7 @@ def parse_source_lines_from_gcov_html(
             # Build semantic block
             block_lines = [item]
             start_is_fn = is_function_entry_text(item["code_text"])
+            start_reviewer = _effective_reviewer_for_line(item, analysis_map)
             consumed_until = index
 
             for j in range(index + 1, len(raw_lines)):
@@ -712,6 +844,8 @@ def parse_source_lines_from_gcov_html(
                     next_is_uncov = False
 
                 if next_is_uncov:
+                    if _effective_reviewer_for_line(next_item, analysis_map) != start_reviewer:
+                        break
                     if is_control_flow_text(next_item["code_text"]) or is_function_entry_text(next_item["code_text"]):
                         break
                     if start_is_fn and not is_simple_auto_group_text(next_item["code_text"]):
@@ -761,7 +895,8 @@ def parse_source_lines_from_gcov_html(
         analysis_state = rec.get("status") if rec else "未确认"
         is_draft = bool(rec.get("is_draft", False)) if rec else False
         fill_status = rec.get("fill_status", "已填写" if rec and rec.get("status") else "未填写") if rec else "未填写"
-        reviewer = rec.get("reviewer", "") if rec else ""
+        suggested_reviewer = item.get("suggested_reviewer", "")
+        reviewer = (rec.get("reviewer") if rec else "") or suggested_reviewer
         coverage_method = rec.get("coverage_method", "") if rec else ""
         uncovered_reason = rec.get("uncovered_reason", "") if rec else ""
 
@@ -798,6 +933,7 @@ def parse_source_lines_from_gcov_html(
                 block_type=b_type,
                 function_name=item.get("function_name", ""),
                 is_block_entry=is_entry,
+                suggested_reviewer=suggested_reviewer,
             )
         )
 

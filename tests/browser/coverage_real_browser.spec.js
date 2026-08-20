@@ -8,18 +8,20 @@ const ROOT = path.join(__dirname, '../..');
 const CLIENT_JS = fs.readFileSync(path.join(ROOT, 'web/assets/js/coverage_enhance.js'), 'utf8');
 const CLIENT_CSS = fs.readFileSync(path.join(ROOT, 'web/assets/css/coverage_enhance.css'), 'utf8');
 
-function makeLines(start, end, withPanels) {
+function makeLines(start, end, withPanels, savedReviewers) {
   const lines = [];
   for (let lineNo = start; lineNo <= end; lineNo += 1) {
+    const suggestedReviewer = lineNo === start ? 'Alice' : (lineNo === start + 1 ? 'Bob' : '');
     lines.push({
       line_no: lineNo,
       source: `int fixture_line_${lineNo} = ${lineNo};`,
       coverage_state: 'uncovered',
-      is_block_entry: withPanels && ((lineNo - start) % 100 === 0),
+      is_block_entry: withPanels && (lineNo === start || lineNo === start + 1 || ((lineNo - start) % 100 === 0)),
       block_start_line: lineNo,
       block_end_line: lineNo,
       analysis_state: '未确认',
-      reviewer: '',
+      suggested_reviewer: suggestedReviewer,
+      reviewer: (savedReviewers && savedReviewers.get(lineNo)) || '',
       is_draft: false,
       coverage_method: '',
       uncovered_reason: '',
@@ -59,6 +61,7 @@ function createHarness({ large = false, failOnce = false } = {}) {
   let activeRequests = 0;
   let maxConcurrent = 0;
   let failureUsed = false;
+  const savedReviewers = new Map();
 
   const server = http.createServer((req, res) => {
     const parsed = new URL(req.url, 'http://127.0.0.1');
@@ -108,7 +111,7 @@ function createHarness({ large = false, failOnce = false } = {}) {
         }
         return json(200, {
           status: 'success',
-          data: { start_line: start, end_line: end, lines: makeLines(start, end, !large) },
+          data: { start_line: start, end_line: end, lines: makeLines(start, end, !large, savedReviewers) },
         });
       }, delay);
     }
@@ -116,7 +119,15 @@ function createHarness({ large = false, failOnce = false } = {}) {
       let body = '';
       req.on('data', chunk => { body += chunk; });
       req.on('end', () => {
-        try { requests.push({ batch: JSON.parse(body) }); } catch (_) { /* client error is asserted by HTTP status */ }
+        try {
+          const payload = JSON.parse(body);
+          requests.push({ batch: payload });
+          (payload.records || []).forEach(record => {
+            (record.line_numbers || []).forEach(lineNumber => {
+              savedReviewers.set(Number(lineNumber), record.reviewer || '');
+            });
+          });
+        } catch (_) { /* client error is asserted by HTTP status */ }
         json(200, { status: 'success', data_version: 2 });
       });
       return undefined;
@@ -216,6 +227,37 @@ test('real Chromium chunk ordering and retry are fail-closed and retryable', asy
     expect(harness.failedRequests.length).toBe(1);
     // The first failure is intentional and is not a stuck-loading state.
     expect(consoleErrors.some(message => message.includes('Failed to expand region'))).toBe(true);
+  } finally {
+    await stopHarness(harness);
+  }
+});
+
+test('real Chromium incremental reviewer suggestions split adjacent blocks and survive DB refresh', async ({ page, browserName }) => {
+  expect(browserName).toBe('chromium');
+  const harness = await startHarness();
+  try {
+    await page.goto(`${harness.baseUrl}/fixture.c.gcov.html`, { waitUntil: 'networkidle' });
+    await page.locator('.coverage-region-placeholder').nth(0).click();
+    await expect(page.locator('#L600')).toBeVisible({ timeout: 15000 });
+
+    const panels = page.locator('.coverage-analysis-panel');
+    await expect(panels).toHaveCount(8);
+    await expect(panels.nth(0).locator('input.reviewer-input')).toHaveValue('Alice');
+    await expect(panels.nth(1).locator('input.reviewer-input')).toHaveValue('Bob');
+    await expect(page.locator('#L1')).toHaveAttribute('data-coverage-reviewer', 'Alice');
+    await expect(page.locator('#L2')).toHaveAttribute('data-coverage-reviewer', 'Bob');
+
+    await panels.nth(0).locator('input.reviewer-input').fill('database-owner');
+    await page.locator('.coverage-batch-btn.draft').click();
+    await expect.poll(() => harness.requests.filter(item => item.batch).length).toBe(1);
+
+    await page.reload({ waitUntil: 'networkidle' });
+    await page.locator('.coverage-region-placeholder').nth(0).click();
+    await expect(page.locator('#L600')).toBeVisible({ timeout: 15000 });
+    await expect(page.locator('.coverage-analysis-panel').first().locator('input.reviewer-input')).toHaveValue('database-owner');
+    await page.locator('.coverage-region-collapse-btn').first().click();
+    await page.locator('.coverage-region-placeholder').nth(0).click();
+    await expect(page.locator('.coverage-analysis-panel').first().locator('input.reviewer-input')).toHaveValue('database-owner');
   } finally {
     await stopHarness(harness);
   }

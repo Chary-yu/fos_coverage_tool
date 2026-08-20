@@ -517,13 +517,22 @@ pre.source > span{{display:block;position:relative;white-space:pre}}.lineCov{{ba
     demo_details = [
         {"repository": "demo_repo", "file_path": DEMO_FILE, "coverage_file": DEMO_FILE,
          "review_file_path": DEMO_FILE, "line_number": 3, "execution_count": 0,
-         "status": enhance_coverage.coverage_check.STATUS_UNCOVERED},
+         "status": enhance_coverage.coverage_check.STATUS_UNCOVERED,
+         "author_name": "Alice Chen", "author_email": "alice@example.com",
+         "reviewer": "Alice Chen", "commit": "demoa1234567",
+         "subject": "add calculator branches"},
         {"repository": "demo_repo", "file_path": DEMO_FILE, "coverage_file": DEMO_FILE,
          "review_file_path": DEMO_FILE, "line_number": 5, "execution_count": 0,
-         "status": enhance_coverage.coverage_check.STATUS_UNCOVERED},
+         "status": enhance_coverage.coverage_check.STATUS_UNCOVERED,
+         "author_name": "Bob Li", "author_email": "bob@example.com",
+         "reviewer": "Bob Li", "commit": "demob7654321",
+         "subject": "complete boundary branch"},
         {"repository": "demo_repo", "file_path": DEMO_FILE, "coverage_file": DEMO_FILE,
          "review_file_path": DEMO_FILE, "line_number": 7, "execution_count": 1,
-         "status": enhance_coverage.coverage_check.STATUS_COVERED},
+         "status": enhance_coverage.coverage_check.STATUS_COVERED,
+         "author_name": "Bob Li", "author_email": "bob@example.com",
+         "reviewer": "Bob Li", "commit": "demob7654321",
+         "subject": "complete boundary branch"},
     ]
     developer_changes = [
         {"repository": "demo_repo", "commit": "demoa1234567", "author_name": "Alice Chen",
@@ -534,12 +543,16 @@ pre.source > span{{display:block;position:relative;white-space:pre}}.lineCov{{ba
          "subject": "complete boundary branch", "file_path": DEMO_FILE, "change_type": "M"},
     ]
     demo_result = {
-        "schema_version": 2,
+        "schema_version": 3,
         "generated_at": "2026-08-13 10:30:00",
         "oldgit": "demo-old", "newgit": "demo-new",
         "summary": {"changed_lines": 3, "covered": 1, "uncovered": 2, "ignored": 0,
                     "missing": 0, "coverable_total": 3, "coverage_rate": 33.3333333333},
         "details": demo_details,
+        "reviewers_by_file": {
+            DEMO_FILE: {"3": "Alice Chen", "5": "Bob Li"}
+        },
+        "function_ranges_by_file": {},
         "developer_file_changes": developer_changes,
         "developer_tasks": enhance_coverage.coverage_check.build_developer_tasks(
             demo_details, developer_changes

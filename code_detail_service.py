@@ -418,13 +418,13 @@ class CodeDetailService:
             rec = overlay.get_line_analysis(line.line_no)
             if rec:
                 line.analysis_state = rec.get("status") or "未确认"
-                line.reviewer = rec.get("reviewer") or ""
+                line.reviewer = rec.get("reviewer") or line.suggested_reviewer
                 line.is_draft = bool(rec.get("is_draft", False))
                 line.coverage_method = rec.get("coverage_method") or ""
                 line.uncovered_reason = rec.get("uncovered_reason") or ""
             else:
                 line.analysis_state = "未确认"
-                line.reviewer = ""
+                line.reviewer = line.suggested_reviewer
                 line.is_draft = False
                 line.coverage_method = ""
                 line.uncovered_reason = ""
@@ -648,13 +648,13 @@ class CodeDetailService:
                     rec = overlay.get_line_analysis(l_no)
                     if rec:
                         ld["analysis_state"] = rec.get("status") or "未确认"
-                        ld["reviewer"] = rec.get("reviewer") or ""
+                        ld["reviewer"] = rec.get("reviewer") or ld.get("suggested_reviewer", "")
                         ld["is_draft"] = bool(rec.get("is_draft", False))
                         ld["coverage_method"] = rec.get("coverage_method") or ""
                         ld["uncovered_reason"] = rec.get("uncovered_reason") or ""
                     else:
                         ld["analysis_state"] = "未确认"
-                        ld["reviewer"] = ""
+                        ld["reviewer"] = ld.get("suggested_reviewer", "")
                         ld["is_draft"] = False
                     is_pend = is_line_pending_analysis(
                         coverage_state=ld.get("coverage_state", "covered"),
