@@ -11,6 +11,9 @@ from datetime import datetime
 from app.api.application import VNextApplication
 from app.api.serialization import to_jsonable
 from app.bootstrap import VNextRuntime, create_vnext_server
+from app.code_detail.sidecar_store import SidecarStore
+from app.code_detail.source_reader import SourceContext, SourceLineDTO, calc_sidecar_file_key
+from app.code_detail.code_region import FunctionRange
 from scripts.upgrade.migration_runner import create_sqlite_schema
 
 
@@ -28,6 +31,7 @@ class VNextRuntimeTest(unittest.TestCase):
         self.application = self.runtime.application()
 
     def tearDown(self):
+        self.runtime.close()
         self.connection.close()
 
     def test_scan_analysis_freshness_and_report_identity(self):
@@ -172,6 +176,46 @@ class VNextRuntimeTest(unittest.TestCase):
             server.shutdown()
             thread.join(timeout=5)
             server.server_close()
+
+    def test_code_detail_binds_exact_scan_report_and_sidecar_key(self):
+        with tempfile.TemporaryDirectory(prefix="vnext-report-") as report_root:
+            key = calc_sidecar_file_key("src/detail.c")
+            context = SourceContext(
+                "detail", "src/detail.c", [
+                    SourceLineDTO(1, "return 0;", coverage_state="uncovered"),
+                    SourceLineDTO(2, "return 1;", coverage_state="covered"),
+                ], function_ranges=[FunctionRange(1, 2, "main")],
+                report_id="report_detail",
+            )
+            SidecarStore([report_root], chunk_size=2).save_chunked_sidecar(
+                report_root, "report_detail", key, context
+            )
+            self.runtime.report_registry.register(
+                "report_detail", [report_root], sidecar_required=True
+            )
+            with self.runtime.connection_context() as connection:
+                scan = self.runtime.project_service.create_scan(
+                    connection, "detail", info_sha256="d" * 64,
+                    report={"report_id": "report_detail", "report_root": report_root},
+                )
+                self.runtime.project_service.ingest_files(
+                    connection, scan["id"], [{
+                        "file_path": "src/detail.c", "file_path_hash": "" * 0,
+                        "lines": [{"line_number": 1, "coverage_state": "uncovered"}],
+                    }],
+                )
+                layout = self.runtime.code_detail.layout(
+                    connection, scan["id"], "report_detail", "src/detail.c"
+                )
+                self.assertEqual(layout["pending_line_count"], 1)
+                lines = self.runtime.code_detail.lines(
+                    connection, scan["id"], "report_detail", "src/detail.c", 1, 1
+                )
+                self.assertEqual(lines["lines"][0]["line_no"], 1)
+                with self.assertRaises(KeyError):
+                    self.runtime.code_detail.layout(
+                        connection, scan["id"], "report_other", "src/detail.c"
+                    )
 
 
 if __name__ == "__main__":

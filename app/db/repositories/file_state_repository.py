@@ -108,3 +108,29 @@ class FileStateRepository(object):
                 for row in pending
             ],
         }
+
+    def pending_line_references(self, connection, scan_id: int):
+        """Return file-qualified pending physical lines for a scan."""
+        rows = fetchall(connection, """
+            SELECT f.repository_name, f.file_path, l.line_number,
+                   l.coverage_state, a.status, COALESCE(a.is_draft, 0) AS is_draft
+            FROM coverage_files f
+            JOIN coverage_lines l ON l.file_id = f.id
+            LEFT JOIN coverage_analyses a ON a.line_id = l.id
+            WHERE f.scan_id = ?
+            ORDER BY f.repository_name, f.file_path, l.line_number
+        """, (scan_id,))
+        result = []
+        for row in rows:
+            state = str(row.get("coverage_state") or "").lower()
+            confirmed = (
+                not int(row.get("is_draft") or 0)
+                and row.get("status") in CONFIRMED_STATUSES
+            )
+            if state in ("uncovered", "uncovered_line", "uncovered-code", "0", "未覆盖") and not confirmed:
+                result.append({
+                    "repository_name": row.get("repository_name") or "",
+                    "file_path": row.get("file_path") or "",
+                    "line_number": int(row["line_number"]),
+                })
+        return result

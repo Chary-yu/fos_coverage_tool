@@ -255,11 +255,11 @@ def capture_normalized_semantic_snapshot(connection, schema="legacy"):
     compares business facts rather than same-name table bytes.
     """
     from scripts.upgrade.migration_runner import (
-        capture_legacy_snapshot,
+        capture_legacy_semantic_snapshot,
         capture_vnext_semantic_snapshot,
     )
     if str(schema).lower() in ("legacy", "old"):
-        return capture_legacy_snapshot(connection)
+        return capture_legacy_semantic_snapshot(connection)
     if str(schema).lower() in ("vnext", "candidate", "new"):
         return capture_vnext_semantic_snapshot(connection)
     raise ValueError("schema must be legacy or vnext")
@@ -267,8 +267,18 @@ def capture_normalized_semantic_snapshot(connection, schema="legacy"):
 
 def verify_normalized_semantic_integrity(legacy_snapshot, vnext_snapshot):
     """Return exact semantic equality and field-level diff evidence."""
+    legacy_hash = hashlib.sha256(json.dumps(
+        legacy_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
+    vnext_hash = hashlib.sha256(json.dumps(
+        vnext_snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
     if legacy_snapshot == vnext_snapshot:
-        return True, {"status": "PASSED", "differences": []}
+        return True, {
+            "status": "PASSED", "differences": [],
+            "legacy_semantic_hash": legacy_hash,
+            "vnext_semantic_hash": vnext_hash,
+        }
     differences = []
     keys = sorted(set(legacy_snapshot) | set(vnext_snapshot))
     for key in keys:
@@ -277,5 +287,13 @@ def verify_normalized_semantic_integrity(legacy_snapshot, vnext_snapshot):
                 "field": key,
                 "legacy": legacy_snapshot.get(key),
                 "vnext": vnext_snapshot.get(key),
+                "legacy_count": len(legacy_snapshot.get(key) or [])
+                if isinstance(legacy_snapshot.get(key), list) else None,
+                "vnext_count": len(vnext_snapshot.get(key) or [])
+                if isinstance(vnext_snapshot.get(key), list) else None,
             })
-    return False, {"status": "FAILED", "differences": differences}
+    return False, {
+        "status": "FAILED", "differences": differences,
+        "legacy_semantic_hash": legacy_hash,
+        "vnext_semantic_hash": vnext_hash,
+    }

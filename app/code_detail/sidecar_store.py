@@ -23,7 +23,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from source_reader import SourceContext, SourceLineDTO, calc_sidecar_file_key
+from .source_reader import SourceContext, SourceLineDTO, calc_sidecar_file_key
 
 logger = logging.getLogger(__name__)
 
@@ -50,14 +50,17 @@ class SidecarStore:
             p1 = os.path.join(s_dir, ".source_cache", report_id)
             p1_real = os.path.realpath(p1)
             cache_parent = os.path.realpath(os.path.join(s_dir, ".source_cache"))
-            if (os.path.isdir(p1) and not os.path.islink(p1)
+            if (os.path.isdir(p1) and not os.path.islink(os.path.join(s_dir, ".source_cache"))
+                    and not os.path.islink(p1)
                     and os.path.commonpath((cache_parent, p1_real)) == cache_parent
                     and p1 not in cache_dirs):
                 cache_dirs.append(p1)
             p2 = os.path.join(s_dir, report_id, ".source_cache", report_id)
             p2_real = os.path.realpath(p2)
             p2_parent = os.path.realpath(os.path.join(s_dir, report_id, ".source_cache"))
-            if (os.path.isdir(p2) and not os.path.islink(p2)
+            if (os.path.isdir(p2) and not os.path.islink(os.path.join(s_dir, report_id))
+                    and not os.path.islink(os.path.join(s_dir, report_id, ".source_cache"))
+                    and not os.path.islink(p2)
                     and os.path.commonpath((p2_parent, p2_real)) == p2_parent
                     and p2 not in cache_dirs):
                 cache_dirs.append(p2)
@@ -73,7 +76,7 @@ class SidecarStore:
             # 1. Try Chunked v2 meta.json
             chunk_dir = os.path.join(c_dir, file_path_hash)
             meta_path = os.path.join(chunk_dir, "meta.json")
-            if os.path.isfile(meta_path):
+            if os.path.isfile(meta_path) and not os.path.islink(chunk_dir) and not os.path.islink(meta_path):
                 try:
                     with open(meta_path, "r", encoding="utf-8") as f:
                         meta = json.load(f)
@@ -86,7 +89,7 @@ class SidecarStore:
 
             # 2. Try Legacy v1 .source.json
             legacy_path = os.path.join(c_dir, f"{file_path_hash}.source.json")
-            if os.path.isfile(legacy_path):
+            if os.path.isfile(legacy_path) and not os.path.islink(legacy_path):
                 try:
                     with open(legacy_path, "r", encoding="utf-8") as f:
                         data = json.load(f)
@@ -121,7 +124,8 @@ class SidecarStore:
             # 1. Try Chunked v2
             chunk_dir = os.path.join(c_dir, file_path_hash)
             meta_path = os.path.join(chunk_dir, "meta.json")
-            if os.path.isdir(chunk_dir) and os.path.isfile(meta_path):
+            if (os.path.isdir(chunk_dir) and not os.path.islink(chunk_dir)
+                    and os.path.isfile(meta_path) and not os.path.islink(meta_path)):
                 try:
                     with open(meta_path, "r", encoding="utf-8") as f:
                         meta = json.load(f)
@@ -130,7 +134,9 @@ class SidecarStore:
                     declared_chunks = meta.get("chunks") or []
                     if declared_chunks:
                         for name in declared_chunks:
-                            if not os.path.isfile(os.path.join(chunk_dir, os.path.basename(name))):
+                            chunk_path = os.path.join(chunk_dir, os.path.basename(name))
+                            if (not os.path.isfile(chunk_path) or
+                                    os.path.islink(chunk_path)):
                                 raise FileNotFoundError("sidecar chunk is missing")
                     c_size = meta.get("chunk_size", self.chunk_size)
                     start_chunk_idx = (start_line - 1) // c_size
@@ -141,7 +147,7 @@ class SidecarStore:
                         c_start = c_idx * c_size
                         c_end = c_start + c_size - 1
                         chunk_file = os.path.join(chunk_dir, f"lines-{c_start:06d}-{c_end:06d}.json")
-                        if os.path.isfile(chunk_file):
+                        if os.path.isfile(chunk_file) and not os.path.islink(chunk_file):
                             with open(chunk_file, "r", encoding="utf-8") as cf:
                                 c_lines = json.load(cf)
                             for l_dict in c_lines:
@@ -154,7 +160,7 @@ class SidecarStore:
 
             # 2. Try Legacy v1
             legacy_path = os.path.join(c_dir, f"{file_path_hash}.source.json")
-            if os.path.isfile(legacy_path):
+            if os.path.isfile(legacy_path) and not os.path.islink(legacy_path):
                 try:
                     with open(legacy_path, "r", encoding="utf-8") as f:
                         data = json.load(f)

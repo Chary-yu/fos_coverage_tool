@@ -63,6 +63,17 @@ class VNextBackgroundJobService(object):
 
     def submit(self, project_id, scan_id, kind, data_version, callback,
                input_payload=None, job_id=None):
+        connection = self.connection_factory()
+        try:
+            active = self.repository.find_active(
+                connection, project_id, scan_id, kind, data_version
+            )
+            if active and not job_id:
+                return active
+        finally:
+            close = getattr(connection, "close", None)
+            if close:
+                close()
         job_id = job_id or "job_{}".format(uuid.uuid4().hex[:16])
         job = {
             "job_id": job_id, "project_id": project_id, "scan_id": scan_id,
@@ -70,7 +81,7 @@ class VNextBackgroundJobService(object):
             "input_payload": json.dumps(input_payload or {}, sort_keys=True),
             "data_version": data_version,
         }
-        self._save(job)
+        persisted = self._save(job)
 
         def run():
             started = dict(job)
@@ -102,13 +113,15 @@ class VNextBackgroundJobService(object):
             job_id=job_id,
             reuse_existing=True,
         )
-        return self._save(job)
+        return persisted
 
-    def recover(self):
+    def recover(self, heartbeat_timeout=None):
         connection = self.connection_factory()
         try:
             with transaction(connection) as conn:
-                return self.repository.mark_stale(conn, self.heartbeat_timeout)
+                return self.repository.mark_stale(
+                    conn, self.heartbeat_timeout if heartbeat_timeout is None else heartbeat_timeout
+                )
         finally:
             close = getattr(connection, "close", None)
             if close:

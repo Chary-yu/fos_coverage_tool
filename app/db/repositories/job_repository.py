@@ -25,6 +25,14 @@ class JobRepository(object):
         sql += " ORDER BY created_at, job_id"
         return fetchall(connection, sql, params)
 
+    def find_active(self, connection, project_id, scan_id, kind, data_version):
+        return fetchone(connection, """
+            SELECT * FROM coverage_background_jobs
+            WHERE project_id = ? AND scan_id = ? AND kind = ? AND data_version = ?
+              AND state IN ('queued', 'running')
+            ORDER BY created_at, job_id LIMIT 1
+        """, (project_id, scan_id, kind, data_version))
+
     def upsert(self, connection, job: dict):
         existing = self.get(connection, job["job_id"])
         fields = (
@@ -63,8 +71,9 @@ class JobRepository(object):
             UPDATE coverage_background_jobs
             SET state = 'interrupted', error_message = 'heartbeat timeout',
                 updated_at = CURRENT_TIMESTAMP, finished_at = CURRENT_TIMESTAMP
-            WHERE state IN ('queued', 'running')
-              AND heartbeat_at IS NOT NULL AND heartbeat_at < ?
+            WHERE (state = 'queued'
+                   OR (state = 'running' AND (heartbeat_at IS NULL
+                       OR heartbeat_at < ?)))
         """, (cutoff_text,))
         count = int(getattr(cursor, "rowcount", 0) or 0)
         cursor.close()

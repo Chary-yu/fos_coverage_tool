@@ -19,6 +19,7 @@ def _legacy_fn(fields):
 def parse_function_records(lines):
     modern_ranges = {}
     modern_names = {}
+    modern_counts = {}
     legacy = []
     modern_seen = False
     modern_invalid = False
@@ -44,12 +45,19 @@ def parse_function_records(lines):
                 modern_invalid = True
                 continue
             index = int(fields[0])
-            modern_ranges[index] = {
+            candidate = {
                 "start_line": int(fields[1]),
                 "end_line": int(fields[2]) if len(fields) == 3 else None,
                 "name": "",
                 "format": "modern",
             }
+            if candidate["start_line"] < 1 or (
+                    candidate["end_line"] is not None and
+                    candidate["end_line"] < candidate["start_line"]):
+                modern_invalid = True
+            if index in modern_ranges and modern_ranges[index] != candidate:
+                modern_invalid = True
+            modern_ranges[index] = candidate
             continue
         if raw.startswith("FNA:"):
             modern_seen = True
@@ -57,15 +65,27 @@ def parse_function_records(lines):
             if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
                 modern_invalid = True
                 continue
-            modern_names[int(fields[0])] = fields[2]
+            index = int(fields[0])
+            count = int(fields[1])
+            candidate = (count, fields[2])
+            if index in modern_names and (
+                    modern_counts.get(index), modern_names.get(index)
+            ) != candidate:
+                modern_invalid = True
+            modern_counts[index] = count
+            modern_names[index] = fields[2]
     if modern_seen:
         ranges = []
         for index in sorted(modern_ranges):
             item = dict(modern_ranges[index])
             item["name"] = modern_names.get(index, "")
+            if index not in modern_names:
+                modern_invalid = True
             if item["end_line"] is None or item["end_line"] < item["start_line"]:
                 modern_invalid = True
             ranges.append(item)
+        if set(modern_names) - set(modern_ranges):
+            modern_invalid = True
         if modern_invalid or not ranges:
             return ranges, True
         return ranges, False

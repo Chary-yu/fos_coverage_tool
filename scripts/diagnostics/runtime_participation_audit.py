@@ -34,7 +34,7 @@ def _check(name, paths, patterns):
 
 def audit():
     checks = [
-        _check("vnext_bootstrap_api", ["enhance_coverage.py", "app/bootstrap.py", "app/api/handler.py"], [
+        _check("vnext_bootstrap_api", ["enhance_coverage.py", "app/legacy_runtime.py", "app/bootstrap.py", "app/api/handler.py"], [
             r"runtime_mode",
             r"create_vnext_server",
             r"class VNextHTTPRequestHandler",
@@ -78,55 +78,57 @@ def audit():
             r"boundary",
             r"def added_lines",
         ]),
-        _check("mysql_connection_pool", ["enhance_coverage.py", "app/db/manager.py"], [
-            r"from app\.db\.connection_pool import get_global_pool",
+        _check("mysql_connection_pool", ["app/bootstrap.py", "app/db/manager.py", "app/db/connection_pool.py"], [
+            r"DatabaseManager\(config\)",
             r"get_global_pool\(self\.config\)",
-            r"DatabaseManager\(config, exit_on_error=False, init_schema=False\)",
+            r"class MySQLConnectionPool",
         ]),
-        _check("bounded_background_executor", ["enhance_coverage.py", "app/jobs/service.py"], [
+        _check("bounded_background_executor", ["app/bootstrap.py", "app/jobs/service.py"], [
             r"from app\.jobs\.bounded_executor import BoundedJobExecutor",
             r"BoundedJobExecutor\(",
-            r"_get_background_executor\(\)\.submit_job",
-            r"class BackgroundJobService",
+            r"class VNextBackgroundJobService",
+            r"self\.job_service",
         ]),
-        _check("progress_aggregate_service", ["enhance_coverage.py", "app/progress/service.py"], [
-            r"from app\.progress\.service import ProgressService",
-            r"ProgressService\(connection\)\.project_summary",
-            r"query_project_progress_aggregated",
+        _check("progress_aggregate_service", ["app/bootstrap.py", "app/services/progress_service.py", "app/db/repositories/file_state_repository.py"], [
+            r"ProgressService\(",
+            r"def summary",
+            r"pending_line_references",
         ]),
-        _check("bounded_excel_export", ["enhance_coverage.py", "app/jobs/excel_streaming.py"], [
-            r"from app\.jobs\.excel_streaming import export_project_coverage_streaming_zip",
+        _check("bounded_excel_export", ["app/services/export_service.py", "app/jobs/excel_streaming.py", "app/api/application.py"], [
+            r"class ExportService",
+            r"export_scan",
             r"export_project_coverage_streaming_zip\(",
             r"MAX_INFLIGHT_DIR_EXPORTS",
         ]),
-        _check("inject_parse_once", ["enhance_coverage.py", "app/inject/service.py", "app/inject/parse_once.py"], [
-            r"from app\.inject\.service import InjectService",
-            r"InjectService\.parse_once\(",
+        _check("inject_parse_once", ["app/bootstrap.py", "app/inject/service.py", "app/inject/parse_once.py"], [
+            r"ScanImportService\(",
+            r"parse_once = staticmethod",
             r"class ParsedSourceArtifact",
         ]),
-        _check("directory_signature", ["enhance_coverage.py", "app/inject/directory_signature.py"], [
+        _check("directory_signature", ["app/legacy_runtime.py", "app/inject/directory_signature.py"], [
             r"from app\.inject\.directory_signature import calculate_directory_signature_incremental",
             r"calculate_directory_signature_incremental\(",
             r"manifest_path=manifest_path",
         ]),
-        _check("lcov_path_index", ["coverage_check.py", "app/incremental/path_index.py"], [
+        _check("lcov_path_index", ["app/incremental/legacy.py", "app/incremental/path_index.py"], [
             r"from app\.incremental\.service import IncrementalService",
             r"IncrementalService\(\{\"repo\": list\(coverage_data\.keys\(\)\)\}\)",
             r"class LCOVPathLookupIndex",
         ]),
-        _check("chunked_sidecar", ["enhance_coverage.py", "app/code_detail/sidecar_store.py"], [
+        _check("chunked_sidecar", ["app/code_detail/vnext_service.py", "app/code_detail/sidecar_store.py"], [
             r"from app\.code_detail\.sidecar_store import SidecarStore",
             r"save_chunked_sidecar\(",
             r"load_lines_range\(",
         ]),
-        _check("release_identity_endpoint", ["enhance_coverage.py", "app/release_identity.py"], [
-            r"verify_release_identity\(SCRIPT_DIR\)",
+        _check("release_identity_endpoint", ["app/bootstrap.py", "app/api/application.py", "app/release_identity.py"], [
+            r"get_current_release_identity",
+            r"def release",
             r"release_manifest\.json",
             r"runtime never rewrites",
         ]),
-        _check("write_freeze_auth_boundary", ["enhance_coverage.py", "app/upgrade/lifecycle.py"], [
+        _check("write_freeze_auth_boundary", ["app/api/auth.py", "app/upgrade/lifecycle.py"], [
             r"writes_are_frozen\(",
-            r"def _authorize_mutation",
+            r"def authorize",
             r"trusted_proxy_addresses",
         ]),
     ]
@@ -142,7 +144,7 @@ def audit():
     else:
         checks.append({
             "name": "legacy_unbounded_job_thread", "status": "RUNTIME_WIRED",
-            "paths": ["enhance_coverage.py"], "missing_patterns": [],
+            "paths": ["enhance_coverage.py", "app/bootstrap.py"], "missing_patterns": [],
         })
 
     result = {

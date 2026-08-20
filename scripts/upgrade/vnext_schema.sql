@@ -181,3 +181,18 @@ CREATE TABLE IF NOT EXISTS coverage_background_jobs (
     CONSTRAINT fk_vnext_jobs_scan FOREIGN KEY (scan_id)
         REFERENCES coverage_scans(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS coverage_incremental_results (
+    id BIGINT NOT NULL AUTO_INCREMENT,
+    scan_id BIGINT NOT NULL,
+    report_id VARCHAR(64) NOT NULL DEFAULT '',
+    repository_name VARCHAR(128) NOT NULL,
+    old_commit_sha CHAR(40) NOT NULL DEFAULT '',
+    new_commit_sha CHAR(40) NOT NULL DEFAULT '',
+    payload LONGTEXT NOT NULL,
+    generated_at DATETIME NOT NULL,
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_incremental_scan_repo (scan_id, report_id, repository_name),
+    CONSTRAINT fk_incremental_result_scan FOREIGN KEY (scan_id)
+        REFERENCES coverage_scans(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

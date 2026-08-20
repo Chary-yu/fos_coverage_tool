@@ -21,7 +21,7 @@ from app.db.repositories import (
     ProjectRepository,
     ProjectStateRepository,
 )
-from app.db.repositories.base import fetchall, fetchone, is_sqlite
+from app.db.repositories.base import adapt_sql, fetchall, fetchone, is_sqlite
 from app.db.transaction import transaction
 
 
@@ -94,6 +94,13 @@ CREATE TABLE IF NOT EXISTS coverage_background_jobs (
     heartbeat_at TEXT, created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS coverage_incremental_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL,
+    report_id TEXT NOT NULL DEFAULT '', repository_name TEXT NOT NULL,
+    old_commit_sha TEXT NOT NULL DEFAULT '', new_commit_sha TEXT NOT NULL DEFAULT '',
+    payload TEXT NOT NULL, generated_at TEXT NOT NULL,
+    UNIQUE(scan_id, report_id, repository_name)
+);
 """
 
 
@@ -139,6 +146,14 @@ def _legacy_key(row):
     return file_hash, int(row.get("line_number") or 0), path
 
 
+def _legacy_text(row, names):
+    for name in names:
+        value = row.get(name)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
 def capture_legacy_snapshot(connection):
     """Normalize legacy facts without changing their source semantics."""
     analysis = []
@@ -152,9 +167,9 @@ def capture_legacy_snapshot(connection):
             "status": str(row.get("status") or ""),
             "is_draft": int(row.get("is_draft") or 0),
             "reviewer": str(row.get("reviewer") or ""),
-            "coverage_method": str(row.get("coverage_method") or ""),
-            "uncovered_reason": str(row.get("uncovered_reason") or ""),
-            "comment": str(row.get("comment") or ""),
+            "coverage_method": _legacy_text(row, ("coverage_method", "method")),
+            "uncovered_reason": _legacy_text(row, ("uncovered_reason", "reason")),
+            "comment": _legacy_text(row, ("comment", "comments", "remark")),
         })
     lines = []
     for row in _rows(connection, "coverage_line_index"):
@@ -257,13 +272,65 @@ def capture_vnext_semantic_snapshot(connection):
         LEFT JOIN coverage_projects p ON p.id = j.project_id
         ORDER BY j.job_id
     """)
+    normalized_jobs = []
+    for job in jobs:
+        item = dict(job)
+        if item.get("state") in ("queued", "running", "interrupted"):
+            item["state"] = "interrupted"
+            item["error_message"] = item.get("error_message") or (
+                "legacy active job requires manual migration decision"
+            )
+        normalized_jobs.append(item)
     return {
         "projects": snapshot["projects"],
         "project_data_versions": snapshot["project_data_versions"],
         "lines": snapshot["lines"],
         "analyses": snapshot["analyses"],
-        "jobs": jobs,
+        "jobs": normalized_jobs,
     }
+
+
+def capture_legacy_semantic_snapshot(connection):
+    """Normalize expected migration transformations for semantic comparison."""
+    snapshot = capture_legacy_snapshot(connection)
+    line_keys = {
+        (row["project_name"], row["file_path_hash"], row["file_path"], row["line_number"])
+        for row in snapshot["lines"]
+    }
+    for analysis in snapshot["analyses"]:
+        key = (
+            analysis["project_name"], analysis["file_path_hash"],
+            analysis["file_path"], analysis["line_number"],
+        )
+        if key not in line_keys:
+            snapshot["lines"].append({
+                "project_name": analysis["project_name"],
+                "file_path_hash": analysis["file_path_hash"],
+                "file_path": analysis["file_path"],
+                "line_number": analysis["line_number"],
+                "line_text": "",
+                "block_start_line": analysis["line_number"],
+                "block_end_line": analysis["line_number"],
+                "block_type": "unknown",
+                "function_name": "",
+                "function_hash": "",
+                "code_line_hash": "",
+                "code_occurrence": 1,
+            })
+    snapshot["lines"].sort(key=lambda item: (
+        item["project_name"], item["file_path_hash"], item["line_number"]
+    ))
+    jobs = []
+    for job in snapshot["jobs"]:
+        item = dict(job)
+        if item.get("state") in ("queued", "running", "interrupted"):
+            item["state"] = "interrupted"
+            item["error_message"] = item.get("error_message") or (
+                "legacy active job requires manual migration decision"
+            )
+        jobs.append(item)
+    snapshot["jobs"] = jobs
+    return snapshot
 
 
 def semantic_hash(snapshot):
@@ -311,22 +378,42 @@ def apply_schema(connection, ddl_path, release_sha=""):
     """, ("coverage_vnext",))
     cursor = connection.cursor()
     if existing:
-        cursor.execute(
-            "UPDATE coverage_schema_meta SET schema_version = ?, applied_at = ?, release_sha = ? WHERE schema_key = ?",
+        cursor.execute(adapt_sql(connection,
+            "UPDATE coverage_schema_meta SET schema_version = ?, applied_at = ?, release_sha = ? WHERE schema_key = ?"),
             (1, _now(), release_sha or "", "coverage_vnext"),
         )
     else:
-        cursor.execute(
-            "INSERT INTO coverage_schema_meta(schema_key, schema_version, applied_at, release_sha) VALUES (?, ?, ?, ?)",
+        cursor.execute(adapt_sql(connection,
+            "INSERT INTO coverage_schema_meta(schema_key, schema_version, applied_at, release_sha) VALUES (?, ?, ?, ?)"),
             ("coverage_vnext", 1, _now(), release_sha or ""),
         )
     cursor.close()
     connection.commit()
 
 
+def validate_migration_database_separation(source_config, target_config):
+    """Reject a migration that could accidentally point both sides at one DB."""
+    source = source_config.get("mysql") or source_config
+    target = target_config.get("mysql") or target_config
+    source_identity = (
+        str(source.get("host", "127.0.0.1")), int(source.get("port", 3306)),
+        str(source.get("user", "")), str(source.get("database", "")),
+    )
+    target_identity = (
+        str(target.get("host", "127.0.0.1")), int(target.get("port", 3306)),
+        str(target.get("user", "")), str(target.get("database", "")),
+    )
+    if source_identity == target_identity:
+        raise ValueError("source and target database identities must be different")
+    if not target_identity[3]:
+        raise ValueError("target database name is required")
+    return {"source": source_identity, "target": target_identity}
+
+
 def migrate_legacy(source_connection, target_connection, anomaly_path=None, release_sha=""):
     """Migrate one legacy current-state snapshot idempotently."""
     source = capture_legacy_snapshot(source_connection)
+    source_semantic = capture_legacy_semantic_snapshot(source_connection)
     anomalies = []
     project_repo = ProjectRepository()
     line_repo = LineIndexRepository()
@@ -360,19 +447,54 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None, rele
                 conn, scan["id"], "legacy_{}".format(scan_key[:16]),
                 source_signature="legacy_migration", sidecar_schema=0,
             )
-            line_rows = {
-                (row["file_path_hash"], row["line_number"]): row
-                for row in source["lines"] if row["project_name"] == project_name
+            project_lines = [
+                row for row in source["lines"] if row["project_name"] == project_name
+            ]
+            project_analyses = [
+                row for row in source["analyses"] if row["project_name"] == project_name
+            ]
+            line_candidates = {}
+            line_rows = {}
+            for row in project_lines:
+                group_key = (row["file_path_hash"], row["line_number"])
+                line_candidates.setdefault(group_key, set()).add(row.get("file_path") or "")
+                line_rows[(row["file_path_hash"], row["line_number"],
+                           row.get("file_path") or "")] = row
+            for (file_hash, line_number), paths in sorted(line_candidates.items()):
+                if len(paths) > 1:
+                    anomalies.append({
+                        "type": "path_conflict", "project_name": project_name,
+                        "file_path_hash": file_hash, "line_number": line_number,
+                        "paths": sorted(paths),
+                    })
+            conflict_hashes = {
+                file_hash for (file_hash, _line_number), paths in line_candidates.items()
+                if len(paths) > 1
             }
-            analysis_rows = {
-                (row["file_path_hash"], row["line_number"]): row
-                for row in source["analyses"] if row["project_name"] == project_name
-            }
+            analysis_rows = {}
+            for row in project_analyses:
+                file_hash = row["file_path_hash"]
+                line_number = row["line_number"]
+                path = row.get("file_path") or ""
+                if not path:
+                    candidates = line_candidates.get((file_hash, line_number), set())
+                    if len(candidates) == 1:
+                        path = next(iter(candidates))
+                    else:
+                        anomalies.append({
+                            "type": "analysis_path_ambiguous",
+                            "project_name": project_name,
+                            "file_path_hash": file_hash,
+                            "line_number": line_number,
+                            "paths": sorted(candidates),
+                        })
+                        path = file_hash
+                analysis_rows[(file_hash, line_number, path)] = row
             keys = sorted(set(line_rows) | set(analysis_rows))
             files = {}
-            for file_hash, line_number in keys:
-                source_line = line_rows.get((file_hash, line_number))
-                analysis_line = analysis_rows.get((file_hash, line_number))
+            for file_hash, line_number, path_key in keys:
+                source_line = line_rows.get((file_hash, line_number, path_key))
+                analysis_line = analysis_rows.get((file_hash, line_number, path_key))
                 path = (source_line or analysis_line or {}).get("file_path") or ""
                 if not path:
                     anomalies.append({
@@ -380,11 +502,18 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None, rele
                         "file_path_hash": file_hash, "line_number": line_number,
                     })
                     path = file_hash
-                if file_hash not in files:
+                file_key = (file_hash, path)
+                if file_key not in files:
+                    repository_name = ""
+                    if file_hash in conflict_hashes:
+                        repository_name = "legacy-conflict-{}".format(
+                            hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
+                        )
                     file_rows = project_repo.ensure_file(
-                        conn, scan["id"], "", file_hash, path, os.path.basename(path)
+                        conn, scan["id"], repository_name, file_hash,
+                        path, os.path.basename(path)
                     )
-                    files[file_hash] = file_rows
+                    files[file_key] = file_rows
                 if source_line is None:
                     anomalies.append({
                         "type": "missing_line_index_context", "project_name": project_name,
@@ -399,7 +528,7 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None, rele
                 line_record = dict(source_line)
                 line_record["coverage_state"] = "uncovered"
                 line_record["suggested_reviewer"] = ""
-                line = line_repo.upsert_line(conn, files[file_hash]["id"], line_record)
+                line = line_repo.upsert_line(conn, files[file_key]["id"], line_record)
                 if analysis_line is not None:
                     analysis_repo.upsert(conn, line["id"], analysis_line)
             state_repo.ensure(
@@ -441,11 +570,11 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None, rele
         "source_analysis_facts": len(source["analyses"]),
         "source_jobs": len(source["jobs"]),
         "anomalies": anomalies,
-        "source_semantic_hash": semantic_hash(source),
+        "source_semantic_hash": semantic_hash(source_semantic),
         "target_semantic_hash": semantic_hash(
             capture_vnext_semantic_snapshot(target_connection)
         ),
-        "authoritative_semantic_match": semantic_hash(source) == semantic_hash(
+        "authoritative_semantic_match": semantic_hash(source_semantic) == semantic_hash(
             capture_vnext_semantic_snapshot(target_connection)
         ),
         "release_sha": release_sha or "",
@@ -507,13 +636,19 @@ def main(argv=None):
                 cursorclass=pymysql.cursors.DictCursor,
             )
 
-        source = connect(load_mysql_config(args.source_config))
-        target = connect(load_mysql_config(args.target_config))
+        source_config = load_mysql_config(args.source_config)
+        target_config = load_mysql_config(args.target_config)
+        validate_migration_database_separation(source_config, target_config)
+        source = connect(source_config)
+        target = connect(target_config)
         try:
             if not args.schema:
                 parser.error("--schema is required for MySQL migration")
             apply_schema(target, args.schema, args.release_sha)
             first = migrate_legacy(source, target, args.anomaly_path or None, args.release_sha)
+            # The source connection is never used for writes.  Rollback also
+            # releases any driver-side read snapshot before the second audit.
+            source.rollback()
             first_snapshot = capture_vnext_semantic_snapshot(target)
             second = migrate_legacy(source, target, args.anomaly_path or None, args.release_sha)
             second_snapshot = capture_vnext_semantic_snapshot(target)

@@ -24,6 +24,57 @@ def load_runtime_config(path: str, defaults: Optional[Dict[str, Any]] = None) ->
     return _merge(result, loaded)
 
 
+def default_runtime_config(base_dir: str, project_name: str = "Gemini-NOS") -> Dict[str, Any]:
+    """Return the repository-relative defaults shared by CLI and services.
+
+    Keeping defaults here prevents the historical root entrypoint from
+    maintaining a second configuration contract.  Callers still decide which
+    environment-specific file to load and may override any value in it.
+    """
+    base_dir = os.path.realpath(base_dir)
+    return {
+        "mysql": {
+            "host": "localhost",
+            "port": 3306,
+            "user": "root",
+            "password": "",
+            "database": "coverage",
+        },
+        "server": {"host": "0.0.0.0", "port": 9528},
+        "auth": {
+            "mode": "disabled",
+            "user_header": "X-Remote-User",
+            "trusted_proxy_addresses": [],
+            "allowed_origins": [],
+        },
+        "ownership": {
+            "enabled": True,
+            "xlsx_path": os.path.join(base_dir, "代码目录归属模块统计.xlsx"),
+        },
+        "runtime_state": {
+            "root": os.path.join(base_dir, ".runtime-state"),
+            "jobs_dir": "jobs",
+            "registry_dir": "report-registry",
+        },
+        "runtime_mode": "legacy",
+        "project_name": project_name,
+    }
+
+
+def load_application_config(path: Optional[str] = None, base_dir: Optional[str] = None,
+                            project_name: str = "Gemini-NOS") -> Dict[str, Any]:
+    """Load, normalize, and validate one application configuration."""
+    base_dir = os.path.realpath(base_dir or os.getcwd())
+    configured_path = path or os.environ.get("COVERAGE_CONFIG_PATH")
+    if configured_path and not os.path.isabs(configured_path):
+        configured_path = os.path.join(base_dir, configured_path)
+    defaults = default_runtime_config(base_dir, project_name=project_name)
+    result = load_runtime_config(configured_path, defaults) if configured_path else defaults
+    result = normalize_candidate_paths(result, base_dir)
+    validate_production_config(result)
+    return result
+
+
 def resolve_runtime_path(config: Dict[str, Any], key: str, base_dir: str,
                          default: Optional[str] = None) -> str:
     """Resolve configured paths relative to the config/repository root."""
@@ -49,7 +100,19 @@ def normalize_candidate_paths(config: Dict[str, Any], base_dir: str) -> Dict[str
     state["registry_dir"] = resolve_runtime_path(
         state, "registry_dir", state["root"], "report-registry"
     )
+    if "exports_dir" in state:
+        state["exports_dir"] = resolve_runtime_path(
+            state, "exports_dir", state["root"], "exports"
+        )
     result["runtime_state"] = state
+    result["input_roots"] = [
+        resolve_runtime_path({"root": item}, "root", base_dir, base_dir)
+        for item in (result.get("input_roots") or [])
+    ]
+    result["report_roots"] = [
+        resolve_runtime_path({"root": item}, "root", base_dir, base_dir)
+        for item in (result.get("report_roots") or [])
+    ]
     return result
 
 

@@ -12,7 +12,7 @@ import sys
 import hashlib
 from typing import Dict, Any, List, Tuple, Optional, Set
 
-from source_reader import (
+from app.code_detail.source_reader import (
     SourceContext,
     SourceLineDTO,
     calc_sidecar_file_key,

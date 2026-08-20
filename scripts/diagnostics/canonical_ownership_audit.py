@@ -53,6 +53,15 @@ def audit_canonical_ownership(repo_root: str) -> Dict[str, Any]:
         "app/services/project_service.py",
         "app/services/analysis_service.py",
         "app/services/progress_service.py",
+        "app/services/export_service.py",
+        "app/services/incremental_service.py",
+        "app/incremental/orchestrator.py",
+        "app/incremental/path_index.py",
+        "app/incremental/lcov.py",
+        "app/incremental/git_diff.py",
+        "app/incremental/blame.py",
+        "app/inject/service.py",
+        "app/jobs/service.py",
         "scripts/upgrade/vnext_schema.sql",
         "scripts/upgrade/migration_runner.py",
     ]
@@ -61,6 +70,30 @@ def audit_canonical_ownership(repo_root: str) -> Dict[str, Any]:
         if not os.path.isfile(os.path.join(repo_root, path))
     ]
     transitional = []
+    shim_specs = {
+        "enhance_coverage.py": ("app.legacy_runtime", ("runpy.run_module",)),
+        "coverage_check.py": ("app.incremental.legacy", ("sys.modules[__name__]",)),
+        "code_detail_service.py": ("app.code_detail.service", ("from app.code_detail.service",)),
+        "code_region.py": ("app.code_detail.code_region", ("from app.code_detail.code_region",)),
+        "source_reader.py": ("app.code_detail.source_reader", ("from app.code_detail import source_reader",)),
+    }
+    shim_results = {}
+    for relative_path, (owner, required_patterns) in shim_specs.items():
+        path = os.path.join(repo_root, relative_path)
+        if not os.path.isfile(path):
+            transitional.append("missing_compatibility_shim:{}".format(relative_path))
+            shim_results[relative_path] = {"owner": owner, "status": "missing"}
+            continue
+        with open(path, "r", encoding="utf-8") as stream:
+            root_text = stream.read()
+        missing = [pattern for pattern in required_patterns if pattern not in root_text]
+        if missing:
+            transitional.append("non_delegating_compatibility_shim:{}".format(relative_path))
+        shim_results[relative_path] = {
+            "owner": owner,
+            "status": "valid" if not missing else "invalid",
+            "missing_patterns": missing,
+        }
     root_path = os.path.join(repo_root, "enhance_coverage.py")
     if os.path.isfile(root_path):
         with open(root_path, "r", encoding="utf-8") as stream:
@@ -81,6 +114,7 @@ def audit_canonical_ownership(repo_root: str) -> Dict[str, Any]:
             "canonical_sources": sorted(mappings.values()),
             "compatibility_copies": copies, "violations": violations,
             "transitional_root_owners": transitional,
+            "compatibility_shims": shim_results,
             "missing_vnext_modules": missing_modules,
             "is_valid": not violations and not transitional}
 

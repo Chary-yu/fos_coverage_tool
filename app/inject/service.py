@@ -6,6 +6,7 @@ import os
 from app.inject.parse_once import parse_gcov_source_once
 from app.incremental.lcov import load_info
 from app.services.project_service import ProjectService
+from app.config.path_policy import realpath_within, reject_relative_traversal
 
 
 class InjectService:
@@ -15,20 +16,27 @@ class InjectService:
 class ScanImportService(object):
     """Create one immutable Scan and populate its physical line identities."""
 
-    def __init__(self, project_service=None):
+    def __init__(self, project_service=None, report_registry=None,
+                 allowed_info_roots=None, allowed_report_roots=None):
         self.projects = project_service or ProjectService()
+        self.report_registry = report_registry
+        self.allowed_info_roots = [os.path.realpath(root) for root in (allowed_info_roots or [])]
+        self.allowed_report_roots = [os.path.realpath(root) for root in
+                                     (allowed_report_roots or [])]
 
     def import_info(self, connection, project_name, info_path, review_scope="full",
                     repositories=None, report=None, info_file_name=""):
+        reject_relative_traversal(info_path)
+        info_path = os.path.realpath(info_path)
+        if self.allowed_info_roots and not realpath_within(info_path, self.allowed_info_roots):
+            raise ValueError("info_path is outside configured input roots")
         if not os.path.isfile(info_path):
             raise FileNotFoundError(info_path)
+        digest = hashlib.sha256()
         with open(info_path, "rb") as stream:
-            info_sha256 = hashlib.sha256(stream.read()).hexdigest()
-        scan = self.projects.create_scan(
-            connection, project_name, info_file_name=info_file_name or os.path.basename(info_path),
-            info_sha256=info_sha256, review_scope=review_scope,
-            repositories=repositories or [], report=report,
-        )
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        info_sha256 = digest.hexdigest()
         parsed = load_info(info_path)
         files = []
         for file_path, item in parsed.items():
@@ -64,7 +72,29 @@ class ScanImportService(object):
                 "source_file_name": os.path.basename(normalized),
                 "lines": line_records,
             })
-        self.projects.ingest_files(connection, scan["id"], files)
+        if report and self.allowed_report_roots:
+            report_directories = report.get("directories") or (
+                [report.get("report_root")] if report.get("report_root") else []
+            )
+            for directory in report_directories:
+                if not realpath_within(directory, self.allowed_report_roots):
+                    raise ValueError("report root is outside configured report roots")
+        scan = self.projects.create_scan_and_ingest(
+            connection, project_name, files,
+            info_file_name=info_file_name or os.path.basename(info_path),
+            info_sha256=info_sha256, review_scope=review_scope,
+            repositories=repositories or [], report=report,
+        )
+        if report and self.report_registry:
+            report_root = report.get("report_root") or ""
+            directories = report.get("directories") or ([report_root] if report_root else [])
+            self.report_registry.register(
+                report["report_id"], directories,
+                sidecar_required=bool(report.get("sidecar_required", True)),
+                report_root=report_root,
+                scan_id=scan["id"],
+                source_signature=report.get("source_signature", ""),
+            )
         return {
             "scan": scan, "files": len(files),
             "line_count": sum(len(item["lines"]) for item in files),

@@ -22,7 +22,8 @@ PROTECTED_TABLES = {
     "coverage_line_index",
     "coverage_project_state",
     "coverage_file_state",
-    "coverage_background_jobs"
+    "coverage_background_jobs",
+    "coverage_incremental_results"
 }
 
 FORBIDDEN_KEYWORDS = [

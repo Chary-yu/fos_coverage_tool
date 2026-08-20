@@ -344,6 +344,11 @@
     function getApiBaseCandidates() {
         return ["/api/coverage"];
     }
+    function fileKey(repositoryName, filePath) {
+        var repository = String(repositoryName || "").trim();
+        var path = String(filePath || "").replace(/\\/g, "/").replace(/^\.\//, "");
+        return repository ? repository + "::" + path : path;
+    }
 
     function fetchUnanalyzedFromCandidates(candidates, index) {
         if (index >= candidates.length) {
@@ -381,7 +386,10 @@
                 var files = payload.files || [];
                 var map = {};
                 for (var i = 0; i < files.length; i++) {
-                    map[files[i].file_path] = files[i].unanalyzed;
+                    map[fileKey(files[i].repository_name, files[i].file_path)] = files[i].unanalyzed;
+                    if (!files[i].repository_name) {
+                        map[files[i].file_path] = files[i].unanalyzed;
+                    }
                 }
 
                 var total = 0;

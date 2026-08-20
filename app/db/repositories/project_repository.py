@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
-from app.db.repositories.base import execute, fetchall, fetchone, insert_id
+from app.db.repositories.base import adapt_sql, execute, fetchall, fetchone, insert_id, row_to_dict
 
 
 def _now(value=None):
@@ -116,6 +116,17 @@ class ProjectRepository(object):
     def get_report(self, connection, report_id: str):
         return fetchone(connection, "SELECT * FROM coverage_reports WHERE report_id = ?", (report_id,))
 
+    def get_report_for_scan(self, connection, scan_id: int):
+        return fetchone(connection, """
+            SELECT * FROM coverage_reports WHERE scan_id = ? ORDER BY id LIMIT 1
+        """, (scan_id,))
+
+    def list_repository_snapshots(self, connection, scan_id: int):
+        return fetchall(connection, """
+            SELECT * FROM coverage_scan_repositories
+            WHERE scan_id = ? ORDER BY repository_name
+        """, (scan_id,))
+
     def bind_report(self, connection, scan_id: int, report_id: str, report_root: str = "",
                     source_signature: str = "", sidecar_schema: int = 0,
                     asset_identity: str = "", generated_at=None):
@@ -173,3 +184,26 @@ class ProjectRepository(object):
         return fetchall(connection, """
             SELECT * FROM coverage_files WHERE scan_id = ? ORDER BY repository_name, file_path
         """, (scan_id,))
+
+    def iter_scan_export_rows(self, connection, scan_id: int):
+        """Yield joined facts one row at a time for bounded exports."""
+        cursor = connection.cursor()
+        cursor.execute(adapt_sql(connection, """
+            SELECT f.repository_name, f.file_path_hash, f.file_path,
+                   f.source_file_name, l.line_number, l.line_text,
+                   l.coverage_state, l.block_start_line, l.block_end_line,
+                   l.block_type, l.function_name, l.function_hash,
+                   l.code_line_hash, l.code_occurrence, l.suggested_reviewer,
+                   a.status, a.is_draft, a.reviewer, a.coverage_method,
+                   a.uncovered_reason, a.comment
+            FROM coverage_files f
+            JOIN coverage_lines l ON l.file_id = f.id
+            LEFT JOIN coverage_analyses a ON a.line_id = l.id
+            WHERE f.scan_id = ?
+            ORDER BY f.repository_name, f.file_path, l.line_number
+        """), (scan_id,))
+        try:
+            for row in cursor:
+                yield row_to_dict(cursor, row)
+        finally:
+            cursor.close()

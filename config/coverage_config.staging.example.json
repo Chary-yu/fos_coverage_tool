@@ -23,8 +23,11 @@
   "runtime_state": {
     "root": ".runtime-state-staging",
     "jobs_dir": "jobs",
-    "registry_dir": "report-registry"
+    "registry_dir": "report-registry",
+    "exports_dir": "exports"
   },
+  "input_roots": [".runtime-state-staging/inputs"],
+  "report_roots": [".runtime-state-staging/reports"],
   "runtime_mode": "vnext",
   "schema_version": 1,
   "environment": "candidate",

@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 
+from app.bootstrap import VNextRuntime
 from app.jobs.bounded_executor import BoundedJobExecutor
 from app.jobs.service import VNextBackgroundJobService
 from scripts.upgrade.migration_runner import create_sqlite_schema
@@ -44,6 +45,55 @@ class VNextJobsTest(unittest.TestCase):
             self.assertEqual(service.recover(), 1)
             self.assertEqual(service.get(job["job_id"])["state"], "interrupted")
             service.shutdown()
+
+    def test_vnext_runtime_connection_factory_supports_worker_threads(self):
+        with tempfile.TemporaryDirectory(prefix="vnext-runtime-job-") as root:
+            db_path = os.path.join(root, "runtime.db")
+            initial = sqlite3.connect(db_path)
+            initial.row_factory = sqlite3.Row
+            create_sqlite_schema(initial)
+            initial.close()
+
+            def factory():
+                connection = sqlite3.connect(db_path)
+                connection.row_factory = sqlite3.Row
+                return connection
+
+            runtime = VNextRuntime(
+                {
+                    "project_name": "fixture",
+                    "auth": {"mode": "disabled"},
+                    "runtime_state": {"root": os.path.join(root, "state")},
+                },
+                os.getcwd(), connection_factory=factory,
+            )
+            try:
+                app = runtime.application()
+                self.assertEqual(
+                    app.dispatch("POST", "/api/coverage/projects",
+                                 body={"project_name": "fixture"})[0], 201
+                )
+                status, payload = app.dispatch(
+                    "POST", "/api/coverage/scans",
+                    body={"project_name": "fixture", "info_sha256": "a" * 64},
+                )
+                self.assertEqual(status, 201)
+                scan_id = payload["scan"]["id"]
+                status, payload = app.dispatch(
+                    "POST", "/api/coverage/jobs",
+                    body={"kind": "rebuild_progress", "scan_id": scan_id},
+                )
+                self.assertEqual(status, 202)
+                job_id = payload["job"]["job_id"]
+                deadline = time.time() + 3
+                while time.time() < deadline:
+                    current = runtime.job_service.get(job_id)
+                    if current and current["state"] in ("completed", "failed"):
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(runtime.job_service.get(job_id)["state"], "completed")
+            finally:
+                runtime.close()
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, Optional
 
 
 def is_sqlite(connection) -> bool:
+    connection = getattr(connection, "_connection", connection)
     module = getattr(connection.__class__, "__module__", "")
     return module.startswith("sqlite3") or (
         connection.__class__.__name__ in ("Connection", "Cursor")

@@ -29,13 +29,15 @@ class AnalysisService(object):
 
     def save(self, connection, project_name, scan_id, records, reviewer=""):
         project = self._project(connection, project_name=project_name)
+        scan = self.projects.get_scan(connection, int(scan_id))
+        if not scan or int(scan.get("project_id")) != int(project["id"]):
+            raise KeyError("scan is not bound to project")
         records = list(records or [])
-        if not records:
-            return {"saved": 0, "data_version": self.states.ensure(
-                connection, project["id"], current_scan_id=scan_id
-            ).get("data_version", 0)}
         with transaction(connection) as conn:
             state = self.states.ensure(conn, project["id"], current_scan_id=scan_id)
+            if not records:
+                self.states.set_current_scan(conn, project["id"], scan_id)
+                return {"saved": 0, "data_version": state.get("data_version", 0)}
             saved = 0
             for item in records:
                 line_id = item.get("line_id")
@@ -50,6 +52,10 @@ class AnalysisService(object):
                     if not line:
                         raise KeyError("physical source line not found")
                     line_id = line["id"]
+                else:
+                    line = self._line_identity(conn, line_id)
+                    if not line or int(line.get("scan_id")) != int(scan_id):
+                        raise KeyError("physical source line is not in scan")
                 values = dict(item)
                 if reviewer and not values.get("reviewer"):
                     values["reviewer"] = reviewer
@@ -68,6 +74,15 @@ class AnalysisService(object):
         return fetchone(connection, """
             SELECT * FROM coverage_lines WHERE file_id = ? AND line_number = ?
         """, (file_id, int(line_number)))
+
+    @staticmethod
+    def _line_identity(connection, line_id):
+        from app.db.repositories.base import fetchone
+        return fetchone(connection, """
+            SELECT l.*, f.scan_id, f.repository_name, f.file_path, f.file_path_hash
+            FROM coverage_lines l JOIN coverage_files f ON f.id = l.file_id
+            WHERE l.id = ?
+        """, (int(line_id),))
 
     def read_for_file(self, connection, file_id):
         return self.analyses.get_by_file(connection, file_id)

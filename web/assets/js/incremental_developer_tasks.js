@@ -17,11 +17,16 @@
     function getApiBaseCandidates() {
         return ["/api/coverage"];
     }
+    function fileKey(repositoryName, filePath) {
+        var repository = String(repositoryName || "").trim();
+        var path = String(filePath || "").replace(/\\/g, "/").replace(/^\.\//, "");
+        return repository ? repository + "::" + path : path;
+    }
     function fetchUnanalyzedFromCandidates(candidates, index) {
         if (!candidates.length || index >= candidates.length) {
             return Promise.reject(new Error("Canonical API endpoint unavailable"));
         }
-        var base = candidates[0];
+        var base = candidates[index];
         var url = base + "/incremental/unanalyzed?project=" + encodeURIComponent(projectName);
         return fetch(url).then(function(res) {
             if (!res.ok) throw new Error("HTTP " + res.status);
@@ -83,8 +88,15 @@
                 var unanalyzedMap = {};
                 var pendingLineMap = {};
                 for (var i = 0; i < files.length; i++) {
-                    unanalyzedMap[files[i].file_path] = files[i].unanalyzed;
-                    pendingLineMap[files[i].file_path] = parseLineNumbers(files[i].pending_line_numbers);
+                    var key = fileKey(files[i].repository_name, files[i].file_path);
+                    unanalyzedMap[key] = files[i].unanalyzed;
+                    pendingLineMap[key] = parseLineNumbers(files[i].pending_line_numbers);
+                    // Legacy responses did not carry repository identity;
+                    // retain a path-only alias only for those responses.
+                    if (!files[i].repository_name) {
+                        unanalyzedMap[files[i].file_path] = files[i].unanalyzed;
+                        pendingLineMap[files[i].file_path] = parseLineNumbers(files[i].pending_line_numbers);
+                    }
                 }
 
                 var devSections = document.querySelectorAll("section[id]");
@@ -97,7 +109,7 @@
 
                     for (var r = 0; r < fileRows.length; r++) {
                         var row = fileRows[r];
-                        var fileKey = row.getAttribute("data-file-key");
+                        var rowFileKey = row.getAttribute("data-file-key");
                         var pageLink = row.getAttribute("data-page-link");
                         var changed = parseInt(row.getAttribute("data-changed") || "0", 10);
                         var ownerSpecific = row.getAttribute("data-owner-specific") === "true";
@@ -105,14 +117,14 @@
                         var actionCell = row.querySelector(".js-task-action");
 
                         var count;
-                        if (ownerSpecific && fileKey && Object.prototype.hasOwnProperty.call(pendingLineMap, fileKey)) {
+                        if (ownerSpecific && rowFileKey && Object.prototype.hasOwnProperty.call(pendingLineMap, rowFileKey)) {
                             // A file can belong to several developers.  The
                             // API returns current pending line numbers; only
                             // the intersection with this row's owned lines is
                             // the developer's live task count.
-                            count = countOwnedPendingLines(row, pendingLineMap[fileKey]);
-                        } else if (fileKey && (fileKey in unanalyzedMap)) {
-                            count = unanalyzedMap[fileKey];
+                            count = countOwnedPendingLines(row, pendingLineMap[rowFileKey]);
+                        } else if (rowFileKey && (rowFileKey in unanalyzedMap)) {
+                            count = unanalyzedMap[rowFileKey];
                         } else {
                             count = parseInt((unanalyzedCell && unanalyzedCell.textContent) ? unanalyzedCell.textContent.trim() : "0", 10);
                         }

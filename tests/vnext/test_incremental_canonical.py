@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -6,6 +7,9 @@ import unittest
 from app.incremental.lcov import parse_function_records
 from app.incremental.blame import parse_porcelain
 from app.incremental.git_diff import parse_unified_diff
+from app.services.incremental_service import IncrementalReportService
+from app.services.project_service import ProjectService
+from scripts.upgrade.migration_runner import create_sqlite_schema
 
 
 class CanonicalIncrementalTest(unittest.TestCase):
@@ -90,6 +94,66 @@ class CanonicalIncrementalTest(unittest.TestCase):
                 item["suggested_reviewer"].startswith("Alice")
                 for item in result["files"][0]["details"]
             ))
+
+    def test_incremental_result_is_persisted_against_immutable_scan_snapshot(self):
+        with tempfile.TemporaryDirectory(prefix="vnext-incremental-db-") as root:
+            subprocess.check_call(["git", "init", "-q", root])
+            subprocess.check_call(["git", "-C", root, "config", "user.name", "Alice"])
+            subprocess.check_call(["git", "-C", root, "config", "user.email", "alice@example.com"])
+            source_dir = os.path.join(root, "src")
+            os.makedirs(source_dir)
+            source_path = os.path.join(source_dir, "a.c")
+            with open(source_path, "w") as stream:
+                stream.write("int main(void) {\n    return 0;\n}\n")
+            subprocess.check_call(["git", "-C", root, "add", "."])
+            subprocess.check_call(["git", "-C", root, "commit", "-q", "-m", "old"])
+            oldgit = subprocess.check_output(
+                ["git", "-C", root, "rev-parse", "HEAD"]
+            ).decode().strip()
+            with open(source_path, "w") as stream:
+                stream.write("int main(void) {\n    int added = 1;\n    return added;\n}\n")
+            subprocess.check_call(["git", "-C", root, "add", "."])
+            subprocess.check_call(["git", "-C", root, "commit", "-q", "-m", "new"])
+            newgit = subprocess.check_output(
+                ["git", "-C", root, "rev-parse", "HEAD"]
+            ).decode().strip()
+            info_path = os.path.join(root, "coverage.info")
+            with open(info_path, "w") as stream:
+                stream.write(
+                    "TN:\nSF:src/a.c\nDA:2,0\n"
+                    "FNL:0,1,4\nFNA:0,1,main\nend_of_record\n"
+                )
+
+            connection = sqlite3.connect(":memory:")
+            connection.row_factory = sqlite3.Row
+            create_sqlite_schema(connection)
+            project_service = ProjectService()
+            scan = project_service.create_scan(
+                connection, "fixture", info_sha256="a" * 64,
+                repositories=[{
+                    "repository_name": "repo-a", "repository_path": root,
+                    "old_commit_sha": oldgit, "new_commit_sha": newgit,
+                    "verified": True,
+                }],
+            )
+            service = IncrementalReportService(project_service.projects)
+            service.allowed_roots = [root]
+            result = service.build_and_persist(
+                connection, "fixture", scan["id"], root, oldgit, newgit,
+                info_path, repository_name="repo-a", report_id="report-a",
+            )
+            self.assertEqual(result["stored"]["repository_name"], "repo-a")
+            loaded = service.results.load_payload(
+                connection, scan["id"], "report-a", "repo-a"
+            )
+            self.assertEqual(loaded["scan_id"], scan["id"])
+            self.assertEqual(loaded["report_id"], "report-a")
+            with self.assertRaises(ValueError):
+                service.build_and_persist(
+                    connection, "fixture", scan["id"], root, "0" * 40, newgit,
+                    info_path, repository_name="repo-a", report_id="report-a",
+                )
+            connection.close()
 
 
 if __name__ == "__main__":

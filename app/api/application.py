@@ -6,6 +6,14 @@ import time
 from app.api.auth import MutationAuthorizer
 from app.api.router import Router
 from app.api.serialization import to_jsonable
+from app.api.endpoints import analysis as analysis_endpoint
+from app.api.endpoints import code_detail as code_detail_endpoint
+from app.api.endpoints import health as health_endpoint
+from app.api.endpoints import incremental as incremental_endpoint
+from app.api.endpoints import jobs as jobs_endpoint
+from app.api.endpoints import progress as progress_endpoint
+from app.api.endpoints import projects as projects_endpoint
+from app.api.endpoints import release as release_endpoint
 
 
 class VNextApplication(object):
@@ -25,6 +33,8 @@ class VNextApplication(object):
         self.router.add("GET", r"^/api/coverage/projects/([^/]+)/scans$", self.scans)
         self.router.add("GET", r"^/api/coverage/progress$", self.progress)
         self.router.add("GET", r"^/api/coverage/incremental/unanalyzed$", self.unanalyzed)
+        self.router.add("POST", r"^/api/coverage/incremental$", self.incremental)
+        self.router.add("GET", r"^/api/coverage/incremental$", self.incremental_result)
         self.router.add("GET", r"^/api/coverage/code-layout$", self.code_layout)
         self.router.add("GET", r"^/api/coverage/code-lines$", self.code_lines)
         self.router.add("POST", r"^/api/coverage/code-lines/batch$", self.code_lines_batch)
@@ -34,7 +44,11 @@ class VNextApplication(object):
         self.router.add("POST", r"^/api/coverage/progress/rebuild$", self.rebuild_progress)
         self.router.add("GET", r"^/api/coverage/routes$", self.routes)
         self.router.add("GET", r"^/api/coverage/jobs$", self.jobs)
+        self.router.add("GET", r"^/api/coverage/jobs/([^/]+)$", self.job_detail)
+        self.router.add("POST", r"^/api/coverage/jobs$", self.create_job)
         self.router.add("POST", r"^/api/coverage/jobs/recover$", self.recover_jobs)
+        self.router.add("POST", r"^/api/coverage/exports$", self.create_export)
+        self.router.add("GET", r"^/api/coverage/exports/([^/]+)$", self.export_detail)
 
     def dispatch(self, method, path, query=None, body=None, headers=None, remote_address=""):
         query = query or {}
@@ -45,6 +59,8 @@ class VNextApplication(object):
                 method, path, query, body, headers, remote_address
             )
         except KeyError as exc:
+            return 404, {"error": "not_found", "message": str(exc)}
+        except FileNotFoundError as exc:
             return 404, {"error": "not_found", "message": str(exc)}
         except ValueError as exc:
             return 400, {"error": "invalid_request", "message": str(exc)}
@@ -70,10 +86,10 @@ class VNextApplication(object):
         return identity
 
     def health(self, query, body, headers, remote_address):
-        return 200, {"status": "ok", "runtime": "vnext", "schema_version": 1}
+        return 200, health_endpoint.payload(self)
 
     def release(self, query, body, headers, remote_address):
-        return 200, {"release": self.runtime.release_identity}
+        return 200, release_endpoint.payload(self)
 
     def routes(self, query, body, headers, remote_address):
         return 200, {"base": self.BASE, "routes": self.router.describe()}
@@ -91,11 +107,57 @@ class VNextApplication(object):
     def recover_jobs(self, query, body, headers, remote_address):
         self._require_mutation(headers, remote_address)
         timeout = float(body.get("heartbeat_timeout", 300))
-        with self._read_connection() as connection:
-            from app.db.transaction import transaction
-            with transaction(connection) as conn:
-                recovered = self.runtime.jobs.mark_stale(conn, timeout)
+        recovered = self.runtime.job_service.recover(timeout)
         return 200, {"recovered": recovered}
+
+    def job_detail(self, job_id, query, body, headers, remote_address):
+        job = self.runtime.job_service.get(job_id)
+        if not job:
+            raise KeyError("job not found: {}".format(job_id))
+        return 200, {"job": job}
+
+    def create_job(self, query, body, headers, remote_address):
+        identity = self._require_mutation(headers, remote_address)
+        kind, scan_id = jobs_endpoint.request(body)
+        with self._read_connection() as connection:
+            scan = self.runtime.projects.get_scan(connection, int(scan_id))
+            if not scan:
+                raise KeyError("scan not found: {}".format(scan_id))
+            project = self.runtime.projects.get_project(connection, int(scan["project_id"]))
+            state = self.runtime.states.get(connection, int(scan["project_id"])) or {}
+        if kind == "rebuild_progress":
+            def callback():
+                with self._read_connection() as callback_connection:
+                    self.runtime.progress_service.rebuild(
+                        callback_connection, project["project_name"], int(scan_id)
+                    )
+                return ""
+        elif kind == "export":
+            report_id = str(body.get("report_id") or "")
+            output_path = body.get("output_path")
+
+            def callback():
+                with self._read_connection() as callback_connection:
+                    return self.runtime.export_service.export_scan(
+                        callback_connection, project["project_name"], int(scan_id),
+                        report_id=report_id, output_path=output_path,
+                    )
+        else:
+            raise ValueError("unsupported job kind: {}".format(kind))
+        job = self.runtime.job_service.submit(
+            project_id=project["id"], scan_id=int(scan_id), kind=kind,
+            data_version=int(state.get("data_version") or 0), callback=callback,
+            input_payload={"requested_by": identity, "payload": body.get("input_payload") or {}},
+        )
+        return 202, {"job": job}
+
+    def create_export(self, query, body, headers, remote_address):
+        values = dict(body or {})
+        values["kind"] = "export"
+        return self.create_job(query, values, headers, remote_address)
+
+    def export_detail(self, job_id, query, body, headers, remote_address):
+        return self.job_detail(job_id, query, body, headers, remote_address)
 
     def projects(self, query, body, headers, remote_address):
         with self._read_connection() as connection:
@@ -107,10 +169,7 @@ class VNextApplication(object):
                          "scans": self.runtime.project_service.list_scans(connection, project_name)}
 
     def progress(self, query, body, headers, remote_address):
-        project_name = str(query.get("project") or query.get("project_name") or
-                           self.config.get("project_name") or "")
-        if not project_name:
-            raise ValueError("project is required")
+        project_name = progress_endpoint.project_name(query, self.config.get("project_name") or "")
         scan_id = query.get("scan_id")
         with self._read_connection() as connection:
             return 200, self.runtime.progress_service.summary(
@@ -118,23 +177,48 @@ class VNextApplication(object):
             )
 
     def unanalyzed(self, query, body, headers, remote_address):
-        project_name = str(query.get("project") or query.get("project_name") or
-                           self.config.get("project_name") or "")
-        if not project_name:
-            raise ValueError("project is required")
+        project_name = progress_endpoint.project_name(query, self.config.get("project_name") or "")
         with self._read_connection() as connection:
             return 200, {
                 "project_name": project_name,
                 "files": self.runtime.progress_service.pending_by_file(connection, project_name),
             }
 
+    def incremental(self, query, body, headers, remote_address):
+        self._require_mutation(headers, remote_address)
+        project_name = incremental_endpoint.request(body)
+        with self._read_connection() as connection:
+            result = self.runtime.incremental_service.build_and_persist(
+                connection, project_name, int(body["scan_id"]), body["repo_path"],
+                body["oldgit"], body["newgit"], body["info_path"],
+                repository_name=body.get("repository_name", "default"),
+                report_id=body.get("report_id", ""),
+            )
+        return 200, result
+
+    def incremental_result(self, query, body, headers, remote_address):
+        project_name = str(query.get("project_name") or query.get("project") or "").strip()
+        scan_id = query.get("scan_id")
+        repository_name = query.get("repository_name", "default")
+        report_id = query.get("report_id", "")
+        if not project_name or not scan_id:
+            raise ValueError("project_name and scan_id are required")
+        with self._read_connection() as connection:
+            project = self.runtime.projects.get_project_by_name(connection, project_name)
+            if not project:
+                raise KeyError("project not found")
+            scan = self.runtime.projects.get_scan(connection, int(scan_id))
+            if not scan or int(scan["project_id"]) != int(project["id"]):
+                raise KeyError("scan is not bound to project")
+            result = self.runtime.incremental_results.load_payload(
+                connection, int(scan_id), report_id, repository_name
+            )
+        if result is None:
+            raise KeyError("incremental result not found")
+        return 200, {"result": result}
+
     def _code_detail_args(self, source):
-        scan_id = source.get("scan_id")
-        report_id = str(source.get("report_id") or "")
-        file_path = str(source.get("file_path") or "")
-        if not scan_id or not report_id or not file_path:
-            raise ValueError("scan_id, report_id and file_path are required")
-        return int(scan_id), report_id, file_path
+        return code_detail_endpoint.identity(source)
 
     def code_layout(self, query, body, headers, remote_address):
         scan_id, report_id, file_path = self._code_detail_args(query)
@@ -172,20 +256,14 @@ class VNextApplication(object):
 
     def create_project(self, query, body, headers, remote_address):
         self._require_mutation(headers, remote_address)
-        project_name = str(body.get("project_name") or "").strip()
-        if not project_name:
-            raise ValueError("project_name is required")
+        project_name = projects_endpoint.project_name(body)
         with self._read_connection() as connection:
-            row = self.runtime.project_service.projects.ensure_project(connection, project_name)
-            self.runtime.project_service.states.ensure(connection, row["id"])
-            connection.commit()
+            row = self.runtime.project_service.ensure_project(connection, project_name)
             return 201, {"project": row}
 
     def create_scan(self, query, body, headers, remote_address):
         self._require_mutation(headers, remote_address)
-        project_name = str(body.get("project_name") or "").strip()
-        if not project_name:
-            raise ValueError("project_name is required")
+        project_name = projects_endpoint.project_name(body)
         with self._read_connection() as connection:
             if body.get("info_path"):
                 result = self.runtime.scan_import_service.import_info(
@@ -208,13 +286,10 @@ class VNextApplication(object):
 
     def save_analysis(self, query, body, headers, remote_address):
         identity = self._require_mutation(headers, remote_address)
-        project_name = str(body.get("project_name") or "").strip()
-        scan_id = body.get("scan_id")
-        if not project_name or not scan_id:
-            raise ValueError("project_name and scan_id are required")
+        project_name, scan_id, records = analysis_endpoint.request(body)
         with self._read_connection() as connection:
             result = self.runtime.analysis_service.save(
-                connection, project_name, int(scan_id), body.get("records") or [],
+                connection, project_name, scan_id, records,
                 reviewer=body.get("reviewer") or identity,
             )
         return 200, result

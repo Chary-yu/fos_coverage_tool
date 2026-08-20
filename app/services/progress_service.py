@@ -38,7 +38,7 @@ class ProgressService(object):
         if ready:
             rows = self._file_state_rows(connection, scan_id)
             if rows:
-                return self._aggregate_file_states(project_name, scan_id, state, rows)
+                return self._aggregate_file_states(connection, project_name, scan_id, state, rows)
         result = self.file_states.scan_summary_from_facts(connection, scan_id)
         result.update({
             "project_name": project_name,
@@ -55,8 +55,8 @@ class ProgressService(object):
             SELECT * FROM coverage_file_state WHERE scan_id = ? ORDER BY file_id
         """, (scan_id,))
 
-    @staticmethod
-    def _aggregate_file_states(project_name, scan_id, state, rows):
+    def _aggregate_file_states(self, connection, project_name, scan_id, state, rows):
+        pending = self.file_states.pending_line_references(connection, scan_id)
         return {
             "project_name": project_name, "scan_id": scan_id,
             "source": "coverage_file_state",
@@ -67,7 +67,11 @@ class ProgressService(object):
             "draft_total": sum(int(row.get("draft_total") or 0) for row in rows),
             "confirmed_total": sum(int(row.get("confirmed_total") or 0) for row in rows),
             "pending_total": sum(int(row.get("pending_total") or 0) for row in rows),
-            "pending_line_references": [],
+            "pending_line_references": [
+                "{}:{}:{}".format(
+                    item["repository_name"], item["file_path"], item["line_number"]
+                ) for item in pending
+            ],
         }
 
     def rebuild(self, connection, project_name, scan_id=None):
@@ -91,25 +95,9 @@ class ProgressService(object):
         if not scan_id:
             return []
         from app.db.repositories.base import fetchall
-        rows = fetchall(connection, """
-            SELECT f.id AS file_id, f.repository_name, f.file_path, l.line_number,
-                   l.coverage_state, a.status, COALESCE(a.is_draft, 0) AS is_draft
-            FROM coverage_files f JOIN coverage_lines l ON l.file_id = f.id
-            LEFT JOIN coverage_analyses a ON a.line_id = l.id
-            WHERE f.scan_id = ?
-            ORDER BY f.repository_name, f.file_path, l.line_number
-        """, (scan_id,))
+        rows = self.file_states.pending_line_references(connection, scan_id)
         grouped = {}
         for row in rows:
-            coverage_state = str(row.get("coverage_state") or "").lower()
-            if coverage_state not in ("uncovered", "uncovered_line", "uncovered-code", "0", "未覆盖"):
-                continue
-            confirmed = (
-                not int(row.get("is_draft") or 0)
-                and row.get("status") in ("可覆盖", "无法覆盖", "冗余代码")
-            )
-            if confirmed:
-                continue
             key = (row.get("repository_name") or "", row.get("file_path") or "")
             grouped.setdefault(key, []).append(int(row["line_number"]))
         return [{

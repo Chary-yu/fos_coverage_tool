@@ -18,7 +18,7 @@ class ReportRegistry(object):
     def register(self, report_id, directories, **metadata):
         report_id = validate_report_id(report_id)
         directories = [os.path.realpath(path) for path in directories or []
-                       if path and os.path.isdir(path)]
+                       if path and os.path.isdir(path) and not os.path.islink(path)]
         if not directories:
             return None
         os.makedirs(self.registry_dir, exist_ok=True)

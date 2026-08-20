@@ -13,6 +13,27 @@
 * 支持新版本从旧版本继承未变化函数的分析结论；
 * 支持导出填写明细、文件汇总、项目汇总和全量进度报表。
 
+### VNext Candidate（Gate 1～3）
+
+VNext runtime 的唯一业务实现位于 `app/`，root Python 文件仅保留 CLI/兼容 shim。Candidate 使用独立配置与数据库：
+
+```bash
+python3 enhance_coverage.py server --config config/coverage_config.staging.example.json
+python3 scripts/upgrade/schema_preflight.py scripts/upgrade/vnext_schema.sql
+python3 scripts/upgrade/migration_runner.py --demo
+```
+
+浏览器只使用同源 `/api/coverage`，由 Nginx 反向代理到 Candidate；不在页面中猜测旧端口或备用 API。Candidate 的写入冻结、Scan/Report 身份、任务持久化、Sidecar fail-closed 和迁移验证均使用 `.runtime-state-staging` 与 `coverage_candidate`，不得指向生产库 `coverage`。
+
+架构与运行参与证据可用以下命令生成：
+
+```bash
+python3 scripts/diagnostics/canonical_ownership_audit.py
+python3 scripts/diagnostics/runtime_participation_audit.py
+python3 scripts/diagnostics/runtime_legacy_dependency_audit.py
+python3 scripts/diagnostics/build_vnext_evidence.py .artifacts/vnext-foundation-evidence/vnext/architecture_ownership_matrix.json
+```
+
 ### WSL 本地浏览器 Demo
 
 不配置 MySQL 也可以先完整验证“填写 → 暂存/确认 → 查看进展 → 导出报表”链路：
@@ -647,21 +668,13 @@ http://服务器IP/coverage/coverage_progress.html?project=review_main_202606
 
 如果部署时漏拷了工具目录下的 `coverage_progress.html`，`inject` 会自动生成一个内置版进度页面，并在控制台打印 warning。
 
-如果页面能打开但点击“查看进度”后连不上接口，可以显式指定后台 API 地址：
+VNext Candidate 页面固定使用同源 `/api/coverage`。Nginx 应把该路径代理到 Candidate API；页面不会尝试 `9528`、`19528`、`127.0.0.1` 或 `/coverage/api/coverage` 等备用地址。
 
 ```text
-http://服务器IP/coverage/review_main_202606/coverage_progress.html?project=review_main_202606&api=http://服务器IP:9528/api/coverage
+http://服务器IP/coverage/review_main_202606/coverage_progress.html?project=review_main_202606
 ```
 
-进度页会按顺序尝试多个 API 地址：
-
-* URL 中 `api=` 指定的地址；
-* 当前域名下的 `/api/coverage`；
-* 当前主机的 `:9528/api/coverage`；
-* `http://127.0.0.1:9528/api/coverage`；
-* 相对路径 `/api/coverage`。
-
-页面顶部会显示正在尝试的接口地址；如果全部失败，会把已尝试地址展示出来，便于定位 Nginx 代理、端口或跨机器访问问题。
+如果页面无法加载，应检查 Nginx 的同源代理、Candidate health/release endpoint 以及反向代理认证头，而不是为页面增加端口 fallback。
 
 页面默认展示：
 
