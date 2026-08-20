@@ -13,9 +13,17 @@ import mimetypes
 import os
 import shutil
 import sqlite3
+import sys
 import threading
 import urllib.parse
 from datetime import datetime
+
+# Keep the demo runnable from any working directory after it is moved out of
+# the repository root.  The production compatibility shims and app package
+# still live at the repository root.
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 import enhance_coverage
 from enhance_coverage import CoverageHTTPRequestHandler, ThreadingHTTPServer

@@ -1133,14 +1133,16 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
             self.assertIsNone(res, "Expired job query from DB should return None and expire DB row")
 
     def test_cli_ops_paths_invalidate_data_version(self):
-        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "enhance_coverage.py")
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "legacy_runtime.py")
         with open(py_path, "r", encoding="utf-8") as f:
             py_content = f.read()
 
         self.assertIn("invalidate_project_background_jobs(project_name", py_content)
         self.assertIn("invalidate_project_background_jobs(target_project", py_content)
 
-        clear_path = os.path.join(enhance_coverage.SCRIPT_DIR, "clear_coverage_data.py")
+        clear_path = os.path.join(
+            enhance_coverage.SCRIPT_DIR, "scripts", "maintenance", "clear_coverage_data.py"
+        )
         with open(clear_path, "r", encoding="utf-8") as f:
             clear_content = f.read()
 

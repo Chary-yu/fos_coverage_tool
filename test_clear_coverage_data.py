@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""Unit tests for clear_coverage_data.py tool script."""
+"""Unit tests for scripts/maintenance/clear_coverage_data.py."""
 
 import unittest
 from unittest import mock
 
-import clear_coverage_data
+from scripts.maintenance import clear_coverage_data
 
 
 class TestClearCoverageData(unittest.TestCase):
@@ -53,8 +53,8 @@ class TestClearCoverageData(unittest.TestCase):
         mock_db_mgr.conn = mock_conn
 
         with mock.patch("sys.argv", ["clear_coverage_data.py", "--project", "proj_a", "--yes"]):
-            with mock.patch("clear_coverage_data.load_config", return_value={}):
-                with mock.patch("clear_coverage_data.DatabaseManager", return_value=mock_db_mgr):
+            with mock.patch.object(clear_coverage_data, "load_config", return_value={}):
+                with mock.patch.object(clear_coverage_data, "DatabaseManager", return_value=mock_db_mgr):
                     ret = clear_coverage_data.main()
 
         self.assertEqual(ret, 0)

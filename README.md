@@ -42,7 +42,7 @@ python3 scripts/diagnostics/build_vnext_evidence.py .artifacts/vnext-foundation-
 
 ```bash
 cd /home/wangsuisheng/coverage_tool
-python3 coverage_demo.py
+python3 examples/coverage_demo.py
 ```
 
 然后在 Windows 浏览器打开：
@@ -63,8 +63,8 @@ Demo 使用 `.coverage_demo/coverage_demo.sqlite3` 持久化，刷新页面后�
 /opt/coverage_tool/
   enhance_coverage.py        # 后台脚本：注入、启动服务、导出、继承
   coverage_check.py          # Git + LCOV 增量覆盖率计算模块/独立命令
-  repositories.example.json  # 多仓库增量覆盖率配置示例
-  clear_coverage_data.py     # 调试脚本：清空单项目或全部数据库数据
+  config/repositories.example.json              # 多仓库增量覆盖率配置示例
+  scripts/maintenance/clear_coverage_data.py   # 调试脚本：清空单项目或全部数据库数据
   coverage_progress.html     # 独立网页：查看项目/小组/组长/目录/文件分析进度
   coverage_progress.js       # 进度页外部脚本：后台任务轮询，兼容严格 CSP
   代码目录归属模块统计.xlsx   # 目录 -> 模块 -> 小组/组长归属表
@@ -279,7 +279,7 @@ python3 coverage_check.py \
 
 ### 多仓库增量评审
 
-一个 `.info` 同时包含多个独立 Git 仓库时，复制 `repositories.example.json` 为实际配置文件，并为每个仓库填写独立的路径和 commit 范围：
+一个 `.info` 同时包含多个独立 Git 仓库时，复制 `config/repositories.example.json` 为实际配置文件，并为每个仓库填写独立的路径和 commit 范围：
 
 ```json
 {
@@ -765,13 +765,13 @@ http://服务器IP/coverage/review_main_202606/coverage_progress.html?project=re
 只清空某个项目：
 
 ```bash
-python3 clear_coverage_data.py --project review_main_202606 --yes
+python3 scripts/maintenance/clear_coverage_data.py --project review_main_202606 --yes
 ```
 
 清空全部项目：
 
 ```bash
-python3 clear_coverage_data.py --all --yes
+python3 scripts/maintenance/clear_coverage_data.py --all --yes
 ```
 
 为了避免误操作，脚本不带 `--yes` 会拒绝执行。
@@ -780,7 +780,7 @@ python3 clear_coverage_data.py --all --yes
 
 ```bash
 # 1. 清空新版本项目数据
-python3 clear_coverage_data.py --project review_main_202606 --yes
+python3 scripts/maintenance/clear_coverage_data.py --project review_main_202606 --yes
 
 # 2. 重新注入新版本报告并重建行索引
 python3 enhance_coverage.py inject \

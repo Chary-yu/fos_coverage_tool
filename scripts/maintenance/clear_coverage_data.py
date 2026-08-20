@@ -5,11 +5,17 @@
 Clear persisted coverage review data for local debugging.
 
 Examples:
-  python3 clear_coverage_data.py --project review_main_202606 --yes
-  python3 clear_coverage_data.py --all --yes
+  python3 scripts/maintenance/clear_coverage_data.py --project review_main_202606 --yes
+  python3 scripts/maintenance/clear_coverage_data.py --all --yes
 """
 
+import os
 import sys
+
+# Make direct execution work regardless of the caller's current directory.
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from enhance_coverage import DatabaseManager, load_config
 
@@ -27,16 +33,16 @@ def has_arg(args, name):
 
 def print_help():
     print("Usage:")
-    print("  python3 clear_coverage_data.py --project <project_name> --yes")
+    print("  python3 scripts/maintenance/clear_coverage_data.py --project <project_name> --yes")
     print("    - Delete coverage_analysis and coverage_line_index rows for one project.")
-    print("  python3 clear_coverage_data.py --all --yes")
+    print("  python3 scripts/maintenance/clear_coverage_data.py --all --yes")
     print("    - Delete all rows from coverage_analysis and coverage_line_index.")
 
 
 def table_count(cursor, table_name, project_name=None):
     if table_name not in ("coverage_analysis", "coverage_line_index", "coverage_project_state", "coverage_background_jobs", "coverage_file_state"):
         raise ValueError("Invalid table name: {}".format(table_name))
-    sql = "SELECT COUNT(*) FROM `{}`".format(table_name)
+    sql = "SELECT COUNT(*) FROM {}".format(table_name)
     if project_name:
         sql += " WHERE project_name = %s"
         cursor.execute(sql, (project_name,))

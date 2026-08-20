@@ -143,7 +143,8 @@ def run_performance_suite() -> Dict[str, Any]:
 if __name__ == "__main__":
     print("=== Running Performance Benchmark Suite (Items 24) ===")
     res = run_performance_suite()
-    out_file = os.path.join(_REPO_ROOT, "perf_baseline.json")
+    out_file = os.path.join(_REPO_ROOT, "benchmarks", "perf_baseline.json")
+    os.makedirs(os.path.dirname(out_file), exist_ok=True)
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(res, f, indent=2)
     print(f"Benchmark results recorded to {out_file}:")
