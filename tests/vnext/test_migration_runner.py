@@ -8,6 +8,7 @@ from scripts.upgrade.migration_runner import (
     capture_vnext_snapshot,
     create_sqlite_schema,
     migrate_legacy,
+    _split_sql,
 )
 
 
@@ -62,6 +63,17 @@ def legacy_connection():
 
 
 class MigrationRunnerTest(unittest.TestCase):
+    def test_sql_splitter_strips_comments_without_splitting_string_literals(self):
+        statements = _split_sql(
+            "-- schema header;\n"
+            "CREATE TABLE audit (value VARCHAR(32) COMMENT 'a;b');\n"
+            "/* block comment; */ INSERT INTO audit VALUES ('x;y');"
+        )
+        self.assertEqual(len(statements), 2)
+        self.assertTrue(statements[0].startswith("CREATE TABLE audit"))
+        self.assertNotIn("schema header", statements[0])
+        self.assertEqual(statements[1], "INSERT INTO audit VALUES ('x;y')")
+
     def test_migration_preserves_facts_and_is_idempotent(self):
         source = legacy_connection()
         self.addCleanup(source.close)

@@ -355,22 +355,71 @@ def create_sqlite_schema(connection):
 
 
 def _split_sql(sql_text):
+    """Split DDL on semicolons while respecting strings and SQL comments.
+
+    MariaDB receives each returned statement directly. Keeping a leading
+    ``--``/``/*`` comment attached to the following DDL makes the server
+    parse the comment and statement as one malformed command, so comments
+    must be removed before statements are sent to the driver.
+    """
     statements = []
     current = []
     quote = None
-    for char in sql_text:
-        if char in ("'", '"', chr(96)):
-            if quote == char:
-                quote = None
-            elif quote is None:
+    line_comment = False
+    block_comment = False
+    index = 0
+    length = len(sql_text or "")
+    while index < length:
+        char = sql_text[index]
+        next_char = sql_text[index + 1] if index + 1 < length else ""
+        if line_comment:
+            if char in ("\n", "\r"):
+                line_comment = False
+                current.append("\n")
+            index += 1
+            continue
+        if block_comment:
+            if char == "*" and next_char == "/":
+                block_comment = False
+                index += 2
+            else:
+                index += 1
+            continue
+        if quote is None:
+            if char == "#":
+                line_comment = True
+                index += 1
+                continue
+            if char == "-" and next_char == "-" and (
+                    index + 2 >= length or sql_text[index + 2].isspace()):
+                line_comment = True
+                index += 2
+                continue
+            if char == "/" and next_char == "*":
+                block_comment = True
+                index += 2
+                continue
+            if char in ("'", '"', chr(96)):
                 quote = char
-        if char == ";" and quote is None:
-            statement = "".join(current).strip()
-            if statement:
-                statements.append(statement)
-            current = []
+            if char == ";":
+                statement = "".join(current).strip()
+                if statement:
+                    statements.append(statement)
+                current = []
+                index += 1
+                continue
         else:
-            current.append(char)
+            # SQL strings escape a quote by doubling it. Do not terminate the
+            # quoted state on the first half of ``''``/``""``/````.
+            if char == quote:
+                if next_char == quote:
+                    current.append(char)
+                    current.append(next_char)
+                    index += 2
+                    continue
+                quote = None
+        current.append(char)
+        index += 1
     tail = "".join(current).strip()
     if tail:
         statements.append(tail)

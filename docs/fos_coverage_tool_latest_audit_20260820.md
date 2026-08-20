@@ -1284,15 +1284,17 @@ Maintainer 负责唯一 root owner 和 handoff，不重复开根因。
 
 以下证据在本次整改工作树中已执行通过：
 
-- Python：`88` 项全量测试通过，`1` 项真实 MySQL 测试因未设置 `COVERAGE_TEST_MYSQL=1` 跳过；新增 Job 入队失败、只读 MySQL 断连重试等针对性用例通过。
+- Python：`89` 项全量测试通过，`1` 项真实 MySQL 测试因未设置 `COVERAGE_TEST_MYSQL=1` 跳过；新增 migration SQL 注释兼容、Job 入队失败、只读 MySQL 断连重试等针对性用例通过。
 - Browser：真实 Chromium `6 passed`，其中新增真实 VNext HTTP 集成用例；该用例实际验证布局、`POST /code-lines/batch`、`POST /analysis`、多仓库身份和保存后的 overlay 回读。
 - 100k 虚拟滚动：最新 Chromium A/B 运行得到 `request_count=2`、`logical_line_count=100000`、`resident_js_lines=1569`、`dom_line_count=317`、`first_visible=true`、`scrolled_visible=true`；首屏/目标行耗时、响应 bytes 和滚动后 telemetry 已写入性能证据。
 - 真实 HTTP fixture 的 `/metrics` 回读验证了 `sidecar_decode_count`、`overlay_db_queries`、`overlay_db_rows` 和 `sidecar_store_count`；浏览器 A/B 文件仍明确标记 DB/RSS/p95 字段未采集，`performance_evidence_audit --allow-partial` 只允许透明报告 PARTIAL。
+- 本地真实 MariaDB `11.8.6` disposable integration 已通过：独立数据库建库、VNext schema/migration、批量 Scan ingest/seal、Code Detail HTTP contract、批量 Analysis upsert、SQL Progress aggregate、失败事务回滚、真实 stdlib HTTP transport 和连接池 health/rollback 指标均通过；生成的 `coverage_vnext_audit_*` 数据库已在 `finally` 中删除，未触碰既有 `coverage` 数据库。
+- 为使真实 MariaDB migration 可执行，`migration_runner._split_sql()` 已补齐 `--`、`#`、`/*...*/` 注释处理，并保持字符串字面量中的分号不被错误切分；该行为有独立回归测试，且已由真实 MariaDB schema apply 验证。
 - Architecture/contract：runtime participation、canonical ownership、legacy dependency、active runtime、frontend VNext API contract、Scan immutability、Sidecar registry 均通过。
 - 兼容副本：root CSS/JS 与 `web/assets` canonical SHA 一致。
 
 ## 10.3 仍需外部环境补证的项目
 
-以下项目不能由本地静态代码或 fixture 代替：真实 Candidate MySQL transaction/session、真实生产 schema/migration、生产 job orphan inventory、真实 50k/100k 数据集的 p95/RSS/DB rows、Nginx/auth 暴露面、真实 previous→target→rollback 文件树和 GitHub Actions run。Rollback rehearsal 现在对缺失真实 before/target identity 或 release endpoint 直接 fail-closed。
+以下项目不能由本地 disposable MariaDB、静态代码或 fixture 代替：真实 Candidate MySQL transaction/session、真实生产 schema/migration、生产 job orphan inventory、真实 50k/100k 数据集的 p95/RSS/DB rows、Nginx/auth 暴露面、真实 previous→target→rollback 文件树和 GitHub Actions run。Rollback rehearsal 现在对缺失真实 before/target identity 或 release endpoint 直接 fail-closed。
 
 因此整改后的准确结论是：代码与本地 Gate 证据已收口，但 VNext 生产切换仍须完成上述外部证据，不将 `TRANSITIONAL_LEGACY` 宣称为 `RETIRED`。
