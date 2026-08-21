@@ -81,12 +81,15 @@ def changed_files(repo_root, base=None, before=None, head=None):
         _git_revision(repo_root, left)
     try:
         output = subprocess.check_output(
-            ["git", "-C", repo_root, "diff", "--name-only", spec],
+            ["git", "-C", repo_root, "diff", "--name-only", "-z", spec],
             stderr=subprocess.STDOUT,
         )
     except (OSError, subprocess.CalledProcessError) as exc:
         raise DiffResolutionError("unable to resolve changed files for {}".format(spec)) from exc
-    return [item for item in output.decode("utf-8").splitlines() if item]
+    # ``-z`` disables Git's C-style quoting, so Unicode, whitespace and odd
+    # but valid names remain exact manifest values rather than becoming an
+    # escaped approximation that cannot match specialist ownership patterns.
+    return [item for item in output.decode("utf-8").split("\0") if item]
 
 
 def select(files):
