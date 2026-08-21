@@ -136,6 +136,15 @@ def _external(name, requirement, env_name=None, candidate_revision="",
                     observed_status = "PASSED"
                 else:
                     observed_status = "INCOMPLETE"
+                if name == "cross_layer_performance" and observed_status == "PASSED":
+                    if any(
+                        not isinstance(item, dict) or
+                        item.get("release_eligible") is not True
+                        for item in records
+                    ):
+                        violations.append(
+                            "PASSED cross-layer performance evidence must explicitly set release_eligible=true"
+                        )
         else:
             observed_status = str(evidence_payload.get("status") or
                                   "INCOMPLETE").upper()
@@ -165,6 +174,11 @@ def _external(name, requirement, env_name=None, candidate_revision="",
                 violations.append("PASSED external evidence must have exit_code=0")
             if evidence_payload.get("synthetic") is not False:
                 violations.append("external evidence must explicitly set synthetic=false")
+            if name == "cross_layer_performance" and \
+                    evidence_payload.get("release_eligible") is not True:
+                violations.append(
+                    "cross-layer performance evidence must explicitly set release_eligible=true"
+                )
             if observed_status == "PASSED":
                 release_identity = evidence_payload.get("release_identity")
                 if not isinstance(release_identity, dict) or not release_identity.get("commit_sha"):

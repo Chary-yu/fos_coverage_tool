@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from scripts.diagnostics.gate_matrix import _external, _revision, build
+from scripts.upgrade.evidence_manifest import EvidenceManifestV2
 
 
 class GateMatrixEvidenceTest(unittest.TestCase):
@@ -152,6 +153,113 @@ class GateMatrixEvidenceTest(unittest.TestCase):
                     os.remove(target)
                 except OSError:
                     pass
+
+    def test_cross_layer_performance_requires_explicit_release_eligibility(self):
+        fd, path = tempfile.mkstemp(prefix="coverage-gate-perf-", suffix=".json")
+        os.close(fd)
+        artifact = path + ".payload"
+        old = os.environ.get("COVERAGE_GATE_TEST_EVIDENCE")
+        base = {
+            "status": "PASSED",
+            "gate": "gate-e",
+            "candidate_revision": self.revision,
+            "host_identity": {"hostname": "test"},
+            "evidence_class": "real_http_chromium_performance",
+            "command_or_action": "test performance evidence",
+            "started_at": "2026-08-21T00:00:00Z",
+            "finished_at": "2026-08-21T00:00:01Z",
+            "exit_code": 0,
+            "release_identity": {"commit_sha": self.revision},
+            "synthetic": False,
+        }
+        try:
+            with open(artifact, "w", encoding="utf-8") as stream:
+                stream.write("cross-layer performance artifact\n")
+            with open(artifact, "rb") as stream:
+                base["artifact_sha256"] = hashlib.sha256(stream.read()).hexdigest()
+            base["artifact_path"] = artifact
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(base, stream)
+            os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = path
+            incomplete = _external(
+                "cross_layer_performance", "cross-layer performance",
+                "COVERAGE_GATE_TEST_EVIDENCE", self.revision,
+                self.repo_root, "gate-e",
+            )
+            self.assertEqual(incomplete["status"], "INCOMPLETE")
+            self.assertTrue(any(
+                "release_eligible=true" in item
+                for item in incomplete["violations"]
+            ))
+
+            base["release_eligible"] = True
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(base, stream)
+            passed = _external(
+                "cross_layer_performance", "cross-layer performance",
+                "COVERAGE_GATE_TEST_EVIDENCE", self.revision,
+                self.repo_root, "gate-e",
+            )
+            self.assertEqual(passed["status"], "PASSED")
+        finally:
+            if old is None:
+                os.environ.pop("COVERAGE_GATE_TEST_EVIDENCE", None)
+            else:
+                os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = old
+            for target in (path, artifact):
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
+
+    def test_cross_layer_manifest_requires_explicit_release_eligibility(self):
+        old = os.environ.get("COVERAGE_GATE_TEST_EVIDENCE")
+        with tempfile.TemporaryDirectory() as directory:
+            manifest_path = os.path.join(directory, "gate-e-manifest.json")
+            artifact = os.path.join(directory, "performance.json")
+            with open(artifact, "w", encoding="utf-8") as stream:
+                stream.write("cross-layer manifest artifact\n")
+            manifest = EvidenceManifestV2(
+                self.repo_root, "gate-e", candidate_revision=self.revision,
+                release_identity={"commit_sha": self.revision},
+                manifest_path=manifest_path,
+            )
+            manifest.record(
+                "cross-layer", "real_http_chromium_performance", "PASSED",
+                command_or_action="test performance manifest",
+                exit_code=0, artifact_path=artifact, synthetic=False,
+                release_identity={"commit_sha": self.revision},
+                release_eligible=False,
+            )
+            os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = manifest_path
+            incomplete = _external(
+                "cross_layer_performance", "cross-layer performance",
+                "COVERAGE_GATE_TEST_EVIDENCE", self.revision,
+                self.repo_root, "gate-e",
+            )
+            self.assertEqual(incomplete["status"], "INCOMPLETE")
+            self.assertTrue(any(
+                "release_eligible=true" in item
+                for item in incomplete["violations"]
+            ))
+
+            manifest.record(
+                "cross-layer", "real_http_chromium_performance", "PASSED",
+                command_or_action="test performance manifest",
+                exit_code=0, artifact_path=artifact, synthetic=False,
+                release_identity={"commit_sha": self.revision},
+                release_eligible=True,
+            )
+            passed = _external(
+                "cross_layer_performance", "cross-layer performance",
+                "COVERAGE_GATE_TEST_EVIDENCE", self.revision,
+                self.repo_root, "gate-e",
+            )
+            self.assertEqual(passed["status"], "PASSED")
+        if old is None:
+            os.environ.pop("COVERAGE_GATE_TEST_EVIDENCE", None)
+        else:
+            os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = old
 
     def test_gate_f_includes_exact_source_and_security_reviews(self):
         matrix = build(self.repo_root)

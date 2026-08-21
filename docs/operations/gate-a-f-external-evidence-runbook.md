@@ -85,6 +85,8 @@ python3 scripts/upgrade/run_verified_backup_rehearsal.py \
 ## Gate E：浏览器功能与跨层性能分开取证
 
 浏览器功能证据必须来自真实 HTTP + Chromium，并保存 route/network/console/report artifact。性能证据必须另外保存 DB query/row 计数、Sidecar decode 计数、expand p95、峰值 RSS、100k virtual-scroll resident lines 和环境身份。只有浏览器功能绿而缺少跨层指标时，Gate E 仍是 `INCOMPLETE`；不得用 `--allow-partial` 结果作为 release performance PASS。
+Gate Matrix 还要求跨层性能 artifact 明确声明 `synthetic=false` 且
+`release_eligible=true`；即使指标齐全，缺少发布资格声明也不能推进 Gate E。
 
 仓库内的 `real_browser_evidence.js` 提供统一采集入口。它会先访问 Candidate 的
 `/api/coverage/release` 并 exact 比较 commit，再打开真实 HTML 页面执行 100k
