@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -34,6 +35,22 @@ class ReportRegistryTest(unittest.TestCase):
                 registry.register("report_a", [second])
             registry.register("report_a", [second], replace=True)
             self.assertEqual(registry.load_exact("report_a")["directories"], [second])
+
+    def test_register_prunes_dead_report_roots_before_persisting_new_report(self):
+        with tempfile.TemporaryDirectory(prefix="report-registry-prune-") as root:
+            registry_dir = os.path.join(root, "registry")
+            stale = os.path.join(root, "stale")
+            fresh = os.path.join(root, "fresh")
+            os.makedirs(stale)
+            os.makedirs(fresh)
+            registry = ReportRegistry(registry_dir)
+            registry.register("report_stale", [stale])
+            shutil.rmtree(stale)
+            registry.register("report_fresh", [fresh])
+            self.assertIsNone(registry.load_exact("report_stale"))
+            self.assertEqual(
+                registry.load_exact("report_fresh")["directories"], [fresh]
+            )
 
 
 if __name__ == "__main__":

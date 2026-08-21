@@ -25,6 +25,13 @@ class ReportRegistry(object):
         if not directories:
             return None
         os.makedirs(self.registry_dir, exist_ok=True)
+        # A report output can be removed independently of the registry file
+        # (for example by retention cleanup).  Prune those dead registrations
+        # at the next registration boundary so the registry does not grow
+        # stale roots that make the sidecar audit fail closed forever.  The
+        # explicit audit remains observation-only; this is lifecycle cleanup
+        # performed only while a valid report is being registered.
+        self.prune()
         path = self._path(report_id)
         current = self.load_exact(report_id) or {}
         existing_directories = list(dict.fromkeys(current.get("directories") or []))

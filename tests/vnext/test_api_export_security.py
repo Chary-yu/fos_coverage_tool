@@ -246,6 +246,71 @@ class VNextApiExportSecurityTest(unittest.TestCase):
             3,
         )
 
+    def test_analysis_save_batches_cas_and_shared_record_reference_reads(self):
+        project_repo = ProjectService()
+        scan = project_repo.create_scan_and_ingest(
+            self.connection, "bulk-cas-analysis", [{
+                "repository_name": "repo-a",
+                "file_path": "src/cas.c",
+                "file_path_hash": "d" * 32,
+                "lines": [
+                    {"line_number": line_number, "coverage_state": "uncovered"}
+                    for line_number in (10, 11, 12)
+                ],
+            }], info_sha256="e" * 64,
+        )
+        service = AnalysisService()
+        line_ids = [row[0] for row in self.connection.execute(
+            "SELECT id FROM coverage_lines ORDER BY line_number"
+        ).fetchall()]
+        # Create three independent records so the follow-up request can
+        # exercise several relation/content CAS checks in one save.
+        for line_id in line_ids:
+            service.save(
+                self.connection, "bulk-cas-analysis", scan["id"],
+                [{"line_id": line_id, "status": "可覆盖", "coverage_method": "unit"}],
+            )
+        identities = self.connection.execute("""
+            SELECT line_id, analysis_record_id, relation_revision
+            FROM coverage_analysis_line_links
+            ORDER BY line_id
+        """).fetchall()
+        records = [{
+            "line_id": int(line_id),
+            "record_id": int(record_id),
+            "expected_relation_revision": int(relation_revision),
+            "expected_record_revision": 1,
+            "status": "无法覆盖",
+            "uncovered_reason": "batch-cas",
+        } for line_id, record_id, relation_revision in identities]
+
+        trace = []
+        self.connection.set_trace_callback(trace.append)
+        result = service.save(
+            self.connection, "bulk-cas-analysis", scan["id"], records,
+            reviewer="alice",
+        )
+        self.connection.set_trace_callback(None)
+
+        self.assertEqual(result["saved"], 3)
+        relation_reads = [
+            statement for statement in trace
+            if "FROM coverage_analysis_line_links" in statement
+        ]
+        self.assertLessEqual(
+            len(relation_reads), 4,
+            "CAS/shared-record validation must use bounded batch relation reads",
+        )
+        self.assertFalse(
+            any("WHERE analysis_record_id=" in statement for statement in relation_reads),
+            "shared Record references must not be queried once per operation",
+        )
+        self.assertEqual(
+            len([statement for statement in trace
+                 if "INSERT INTO coverage_analysis_blocks" in statement]),
+            1,
+        )
+
     def test_http_analysis_uses_authenticated_reviewer_not_client_value(self):
         runtime = self._runtime({"mode": "disabled"})
         scan = runtime.project_service.create_scan_and_ingest(

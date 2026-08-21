@@ -68,23 +68,29 @@ class AnalysisService(object):
 
     def _validate_concurrency(self, connection, scan_id, resolved):
         """Validate the complete relation/content CAS bundle before writes."""
-        for item in resolved:
+        cas_items = [item for item in resolved if
+                     item.get("expected_relation_revision") is not None or
+                     item.get("expected_record_revision") is not None]
+        if not cas_items:
+            return
+        relation_by_line = self.domain.get_links_many(
+            connection, int(scan_id), [item["line_id"] for item in cas_items]
+        )
+        record_ids = set()
+        for item in cas_items:
+            relation = relation_by_line.get(int(item["line_id"]))
+            if item.get("expected_record_revision") is not None:
+                record_id = int(item.get("record_id") or
+                                item.get("analysis_record_id") or
+                                (relation or {}).get("analysis_record_id") or 0)
+                if record_id:
+                    record_ids.add(record_id)
+        records_by_id = self.domain.get_records_many(connection, record_ids)
+        for item in cas_items:
             expected_relation = item.get("expected_relation_revision")
             expected_record = item.get("expected_record_revision")
-            if expected_relation is None and expected_record is None:
-                continue
             line_id = int(item["line_id"])
-            relation = self.domain.get_link(
-                connection, int(scan_id), line_id
-            )
-            # ``scan_id`` is attached by the resolver below; fall back to the
-            # operation's scan identity when validating direct callers.
-            if relation is None:
-                relation = fetchall(connection, """
-                    SELECT * FROM coverage_analysis_line_links
-                    WHERE scan_id=? AND line_id=? ORDER BY id DESC LIMIT 1
-                """, (int(scan_id), line_id))
-                relation = relation[0] if relation else None
+            relation = relation_by_line.get(line_id)
             if expected_relation is not None:
                 actual_relation = int((relation or {}).get("relation_revision") or 0)
                 if actual_relation != int(expected_relation):
@@ -93,7 +99,7 @@ class AnalysisService(object):
                 record_id = int(item.get("record_id") or
                                 item.get("analysis_record_id") or
                                 (relation or {}).get("analysis_record_id") or 0)
-                record = self.domain.get_record(connection, record_id) if record_id else None
+                record = records_by_id.get(record_id)
                 if (not record or
                         int(record.get("content_revision") or 0) != int(expected_record)):
                     raise ValueError("STALE_CONTENT_REVISION")
@@ -123,6 +129,14 @@ class AnalysisService(object):
         plans = []
         new_record_values = []
         update_record_values = []
+        requested_record_ids = {
+            int(items[0].get("record_id") or items[0].get("analysis_record_id") or 0)
+            for items in groups.values()
+            if int(items[0].get("record_id") or items[0].get("analysis_record_id") or 0)
+        }
+        active_lines_by_record = self.domain.get_active_line_ids_by_record_ids(
+            connection, requested_record_ids
+        )
         for operation_key in sorted(groups):
             items = groups[operation_key]
             first = items[0]
@@ -133,11 +147,7 @@ class AnalysisService(object):
             content = None
             record_id = 0
             if requested_record_id:
-                current_refs = fetchall(connection, """
-                    SELECT line_id FROM coverage_analysis_line_links
-                    WHERE analysis_record_id=? AND is_active=1
-                """, (requested_record_id,))
-                current_ids = {int(row["line_id"]) for row in current_refs}
+                current_ids = active_lines_by_record.get(requested_record_id, set())
                 if current_ids == set(line_ids):
                     expected_revision = first.get("expected_record_revision")
                     if expected_revision is None:

@@ -77,11 +77,55 @@ class AnalysisDomainRepository(object):
         return fetchone(connection, "SELECT * FROM coverage_analysis_records WHERE id=?",
                         (int(record_id),))
 
+    def get_records_many(self, connection, record_ids):
+        """Read a bounded set of analysis records in bulk."""
+        ids = sorted({int(record_id) for record_id in (record_ids or [])
+                      if int(record_id) > 0})
+        rows = []
+        for batch in _chunks(ids):
+            placeholders = ", ".join("?" for _ in batch)
+            rows.extend(fetchall(connection, """
+                SELECT * FROM coverage_analysis_records
+                WHERE id IN ({})
+            """.format(placeholders), batch))
+        return {int(row["id"]): row for row in rows}
+
     def get_link(self, connection, scan_id, line_id):
         return fetchone(connection, """
             SELECT * FROM coverage_analysis_line_links
             WHERE scan_id=? AND line_id=?
         """, (int(scan_id), int(line_id)))
+
+    def get_links_many(self, connection, scan_id, line_ids):
+        """Read current line relations for one Scan without per-line SQL."""
+        ids = sorted({int(line_id) for line_id in (line_ids or [])
+                      if int(line_id) > 0})
+        rows = []
+        for batch in _chunks(ids):
+            placeholders = ", ".join("?" for _ in batch)
+            rows.extend(fetchall(connection, """
+                SELECT * FROM coverage_analysis_line_links
+                WHERE scan_id=? AND line_id IN ({})
+            """.format(placeholders), [int(scan_id)] + batch))
+        return {int(row["line_id"]): row for row in rows}
+
+    def get_active_line_ids_by_record_ids(self, connection, record_ids):
+        """Return active physical lines grouped by shared Record identity."""
+        ids = sorted({int(record_id) for record_id in (record_ids or [])
+                      if int(record_id) > 0})
+        grouped = {record_id: set() for record_id in ids}
+        for batch in _chunks(ids):
+            placeholders = ", ".join("?" for _ in batch)
+            rows = fetchall(connection, """
+                SELECT analysis_record_id, line_id
+                FROM coverage_analysis_line_links
+                WHERE is_active=1 AND analysis_record_id IN ({})
+            """.format(placeholders), batch)
+            for row in rows:
+                grouped.setdefault(int(row["analysis_record_id"]), set()).add(
+                    int(row["line_id"])
+                )
+        return grouped
 
     def get_active_for_line(self, connection, line_id, scan_id=None):
         if scan_id is None:
