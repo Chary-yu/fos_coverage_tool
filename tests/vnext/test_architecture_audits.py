@@ -72,6 +72,11 @@ class ArchitectureAuditTest(unittest.TestCase):
         self.assertEqual(partial["status"], "PARTIAL")
         self.assertEqual(strict["status"], "FAILED")
         self.assertIn("peak_rss_bytes", strict["missing_cross_layer_metrics"])
+        with tempfile.TemporaryDirectory() as directory:
+            missing = os.path.join(directory, "missing.json")
+            result = audit_performance(missing, allow_partial=True)
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["browser_status"], "FAILED")
         self.assertEqual(audit_frontend(os.getcwd())["status"], "PASSED")
         self.assertEqual(audit_immutability()["status"], "PASSED")
 

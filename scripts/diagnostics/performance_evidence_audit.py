@@ -24,6 +24,8 @@ def audit(path, allow_partial=False, require_cross_layer=False):
             "status": "FAILED",
             "evidence_class": "performance_evidence_audit",
             "path": os.path.abspath(path),
+            "browser_status": "FAILED",
+            "gate": "cross_layer_performance" if require_cross_layer else "browser_functional",
             "violations": ["performance evidence file is missing"],
             "missing_cross_layer_metrics": [],
         })
@@ -35,6 +37,8 @@ def audit(path, allow_partial=False, require_cross_layer=False):
             "status": "FAILED",
             "evidence_class": "performance_evidence_audit",
             "path": os.path.abspath(path),
+            "browser_status": "FAILED",
+            "gate": "cross_layer_performance" if require_cross_layer else "browser_functional",
             "violations": ["performance evidence is not valid JSON: {}".format(exc)],
             "missing_cross_layer_metrics": [],
         })
