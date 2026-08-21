@@ -78,6 +78,7 @@ GATE_FILES = {
         "final_migration.json", "final_semantic_reconciliation.json",
         "runtime_verification.json", "browser_smoke.json", "cutover_record.json",
         "rollback_rehearsal.json", "acceptance_window_checks.json", "skill_drift_audit.json",
+        "legacy_retirement.json",
     ),
 }
 
@@ -562,6 +563,13 @@ def build(repo_root, output_root, run_tests=True):
                 os.path.join(gate_dir, "final_security_review.json"),
                 security_review.get("summary") or _missing(
                     "final_security_review", "exact-SHA security review is unavailable"
+                ),
+            )
+            _write(
+                os.path.join(gate_dir, "legacy_retirement.json"),
+                (local_checks.get("legacy_retirement") or {}).get("summary") or
+                _missing(
+                    "legacy_retirement", "legacy retirement audit is unavailable"
                 ),
             )
             _write(os.path.join(gate_dir, "release_identity.json"), identity)

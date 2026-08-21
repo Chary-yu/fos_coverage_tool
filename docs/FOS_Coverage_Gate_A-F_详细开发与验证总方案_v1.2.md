@@ -3288,6 +3288,7 @@ gate-f/
   evidence-manifest-v2.json
   final_source_review.json
   final_security_review.json
+  legacy_retirement.json
   release_identity.json
   database_runtime_identity.json
   fresh_inventory/

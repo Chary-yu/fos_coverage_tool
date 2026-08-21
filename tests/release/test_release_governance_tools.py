@@ -234,6 +234,14 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
                     self.assertTrue(os.path.isfile(os.path.join(
                         gate_dir, "fresh_inventory", "summary.json"
                     )))
+                    with open(
+                            os.path.join(gate_dir, "legacy_retirement.json"),
+                            encoding="utf-8") as stream:
+                        legacy_retirement = json.load(stream)
+                    self.assertEqual(
+                        legacy_retirement["evidence_class"],
+                        "legacy_retirement_gate",
+                    )
                 self.assertTrue(os.path.isfile(os.path.join(
                     gate_dir, "evidence-manifest-v2.json"
                 )))
