@@ -10,7 +10,14 @@ CONFIRMED_STATUSES = ("可覆盖", "无法覆盖", "冗余代码")
 
 class FileStateRepository(object):
     _UNCOVERED_SQL = "LOWER(COALESCE(l.coverage_state, '')) IN ('uncovered', 'uncovered_line', 'uncovered-code', '0', '未覆盖')"
-    _CONFIRMED_SQL = "COALESCE(a.is_draft, 0) = 0 AND COALESCE(a.status, '') IN ('可覆盖', '无法覆盖', '冗余代码')"
+    # The old coverage_analyses table remains a compatibility projection.  A
+    # current line link is authoritative whenever it exists, including when
+    # its content is intentionally empty or still pending inheritance.
+    _STATUS_SQL = "CASE WHEN q.id IS NOT NULL THEN COALESCE(r.conclusion_status, '') ELSE COALESCE(a.status, '') END"
+    _DRAFT_SQL = "CASE WHEN q.id IS NOT NULL THEN CASE WHEN q.review_state IN ('MANUAL_DRAFT', 'INHERITED_PENDING') THEN 1 ELSE 0 END ELSE COALESCE(a.is_draft, 0) END"
+    _CONFIRMED_SQL = "({status}) IN ('可覆盖', '无法覆盖', '冗余代码') AND ({draft}) = 0".format(
+        status=_STATUS_SQL, draft=_DRAFT_SQL
+    )
 
     def get(self, connection, scan_id: int, file_id: int):
         return fetchone(connection, """
@@ -20,11 +27,15 @@ class FileStateRepository(object):
     def authoritative_file_summary(self, connection, scan_id: int, file_id: int):
         rows = fetchall(connection, """
             SELECT l.id, l.line_number, l.coverage_state,
-                   a.status, COALESCE(a.is_draft, 0) AS is_draft
+                   {status} AS status, {draft} AS is_draft
             FROM coverage_lines l
+            JOIN coverage_files f ON f.id = l.file_id
             LEFT JOIN coverage_analyses a ON a.line_id = l.id
-            WHERE l.file_id = ? ORDER BY l.line_number
-        """, (file_id,))
+            LEFT JOIN coverage_analysis_line_links q
+              ON q.scan_id = f.scan_id AND q.line_id = l.id AND q.is_active = 1
+            LEFT JOIN coverage_analysis_records r ON r.id = q.analysis_record_id
+            WHERE l.file_id = ? AND f.scan_id = ? ORDER BY l.line_number
+        """.format(status=self._STATUS_SQL, draft=self._DRAFT_SQL), (file_id, scan_id))
         total = len(rows)
         uncovered = [row for row in rows if str(row.get("coverage_state") or "").lower() in
                      ("uncovered", "uncovered_line", "uncovered-code", "0", "未覆盖")]
@@ -87,17 +98,21 @@ class FileStateRepository(object):
             SELECT f.scan_id, f.id,
                    COUNT(l.id),
                    COALESCE(SUM(CASE WHEN {uncovered} THEN 1 ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN a.id IS NOT NULL AND COALESCE(a.status, '') <> '' THEN 1 ELSE 0 END), 0),
-                   COALESCE(SUM(CASE WHEN COALESCE(a.is_draft, 0) = 1 THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN ({status}) <> '' THEN 1 ELSE 0 END), 0),
+                   COALESCE(SUM(CASE WHEN ({draft}) = 1 THEN 1 ELSE 0 END), 0),
                    COALESCE(SUM(CASE WHEN {uncovered} AND {confirmed} THEN 1 ELSE 0 END), 0),
                    COALESCE(SUM(CASE WHEN {uncovered} AND NOT ({confirmed}) THEN 1 ELSE 0 END), 0),
                    ?, CURRENT_TIMESTAMP
             FROM coverage_files f
             LEFT JOIN coverage_lines l ON l.file_id = f.id
             LEFT JOIN coverage_analyses a ON a.line_id = l.id
+            LEFT JOIN coverage_analysis_line_links q
+              ON q.scan_id = f.scan_id AND q.line_id = l.id AND q.is_active = 1
+            LEFT JOIN coverage_analysis_records r ON r.id = q.analysis_record_id
             WHERE f.scan_id = ?
             GROUP BY f.scan_id, f.id
-        """.format(uncovered=uncovered, confirmed=confirmed)
+        """.format(uncovered=uncovered, status=self._STATUS_SQL,
+                   draft=self._DRAFT_SQL, confirmed=confirmed)
         if is_sqlite(connection):
             upsert_suffix = """
                 ON CONFLICT(scan_id, file_id) DO UPDATE SET
@@ -168,15 +183,19 @@ class FileStateRepository(object):
             SELECT COUNT(DISTINCT f.id) AS file_count,
                    COUNT(l.id) AS total_lines,
                    COALESCE(SUM(CASE WHEN {uncovered} THEN 1 ELSE 0 END), 0) AS total_uncovered,
-                   COALESCE(SUM(CASE WHEN a.id IS NOT NULL AND COALESCE(a.status, '') <> '' THEN 1 ELSE 0 END), 0) AS filled_total,
-                   COALESCE(SUM(CASE WHEN COALESCE(a.is_draft, 0) = 1 THEN 1 ELSE 0 END), 0) AS draft_total,
+                   COALESCE(SUM(CASE WHEN ({status}) <> '' THEN 1 ELSE 0 END), 0) AS filled_total,
+                   COALESCE(SUM(CASE WHEN ({draft}) = 1 THEN 1 ELSE 0 END), 0) AS draft_total,
                    COALESCE(SUM(CASE WHEN {uncovered} AND {confirmed} THEN 1 ELSE 0 END), 0) AS confirmed_total,
                    COALESCE(SUM(CASE WHEN {uncovered} AND NOT ({confirmed}) THEN 1 ELSE 0 END), 0) AS pending_total
             FROM coverage_files f
             LEFT JOIN coverage_lines l ON l.file_id = f.id
             LEFT JOIN coverage_analyses a ON a.line_id = l.id
+            LEFT JOIN coverage_analysis_line_links q
+              ON q.scan_id = f.scan_id AND q.line_id = l.id AND q.is_active = 1
+            LEFT JOIN coverage_analysis_records r ON r.id = q.analysis_record_id
             WHERE f.scan_id = ?
-        """.format(uncovered=uncovered, confirmed=confirmed), (scan_id,))
+        """.format(uncovered=uncovered, status=self._STATUS_SQL,
+                   draft=self._DRAFT_SQL, confirmed=confirmed), (scan_id,))
         row = row or {}
         return {
             "scan_id": scan_id,
@@ -203,6 +222,9 @@ class FileStateRepository(object):
             FROM coverage_files f
             JOIN coverage_lines l ON l.file_id = f.id
             LEFT JOIN coverage_analyses a ON a.line_id = l.id
+            LEFT JOIN coverage_analysis_line_links q
+              ON q.scan_id = f.scan_id AND q.line_id = l.id AND q.is_active = 1
+            LEFT JOIN coverage_analysis_records r ON r.id = q.analysis_record_id
             WHERE f.scan_id = ? AND {uncovered} AND NOT ({confirmed})
             ORDER BY f.repository_name, f.file_path, l.line_number
         """.format(uncovered=uncovered, confirmed=confirmed)
@@ -225,6 +247,9 @@ class FileStateRepository(object):
             FROM coverage_files f
             JOIN coverage_lines l ON l.file_id = f.id
             LEFT JOIN coverage_analyses a ON a.line_id = l.id
+            LEFT JOIN coverage_analysis_line_links q
+              ON q.scan_id = f.scan_id AND q.line_id = l.id AND q.is_active = 1
+            LEFT JOIN coverage_analysis_records r ON r.id = q.analysis_record_id
             WHERE f.scan_id = ? AND {uncovered} AND NOT ({confirmed})
         """.format(uncovered=uncovered, confirmed=confirmed), (int(scan_id),))
         return int((row or {}).get("total") or 0)

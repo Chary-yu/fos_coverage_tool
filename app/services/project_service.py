@@ -6,9 +6,13 @@ import os
 
 from app.code_detail.source_reader import compute_db_file_path_hash
 from app.config.path_policy import realpath_within, reject_relative_traversal
-from app.db.repositories import ProjectRepository, ProjectStateRepository, LineIndexRepository
+from app.db.repositories import (
+    ProjectRepository, ProjectStateRepository, LineIndexRepository,
+    RepositoryRepository,
+)
 from app.db.transaction import transaction
 from app.reports.identity import validate_report_id
+from app.scan_import.publication import ScanPublicationService
 
 
 CONSTRUCTION_STATUSES = {"building", "importing", "constructing"}
@@ -16,10 +20,12 @@ CONSTRUCTION_STATUSES = {"building", "importing", "constructing"}
 
 class ProjectService(object):
     def __init__(self, project_repo=None, state_repo=None, line_repo=None,
-                 allowed_report_roots=None):
+                 allowed_report_roots=None, repository_repo=None):
         self.projects = project_repo or ProjectRepository()
         self.states = state_repo or ProjectStateRepository()
         self.lines = line_repo or LineIndexRepository()
+        self.repositories = repository_repo or RepositoryRepository()
+        self.publication = ScanPublicationService(self.states)
         self.allowed_report_roots = [os.path.realpath(root) for root in
                                      (allowed_report_roots or [])]
 
@@ -47,18 +53,25 @@ class ProjectService(object):
         return project
 
     @staticmethod
-    def scan_key(project_name, info_sha256, repositories, review_scope):
+    def scan_key(project_name, info_sha256, repositories, review_scope,
+                 report_source_signature=""):
         repositories = sorted(
-            [dict(item or {}) for item in (repositories or [])],
+            [{
+                "repository_name": str((item or {}).get("repository_name") or ""),
+                "branch_name": str((item or {}).get("branch_name") or ""),
+                "commit_sha": str((item or {}).get("commit_sha") or ""),
+            } for item in (repositories or [])],
             key=lambda item: (
                 str(item.get("repository_name") or ""),
-                str(item.get("old_commit_sha") or ""),
-                str(item.get("new_commit_sha") or ""),
+                str(item.get("branch_name") or ""),
+                str(item.get("commit_sha") or ""),
             ),
         )
         payload = {
             "project": project_name, "info_sha256": info_sha256 or "",
             "review_scope": review_scope or "full", "repositories": repositories,
+            "report_source_signature": report_source_signature or "",
+            "identity_contract_version": 2,
         }
         return hashlib.sha256(json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -81,29 +94,49 @@ class ProjectService(object):
                     review_scope="full", repositories=None, report=None,
                     scan_type="import", status="building"):
         repositories = list(repositories or [])
-        scan_key = self.scan_key(project_name, info_sha256, repositories, review_scope)
+        scan_key = self.scan_key(
+            project_name, info_sha256, repositories, review_scope,
+            (report or {}).get("source_signature", "") if report else "",
+        )
         with transaction(connection) as conn:
             project = self.projects.ensure_project(conn, project_name)
             existing = self.projects.get_scan_by_key(conn, scan_key)
             if existing:
                 self._validate_existing_scan(conn, existing, repositories, report)
-                self.states.ensure(conn, project["id"], current_scan_id=existing["id"])
-                self.states.set_current_scan(conn, project["id"], existing["id"])
+                self.states.ensure(conn, project["id"])
                 return existing
+            previous_state = self.states.get(conn, project["id"])
+            predecessor_scan_id = (previous_state or {}).get("current_scan_id")
             scan = self.projects.create_scan(
                 conn, project["id"], scan_key, scan_type, review_scope,
                 info_file_name=info_file_name, info_sha256=info_sha256,
-                status=status,
+                status=status, predecessor_scan_id=predecessor_scan_id,
+                algorithm_version="vnext-scan-identity-v2",
             )
             for snapshot in repositories:
+                repository_id = None
+                repository_name = snapshot.get("repository_name", "")
+                if repository_name:
+                    repository = self.repositories.ensure(
+                        conn, project["id"], repository_name,
+                        canonical_remote=snapshot.get("canonical_remote", ""),
+                        physical_resource_id=snapshot.get("physical_resource_id"),
+                        physical_path=snapshot.get("repository_path", ""),
+                    )
+                    repository_id = repository["id"]
                 self.projects.upsert_repository_snapshot(
-                    conn, scan["id"], snapshot.get("repository_name", ""),
+                    conn, scan["id"], repository_name,
                     repository_path=snapshot.get("repository_path", ""),
                     branch_name=snapshot.get("branch_name", ""),
                     old_commit_sha=snapshot.get("old_commit_sha"),
                     new_commit_sha=snapshot.get("new_commit_sha"),
                     verified=int(bool(snapshot.get("verified"))),
                     provenance=snapshot.get("provenance", ""),
+                    repository_id=repository_id,
+                    commit_sha=snapshot.get("commit_sha"),
+                    identity_verified=int(bool(snapshot.get("identity_verified",
+                                                     snapshot.get("verified")))),
+                    identity_provenance=snapshot.get("identity_provenance", ""),
                 )
             if report:
                 self._validate_report(report)
@@ -114,9 +147,8 @@ class ProjectService(object):
                     sidecar_schema=report.get("sidecar_schema", 0),
                     asset_identity=report.get("asset_identity", ""),
                 )
-            self.states.ensure(conn, project["id"], current_scan_id=scan["id"])
+            self.states.ensure(conn, project["id"])
             self.states.advance(conn, project["id"])
-            self.states.set_current_scan(conn, project["id"], scan["id"])
         return self.get_scan(connection, scan["id"])
 
     def _ingest_files(self, connection, scan_id, files):
@@ -146,29 +178,49 @@ class ProjectService(object):
                                status="building"):
         """Create, populate and seal one immutable scan transactionally."""
         repositories = list(repositories or [])
-        scan_key = self.scan_key(project_name, info_sha256, repositories, review_scope)
+        scan_key = self.scan_key(
+            project_name, info_sha256, repositories, review_scope,
+            (report or {}).get("source_signature", "") if report else "",
+        )
         with transaction(connection) as conn:
             project = self.projects.ensure_project(conn, project_name)
             existing = self.projects.get_scan_by_key(conn, scan_key)
             if existing:
                 self._validate_existing_scan(conn, existing, repositories, report)
-                self.states.ensure(conn, project["id"], current_scan_id=existing["id"])
-                self.states.set_current_scan(conn, project["id"], existing["id"])
+                self.states.ensure(conn, project["id"])
                 return existing
+            previous_state = self.states.get(conn, project["id"])
+            predecessor_scan_id = (previous_state or {}).get("current_scan_id")
             scan = self.projects.create_scan(
                 conn, project["id"], scan_key, scan_type, review_scope,
                 info_file_name=info_file_name, info_sha256=info_sha256,
-                status=status,
+                status=status, predecessor_scan_id=predecessor_scan_id,
+                algorithm_version="vnext-scan-identity-v2",
             )
             for snapshot in repositories:
+                repository_id = None
+                repository_name = snapshot.get("repository_name", "")
+                if repository_name:
+                    repository = self.repositories.ensure(
+                        conn, project["id"], repository_name,
+                        canonical_remote=snapshot.get("canonical_remote", ""),
+                        physical_resource_id=snapshot.get("physical_resource_id"),
+                        physical_path=snapshot.get("repository_path", ""),
+                    )
+                    repository_id = repository["id"]
                 self.projects.upsert_repository_snapshot(
-                    conn, scan["id"], snapshot.get("repository_name", ""),
+                    conn, scan["id"], repository_name,
                     repository_path=snapshot.get("repository_path", ""),
                     branch_name=snapshot.get("branch_name", ""),
                     old_commit_sha=snapshot.get("old_commit_sha"),
                     new_commit_sha=snapshot.get("new_commit_sha"),
                     verified=int(bool(snapshot.get("verified"))),
                     provenance=snapshot.get("provenance", ""),
+                    repository_id=repository_id,
+                    commit_sha=snapshot.get("commit_sha"),
+                    identity_verified=int(bool(snapshot.get("identity_verified",
+                                                     snapshot.get("verified")))),
+                    identity_provenance=snapshot.get("identity_provenance", ""),
                 )
             if report:
                 self._validate_report(report)
@@ -180,10 +232,18 @@ class ProjectService(object):
                     asset_identity=report.get("asset_identity", ""),
                 )
             self._ingest_files(conn, scan["id"], files)
-            self.states.ensure(conn, project["id"], current_scan_id=scan["id"])
+            self.states.ensure(conn, project["id"])
             self.states.advance(conn, project["id"])
-            self.states.set_current_scan(conn, project["id"], scan["id"])
             self.projects.seal_scan(conn, scan["id"])
+            # Synchronous compatibility API: the actual pointer mutation is
+            # still owned by ScanPublicationService and happens only after
+            # the candidate is fully sealed. Durable imports call it later.
+            self.publication.publish_in_transaction(
+                conn, project["id"], scan["id"],
+                expected_current_scan_id=(self.states.get(conn, project["id"]) or {}).get(
+                    "current_scan_id"
+                ),
+            )
         return self.get_scan(connection, scan["id"])
 
     def get_scan(self, connection, scan_id):
@@ -214,10 +274,15 @@ class ProjectService(object):
         project = self.projects.get_project(connection, int(scan["project_id"]))
         with transaction(connection) as conn:
             self._ingest_files(conn, scan_id, files)
-            self.states.ensure(conn, project["id"], current_scan_id=scan_id)
+            self.states.ensure(conn, project["id"])
             self.states.advance(conn, project["id"])
-            self.states.set_current_scan(conn, project["id"], scan_id)
             self.projects.seal_scan(conn, scan_id)
+            self.publication.publish_in_transaction(
+                conn, project["id"], scan_id,
+                expected_current_scan_id=(self.states.get(conn, project["id"]) or {}).get(
+                    "current_scan_id"
+                ),
+            )
         return {"scan_id": int(scan_id), "files": len(files or [])}
 
     def seal_scan(self, connection, scan_id):

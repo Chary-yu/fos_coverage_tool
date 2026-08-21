@@ -65,7 +65,8 @@ class JobRepository(object):
             cursor.close()
         return self.get(connection, job["job_id"])
 
-    def mark_stale(self, connection, timeout_seconds: float, now=None, lease_owner=None):
+    def mark_stale(self, connection, timeout_seconds: float, now=None, lease_owner=None,
+                   exclude_kinds=None):
         now_value = now or utc_now_naive()
         cutoff = now_value - timedelta(seconds=float(timeout_seconds))
         cutoff_text = cutoff.strftime("%Y-%m-%d %H:%M:%S")
@@ -74,14 +75,24 @@ class JobRepository(object):
         if lease_owner:
             owner_clause = " OR (state = 'running' AND COALESCE(lease_owner, '') <> ?)"
             params.append(str(lease_owner))
+        kind_clause = ""
+        if exclude_kinds:
+            values = list(exclude_kinds)
+            kind_clause = " AND kind NOT IN ({})".format(
+                ", ".join("?" for _ in values)
+            )
+            params.extend(str(value) for value in values)
+        state_sql = """(
+            state = 'queued'
+            OR (state = 'running' AND (heartbeat_at IS NULL
+                OR heartbeat_at < ?){})
+        ){}""".format(owner_clause, kind_clause)
         cursor = execute(connection, """
             UPDATE coverage_background_jobs
             SET state = 'interrupted', error_message = 'worker lease expired',
                 updated_at = CURRENT_TIMESTAMP, finished_at = CURRENT_TIMESTAMP
-            WHERE (state = 'queued'
-                   OR (state = 'running' AND (heartbeat_at IS NULL
-                       OR heartbeat_at < ?)){})
-        """.format(owner_clause), params)
+            WHERE {}
+        """.format(state_sql), params)
         count = int(getattr(cursor, "rowcount", 0) or 0)
         cursor.close()
         return count

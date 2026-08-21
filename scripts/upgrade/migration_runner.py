@@ -20,9 +20,12 @@ from app.db.repositories import (
     ProjectRepository,
     ProjectStateRepository,
 )
-from app.db.repositories.base import adapt_sql, fetchall, fetchone, is_sqlite
+from app.db.repositories.base import adapt_sql, fetchall, fetchone, is_sqlite, insert_id
 from app.db.transaction import transaction
 from app.time_utils import utc_iso, utc_sql
+from scripts.upgrade.database_identity import (
+    assert_separate_connections, fingerprint_connection,
+)
 
 
 SQLITE_SCHEMA = """
@@ -103,6 +106,151 @@ CREATE TABLE IF NOT EXISTS coverage_incremental_results (
 );
 """
 
+# The SQLite test schema mirrors the additive MariaDB contract.  SQLite is
+# used for fast deterministic tests, but it must not silently omit a Gate A/B/C
+# field; otherwise a green unit suite could exercise a different domain model.
+SQLITE_DOMAIN_SCHEMA = """
+CREATE TABLE IF NOT EXISTS coverage_schema_migrations (
+    migration_id TEXT PRIMARY KEY, schema_key TEXT NOT NULL,
+    from_version INTEGER NOT NULL DEFAULT 0, to_version INTEGER NOT NULL,
+    ddl_sha256 TEXT NOT NULL, state TEXT NOT NULL,
+    started_at TEXT NOT NULL, finished_at TEXT, release_sha TEXT NOT NULL DEFAULT '',
+    error_class TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS coverage_legacy_provenance (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, migration_id TEXT NOT NULL,
+    target_entity_type TEXT NOT NULL, target_entity_id INTEGER NOT NULL,
+    source_table TEXT NOT NULL, source_identity TEXT NOT NULL,
+    legacy_created_at TEXT, legacy_updated_at TEXT,
+    legacy_raw_status TEXT, legacy_raw_is_draft INTEGER,
+    raw_payload_sha256 TEXT NOT NULL, raw_payload TEXT, created_at TEXT NOT NULL,
+    UNIQUE(migration_id, target_entity_type, target_entity_id, source_table)
+);
+CREATE TABLE IF NOT EXISTS coverage_repositories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
+    repository_name TEXT NOT NULL, canonical_remote TEXT,
+    last_observed_physical_path TEXT NOT NULL DEFAULT '',
+    physical_resource_id INTEGER, lifecycle_state TEXT NOT NULL DEFAULT 'ACTIVE',
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    UNIQUE(project_id, repository_name)
+);
+CREATE TABLE IF NOT EXISTS coverage_repository_aliases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
+    repository_id INTEGER NOT NULL, alias_name TEXT NOT NULL,
+    created_at TEXT NOT NULL, retired_at TEXT,
+    UNIQUE(project_id, alias_name)
+);
+CREATE TABLE IF NOT EXISTS coverage_repository_resources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, resource_key TEXT NOT NULL UNIQUE,
+    resolved_git_common_dir TEXT NOT NULL, resolved_worktree_root TEXT NOT NULL,
+    fs_device INTEGER, fs_inode INTEGER, next_fencing_token INTEGER NOT NULL DEFAULT 0,
+    observed_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS coverage_analysis_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, conclusion_status TEXT NOT NULL DEFAULT '',
+    coverage_method TEXT, uncovered_reason TEXT, comment TEXT,
+    content_revision INTEGER NOT NULL DEFAULT 1, content_hash TEXT NOT NULL,
+    content_origin TEXT NOT NULL DEFAULT 'MANUAL', legacy_source_analysis_id INTEGER,
+    legacy_source_created_at TEXT, legacy_source_updated_at TEXT,
+    legacy_raw_status TEXT, legacy_raw_is_draft INTEGER,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS coverage_analysis_blocks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL,
+    repository_id INTEGER, file_id INTEGER NOT NULL, start_line INTEGER NOT NULL,
+    end_line INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT 'MANUAL',
+    block_identity_verified INTEGER NOT NULL DEFAULT 0, originating_record_id INTEGER,
+    initial_content_hash TEXT, created_by TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS coverage_inheritance_groups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, decision_run_id TEXT NOT NULL,
+    candidate_scan_id INTEGER NOT NULL, source_scan_id INTEGER NOT NULL,
+    source_analysis_block_id INTEGER NOT NULL, repository_id INTEGER NOT NULL,
+    candidate_file_id INTEGER NOT NULL, mapping_fingerprint TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(decision_run_id, source_analysis_block_id, candidate_file_id, mapping_fingerprint)
+);
+CREATE TABLE IF NOT EXISTS coverage_analysis_line_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL,
+    line_id INTEGER NOT NULL, analysis_record_id INTEGER NOT NULL,
+    analysis_block_id INTEGER, review_state TEXT NOT NULL, relation_origin TEXT NOT NULL,
+    inheritance_group_id INTEGER, is_active INTEGER NOT NULL DEFAULT 1,
+    reviewed_by TEXT NOT NULL DEFAULT '', reviewed_at TEXT,
+    source_scan_id INTEGER, source_line_id INTEGER, source_relation_id INTEGER,
+    relation_revision INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL, UNIQUE(scan_id, line_id)
+);
+CREATE TABLE IF NOT EXISTS coverage_inheritance_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, decision_run_id TEXT NOT NULL,
+    candidate_scan_id INTEGER NOT NULL, candidate_line_id INTEGER NOT NULL,
+    source_scan_id INTEGER, source_line_id INTEGER, source_relation_id INTEGER,
+    decision TEXT NOT NULL, reason_code TEXT NOT NULL, algorithm_version TEXT NOT NULL,
+    old_commit_sha TEXT, new_commit_sha TEXT,
+    line_mapping_fingerprint TEXT NOT NULL DEFAULT '',
+    function_identity_fingerprint TEXT NOT NULL DEFAULT '',
+    control_context_fingerprint TEXT NOT NULL DEFAULT '',
+    preprocessor_context_fingerprint TEXT NOT NULL DEFAULT '',
+    dependency_fingerprint TEXT NOT NULL DEFAULT '', evaluated_at TEXT NOT NULL,
+    UNIQUE(decision_run_id, candidate_line_id)
+);
+CREATE TABLE IF NOT EXISTS coverage_inheritance_rejections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL, line_id INTEGER NOT NULL,
+    rejected_relation_id INTEGER NOT NULL, rejected_relation_revision INTEGER NOT NULL,
+    rejected_analysis_record_id INTEGER NOT NULL, rejected_source_scan_id INTEGER,
+    rejected_source_line_id INTEGER, rejected_source_relation_id INTEGER,
+    rejection_revision INTEGER NOT NULL DEFAULT 1, is_active INTEGER NOT NULL DEFAULT 1,
+    terminal_reason TEXT, rejected_by TEXT NOT NULL, rejected_at TEXT NOT NULL,
+    resolved_at TEXT
+);
+CREATE TABLE IF NOT EXISTS coverage_repository_resource_locks (
+    physical_resource_id INTEGER PRIMARY KEY, job_id TEXT NOT NULL,
+    owner_token TEXT NOT NULL, fencing_token INTEGER NOT NULL,
+    heartbeat_at TEXT NOT NULL, acquired_at TEXT NOT NULL, expires_at TEXT,
+    UNIQUE(job_id, physical_resource_id)
+);
+CREATE TABLE IF NOT EXISTS coverage_import_artifacts (
+    artifact_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, kind TEXT NOT NULL,
+    staged_path TEXT NOT NULL, sha256 TEXT NOT NULL, size_bytes INTEGER NOT NULL DEFAULT 0,
+    immutable INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL,
+    UNIQUE(job_id, kind)
+);
+CREATE TABLE IF NOT EXISTS coverage_import_checkpoints (
+    job_id TEXT PRIMARY KEY, scan_id INTEGER, phase TEXT NOT NULL,
+    phase_version INTEGER NOT NULL DEFAULT 1, checkpoint_seq INTEGER NOT NULL DEFAULT 0,
+    payload TEXT NOT NULL, input_sha256 TEXT NOT NULL DEFAULT '',
+    fencing_token INTEGER NOT NULL DEFAULT 0, expected_current_scan_id INTEGER,
+    created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS coverage_import_failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, scan_id INTEGER,
+    phase TEXT NOT NULL, error_class TEXT NOT NULL, error_fingerprint TEXT NOT NULL,
+    message_redacted TEXT, fencing_token INTEGER, occurred_at TEXT NOT NULL,
+    UNIQUE(job_id, phase, error_fingerprint)
+);
+"""
+
+
+SQLITE_ADDITIVE_COLUMNS = {
+    "coverage_schema_meta": [
+        ("migration_id", "TEXT NOT NULL DEFAULT ''"),
+    ],
+    "coverage_scans": [
+        ("predecessor_scan_id", "INTEGER"),
+        ("algorithm_version", "TEXT NOT NULL DEFAULT ''"),
+    ],
+    "coverage_scan_repositories": [
+        ("repository_id", "INTEGER"),
+        ("commit_sha", "TEXT"),
+        ("identity_verified", "INTEGER NOT NULL DEFAULT 0"),
+        ("identity_provenance", "TEXT NOT NULL DEFAULT ''"),
+    ],
+    "coverage_background_jobs": [
+        ("handler_version", "TEXT NOT NULL DEFAULT ''"),
+        ("legacy_raw_percent", "REAL"),
+        ("legacy_percent_unit", "TEXT NOT NULL DEFAULT ''"),
+    ],
+}
+
 
 def _now():
     return utc_sql()
@@ -165,12 +313,28 @@ def _legacy_text(row, names):
     return ""
 
 
+def _legacy_payload_hash(row):
+    payload = json.dumps(dict(row or {}), ensure_ascii=False, sort_keys=True,
+                         default=str, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _nullable_int(value):
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def capture_legacy_snapshot(connection):
     """Normalize legacy facts without changing their source semantics."""
     analysis = []
     for row in _rows(connection, "coverage_analysis"):
         file_hash, line_number, path = _legacy_key(row)
         analysis.append({
+            "source_pk": _nullable_int(row.get("id")),
             "project_name": str(row.get("project_name") or ""),
             "file_path_hash": file_hash,
             "file_path": path,
@@ -181,11 +345,15 @@ def capture_legacy_snapshot(connection):
             "coverage_method": _legacy_text(row, ("coverage_method", "method")),
             "uncovered_reason": _legacy_text(row, ("uncovered_reason", "reason")),
             "comment": _legacy_text(row, ("comment", "comments", "remark")),
+            "legacy_created_at": row.get("created_at"),
+            "legacy_updated_at": row.get("updated_at"),
+            "raw_payload_sha256": _legacy_payload_hash(row),
         })
     lines = []
     for row in _rows(connection, "coverage_line_index"):
         file_hash, line_number, path = _legacy_key(row)
         lines.append({
+            "source_pk": _nullable_int(row.get("id")),
             "project_name": str(row.get("project_name") or ""),
             "file_path_hash": file_hash,
             "file_path": path,
@@ -198,10 +366,21 @@ def capture_legacy_snapshot(connection):
             "function_hash": str(row.get("function_hash") or ""),
             "code_line_hash": str(row.get("code_line_hash") or ""),
             "code_occurrence": int(row.get("code_occurrence") or 1),
+            "legacy_created_at": row.get("created_at"),
+            "legacy_updated_at": row.get("updated_at"),
+            "raw_payload_sha256": _legacy_payload_hash(row),
         })
     projects = {}
+    project_metadata = {}
     for row in _rows(connection, "coverage_project_state"):
-        projects[str(row.get("project_name") or "")] = int(row.get("data_version") or 0)
+        name = str(row.get("project_name") or "")
+        projects[name] = int(row.get("data_version") or 0)
+        project_metadata[name] = {
+            "file_state_version": int(row.get("file_state_version") or 0),
+            "current_scan_key": str(row.get("current_scan_key") or ""),
+            "updated_at": row.get("updated_at"),
+            "raw_payload_sha256": _legacy_payload_hash(row),
+        }
     jobs = []
     for row in _rows(connection, "coverage_background_jobs"):
         jobs.append({
@@ -211,10 +390,25 @@ def capture_legacy_snapshot(connection):
             "state": str(row.get("state") or ""),
             "data_version": int(row.get("data_version") or 0),
             "error_message": str(row.get("error_message") or ""),
+            "legacy_raw_percent": row.get("percent"),
+            "legacy_percent_unit": str(row.get("progress_unit") or ""),
+            "stage": str(row.get("stage") or ""),
+            "message": str(row.get("message") or ""),
+            "input_payload": row.get("input_payload"),
+            "result_path": str(row.get("result_path") or ""),
+            "filename": str(row.get("filename") or ""),
+            "row_count": _nullable_int(row.get("row_count")),
+            "heartbeat_at": row.get("heartbeat_at"),
+            "finished_at": row.get("finished_at"),
+            "created_at": row.get("created_at"),
+            "started_at": row.get("started_at"),
+            "updated_at": row.get("updated_at"),
+            "raw_payload_sha256": _legacy_payload_hash(row),
         })
     return {
         "projects": sorted(name for name in _project_names(connection) if name),
         "project_data_versions": dict(sorted(projects.items())),
+        "project_metadata": project_metadata,
         "lines": sorted(lines, key=lambda item: (
             item["project_name"], item["file_path_hash"], item["line_number"])),
         "analyses": sorted(analysis, key=lambda item: (
@@ -292,18 +486,43 @@ def capture_vnext_semantic_snapshot(connection):
                 "legacy active job requires manual migration decision"
             )
         normalized_jobs.append(item)
+    provenance = []
+    if _table_exists(connection, "coverage_legacy_provenance"):
+        provenance_rows = fetchall(connection, """
+            SELECT target_entity_type, source_table, source_identity,
+                   legacy_created_at,
+                   legacy_updated_at, legacy_raw_status, legacy_raw_is_draft,
+                   raw_payload_sha256
+            FROM coverage_legacy_provenance
+            ORDER BY source_table, source_identity, target_entity_type
+        """)
+        provenance = []
+        for row in provenance_rows:
+            item = dict(row)
+            if item.get("legacy_raw_status") == "":
+                item["legacy_raw_status"] = None
+            provenance.append(item)
     return {
         "projects": snapshot["projects"],
         "project_data_versions": snapshot["project_data_versions"],
         "lines": snapshot["lines"],
         "analyses": snapshot["analyses"],
         "jobs": normalized_jobs,
+        "legacy_provenance": provenance,
     }
 
 
 def capture_legacy_semantic_snapshot(connection):
     """Normalize expected migration transformations for semantic comparison."""
     snapshot = capture_legacy_snapshot(connection)
+    raw_snapshot = {
+        key: (list(value) if isinstance(value, list) else dict(value)
+              if isinstance(value, dict) else value)
+        for key, value in snapshot.items()
+    }
+    # file_state/current-scan metadata is operational provenance; data_version
+    # below is the only project state fact in the authoritative semantic hash.
+    snapshot.pop("project_metadata", None)
     line_keys = {
         (row["project_name"], row["file_path_hash"], row["file_path"], row["line_number"])
         for row in snapshot["lines"]
@@ -339,8 +558,85 @@ def capture_legacy_semantic_snapshot(connection):
             item["error_message"] = item.get("error_message") or (
                 "legacy active job requires manual migration decision"
             )
-        jobs.append(item)
+        jobs.append({key: item.get(key) for key in (
+            "job_id", "project_name", "kind", "state", "data_version",
+            "error_message",
+        )})
     snapshot["jobs"] = jobs
+    # Surrogate source IDs and raw payloads are provenance, not business
+    # identity.  Keep timestamps/status facts in a separate deterministic
+    # list so target IDs do not affect the authoritative semantic hash.
+    snapshot["analyses"] = [
+        {key: row.get(key) for key in (
+            "project_name", "file_path_hash", "file_path", "line_number",
+            "status", "is_draft", "reviewer", "coverage_method",
+            "uncovered_reason", "comment",
+        )}
+        for row in snapshot["analyses"]
+    ]
+    snapshot["lines"] = [
+        {key: row.get(key) for key in (
+            "project_name", "file_path_hash", "file_path", "line_number",
+            "line_text", "block_start_line", "block_end_line", "block_type",
+            "function_name", "function_hash", "code_line_hash", "code_occurrence",
+        )}
+        for row in snapshot["lines"]
+    ]
+    provenance = []
+    for row in raw_snapshot["lines"]:
+        provenance.append({
+            "target_entity_type": "line",
+            "source_table": "coverage_line_index",
+            "source_identity": "{}:{}:{}".format(
+                row.get("project_name") or "", row.get("file_path_hash") or "",
+                row.get("line_number") or 0,
+            ),
+            "legacy_created_at": row.get("legacy_created_at"),
+            "legacy_updated_at": row.get("legacy_updated_at"),
+            "legacy_raw_status": None,
+            "legacy_raw_is_draft": None,
+            "raw_payload_sha256": row.get("raw_payload_sha256") or "",
+        })
+    for row in raw_snapshot["analyses"]:
+        provenance.append({
+            "target_entity_type": "legacy_analysis",
+            "source_table": "coverage_analysis",
+            "source_identity": "{}:{}:{}".format(
+                row.get("project_name") or "", row.get("file_path_hash") or "",
+                row.get("line_number") or 0,
+            ),
+            "legacy_created_at": row.get("legacy_created_at"),
+            "legacy_updated_at": row.get("legacy_updated_at"),
+            "legacy_raw_status": row.get("status"),
+            "legacy_raw_is_draft": row.get("is_draft"),
+            "raw_payload_sha256": row.get("raw_payload_sha256") or "",
+        })
+    for project_name, metadata in sorted(raw_snapshot.get("project_metadata", {}).items()):
+        provenance.append({
+            "target_entity_type": "project_state",
+            "source_table": "coverage_project_state",
+            "source_identity": project_name,
+            "legacy_created_at": None,
+            "legacy_updated_at": metadata.get("updated_at"),
+            "legacy_raw_status": None,
+            "legacy_raw_is_draft": None,
+            "raw_payload_sha256": metadata.get("raw_payload_sha256") or "",
+        })
+    for row in raw_snapshot["jobs"]:
+        provenance.append({
+            "target_entity_type": "job",
+            "source_table": "coverage_background_jobs",
+            "source_identity": row.get("job_id") or "",
+            "legacy_created_at": row.get("created_at"),
+            "legacy_updated_at": row.get("updated_at"),
+            "legacy_raw_status": row.get("state"),
+            "legacy_raw_is_draft": None,
+            "raw_payload_sha256": row.get("raw_payload_sha256") or "",
+        })
+    snapshot["legacy_provenance"] = sorted(
+        provenance,
+        key=lambda item: (item["source_table"], item["source_identity"]),
+    )
     return snapshot
 
 
@@ -349,8 +645,56 @@ def semantic_hash(snapshot):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def _upsert_legacy_provenance(connection, migration_id, entity_type,
+                               target_entity_id, source_table, source_identity,
+                               row, raw_payload=None):
+    """Persist source timestamps/status/hash in the target DB idempotently."""
+    values = (
+        migration_id, entity_type, int(target_entity_id or 0), source_table,
+        str(source_identity or ""), row.get("legacy_created_at"),
+        row.get("legacy_updated_at"), row.get("status"),
+        row.get("is_draft"), row.get("raw_payload_sha256") or "",
+        raw_payload, _now(),
+    )
+    existing = fetchone(connection, """
+        SELECT id, raw_payload_sha256 FROM coverage_legacy_provenance
+        WHERE migration_id=? AND target_entity_type=? AND target_entity_id=?
+          AND source_table=?
+    """, values[:4])
+    if existing:
+        if str(existing.get("raw_payload_sha256") or "") != values[9]:
+            raise ValueError("legacy provenance input changed on idempotent rerun")
+        return int(existing.get("id") or 0)
+    cursor = connection.cursor()
+    cursor.execute(adapt_sql(connection, """
+        INSERT INTO coverage_legacy_provenance(
+            migration_id, target_entity_type, target_entity_id, source_table,
+            source_identity, legacy_created_at, legacy_updated_at,
+            legacy_raw_status, legacy_raw_is_draft, raw_payload_sha256,
+            raw_payload, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """), values)
+    result = insert_id(cursor)
+    cursor.close()
+    return result
+
+
 def create_sqlite_schema(connection):
     connection.executescript(SQLITE_SCHEMA)
+    for table_name, columns in SQLITE_ADDITIVE_COLUMNS.items():
+        existing = {
+            str(row[1]) for row in connection.execute(
+                "PRAGMA table_info({})".format(table_name)
+            ).fetchall()
+        }
+        for column_name, definition in columns:
+            if column_name not in existing:
+                connection.execute(
+                    "ALTER TABLE {} ADD COLUMN {} {}".format(
+                        table_name, column_name, definition
+                    )
+                )
+    connection.executescript(SQLITE_DOMAIN_SCHEMA)
     connection.commit()
 
 
@@ -429,38 +773,211 @@ def _split_sql(sql_text):
 def apply_schema(connection, ddl_path, release_sha=""):
     with open(ddl_path, "r", encoding="utf-8") as stream:
         ddl = stream.read()
-    for statement in _split_sql(ddl):
+    ddl_sha256 = hashlib.sha256(ddl.encode("utf-8")).hexdigest()
+    migration_id = "coverage-vnext-core-v2"
+
+    if is_sqlite(connection):
+        create_sqlite_schema(connection)
+        existing = fetchone(connection, """
+            SELECT * FROM coverage_schema_migrations WHERE migration_id=?
+        """, (migration_id,))
+        if existing and str(existing.get("state") or "") == "APPLIED":
+            if str(existing.get("ddl_sha256") or "") != ddl_sha256:
+                raise ValueError("schema migration checksum changed after APPLIED state")
+            return {"status": "PASSED", "migration_id": migration_id,
+                    "idempotent": True, "ddl_sha256": ddl_sha256}
+        now = _now()
         cursor = connection.cursor()
-        cursor.execute(statement)
+        if existing:
+            cursor.execute("""
+                UPDATE coverage_schema_migrations
+                SET state='APPLIED', ddl_sha256=?, to_version=1,
+                    finished_at=?, release_sha=?, error_class=''
+                WHERE migration_id=?
+            """, (ddl_sha256, now, release_sha or "", migration_id))
+        else:
+            cursor.execute("""
+                INSERT INTO coverage_schema_migrations(
+                    migration_id, schema_key, from_version, to_version,
+                    ddl_sha256, state, started_at, finished_at, release_sha
+                ) VALUES (?, ?, 0, 1, ?, 'APPLIED', ?, ?, ?)
+            """, (migration_id, "coverage_vnext_core", ddl_sha256,
+                    now, now, release_sha or ""))
+        for schema_key, version in (
+                ("coverage_vnext_core", 1), ("coverage_analysis_domain", 0),
+                ("coverage_inheritance", 0), ("coverage_vnext", 1)):
+            if fetchone(connection, "SELECT schema_key FROM coverage_schema_meta WHERE schema_key=?",
+                         (schema_key,)):
+                cursor.execute("""
+                    UPDATE coverage_schema_meta
+                    SET schema_version=?, applied_at=?, release_sha=?, migration_id=?
+                    WHERE schema_key=?
+                """, (version, now, release_sha or "", migration_id, schema_key))
+            else:
+                cursor.execute("""
+                    INSERT INTO coverage_schema_meta(
+                        schema_key, schema_version, applied_at, release_sha, migration_id
+                    ) VALUES (?, ?, ?, ?, ?)
+                """, (schema_key, version, now, release_sha or "", migration_id))
         cursor.close()
-    if _table_exists(connection, "coverage_background_jobs") and not _column_exists(
-            connection, "coverage_background_jobs", "lease_owner"):
-        cursor = connection.cursor()
-        cursor.execute(adapt_sql(
-            connection,
-            "ALTER TABLE coverage_background_jobs ADD COLUMN lease_owner VARCHAR(128) NOT NULL DEFAULT ''",
-        ))
-        cursor.close()
-    existing = fetchone(connection, """
-        SELECT schema_key FROM coverage_schema_meta WHERE schema_key = ?
-    """, ("coverage_vnext",))
+        connection.commit()
+        return {"status": "PASSED", "migration_id": migration_id,
+                "idempotent": bool(existing), "ddl_sha256": ddl_sha256}
+
+    # The ledger itself must exist before the first non-transactional MariaDB
+    # DDL statement.  It is intentionally additive and safe on a partially
+    # upgraded target.
+    ledger_ddl = """
+        CREATE TABLE IF NOT EXISTS coverage_schema_migrations (
+            migration_id VARCHAR(128) NOT NULL,
+            schema_key VARCHAR(64) NOT NULL,
+            from_version INT NOT NULL DEFAULT 0,
+            to_version INT NOT NULL,
+            ddl_sha256 CHAR(64) NOT NULL,
+            state VARCHAR(16) NOT NULL,
+            started_at DATETIME NOT NULL,
+            finished_at DATETIME NULL,
+            release_sha CHAR(40) NOT NULL DEFAULT '',
+            error_class VARCHAR(128) NOT NULL DEFAULT '',
+            PRIMARY KEY (migration_id)
+        )
+    """
     cursor = connection.cursor()
-    if existing:
-        cursor.execute(adapt_sql(connection,
-            "UPDATE coverage_schema_meta SET schema_version = ?, applied_at = ?, release_sha = ? WHERE schema_key = ?"),
-            (1, _now(), release_sha or "", "coverage_vnext"),
-        )
-    else:
-        cursor.execute(adapt_sql(connection,
-            "INSERT INTO coverage_schema_meta(schema_key, schema_version, applied_at, release_sha) VALUES (?, ?, ?, ?)"),
-            ("coverage_vnext", 1, _now(), release_sha or ""),
-        )
+    cursor.execute(adapt_sql(connection, ledger_ddl))
     cursor.close()
     connection.commit()
+    existing_migration = fetchone(connection, """
+        SELECT * FROM coverage_schema_migrations WHERE migration_id = ?
+    """, (migration_id,))
+    if existing_migration and str(existing_migration.get("state") or "") == "APPLIED":
+        if str(existing_migration.get("ddl_sha256") or "") != ddl_sha256:
+            raise ValueError("schema migration checksum changed after APPLIED state")
+        return {"status": "PASSED", "migration_id": migration_id,
+                "idempotent": True, "ddl_sha256": ddl_sha256}
+
+    schema_version_row = fetchone(connection, """
+        SELECT schema_version FROM coverage_schema_meta WHERE schema_key = ?
+    """, ("coverage_vnext_core",))
+    from_version = int((schema_version_row or {}).get("schema_version") or 0)
+    now = _now()
+    if existing_migration:
+        cursor = connection.cursor()
+        cursor.execute(adapt_sql(connection, """
+            UPDATE coverage_schema_migrations
+            SET schema_key=?, from_version=?, to_version=?, ddl_sha256=?, state='STARTED',
+                started_at=?, finished_at=NULL, release_sha=?, error_class=''
+            WHERE migration_id=?
+        """), ("coverage_vnext_core", from_version, 1, ddl_sha256, now,
+                release_sha or "", migration_id))
+        cursor.close()
+    else:
+        cursor = connection.cursor()
+        cursor.execute(adapt_sql(connection, """
+            INSERT INTO coverage_schema_migrations(
+                migration_id, schema_key, from_version, to_version, ddl_sha256,
+                state, started_at, release_sha
+            ) VALUES (?, ?, ?, ?, ?, 'STARTED', ?, ?)
+        """), (migration_id, "coverage_vnext_core", from_version, 1,
+                ddl_sha256, now, release_sha or ""))
+        cursor.close()
+    connection.commit()
+    try:
+        for statement in _split_sql(ddl):
+            cursor = connection.cursor()
+            cursor.execute(adapt_sql(connection, statement))
+            cursor.close()
+        # Existing Candidate databases are upgraded through information_schema
+        # checks rather than unsafe ADD COLUMN IF NOT EXISTS (unsupported by
+        # MariaDB 5.5).  Fresh targets get the columns from the DDL above.
+        additions = {
+            "coverage_schema_meta": [
+                ("migration_id", "VARCHAR(128) NOT NULL DEFAULT ''"),
+            ],
+            "coverage_scans": [
+                ("predecessor_scan_id", "BIGINT NULL"),
+                ("algorithm_version", "VARCHAR(64) NOT NULL DEFAULT ''"),
+            ],
+            "coverage_scan_repositories": [
+                ("repository_id", "BIGINT NULL"),
+                ("commit_sha", "CHAR(40) NULL"),
+                ("identity_verified", "TINYINT NOT NULL DEFAULT 0"),
+                ("identity_provenance", "VARCHAR(128) NOT NULL DEFAULT ''"),
+            ],
+            "coverage_background_jobs": [
+                ("lease_owner", "VARCHAR(128) NOT NULL DEFAULT ''"),
+                ("handler_version", "VARCHAR(64) NOT NULL DEFAULT ''"),
+                ("legacy_raw_percent", "DECIMAL(12,3) NULL"),
+                ("legacy_percent_unit", "VARCHAR(32) NOT NULL DEFAULT ''"),
+            ],
+        }
+        for table_name, columns in additions.items():
+            if not _table_exists(connection, table_name):
+                continue
+            for column_name, definition in columns:
+                if _column_exists(connection, table_name, column_name):
+                    continue
+                cursor = connection.cursor()
+                cursor.execute(adapt_sql(connection, "ALTER TABLE {} ADD COLUMN {} {}".format(
+                    table_name, column_name, definition
+                )))
+                cursor.close()
+        # Keep the historical key for old health checks while introducing the
+        # stage-specific metadata required by Gate A.
+        meta_rows = [
+            ("coverage_vnext_core", 1, migration_id),
+            ("coverage_analysis_domain", 0, migration_id),
+            ("coverage_inheritance", 0, migration_id),
+            ("coverage_vnext", 1, migration_id),
+        ]
+        for schema_key, version, meta_migration in meta_rows:
+            existing = fetchone(connection, "SELECT schema_key FROM coverage_schema_meta WHERE schema_key=?",
+                                 (schema_key,))
+            cursor = connection.cursor()
+            if existing:
+                cursor.execute(adapt_sql(connection, """
+                    UPDATE coverage_schema_meta
+                    SET schema_version=?, applied_at=?, release_sha=?, migration_id=?
+                    WHERE schema_key=?
+                """), (version, _now(), release_sha or "", meta_migration, schema_key))
+            else:
+                cursor.execute(adapt_sql(connection, """
+                    INSERT INTO coverage_schema_meta(
+                        schema_key, schema_version, applied_at, release_sha, migration_id
+                    ) VALUES (?, ?, ?, ?, ?)
+                """), (schema_key, version, _now(), release_sha or "", meta_migration))
+            cursor.close()
+        cursor = connection.cursor()
+        cursor.execute(adapt_sql(connection, """
+            UPDATE coverage_schema_migrations
+            SET state='APPLIED', finished_at=?, release_sha=?, error_class=''
+            WHERE migration_id=?
+        """), (_now(), release_sha or "", migration_id))
+        cursor.close()
+        connection.commit()
+    except Exception as exc:
+        cursor = connection.cursor()
+        cursor.execute(adapt_sql(connection, """
+            UPDATE coverage_schema_migrations
+            SET state='FAILED', finished_at=?, release_sha=?, error_class=?
+            WHERE migration_id=?
+        """), (_now(), release_sha or "",
+                type(exc).__name__, migration_id))
+        cursor.close()
+        connection.commit()
+        raise
+    return {"status": "PASSED", "migration_id": migration_id,
+            "idempotent": False, "ddl_sha256": ddl_sha256}
 
 
-def validate_migration_database_separation(source_config, target_config):
-    """Reject a migration that could accidentally point both sides at one DB."""
+def validate_migration_database_separation(source_config, target_config,
+                                           source_connection=None,
+                                           target_connection=None):
+    """Reject a migration that could accidentally point both sides at one DB.
+
+    Config equality is only a cheap preflight.  When connections are supplied
+    the runtime fingerprint is authoritative, which prevents localhost/DNS
+    aliases or different DB users from bypassing the same-instance check.
+    """
     source = source_config.get("mysql") or source_config
     target = target_config.get("mysql") or target_config
     source_identity = (
@@ -475,13 +992,27 @@ def validate_migration_database_separation(source_config, target_config):
         raise ValueError("source and target database identities must be different")
     if not target_identity[3]:
         raise ValueError("target database name is required")
-    return {"source": source_identity, "target": target_identity}
+    result = {"source": source_identity, "target": target_identity,
+              "configuration_check": "PASSED"}
+    if (source_connection is None) != (target_connection is None):
+        raise ValueError("source and target runtime connections must be supplied together")
+    if source_connection is not None:
+        runtime = assert_separate_connections(
+            source_connection, target_connection,
+            source_config=source, target_config=target,
+        )
+        result["runtime_fingerprint"] = runtime
+    return result
 
 
-def migrate_legacy(source_connection, target_connection, anomaly_path=None, release_sha=""):
+def migrate_legacy(source_connection, target_connection, anomaly_path=None,
+                   release_sha="", migration_id=None):
     """Migrate one legacy current-state snapshot idempotently."""
     source = capture_legacy_snapshot(source_connection)
     source_semantic = capture_legacy_semantic_snapshot(source_connection)
+    migration_id = migration_id or "legacy-v2-{}".format(
+        semantic_hash(source_semantic)[:32]
+    )
     anomalies = []
     project_repo = ProjectRepository()
     line_repo = LineIndexRepository()
@@ -588,6 +1119,7 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None, rele
                         path, os.path.basename(path)
                     )
                     files[file_key] = file_rows
+                source_line_is_authoritative = source_line is not None
                 if source_line is None:
                     anomalies.append({
                         "type": "missing_line_index_context", "project_name": project_name,
@@ -603,11 +1135,36 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None, rele
                 line_record["coverage_state"] = "uncovered"
                 line_record["suggested_reviewer"] = ""
                 line = line_repo.upsert_line(conn, files[file_key]["id"], line_record)
+                if source_line_is_authoritative:
+                    _upsert_legacy_provenance(
+                        conn, migration_id, "line", line["id"], "coverage_line_index",
+                        "{}:{}:{}".format(project_name, file_hash, line_number),
+                        source_line,
+                    )
                 if analysis_line is not None:
-                    analysis_repo.upsert(conn, line["id"], analysis_line)
+                    analysis = analysis_repo.upsert(conn, line["id"], analysis_line)
+                    _upsert_legacy_provenance(
+                        conn, migration_id, "legacy_analysis", analysis["id"],
+                        "coverage_analysis",
+                        "{}:{}:{}".format(project_name, file_hash, line_number),
+                        analysis_line,
+                    )
             state_repo.ensure(
                 conn, project["id"], current_scan_id=scan["id"], data_version=data_version
             )
+            project_metadata = source.get("project_metadata", {}).get(project_name)
+            if project_metadata is not None:
+                _upsert_legacy_provenance(
+                    conn, migration_id, "project_state", project["id"],
+                    "coverage_project_state", project_name,
+                    {
+                        "legacy_created_at": None,
+                        "legacy_updated_at": project_metadata.get("updated_at"),
+                        "status": "",
+                        "is_draft": None,
+                        "raw_payload_sha256": project_metadata.get("raw_payload_sha256", ""),
+                    },
+                )
             state_repo.set_current_scan(conn, project["id"], scan["id"])
             file_state_repo.rebuild_scan(conn, scan["id"], data_version, None)
             state_repo.mark_ready(conn, project["id"], data_version)
@@ -628,14 +1185,41 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None, rele
                     "job_id": old_job["job_id"], "legacy_state": state,
                 })
                 state = "interrupted"
-            job_repo.upsert(conn, {
+            target_job = job_repo.upsert(conn, {
                 "job_id": old_job["job_id"], "project_id": project["id"],
                 "kind": old_job["kind"], "state": state,
                 "progress": 0, "input_payload": json.dumps(old_job, sort_keys=True),
                 "error_message": old_job["error_message"] if state != "interrupted"
                 else "legacy active job requires manual migration decision",
                 "data_version": old_job["data_version"],
+                "handler_version": "legacy-migration-v2",
+                "legacy_raw_percent": old_job.get("legacy_raw_percent"),
+                "legacy_percent_unit": old_job.get("legacy_percent_unit", ""),
             })
+            # A legacy result path is provenance only.  Do not make an
+            # untrusted historical path an active downloadable target.
+            cursor = conn.cursor()
+            cursor.execute(adapt_sql(conn, """
+                UPDATE coverage_background_jobs
+                SET handler_version=?, legacy_raw_percent=?, legacy_percent_unit=?
+                WHERE job_id=?
+            """), ("legacy-migration-v2", old_job.get("legacy_raw_percent"),
+                    old_job.get("legacy_percent_unit", ""), old_job["job_id"]))
+            cursor.close()
+            job_target_id = int(hashlib.sha256(
+                str(old_job["job_id"]).encode("utf-8")
+            ).hexdigest()[:15], 16)
+            _upsert_legacy_provenance(
+                conn, migration_id, "job", job_target_id,
+                "coverage_background_jobs", old_job["job_id"],
+                {
+                    "legacy_created_at": old_job.get("created_at"),
+                    "legacy_updated_at": old_job.get("updated_at"),
+                    "status": old_job.get("state"),
+                    "is_draft": None,
+                    "raw_payload_sha256": old_job.get("raw_payload_sha256", ""),
+                }, json.dumps(old_job, ensure_ascii=False, sort_keys=True, default=str),
+            )
 
     result = {
         "status": "PASSED",
@@ -652,6 +1236,7 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None, rele
             capture_vnext_semantic_snapshot(target_connection)
         ),
         "release_sha": release_sha or "",
+        "migration_id": migration_id,
         "captured_at": utc_iso(),
     }
     if anomaly_path:

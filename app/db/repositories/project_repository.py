@@ -80,7 +80,8 @@ class ProjectRepository(object):
     def create_scan(self, connection, project_id: int, scan_key: str, scan_type: str,
                     review_scope: str, info_file_name: str = "", info_sha256: str = "",
                     status: str = "building", legacy_migrated: int = 0,
-                    metadata_version: int = 1, imported_at=None):
+                    metadata_version: int = 1, imported_at=None,
+                    predecessor_scan_id=None, algorithm_version=""):
         if str(status or "").lower() not in {"building", "importing", "constructing"}:
             raise ValueError("new scans must be created in a construction state")
         existing = self.get_scan_by_key(connection, scan_key)
@@ -89,11 +90,12 @@ class ProjectRepository(object):
         cursor = execute(connection, """
             INSERT INTO coverage_scans(
                 project_id, scan_key, scan_type, review_scope, info_file_name,
-                info_sha256, imported_at, status, legacy_migrated, metadata_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                info_sha256, imported_at, status, legacy_migrated, metadata_version,
+                predecessor_scan_id, algorithm_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (project_id, scan_key, scan_type, review_scope, info_file_name or "",
               info_sha256 or "", _now(imported_at), status, int(bool(legacy_migrated)),
-              int(metadata_version)))
+              int(metadata_version), predecessor_scan_id, algorithm_version or ""))
         scan_id = insert_id(cursor)
         cursor.close()
         row = self.get_scan(connection, scan_id) if scan_id else None
@@ -119,7 +121,10 @@ class ProjectRepository(object):
                                    old_commit_sha: Optional[str] = None,
                                    new_commit_sha: Optional[str] = None,
                                    verified: int = 0, captured_at=None,
-                                   provenance: str = ""):
+                                   provenance: str = "", repository_id=None,
+                                   commit_sha: Optional[str] = None,
+                                   identity_verified: int = 0,
+                                   identity_provenance: str = ""):
         self._assert_scan_building(connection, scan_id)
         existing = fetchone(connection, """
             SELECT * FROM coverage_scan_repositories
@@ -132,17 +137,25 @@ class ProjectRepository(object):
                 existing.get("repository_path") or "", existing.get("branch_name") or "",
                 existing.get("old_commit_sha"), existing.get("new_commit_sha"),
                 int(existing.get("verified") or 0), existing.get("provenance") or "",
+                existing.get("repository_id"), existing.get("commit_sha"),
+                int(existing.get("identity_verified") or 0),
+                existing.get("identity_provenance") or "",
             )
-            requested = (values[0], values[1], values[2], values[3], values[4], values[6])
+            requested = (values[0], values[1], values[2], values[3], values[4], values[6],
+                         repository_id, commit_sha, int(bool(identity_verified)),
+                         identity_provenance or "")
             if current != requested:
                 raise ValueError("repository snapshot is immutable")
             return existing
         cursor = execute(connection, """
             INSERT INTO coverage_scan_repositories(
                 scan_id, repository_name, repository_path, branch_name,
-                old_commit_sha, new_commit_sha, verified, captured_at, provenance
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (scan_id, repository_name) + values)
+                old_commit_sha, new_commit_sha, verified, captured_at, provenance,
+                repository_id, commit_sha, identity_verified, identity_provenance
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (scan_id, repository_name) + values + (
+            repository_id, commit_sha, int(bool(identity_verified)), identity_provenance or ""
+        ))
         row_id = insert_id(cursor)
         cursor.close()
         return fetchone(connection, "SELECT * FROM coverage_scan_repositories WHERE id = ?", (row_id,))

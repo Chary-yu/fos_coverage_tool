@@ -13,12 +13,20 @@ from app.db.repositories import (
     LineIndexRepository,
     ProjectRepository,
     ProjectStateRepository,
+    RepositoryRepository,
+    AnalysisDomainRepository,
 )
 from app.release_identity import generate_release_identity, get_current_release_identity
 from app.inject.service import ScanImportService
 from app.code_detail.vnext_service import VNextCodeDetailService
 from app.reports.registry import ReportRegistry
 from app.services.analysis_service import AnalysisService
+from app.services.analysis_domain_service import AnalysisDomainService
+from app.services.repository_service import RepositoryService
+from app.scan_import import (
+    ImmutableArtifactStager, ScanImportCoordinator, ScanImportRecoveryService,
+    ScanPublicationService,
+)
 from app.services.project_service import ProjectService
 from app.services.progress_service import ProgressService
 from app.services.export_service import ExportService
@@ -64,6 +72,11 @@ class VNextRuntime(object):
         self.file_states = FileStateRepository()
         self.job_repository = JobRepository()
         self.incremental_results = IncrementalRepository()
+        self.repository_repository = RepositoryRepository()
+        self.analysis_domain_repository = AnalysisDomainRepository()
+        self.repository_service = RepositoryService(self.repository_repository)
+        self.analysis_domain_service = AnalysisDomainService(self.analysis_domain_repository)
+        self.scan_publication_service = ScanPublicationService(self.states)
         # ``jobs`` remains a read/query compatibility attribute; lifecycle
         # mutations go through the durable service below.
         self.jobs = self.job_repository
@@ -86,6 +99,7 @@ class VNextRuntime(object):
         self.project_service = ProjectService(
             self.projects, self.states, self.lines,
             allowed_report_roots=report_roots,
+            repository_repo=self.repository_repository,
         )
         input_roots = []
         for root in self.config.get("input_roots") or []:
@@ -96,14 +110,34 @@ class VNextRuntime(object):
             allowed_info_roots=input_roots, allowed_report_roots=report_roots,
         )
         self.analysis_service = AnalysisService(
-            self.analyses, self.projects, self.states, self.lines
+            self.analyses, self.projects, self.states, self.lines,
+            domain_repo=self.analysis_domain_repository,
+        )
+        state_root = state_config.get("root") or os.path.join(self.repo_root, ".runtime-state")
+        if not os.path.isabs(state_root):
+            state_root = os.path.join(self.repo_root, state_root)
+        import_root = state_config.get("import_staging_dir") or os.path.join(
+            state_root, "import-staging"
+        )
+        if not os.path.isabs(import_root):
+            import_root = os.path.join(self.repo_root, import_root)
+        self.scan_import_coordinator = ScanImportCoordinator(
+            project_repository=self.projects, state_repository=self.states,
+            publication_service=self.scan_publication_service,
+            stager=None,
+        )
+        self.scan_import_staging_root = import_root
+        self.scan_import_recovery = ScanImportRecoveryService(
+            coordinator=self.scan_import_coordinator,
+            jobs=self.job_repository,
+            projects=self.projects,
+            stager=ImmutableArtifactStager(import_root),
         )
         self.progress_service = ProgressService(self.file_states, self.projects, self.states)
         self.incremental_service = IncrementalReportService(
             self.projects, self.incremental_results
         )
         self.incremental_service.allowed_roots = list(input_roots)
-        state_root = state_config.get("root") or os.path.join(self.repo_root, ".runtime-state")
         export_root = state_config.get("exports_dir") or os.path.join(state_root, "exports")
         if not os.path.isabs(export_root):
             export_root = os.path.join(self.repo_root, export_root)
@@ -133,7 +167,18 @@ class VNextRuntime(object):
             heartbeat_interval=float(job_config.get("heartbeat_interval", 15)),
             lease_owner=job_config.get("lease_owner"),
         )
-        self.recovered_jobs = self.job_service.recover()
+        # scan_import has its own checkpoint/fencing recovery owner.  The
+        # generic stale-job reaper must not silently mark those candidates
+        # interrupted before the dedicated service can validate and reclaim
+        # them.
+        self.recovered_jobs = self.job_service.recover(
+            exclude_kinds=("scan_import",)
+        )
+        self.recoverable_scan_imports = []
+        with self.connection_context(read_only=True) as recovery_connection:
+            self.recoverable_scan_imports = self.scan_import_recovery.list_recoverable(
+                recovery_connection
+            )
         try:
             self.release_identity = get_current_release_identity(self.repo_root)
         except Exception:

@@ -36,6 +36,23 @@ class MutationAuthorizer(object):
             return False, 401, "authenticated user is required"
         return True, 200, user
 
+    def authorize_role(self, headers, remote_address, required_roles):
+        if writes_are_frozen(self.repo_root, self.config):
+            return False, 503, "writes are frozen for upgrade"
+        allowed, status, identity = self.authenticate_operator(headers, remote_address)
+        if not allowed:
+            return False, status, identity
+        if str(self.auth.get("mode") or "reverse_proxy").lower() == "disabled":
+            return True, 200, identity or "anonymous"
+        role_header = self.auth.get("role_header") or "X-Remote-Role"
+        observed = str(headers.get(role_header) or "").strip().lower()
+        role_map = self.auth.get("roles") or {}
+        mapped = str(role_map.get(identity) or observed or "").strip().lower()
+        required = {str(item).lower() for item in (required_roles or [])}
+        if mapped not in required:
+            return False, 403, "role is not permitted"
+        return True, 200, identity
+
     def authorize_mutation(self, headers, remote_address):
         if writes_are_frozen(self.repo_root, self.config):
             return False, 503, "writes are frozen for upgrade"

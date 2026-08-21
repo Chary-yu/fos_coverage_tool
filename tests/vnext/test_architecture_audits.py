@@ -24,7 +24,7 @@ class ArchitectureAuditTest(unittest.TestCase):
         }
         self.assertEqual(
             transitional,
-            {"app/legacy_runtime.py", "app/incremental/legacy.py"},
+            {"app/compat/legacy_runtime_impl.py", "app/compat/incremental_impl.py"},
         )
         self.assertEqual(result["classification"]["RETIRED"], [])
 

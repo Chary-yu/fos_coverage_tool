@@ -18,6 +18,8 @@ PATTERN = re.compile(
 )
 
 COMPATIBILITY_SHIMS = [
+    "app/legacy_runtime.py",
+    "app/incremental/legacy.py",
     "enhance_coverage.py",
     "coverage_check.py",
     "code_detail_service.py",
@@ -27,12 +29,14 @@ COMPATIBILITY_SHIMS = [
 
 TRANSITIONAL_LEGACY = [
     {
-        "path": "app/legacy_runtime.py",
-        "reason": "legacy CLI/server compatibility runtime remains available for runtime_mode=legacy",
+        "path": "app/compat/legacy_runtime_impl.py",
+        "adapter": "app/legacy_runtime.py",
+        "reason": "legacy CLI/server compatibility implementation remains available behind an adapter",
     },
     {
-        "path": "app/incremental/legacy.py",
-        "reason": "legacy incremental CLI/report generation remains available for compatibility",
+        "path": "app/compat/incremental_impl.py",
+        "adapter": "app/incremental/legacy.py",
+        "reason": "legacy incremental CLI/report generation remains available behind an adapter",
     },
 ]
 

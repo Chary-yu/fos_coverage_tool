@@ -165,7 +165,7 @@ class VNextBackgroundJobService(object):
         result["lease_owner"] = self.lease_owner
         return result
 
-    def recover(self, heartbeat_timeout=None):
+    def recover(self, heartbeat_timeout=None, exclude_kinds=None):
         connection = self.connection_factory()
         try:
             with transaction(connection) as conn:
@@ -173,6 +173,7 @@ class VNextBackgroundJobService(object):
                     conn,
                     self.heartbeat_timeout if heartbeat_timeout is None else heartbeat_timeout,
                     lease_owner=self.lease_owner,
+                    exclude_kinds=exclude_kinds,
                 )
         finally:
             close = getattr(connection, "close", None)

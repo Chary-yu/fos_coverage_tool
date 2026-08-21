@@ -7,6 +7,8 @@ from app.db.repositories.line_index_repository import LineIndexRepository
 from app.db.repositories.project_repository import ProjectRepository
 from app.db.repositories.project_state_repository import ProjectStateRepository
 from app.db.repositories.incremental_repository import IncrementalRepository
+from app.db.repositories.repository_repository import RepositoryRepository
+from app.db.repositories.analysis_domain_repository import AnalysisDomainRepository
 
 __all__ = [
     "AnalysisRepository",
@@ -16,4 +18,6 @@ __all__ = [
     "ProjectRepository",
     "ProjectStateRepository",
     "IncrementalRepository",
+    "RepositoryRepository",
+    "AnalysisDomainRepository",
 ]

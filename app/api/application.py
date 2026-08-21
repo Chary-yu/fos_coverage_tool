@@ -1,6 +1,8 @@
 """VNext API application independent from the stdlib HTTP transport."""
 
 import os
+import base64
+import json
 import time
 import logging
 
@@ -16,7 +18,11 @@ from app.api.endpoints import progress as progress_endpoint
 from app.api.endpoints import projects as projects_endpoint
 from app.api.endpoints import release as release_endpoint
 from app.code_detail.source_reader import compute_db_file_path_hash
-from app.db.repositories.base import fetchall, fetchone
+from app.db.repositories.base import adapt_sql, fetchall, fetchone
+from app.inheritance.rejections import InheritanceRejectionService
+from app.scan_import import RepositoryBusyError
+from app.db.transaction import transaction
+from app.time_utils import utc_sql
 
 
 logger = logging.getLogger(__name__)
@@ -29,6 +35,7 @@ class VNextApplication(object):
         self.runtime = runtime
         self.config = config or {}
         self.authorizer = MutationAuthorizer(repo_root, self.config)
+        self.rejections = InheritanceRejectionService(runtime.states)
         self.router = Router()
         self._register_routes()
 
@@ -38,6 +45,13 @@ class VNextApplication(object):
         self.router.add("GET", r"^/api/coverage/release$", self.release)
         self.router.add("GET", r"^/api/coverage/projects$", self.projects)
         self.router.add("GET", r"^/api/coverage/projects/([^/]+)/scans$", self.scans)
+        self.router.add("GET", r"^/api/coverage/scans/([^/]+)/inheritance/pending$", self.inheritance_pending)
+        self.router.add("GET", r"^/api/coverage/scans/([^/]+)/inheritance/decisions$", self.inheritance_decisions)
+        self.router.add("POST", r"^/api/coverage/scans/([^/]+)/inheritance/confirm$", self.inheritance_confirm)
+        self.router.add("POST", r"^/api/coverage/scans/([^/]+)/inheritance/edit-confirm$", self.inheritance_edit_confirm)
+        self.router.add("POST", r"^/api/coverage/scans/([^/]+)/inheritance/reject$", self.inheritance_reject)
+        self.router.add("POST", r"^/api/coverage/scans/([^/]+)/inheritance/rejections/([^/]+)/undo$", self.inheritance_undo_rejection)
+        self.router.add("POST", r"^/api/coverage/scans/([^/]+)/inheritance/undo$", self.inheritance_undo)
         self.router.add("GET", r"^/api/coverage/progress$", self.progress)
         self.router.add("GET", r"^/api/coverage/progress/details$", self.progress_details)
         self.router.add("GET", r"^/api/coverage/progress/pending$", self.progress_pending)
@@ -74,8 +88,24 @@ class VNextApplication(object):
             return 404, {"error": "not_found", "message": "resource not found"}
         except FileNotFoundError:
             return 404, {"error": "not_found", "message": "resource not found"}
-        except ValueError:
-            return 400, {"error": "invalid_request", "message": "invalid request"}
+        except RepositoryBusyError:
+            return 409, {"error": "REPOSITORY_BUSY", "message": "repository is busy"}
+        except ValueError as exc:
+            raw_code = str(exc or "").split(":", 1)[0].strip()
+            error_map = {
+                "MUTATION_REQUIRES_CURRENT_SCAN": ("SCAN_NOT_CURRENT_FOR_MUTATION", 409),
+                "STALE_RELATION_REVISION": ("STALE_RELATION_REVISION", 409),
+                "STALE_CONTENT_REVISION": ("STALE_RECORD_REVISION", 409),
+                "STALE_REJECTION_REVISION": ("STALE_REJECTION_REVISION", 409),
+                "CURRENT_POINTER_CHANGED": ("CURRENT_POINTER_CHANGED", 409),
+                "PREDECESSOR_MISMATCH": ("INVALID_SCAN_IDENTITY", 409),
+                "READ_SET_CHANGED": ("STALE_RECORD_REVISION", 409),
+                "REJECTION_NOT_ACTIVE": ("UNDO_NOT_ALLOWED", 409),
+                "INHERITANCE_RELATION_NOT_ACTIVE": ("UNDO_NOT_ALLOWED", 409),
+                "PAGINATION_CURSOR_STALE": ("PAGINATION_CURSOR_STALE", 409),
+            }
+            code, status = error_map.get(raw_code, ("invalid_request", 400))
+            return status, {"error": code, "message": "request was rejected"}
         except PermissionError as exc:
             message = "request is not authorized"
             raw_message = str(exc)
@@ -114,6 +144,14 @@ class VNextApplication(object):
         allowed, status, identity = self.authorizer.authorize_mutation(headers, remote_address)
         if not allowed:
             raise PermissionError("{}:{}".format(status, identity))
+        return identity
+
+    def _require_role(self, headers, remote_address, roles):
+        allowed, status, identity = self.authorizer.authorize_role(
+            headers, remote_address, roles
+        )
+        if not allowed:
+            raise PermissionError("{}:role_not_permitted".format(status))
         return identity
 
     def _require_operator(self, headers, remote_address):
@@ -234,6 +272,188 @@ class VNextApplication(object):
         with self._read_connection() as connection:
             return 200, {"project_name": project_name,
                          "scans": self.runtime.project_service.list_scans(connection, project_name)}
+
+    @staticmethod
+    def _decode_cursor(value):
+        if not value:
+            return None
+        try:
+            raw = base64.urlsafe_b64decode(str(value).encode("ascii"))
+            payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict) or "id" not in payload:
+                raise ValueError
+            return int(payload["id"])
+        except Exception:
+            # Do not let malformed opaque cursors become an unbounded query.
+            raise ValueError("invalid inheritance cursor")
+
+    @staticmethod
+    def _encode_cursor(identifier):
+        if identifier is None:
+            return None
+        raw = json.dumps({"id": int(identifier)}, sort_keys=True).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii")
+
+    def _inheritance_scan(self, connection, scan_id):
+        scan = self.runtime.projects.get_scan(connection, int(scan_id))
+        if not scan:
+            raise KeyError("scan not found")
+        project = self.runtime.projects.get_project(connection, int(scan["project_id"]))
+        if not project:
+            raise KeyError("project not found")
+        return scan, project
+
+    def inheritance_pending(self, scan_id, query, body, headers, remote_address):
+        limit = min(500, max(1, int(query.get("limit") or 100)))
+        cursor = self._decode_cursor(query.get("cursor"))
+        with self._read_connection() as connection:
+            self._inheritance_scan(connection, int(scan_id))
+            clauses = ["d.candidate_scan_id=?", "d.decision='INHERITED'"]
+            params = [int(scan_id)]
+            if cursor is not None:
+                clauses.append("d.id>?" )
+                params.append(cursor)
+            rows = fetchall(connection, """
+                SELECT d.id AS decision_id, d.candidate_line_id, d.reason_code,
+                       d.algorithm_version, d.evaluated_at, l.line_number,
+                       f.file_path, f.repository_name, q.review_state,
+                       q.relation_revision, q.analysis_record_id,
+                       r.conclusion_status, r.coverage_method, r.uncovered_reason,
+                       r.comment
+                FROM coverage_inheritance_decisions d
+                JOIN coverage_lines l ON l.id=d.candidate_line_id
+                JOIN coverage_files f ON f.id=l.file_id
+                LEFT JOIN coverage_analysis_line_links q
+                  ON q.scan_id=d.candidate_scan_id AND q.line_id=d.candidate_line_id
+                 AND q.is_active=1
+                LEFT JOIN coverage_analysis_records r ON r.id=q.analysis_record_id
+                WHERE {where}
+                ORDER BY d.id LIMIT ?
+            """.format(where=" AND ".join(clauses)), params + [limit + 1])
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        return 200, {
+            "scan_id": int(scan_id), "limit": limit,
+            "items": rows, "next_cursor": self._encode_cursor(
+                rows[-1]["decision_id"] if has_more and rows else None
+            ), "has_more": has_more,
+        }
+
+    def inheritance_decisions(self, scan_id, query, body, headers, remote_address):
+        limit = min(500, max(1, int(query.get("limit") or 100)))
+        cursor = self._decode_cursor(query.get("cursor"))
+        with self._read_connection() as connection:
+            self._inheritance_scan(connection, int(scan_id))
+            clauses = ["candidate_scan_id=?"]
+            params = [int(scan_id)]
+            if cursor is not None:
+                clauses.append("id>?" )
+                params.append(cursor)
+            rows = fetchall(connection, """
+                SELECT * FROM coverage_inheritance_decisions
+                WHERE {where} ORDER BY id LIMIT ?
+            """.format(where=" AND ".join(clauses)), params + [limit + 1])
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        return 200, {"scan_id": int(scan_id), "items": rows,
+                     "next_cursor": self._encode_cursor(rows[-1]["id"] if has_more and rows else None),
+                     "has_more": has_more}
+
+    def _current_scan_context(self, connection, scan_id):
+        scan, project = self._inheritance_scan(connection, scan_id)
+        state = self.runtime.states.get(connection, int(project["id"])) or {}
+        if int(state.get("current_scan_id") or 0) != int(scan_id):
+            raise ValueError("MUTATION_REQUIRES_CURRENT_SCAN")
+        return scan, project
+
+    def inheritance_confirm(self, scan_id, query, body, headers, remote_address):
+        identity = self._require_role(headers, remote_address, ("reviewer", "admin"))
+        values = body or {}
+        selected = values.get("selected_line_ids") or [values.get("line_id")]
+        selected = [int(item) for item in selected if item]
+        expected_map = values.get("expected_relation_revisions") or {}
+        if not selected:
+            raise ValueError("line_id and expected_relation_revision are required")
+        if len(selected) > 500:
+            raise ValueError("selected_line_ids exceeds limit")
+        with self._write_connection() as connection:
+            with transaction(connection) as conn:
+                scan, project = self._current_scan_context(conn, scan_id)
+                results = []
+                for line_id in selected:
+                    expected = int(expected_map.get(str(line_id),
+                                      expected_map.get(line_id,
+                                      values.get("expected_relation_revision") or 0)) or 0)
+                    if not expected:
+                        raise ValueError("line_id and expected_relation_revision are required")
+                    relation = fetchone(conn, """
+                        SELECT * FROM coverage_analysis_line_links
+                        WHERE scan_id=? AND line_id=? AND is_active=1
+                    """, (int(scan_id), line_id))
+                    if not relation or int(relation.get("relation_revision") or 0) != expected:
+                        raise ValueError("STALE_RELATION_REVISION")
+                    if relation.get("review_state") not in (
+                            "INHERITED_PENDING", "CARRIED_COVERED"):
+                        raise ValueError("INHERITANCE_RELATION_NOT_ACTIVE")
+                    cursor = conn.cursor()
+                    cursor.execute(adapt_sql(conn,
+                        "UPDATE coverage_analysis_line_links SET review_state='MANUAL_CONFIRMED', "
+                        "reviewed_by=?, reviewed_at=?, relation_revision=relation_revision+1, "
+                        "updated_at=? WHERE id=? AND relation_revision=? AND is_active=1"),
+                        (identity, utc_sql(), utc_sql(), relation["id"], expected))
+                    if int(getattr(cursor, "rowcount", 0) or 0) != 1:
+                        cursor.close()
+                        raise ValueError("STALE_RELATION_REVISION")
+                    cursor.close()
+                    results.append({"line_id": line_id, "review_state": "MANUAL_CONFIRMED"})
+                self.runtime.states.advance(conn, int(project["id"]))
+            return 200, {"scan_id": int(scan_id), "items": results,
+                         "reviewed_by": identity}
+
+    def inheritance_edit_confirm(self, scan_id, query, body, headers, remote_address):
+        identity = self._require_role(headers, remote_address, ("reviewer", "admin"))
+        with self._write_connection() as connection:
+            scan, project = self._current_scan_context(connection, scan_id)
+            records = (body or {}).get("records") or []
+            if not records:
+                raise ValueError("records are required")
+            result = self.runtime.analysis_service.save(
+                connection, project["project_name"], int(scan_id), records,
+                reviewer=(body or {}).get("reviewer") or identity,
+            )
+        return 200, result
+
+    def inheritance_reject(self, scan_id, query, body, headers, remote_address):
+        identity = self._require_role(headers, remote_address, ("reviewer", "admin"))
+        line_id = int((body or {}).get("line_id") or 0)
+        expected = int((body or {}).get("expected_relation_revision") or 0)
+        with self._write_connection() as connection:
+            scan, project = self._current_scan_context(connection, scan_id)
+            rejection = self.rejections.reject(
+                connection, project["id"], int(scan_id), line_id, identity, expected
+            )
+        return 200, {"rejection": rejection}
+
+    def inheritance_undo(self, scan_id, query, body, headers, remote_address):
+        identity = self._require_role(headers, remote_address, ("reviewer", "admin"))
+        del identity
+        with self._write_connection() as connection:
+            scan, project = self._current_scan_context(connection, scan_id)
+            rejection = self.rejections.undo(
+                connection, project["id"], int(scan_id), int((body or {}).get("line_id") or 0),
+                int((body or {}).get("rejection_id") or 0),
+                int((body or {}).get("expected_rejection_revision") or 0),
+                int((body or {}).get("expected_relation_revision") or 0),
+            )
+        return 200, {"rejection": rejection}
+
+    def inheritance_undo_rejection(self, scan_id, rejection_id, query, body,
+                                   headers, remote_address):
+        values = dict(body or {})
+        values["rejection_id"] = int(rejection_id)
+        return self.inheritance_undo(
+            scan_id, query, values, headers, remote_address
+        )
 
     def progress(self, query, body, headers, remote_address):
         project_name = progress_endpoint.project_name(query, self.config.get("project_name") or "")
@@ -400,18 +620,40 @@ class VNextApplication(object):
             return 201, {"project": row}
 
     def create_scan(self, query, body, headers, remote_address):
-        self._require_mutation(headers, remote_address)
+        identity = self._require_role(headers, remote_address, ("importer", "admin"))
         project_name = projects_endpoint.project_name(body)
         with self._write_connection() as connection:
             if body.get("info_path"):
-                result = self.runtime.scan_import_service.import_info(
+                repositories = [dict(item or {}) for item in (body.get("repositories") or [])]
+                resource_ids = []
+                for repository in repositories:
+                    resource_id = repository.get("physical_resource_id")
+                    repository_path = repository.get("repository_path") or ""
+                    if resource_id is None and repository_path:
+                        resolved = self.runtime.repository_repository.resolve_git_resource(
+                            repository_path
+                        )
+                        resource = self.runtime.repository_repository.ensure_resource(
+                            connection, resolved["common_dir"], resolved["worktree_root"],
+                            fs_stat=resolved["stat"],
+                        )
+                        resource_id = resource["id"]
+                        repository["physical_resource_id"] = resource_id
+                    if resource_id is None:
+                        raise ValueError("physical repository resource is required")
+                    resource_ids.append(int(resource_id))
+                durable = self.runtime.scan_import_coordinator.create(
                     connection, project_name, body["info_path"],
+                    info_sha256=body.get("info_sha256", ""),
+                    repository_resource_ids=resource_ids,
+                    repositories=repositories,
                     review_scope=body.get("review_scope", "full"),
-                    repositories=body.get("repositories") or [],
                     report=body.get("report"),
-                    info_file_name=body.get("info_file_name", ""),
+                    requested_by=identity,
+                    staging_root=self.runtime.scan_import_staging_root,
+                    algorithm_version=body.get("algorithm_version", "vnext-import-v1"),
                 )
-                return 201, result
+                return 202, durable
             scan = self.runtime.project_service.create_scan(
                 connection, project_name,
                 info_file_name=body.get("info_file_name", ""),
@@ -423,7 +665,7 @@ class VNextApplication(object):
             return 201, {"scan": scan}
 
     def save_analysis(self, query, body, headers, remote_address):
-        identity = self._require_mutation(headers, remote_address)
+        identity = self._require_role(headers, remote_address, ("reviewer", "admin"))
         project_name, scan_id, records = analysis_endpoint.request(body)
         with self._write_connection() as connection:
             result = self.runtime.analysis_service.save(

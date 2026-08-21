@@ -38,7 +38,10 @@ def _check(name, paths, patterns):
 
 def audit():
     checks = [
-        _check("vnext_bootstrap_api", ["enhance_coverage.py", "app/legacy_runtime.py", "app/bootstrap.py", "app/api/handler.py"], [
+        _check("vnext_bootstrap_api", [
+            "enhance_coverage.py", "app/bootstrap.py", "app/config/runtime_config.py",
+            "app/api/handler.py",
+        ], [
             r"runtime_mode",
             r"create_vnext_server",
             r"class VNextHTTPRequestHandler",
@@ -109,7 +112,7 @@ def audit():
             r"parse_once = staticmethod",
             r"class ParsedSourceArtifact",
         ]),
-        _check("directory_signature", ["app/legacy_runtime.py", "app/inject/directory_signature.py"], [
+        _check("directory_signature", ["app/compat/legacy_runtime_impl.py", "app/inject/directory_signature.py"], [
             r"from app\.inject\.directory_signature import calculate_directory_signature_incremental",
             r"calculate_directory_signature_incremental\(",
             r"manifest_path=manifest_path",
