@@ -116,6 +116,23 @@ backup workflow 会把这两个值和 attestation 时间写入 manifest；未设
 
 仓库内的 `parser_toolchain_preflight` 在没有真实 helper 时会保持 `INCOMPLETE`，不能通过设置环境变量把 builtin parser 伪装成生产 parser。
 
+目标主机上的 parser 应通过同一版本化 JSON adapter 执行 corpus；例如：
+
+```bash
+python3 scripts/diagnostics/deterministic_inheritance_corpus.py \
+  --fixture tests/fixtures/inheritance_deterministic_corpus.json \
+  --adapter json-cli-v1 \
+  --command '/opt/coverage/bin/coverage-cpp-parser' \
+  --require-external \
+  --output /secure/evidence/gate-d/deterministic-corpus-run.json
+```
+
+该命令会先验证 executable、版本、binary SHA 和 `coverage-cpp-parser-v1`
+协议 smoke test，再用外部 adapter 执行与本地相同的 decision corpus。输出本身
+仍是 parser-run artifact（`release_eligible=false`），必须由取证流程再包装为带
+exact candidate revision、主机身份、命令、时间戳和 artifact SHA 的 Gate D evidence；
+helper 失败时不得回退到 builtin parser。
+
 ## Gate E：浏览器功能与跨层性能分开取证
 
 浏览器功能证据必须来自真实 HTTP + Chromium，并保存 route/network/console/report artifact。性能证据必须另外保存 DB query/row 计数、Sidecar decode 计数、expand p95、峰值 RSS、100k virtual-scroll resident lines 和环境身份。只有浏览器功能绿而缺少跨层指标时，Gate E 仍是 `INCOMPLETE`；不得用 `--allow-partial` 结果作为 release performance PASS。

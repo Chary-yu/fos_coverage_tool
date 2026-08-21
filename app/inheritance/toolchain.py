@@ -53,7 +53,9 @@ class ExternalJsonCppParserAdapter(CppParserAdapter):
     It must write one JSON object to stdout.  The object may be the analysis
     itself or ``{"protocol": ..., "analysis": ...}``.  Function entries use
     ``scope``, ``name``, ``parameters``, ``qualifiers``, ``trailing_return``,
-    ``start_line`` and ``end_line``.  Context maps are keyed by physical line.
+    ``start_line`` and ``end_line``.  Control/preprocessor/call maps are keyed
+    by physical line.  Macro and constant maps are keyed by definition name
+    and contain ``[definition_line, normalized_tokens]``.
     """
 
     adapter_name = "json-cli-v1"
@@ -135,6 +137,50 @@ def _line_map(value, field_name):
     return result
 
 
+def _definition_map(value, field_name):
+    """Canonicalize name-keyed macro/constant definitions.
+
+    These maps intentionally do not use :func:`_line_map`: the dependency
+    resolver indexes definitions by symbol name and retains the defining line
+    as part of the value.  Treating the symbol name as a line number would
+    make a valid external parser look malformed only when a macro/constant is
+    present.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ParserAdapterError(
+            "{} must be an object keyed by definition name".format(field_name)
+        )
+    result = {}
+    for key, item in value.items():
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ParserAdapterError(
+                "{} definition '{}' must contain line and tokens".format(
+                    field_name, key
+                )
+            )
+        try:
+            line_number = int(item[0])
+        except (TypeError, ValueError):
+            raise ParserAdapterError(
+                "{} definition '{}' has an invalid line".format(
+                    field_name, key
+                )
+            )
+        if line_number < 1:
+            raise ParserAdapterError(
+                "{} definition '{}' has an invalid line".format(
+                    field_name, key
+                )
+            )
+        result[str(key)] = (line_number, _as_tuple(
+            item[1], "{} definition '{}' tokens".format(field_name, key),
+            allow_string=True,
+        ))
+    return result
+
+
 def _canonicalize_analysis(payload, path):
     """Convert helper JSON into the exact objects used by InheritanceEngine."""
     if not isinstance(payload, dict):
@@ -174,8 +220,8 @@ def _canonicalize_analysis(payload, path):
         "functions": functions,
         "controls": _line_map(payload.get("controls"), "controls"),
         "preprocessor": _line_map(payload.get("preprocessor"), "preprocessor"),
-        "macros": _line_map(payload.get("macros"), "macros"),
-        "constants": _line_map(payload.get("constants"), "constants"),
+        "macros": _definition_map(payload.get("macros"), "macros"),
+        "constants": _definition_map(payload.get("constants"), "constants"),
         "calls": _line_map(payload.get("calls"), "calls"),
         "lines": list(payload.get("lines") or []),
         "tokens": list(payload.get("tokens") or []),

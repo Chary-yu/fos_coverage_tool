@@ -19,7 +19,10 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from app.inheritance.cpp_parser import CppSourceAnalyzer
+from app.inheritance.toolchain import (
+    PARSER_PROTOCOL_VERSION, ParserAdapterError, create_parser_adapter,
+    parser_toolchain_preflight,
+)
 from app.inheritance.dependencies import SourceAnalysisIndex
 from app.inheritance.engine import InheritanceEngine
 from app.inheritance.line_map import GitLineMapEngine
@@ -160,9 +163,84 @@ def _line_map_case(case, mapper):
     }
 
 
-def run(fixture_path=DEFAULT_FIXTURE):
+def _select_parser(command=None, adapter_name="builtin-conservative",
+                   require_external=False):
+    """Select the corpus parser and run the production preflight when needed.
+
+    The repository-local parser remains the compatibility/default backend.  A
+    requested external backend must pass the same executable, version, binary
+    hash and protocol smoke checks used by the runtime; it is never silently
+    replaced by the builtin parser.
+    """
+    adapter_name = str(adapter_name or "builtin-conservative")
+    external_requested = bool(require_external or
+                              adapter_name != "builtin-conservative")
+    preflight = parser_toolchain_preflight(
+        command=command,
+        adapter_name=adapter_name,
+        require_external=external_requested,
+    )
+    if external_requested and preflight.get("status") != "PASSED":
+        raise ParserAdapterError(
+            "parser toolchain preflight failed: {}".format(
+                "; ".join(preflight.get("violations") or [])
+            )
+        )
+    parser = create_parser_adapter(
+        command=command,
+        adapter_name=adapter_name,
+        require_external=external_requested,
+    )
+    return parser, preflight, external_requested
+
+
+def _error_result(fixture, fixture_path, parser_toolchain, error,
+                  parser_backend=""):
+    case_count = len(fixture.get("cases") or [])
+    return {
+        "schema_version": 1,
+        "corpus_name": fixture.get("name"),
+        "fixture_sha256": _sha256_file(fixture_path),
+        "status": "FAILED",
+        "synthetic": True,
+        "release_eligible": False,
+        "parser_backend": parser_backend,
+        "parser_external": False,
+        "parser_protocol": PARSER_PROTOCOL_VERSION,
+        "parser_toolchain": parser_toolchain,
+        "cases_total": case_count,
+        "passed_cases": 0,
+        "failed_cases": case_count,
+        "errors": [{"case_id": None, "error": str(error)}],
+        "reason_counts": {"PARSER_TOOLCHAIN_FAILURE": 1},
+        "parser_uncertainty_cases": [],
+        "dependency_cases": [],
+        "decisions": [],
+    }
+
+
+def run(fixture_path=DEFAULT_FIXTURE, command=None,
+        adapter_name="builtin-conservative", require_external=False):
     fixture = _load_fixture(fixture_path)
-    analyzer = CppSourceAnalyzer()
+    try:
+        analyzer, parser_toolchain, parser_external = _select_parser(
+            command=command,
+            adapter_name=adapter_name,
+            require_external=require_external,
+        )
+    except (OSError, ParserAdapterError, TypeError, ValueError) as exc:
+        return _error_result(
+            fixture, fixture_path,
+            parser_toolchain={
+                "status": "FAILED",
+                "backend": str(adapter_name or "builtin-conservative"),
+                "protocol": PARSER_PROTOCOL_VERSION,
+                "production_ready": False,
+                "violations": [str(exc)],
+            },
+            error=exc,
+            parser_backend=str(adapter_name or "builtin-conservative"),
+        )
     engine = InheritanceEngine(parser=analyzer)
     mapper = GitLineMapEngine()
     decisions = []
@@ -198,8 +276,14 @@ def run(fixture_path=DEFAULT_FIXTURE):
         "corpus_name": fixture.get("name"),
         "fixture_sha256": _sha256_file(fixture_path),
         "status": "PASSED" if not errors and not failed else "FAILED",
-        "synthetic": True,
+        "synthetic": not parser_external,
         "release_eligible": False,
+        "parser_backend": str(getattr(analyzer, "adapter_name", "") or
+                               ("external" if parser_external else
+                                "builtin-conservative")),
+        "parser_external": bool(parser_external),
+        "parser_protocol": PARSER_PROTOCOL_VERSION,
+        "parser_toolchain": parser_toolchain,
         "cases_total": len(decisions),
         "passed_cases": len(decisions) - len(failed),
         "failed_cases": len(failed),
@@ -223,7 +307,7 @@ def derived_reports(result):
     return {
         "false_positive_check": {
             "status": "PASSED" if not false_positives else "FAILED",
-            "synthetic": True,
+            "synthetic": bool(result.get("synthetic", True)),
             "release_eligible": False,
             "known_false_positive_count": len(false_positives),
             "cases": false_positives,
@@ -232,15 +316,18 @@ def derived_reports(result):
             "status": "PASSED" if all(
                 not item.get("observed_ok") for item in parser_cases
             ) else "FAILED",
-            "synthetic": True,
+            "synthetic": bool(result.get("synthetic", True)),
             "release_eligible": False,
+            "parser_backend": result.get("parser_backend", ""),
+            "parser_external": bool(result.get("parser_external", False)),
+            "parser_toolchain": result.get("parser_toolchain") or {},
             "uncertain_case_count": len(parser_cases),
             "cases": parser_cases,
         },
         "dependency_resolution_report": {
             "status": "PASSED" if all(item.get("passed") for item in dependency_cases)
             else "FAILED",
-            "synthetic": True,
+            "synthetic": bool(result.get("synthetic", True)),
             "release_eligible": False,
             "case_count": len(dependency_cases),
             "cases": dependency_cases,
@@ -260,9 +347,23 @@ def write_result(result, output_path):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", default=DEFAULT_FIXTURE)
+    parser.add_argument(
+        "--command", default="",
+        help="external parser command; required with a non-builtin adapter",
+    )
+    parser.add_argument("--adapter", default="builtin-conservative")
+    parser.add_argument(
+        "--require-external", action="store_true",
+        help="fail unless an external parser passes toolchain preflight",
+    )
     parser.add_argument("--output")
     args = parser.parse_args(argv)
-    result = run(os.path.abspath(args.fixture))
+    result = run(
+        os.path.abspath(args.fixture),
+        command=args.command or None,
+        adapter_name=args.adapter,
+        require_external=args.require_external,
+    )
     if args.output:
         write_result(result, args.output)
     print(json.dumps(result, sort_keys=True, indent=2, ensure_ascii=False))
