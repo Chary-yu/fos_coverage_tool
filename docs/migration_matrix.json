@@ -1,0 +1,50 @@
+{
+  "schema_version": 2,
+  "contract_id": "legacy-to-vnext-migration-v2",
+  "source": {
+    "engine": "legacy-compatible MySQL/MariaDB schema",
+    "fixture": "tests/fixtures/legacy_schema_mariadb55.sql",
+    "identity_policy": "legacy ids remain provenance only until target identity is resolved"
+  },
+  "target": {
+    "core_schema": "scripts/upgrade/vnext_schema.sql",
+    "domain_schema": "scripts/upgrade/vnext_domain_constraints.sql",
+    "database_policy": "never migrate in place when source and target database identities are equal"
+  },
+  "mappings": [
+    {
+      "source_table": "coverage_analysis",
+      "target_tables": ["coverage_analysis_records", "coverage_analysis_line_links", "coverage_legacy_provenance"],
+      "loss_policy": "preserve content/status/raw fields; do not invent a human Block"
+    },
+    {
+      "source_table": "coverage_line_index",
+      "target_tables": ["coverage_repositories", "coverage_scan_repositories", "coverage_files", "coverage_lines", "coverage_legacy_provenance"],
+      "loss_policy": "preserve repository/file/line identity and source path provenance"
+    },
+    {
+      "source_table": "coverage_project_state",
+      "target_tables": ["coverage_projects", "coverage_project_state"],
+      "loss_policy": "preserve current pointer only through PublicationService authority"
+    },
+    {
+      "source_table": "coverage_background_jobs",
+      "target_tables": ["coverage_background_jobs", "coverage_legacy_provenance"],
+      "loss_policy": "queued/running/interrupted becomes interrupted with durable anomaly provenance"
+    }
+  ],
+  "required_rehearsals": [
+    "Legacy Source to empty VNext Target",
+    "verified backup restore to empty target",
+    "semantic snapshot conservation",
+    "idempotent second migration",
+    "domain backfill and orphan checks",
+    "MariaDB 5.5 compatibility"
+  ],
+  "result_policy": {
+    "source_target_semantic_hash_mismatch": "BLOCKED",
+    "technical_failure": "BLOCKED",
+    "unverified_legacy_identity": "preserve provenance and fail closed",
+    "synthetic_fixture": "local regression only; never production PASS"
+  }
+}

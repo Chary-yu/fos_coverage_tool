@@ -13,6 +13,7 @@ from scripts.diagnostics.configured_runtime_audit import audit as audit_configur
 from scripts.diagnostics.frontend_vnext_api_contract_audit import audit as audit_frontend
 from scripts.diagnostics.scan_immutability_audit import audit as audit_immutability
 from scripts.diagnostics.legacy_retirement_audit import audit as audit_legacy_retirement
+from scripts.diagnostics.contract_artifact_audit import audit as audit_contract_artifacts
 from scripts.diagnostics.changed_test_selection import DiffResolutionError, changed_files, select
 from scripts.diagnostics.performance_evidence_audit import audit as audit_performance
 
@@ -72,6 +73,13 @@ class ArchitectureAuditTest(unittest.TestCase):
             changed_files(os.getcwd(), head="revision-does-not-exist")
         self.assertIn("tests.vnext.test_vnext_runtime", select([]))
 
+    def test_changed_test_selection_covers_inheritance_owners(self):
+        inheritance = select(["app/inheritance/engine.py"])
+        self.assertIn("tests.vnext.test_inheritance_engine", inheritance)
+        self.assertIn("tests.vnext.test_deterministic_inheritance_corpus", inheritance)
+        review = select(["app/services/inheritance_review_service.py"])
+        self.assertIn("tests.vnext.test_api_export_security", review)
+
     def test_cross_layer_performance_gate_rejects_browser_only_evidence(self):
         payload = {
             "coverage_virtual_scroll_100k": {
@@ -101,6 +109,7 @@ class ArchitectureAuditTest(unittest.TestCase):
             self.assertEqual(result["status"], "FAILED")
             self.assertEqual(result["browser_status"], "FAILED")
         self.assertEqual(audit_frontend(os.getcwd())["status"], "PASSED")
+        self.assertEqual(audit_contract_artifacts(os.getcwd())["status"], "PASSED")
         self.assertEqual(audit_immutability()["status"], "PASSED")
 
 

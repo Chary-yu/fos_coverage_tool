@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "contract_id": "deterministic-inheritance-v1",
+  "algorithm_version": "inheritance-v1",
+  "authoritative_rules_contract": "contracts/inheritance_rules_v1.json",
+  "decision_ledger": {
+    "required_identity": [
+      "decision_run_id",
+      "candidate_scan_id",
+      "candidate_line_id",
+      "algorithm_version",
+      "reason_code"
+    ],
+    "inherit_decision": "INHERITED",
+    "ordinary_no_inherit_decision": "NO_INHERIT",
+    "unknown_or_ambiguous_policy": "fail_closed_to_ordinary_pending"
+  },
+  "reason_code_groups": {
+    "line_mapping": [
+      "LINE_DELETED",
+      "LINE_AMBIGUOUS",
+      "LINE_DELETED_REINTRODUCED",
+      "LINE_CODE_CHANGED"
+    ],
+    "parser_and_function": [
+      "FUNCTION_ID_UNRESOLVED",
+      "FUNCTION_CHANGED",
+      "PARSER_UNRELIABLE",
+      "UNSUPPORTED_LANGUAGE"
+    ],
+    "context": [
+      "CONTROL_CONTEXT_CHANGED",
+      "PP_CONTEXT_CHANGED"
+    ],
+    "dependency": [
+      "CALLEE_CHANGED",
+      "CALLEE_UNRESOLVED",
+      "MACRO_CHANGED",
+      "CONST_CHANGED"
+    ],
+    "relation_and_review": [
+      "BLOCK_AMBIGUOUS",
+      "BLOCK_FORK_OR_MERGE",
+      "REJECTION_ACTIVE",
+      "INHERITED_PENDING",
+      "CARRIED_COVERED",
+      "MANUAL_DRAFT"
+    ]
+  },
+  "evaluation_order": [
+    "immutable_git_snapshot",
+    "exact_repository_and_file_identity",
+    "deterministic_line_mapping",
+    "normalized_line_tokens",
+    "function_identity",
+    "control_context",
+    "preprocessor_context",
+    "macro_and_constant_dependencies",
+    "same_repository_callee_dependencies",
+    "block_identity_and_rejection_chain",
+    "decision_ledger"
+  ],
+  "cache_identity": ["repository_id", "commit_sha", "file_path", "blob_sha"],
+  "invariants": [
+    "inherited_pending_is_not_confirmed",
+    "ordinary_no_inherit_does_not_create_a_technical_failure",
+    "technical_failure_blocks_candidate_publication",
+    "each_non_inherited_candidate_has_an_explicit_reason_code",
+    "repeated_identical_input_produces_identical_decisions",
+    "current_scan_review_mutations_are_revision_bound"
+  ],
+  "production_evidence": {
+    "requires_target_host_parser_preflight": true,
+    "requires_real_git_snapshot": true,
+    "requires_real_database_decision_ledger": true,
+    "synthetic_corpus_is_release_eligible": false
+  }
+}

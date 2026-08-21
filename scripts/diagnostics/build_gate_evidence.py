@@ -24,6 +24,11 @@ from app.release_identity import generate_release_identity
 from app.time_utils import utc_iso
 from scripts.diagnostics.gate_matrix import build as build_gate_matrix
 from scripts.diagnostics.contract import with_contract
+from scripts.diagnostics.deterministic_inheritance_corpus import (
+    DEFAULT_FIXTURE as DETERMINISTIC_FIXTURE,
+    derived_reports as deterministic_derived_reports,
+    run as run_deterministic_corpus,
+)
 from scripts.upgrade.domain_migration import apply_analysis_domain
 from scripts.upgrade.evidence_manifest import EvidenceManifestV2
 from scripts.upgrade.legacy_fixture import create_legacy_fixture_schema, seed_legacy_fixture
@@ -82,6 +87,7 @@ GATE_FILES = {
 # from a hashable file artifact.
 GATE_DIRECTORIES = {
     "E": ("playwright_report",),
+    "F": ("fresh_inventory",),
 }
 
 TEST_GROUPS = {
@@ -90,6 +96,7 @@ TEST_GROUPS = {
     "C": ["tests.vnext.test_scan_import_lifecycle", "tests.vnext.test_jobs"],
     "D": [
         "tests.vnext.test_inheritance_engine",
+        "tests.vnext.test_deterministic_inheritance_corpus",
         "tests.vnext.test_parser_toolchain",
         "tests.vnext.test_analysis_domain",
         "tests.vnext.test_scan_import_lifecycle",
@@ -250,17 +257,11 @@ def build(repo_root, output_root, run_tests=True):
     fixture_source = os.path.join(repo_root, "tests", "fixtures",
                                   "legacy_schema_mariadb55.sql")
     vnext_schema = os.path.join(repo_root, "scripts", "upgrade", "vnext_schema.sql")
-    migration_matrix = {
-        "version": "legacy-migration-v2",
-        "source_tables": {
-            "coverage_analysis": "coverage_analyses + coverage_legacy_provenance",
-            "coverage_line_index": "coverage_files + coverage_lines + provenance",
-            "coverage_project_state": "coverage_projects + coverage_project_state",
-            "coverage_background_jobs": "coverage_background_jobs + provenance",
-        },
-        "active_job_policy": "queued/running/interrupted -> interrupted with anomaly",
-        "result_path_policy": "provenance-only until allowed-root revalidation",
-    }
+    migration_matrix_path = os.path.join(
+        repo_root, "docs", "migration_matrix.json"
+    )
+    with open(migration_matrix_path, "r", encoding="utf-8") as stream:
+        migration_matrix = json.load(stream)
 
     for gate in "ABCDEF":
         gate_dir = os.path.join(output_root, "gate-{}".format(gate.lower()))
@@ -358,25 +359,54 @@ def build(repo_root, output_root, run_tests=True):
         elif gate == "D":
             rules = matrix["gates"]["D"]["local_checks"][0]
             parser = matrix["gates"]["D"]["local_checks"][1]
+            corpus_run_1 = run_deterministic_corpus(DETERMINISTIC_FIXTURE)
+            corpus_run_2 = run_deterministic_corpus(DETERMINISTIC_FIXTURE)
+            corpus_reports = deterministic_derived_reports(corpus_run_1)
+            corpus_hash_1 = hashlib.sha256(json.dumps(
+                corpus_run_1, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")).hexdigest()
+            corpus_hash_2 = hashlib.sha256(json.dumps(
+                corpus_run_2, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=False,
+            ).encode("utf-8")).hexdigest()
             _write(os.path.join(gate_dir, "rule_traceability.json"), rules)
             _write(os.path.join(gate_dir, "reason_code_catalog.json"), {
                 "status": "PASSED", "source": "contracts/inheritance_rules_v1.json",
             })
             _write(os.path.join(gate_dir, "deterministic_fixture_manifest.json"), {
                 "status": "INCOMPLETE", "synthetic": True,
-                "reason": "generated corpus is auxiliary until target parser/toolchain is verified",
+                "release_eligible": False,
+                "fixture_path": os.path.relpath(DETERMINISTIC_FIXTURE, repo_root),
+                "fixture_sha256": corpus_run_1.get("fixture_sha256"),
+                "local_result_status": corpus_run_1.get("status"),
+                "cases_total": corpus_run_1.get("cases_total"),
+                "passed_cases": corpus_run_1.get("passed_cases"),
+                "failed_cases": corpus_run_1.get("failed_cases"),
+                "reason": "local corpus is synthetic until target parser/toolchain is verified",
             })
-            _write(os.path.join(gate_dir, "decisions_run_1.json"), _missing(
-                "decision_run", "production deterministic corpus is external"))
-            _write(os.path.join(gate_dir, "decisions_run_2.json"), _missing(
-                "decision_run", "production deterministic corpus is external"))
-            _write(os.path.join(gate_dir, "determinism_diff.json"), _missing(
-                "determinism_diff", "two independent production corpus runs are external"))
-            _write(os.path.join(gate_dir, "false_positive_check.json"), _missing(
-                "false_positive_check", "verified production corpus is external"))
-            _write(os.path.join(gate_dir, "parser_uncertainty_report.json"), parser)
-            _write(os.path.join(gate_dir, "dependency_resolution_report.json"), _missing(
-                "dependency_resolution_report", "same-repository production dependency evidence is external"))
+            _write(os.path.join(gate_dir, "decisions_run_1.json"), corpus_run_1)
+            _write(os.path.join(gate_dir, "decisions_run_2.json"), corpus_run_2)
+            _write(os.path.join(gate_dir, "determinism_diff.json"), {
+                "status": "PASSED" if corpus_hash_1 == corpus_hash_2 else "FAILED",
+                "synthetic": True,
+                "release_eligible": False,
+                "run_1_sha256": corpus_hash_1,
+                "run_2_sha256": corpus_hash_2,
+                "different": corpus_hash_1 != corpus_hash_2,
+            })
+            _write(os.path.join(gate_dir, "false_positive_check.json"),
+                   corpus_reports["false_positive_check"])
+            parser_report = dict(corpus_reports["parser_uncertainty_report"])
+            parser_report["toolchain_preflight"] = parser
+            parser_report["local_corpus_status"] = parser_report.get("status")
+            parser_report["production_preflight_status"] = parser.get("status")
+            if parser.get("status") != "PASSED":
+                parser_report["status"] = "INCOMPLETE"
+            _write(os.path.join(gate_dir, "parser_uncertainty_report.json"),
+                   parser_report)
+            _write(os.path.join(gate_dir, "dependency_resolution_report.json"),
+                   corpus_reports["dependency_resolution_report"])
         elif gate == "E":
             _write(os.path.join(gate_dir, "api_contract.json"),
                    matrix["gates"]["E"]["local_checks"][0])
@@ -410,6 +440,8 @@ def build(repo_root, output_root, run_tests=True):
                 "database_runtime_identity", "final target DB identity is external"))
             _write(os.path.join(gate_dir, "candidate_layout.json"), _missing(
                 "candidate_layout", "fresh dual-environment inventory is external"))
+            _write(os.path.join(gate_dir, "fresh_inventory", "summary.json"), _missing(
+                "fresh_inventory", "fresh production inventory is external"))
             _write(os.path.join(gate_dir, "candidate_config_audit.json"),
                    matrix["gates"]["F"]["local_checks"][0])
             for name, reason in {
@@ -446,6 +478,10 @@ def build(repo_root, output_root, run_tests=True):
             # The contract names the Playwright report as a directory, while
             # the manifest still needs one concrete, hashable report artifact.
             manifest_files.append(os.path.join("playwright_report", "summary.json"))
+        if gate == "F":
+            # The contract names fresh_inventory as a directory; retain one
+            # concrete, hashable summary artifact in the manifest.
+            manifest_files.append(os.path.join("fresh_inventory", "summary.json"))
         for name in manifest_files:
             path = os.path.join(gate_dir, name)
             if not os.path.isfile(path):
@@ -455,6 +491,9 @@ def build(repo_root, output_root, run_tests=True):
                 "anomalies.json", "migration_run_1.json", "migration_run_2_idempotency.json",
                 "analysis_backfill_before.json", "analysis_backfill_after.json",
                 "analysis_semantic_hashes.json", "deterministic_fixture_manifest.json",
+                "decisions_run_1.json", "decisions_run_2.json", "determinism_diff.json",
+                "false_positive_check.json", "parser_uncertainty_report.json",
+                "dependency_resolution_report.json",
             }
             status = "PASSED" if name == "targeted_tests.txt" and tests["status"] == "PASSED" else "INCOMPLETE"
             payload = None

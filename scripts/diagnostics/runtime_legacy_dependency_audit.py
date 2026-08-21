@@ -43,8 +43,10 @@ TRANSITIONAL_LEGACY = [
 CANONICAL_ONLY = [
     "app/bootstrap.py",
     "app/api/application.py",
+    "app/api/endpoints/inheritance.py",
     "app/services/project_service.py",
     "app/services/analysis_service.py",
+    "app/services/inheritance_review_service.py",
     "app/services/progress_service.py",
     "app/services/incremental_service.py",
     "app/incremental/orchestrator.py",

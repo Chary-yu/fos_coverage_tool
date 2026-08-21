@@ -1,0 +1,188 @@
+{
+  "schema_version": 1,
+  "name": "vnext-inheritance-deterministic-corpus-v1",
+  "description": "Small deterministic corpus for line mapping, parser/context and dependency fail-closed decisions.",
+  "cases": [
+    {
+      "case_id": "D-CORP-01-comment-only",
+      "kind": "compare",
+      "path": "src/basic.cpp",
+      "old_source": "int f() {\n return 1;\n}\n",
+      "new_source": "int f() {\n // documentation only\n return 1;\n}\n",
+      "old_line": 2,
+      "new_line": 3,
+      "expected_ok": true,
+      "expected_reason_code": "INHERITED"
+    },
+    {
+      "case_id": "D-CORP-02-token-change",
+      "kind": "compare",
+      "path": "src/basic.cpp",
+      "old_source": "int f() {\n return 1;\n}\n",
+      "new_source": "int f() {\n return 2;\n}\n",
+      "old_line": 2,
+      "new_line": 2,
+      "expected_ok": false,
+      "expected_reason_code": "LINE_CODE_CHANGED"
+    },
+    {
+      "case_id": "D-CORP-03-function-identity",
+      "kind": "compare",
+      "path": "src/basic.cpp",
+      "old_source": "int f() {\n return 1;\n}\n",
+      "new_source": "int g() {\n return 1;\n}\n",
+      "old_line": 2,
+      "new_line": 2,
+      "expected_ok": false,
+      "expected_reason_code": "FUNCTION_CHANGED"
+    },
+    {
+      "case_id": "D-CORP-04-control-context",
+      "kind": "compare",
+      "path": "src/basic.cpp",
+      "old_source": "int f(int x) {\n if (x) {\n return 1;\n }\n}\n",
+      "new_source": "int f(int x) {\n if (x > 0) {\n return 1;\n }\n}\n",
+      "old_line": 3,
+      "new_line": 3,
+      "expected_ok": false,
+      "expected_reason_code": "CONTROL_CONTEXT_CHANGED"
+    },
+    {
+      "case_id": "D-CORP-05-preprocessor-context",
+      "kind": "compare",
+      "path": "src/basic.cpp",
+      "old_source": "#if ENABLED\nint f() { return 1; }\n#endif\n",
+      "new_source": "#if FEATURE\nint f() { return 1; }\n#endif\n",
+      "old_line": 2,
+      "new_line": 2,
+      "expected_ok": false,
+      "expected_reason_code": "PP_CONTEXT_CHANGED"
+    },
+    {
+      "case_id": "D-CORP-06-callee-changed",
+      "kind": "compare",
+      "path": "src/caller.cpp",
+      "old_files": {
+        "src/caller.cpp": "int caller() {\n return helper();\n}\n",
+        "src/helper.cpp": "int helper() {\n return 1;\n}\n"
+      },
+      "new_files": {
+        "src/caller.cpp": "int caller() {\n return helper();\n}\n",
+        "src/helper.cpp": "int helper() {\n return 2;\n}\n"
+      },
+      "old_line": 2,
+      "new_line": 2,
+      "expected_ok": false,
+      "expected_reason_code": "CALLEE_CHANGED"
+    },
+    {
+      "case_id": "D-CORP-07-callee-ambiguous",
+      "kind": "compare",
+      "path": "src/caller.cpp",
+      "old_files": {
+        "src/caller.cpp": "int caller() {\n return helper();\n}\n",
+        "src/one.cpp": "int helper() { return 1; }\n",
+        "src/two.cpp": "int helper() { return 2; }\n"
+      },
+      "new_files": {
+        "src/caller.cpp": "int caller() {\n return helper();\n}\n",
+        "src/one.cpp": "int helper() { return 1; }\n",
+        "src/two.cpp": "int helper() { return 2; }\n"
+      },
+      "old_line": 2,
+      "new_line": 2,
+      "expected_ok": false,
+      "expected_reason_code": "CALLEE_UNRESOLVED"
+    },
+    {
+      "case_id": "D-CORP-08-macro-changed",
+      "kind": "compare",
+      "path": "src/macro.cpp",
+      "old_source": "int f() { return LIMIT; }\n#define LIMIT 1\n",
+      "new_source": "int f() { return LIMIT; }\n#define LIMIT 2\n",
+      "old_line": 1,
+      "new_line": 1,
+      "expected_ok": false,
+      "expected_reason_code": "MACRO_CHANGED"
+    },
+    {
+      "case_id": "D-CORP-09-constant-changed",
+      "kind": "compare",
+      "path": "src/constant.cpp",
+      "old_source": "const int LIMIT = 1;\nint f() { return LIMIT; }\n",
+      "new_source": "const int LIMIT = 2;\nint f() { return LIMIT; }\n",
+      "old_line": 2,
+      "new_line": 2,
+      "expected_ok": false,
+      "expected_reason_code": "CONST_CHANGED"
+    },
+    {
+      "case_id": "D-CORP-10-parser-uncertain",
+      "kind": "compare",
+      "path": "src/uncertain.cpp",
+      "old_source": "int f() { return 1; }\n\"unterminated\n",
+      "new_source": "int f() { return 1; }\n\"unterminated\n",
+      "old_line": 1,
+      "new_line": 1,
+      "parser_uncertain": true,
+      "expected_ok": false,
+      "expected_reason_code": "PARSER_UNRELIABLE"
+    },
+    {
+      "case_id": "D-CORP-11-unsupported-language",
+      "kind": "compare",
+      "path": "src/script.py",
+      "old_source": "def f():\n    return 1\n",
+      "new_source": "def f():\n    return 1\n",
+      "old_line": 2,
+      "new_line": 2,
+      "expected_ok": false,
+      "expected_reason_code": "FUNCTION_ID_UNRESOLVED"
+    },
+    {
+      "case_id": "D-CORP-12-line-shift",
+      "kind": "line_map",
+      "old_source": "int f() {\n return 1;\n}\n",
+      "new_source": "int f() {\n // comment\n return 1;\n}\n",
+      "old_line": 2,
+      "expected_ok": true,
+      "expected_reason_code": "LINE_MAPPED",
+      "expected_new_line": 3
+    },
+    {
+      "case_id": "D-CORP-13-line-deleted",
+      "kind": "line_map",
+      "old_source": "int f() {\n return 1;\n return 2;\n}\n",
+      "new_source": "int f() {\n return 2;\n}\n",
+      "old_line": 2,
+      "expected_ok": false,
+      "expected_reason_code": "LINE_DELETED"
+    },
+    {
+      "case_id": "D-CORP-14-line-ambiguous",
+      "kind": "line_map",
+      "old_source": "int f() {\n a();\n b();\n}\n",
+      "new_source": "int f() {\n c();\n}\n",
+      "old_line": 2,
+      "expected_ok": false,
+      "expected_reason_code": "LINE_AMBIGUOUS"
+    },
+    {
+      "case_id": "D-CORP-15-unrelated-callee-change",
+      "kind": "compare",
+      "path": "src/caller.cpp",
+      "old_files": {
+        "src/caller.cpp": "int caller() {\n return 1;\n}\n",
+        "src/helper.cpp": "int helper() { return 1; }\n"
+      },
+      "new_files": {
+        "src/caller.cpp": "int caller() {\n return 1;\n}\n",
+        "src/helper.cpp": "int helper() { return 2; }\n"
+      },
+      "old_line": 2,
+      "new_line": 2,
+      "expected_ok": true,
+      "expected_reason_code": "INHERITED"
+    }
+  ]
+}

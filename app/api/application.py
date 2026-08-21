@@ -18,17 +18,16 @@ from app.api.serialization import to_jsonable
 from app.api.endpoints import analysis as analysis_endpoint
 from app.api.endpoints import code_detail as code_detail_endpoint
 from app.api.endpoints import health as health_endpoint
+from app.api.endpoints import inheritance as inheritance_endpoint
 from app.api.endpoints import incremental as incremental_endpoint
 from app.api.endpoints import jobs as jobs_endpoint
 from app.api.endpoints import progress as progress_endpoint
 from app.api.endpoints import projects as projects_endpoint
 from app.api.endpoints import release as release_endpoint
 from app.code_detail.source_reader import compute_db_file_path_hash
-from app.db.repositories.base import adapt_sql, fetchall, fetchone
-from app.inheritance.rejections import InheritanceRejectionService
+from app.db.repositories.base import fetchall, fetchone
 from app.scan_import import RepositoryBusyError
-from app.db.transaction import transaction
-from app.time_utils import utc_sql
+from app.services.inheritance_review_service import InheritanceReviewService
 
 
 logger = logging.getLogger(__name__)
@@ -55,7 +54,9 @@ class VNextApplication(object):
         self.runtime = runtime
         self.config = config or {}
         self.authorizer = MutationAuthorizer(repo_root, self.config)
-        self.rejections = InheritanceRejectionService(runtime.states)
+        self.inheritance_reviews = InheritanceReviewService(
+            runtime.states, runtime.analysis_service,
+        )
         self.router = Router()
         self._register_routes()
 
@@ -414,110 +415,39 @@ class VNextApplication(object):
                      ),
                      "has_more": has_more}
 
-    def _current_scan_context(self, connection, scan_id):
-        scan, project = self._inheritance_scan(connection, scan_id)
-        state = self.runtime.states.get(connection, int(project["id"])) or {}
-        if int(state.get("current_scan_id") or 0) != int(scan_id):
-            raise ValueError("MUTATION_REQUIRES_CURRENT_SCAN")
-        return scan, project
-
     def inheritance_confirm(self, scan_id, query, body, headers, remote_address):
         identity = self._require_role(headers, remote_address, ("reviewer", "admin"))
-        values = body or {}
-        selected = values.get("selected_line_ids") or [values.get("line_id")]
-        selected = [int(item) for item in selected if item]
-        expected_map = values.get("expected_relation_revisions") or {}
-        if not selected:
-            raise ValueError("line_id and expected_relation_revision are required")
-        if len(selected) > 500:
-            raise ValueError("selected_line_ids exceeds limit")
+        selected, expected_map, default_expected = inheritance_endpoint.confirm(body)
         with self._write_connection() as connection:
-            with transaction(connection) as conn:
-                scan, project = self._current_scan_context(conn, scan_id)
-                results = []
-                for line_id in selected:
-                    expected = int(expected_map.get(str(line_id),
-                                      expected_map.get(line_id,
-                                      values.get("expected_relation_revision") or 0)) or 0)
-                    if not expected:
-                        raise ValueError("line_id and expected_relation_revision are required")
-                    relation = fetchone(conn, """
-                        SELECT * FROM coverage_analysis_line_links
-                        WHERE scan_id=? AND line_id=? AND is_active=1
-                    """, (int(scan_id), line_id))
-                    if not relation or int(relation.get("relation_revision") or 0) != expected:
-                        raise ValueError("STALE_RELATION_REVISION")
-                    if relation.get("review_state") not in (
-                            "INHERITED_PENDING", "CARRIED_COVERED"):
-                        raise ValueError("INHERITANCE_RELATION_NOT_ACTIVE")
-                    cursor = conn.cursor()
-                    cursor.execute(adapt_sql(conn,
-                        "UPDATE coverage_analysis_line_links SET review_state='MANUAL_CONFIRMED', "
-                        "reviewed_by=?, reviewed_at=?, relation_revision=relation_revision+1, "
-                        "updated_at=? WHERE id=? AND relation_revision=? AND is_active=1"),
-                        (identity, utc_sql(), utc_sql(), relation["id"], expected))
-                    if int(getattr(cursor, "rowcount", 0) or 0) != 1:
-                        cursor.close()
-                        raise ValueError("STALE_RELATION_REVISION")
-                    cursor.close()
-                    results.append({"line_id": line_id, "review_state": "MANUAL_CONFIRMED"})
-                self.runtime.states.advance(conn, int(project["id"]))
-            return 200, {"scan_id": int(scan_id), "items": results,
-                         "reviewed_by": identity}
+            _, project = self._inheritance_scan(connection, scan_id)
+            return 200, self.inheritance_reviews.confirm(
+                connection, project["id"], int(scan_id), selected,
+                expected_relation_revisions=expected_map,
+                default_expected_revision=default_expected,
+                reviewer=identity,
+            )
 
     def inheritance_edit_confirm(self, scan_id, query, body, headers, remote_address):
         identity = self._require_role(headers, remote_address, ("reviewer", "admin"))
         with self._write_connection() as connection:
-            scan, project = self._current_scan_context(connection, scan_id)
-            records = (body or {}).get("records") or []
-            if not records:
-                raise ValueError("records are required")
-            expected_revision = (body or {}).get("expected_record_revision")
-            expected_relation = (body or {}).get("expected_relation_revision")
-            expected_relation_map = (body or {}).get("expected_relation_revisions") or {}
-            if expected_revision is None and any(
-                    item.get("expected_record_revision") is None
-                    for item in records if isinstance(item, dict)):
-                raise ValueError("EXPECTED_RECORD_REVISION_REQUIRED")
-            if expected_relation is None and not expected_relation_map and any(
-                    item.get("expected_relation_revision") is None
-                    for item in records if isinstance(item, dict)):
-                raise ValueError("STALE_RELATION_REVISION")
-            if expected_revision is not None:
-                records = [
-                    dict(item, expected_record_revision=item.get(
-                        "expected_record_revision", expected_revision
-                    ))
-                    for item in records
-                ]
-            if expected_relation is not None or expected_relation_map:
-                records = [
-                    dict(item, expected_relation_revision=item.get(
-                        "expected_relation_revision",
-                        expected_relation_map.get(str(item.get("line_id")),
-                                                  expected_relation_map.get(
-                                                      item.get("line_id"), expected_relation)),
-                    ))
-                    for item in records
-                ]
+            _, project = self._inheritance_scan(connection, scan_id)
+            records = inheritance_endpoint.edit_confirm(body)
             # The client-side reviewer field is a UI convenience/suggestion,
             # never an identity credential. Persist the authenticated
             # operator that performed the mutation for every selected line.
             records = [dict(item, reviewer=identity) for item in records]
-            result = self.runtime.analysis_service.save(
+            result = self.inheritance_reviews.edit_confirm(
                 connection, project["project_name"], int(scan_id), records,
                 reviewer=identity,
-                enforce_current=True,
             )
         return 200, result
 
     def inheritance_reject(self, scan_id, query, body, headers, remote_address):
         identity = self._require_role(headers, remote_address, ("reviewer", "admin"))
-        line_id = int((body or {}).get("line_id") or 0)
-        expected = int((body or {}).get("expected_relation_revision") or 0)
+        line_id, expected = inheritance_endpoint.reject(body)
         with self._write_connection() as connection:
-            scan, project = self._current_scan_context(connection, scan_id)
-            rejection = self.rejections.reject(
+            _, project = self._inheritance_scan(connection, scan_id)
+            rejection = self.inheritance_reviews.reject(
                 connection, project["id"], int(scan_id), line_id, identity, expected
             )
         return 200, {"rejection": rejection}
@@ -525,23 +455,28 @@ class VNextApplication(object):
     def inheritance_undo(self, scan_id, query, body, headers, remote_address):
         identity = self._require_role(headers, remote_address, ("reviewer", "admin"))
         del identity
+        line_id, rejection_id, expected_rejection, expected_relation = \
+            inheritance_endpoint.undo(body)
         with self._write_connection() as connection:
-            scan, project = self._current_scan_context(connection, scan_id)
-            rejection = self.rejections.undo(
-                connection, project["id"], int(scan_id), int((body or {}).get("line_id") or 0),
-                int((body or {}).get("rejection_id") or 0),
-                int((body or {}).get("expected_rejection_revision") or 0),
-                int((body or {}).get("expected_relation_revision") or 0),
+            _, project = self._inheritance_scan(connection, scan_id)
+            rejection = self.inheritance_reviews.undo(
+                connection, project["id"], int(scan_id), line_id, rejection_id,
+                expected_rejection, expected_relation,
             )
         return 200, {"rejection": rejection}
 
     def inheritance_undo_rejection(self, scan_id, rejection_id, query, body,
                                    headers, remote_address):
-        values = dict(body or {})
-        values["rejection_id"] = int(rejection_id)
-        return self.inheritance_undo(
-            scan_id, query, values, headers, remote_address
+        line_id, _, expected_rejection, expected_relation = inheritance_endpoint.undo(
+            body, rejection_id=rejection_id
         )
+        values = {
+            "line_id": line_id,
+            "rejection_id": int(rejection_id),
+            "expected_rejection_revision": expected_rejection,
+            "expected_relation_revision": expected_relation,
+        }
+        return self.inheritance_undo(scan_id, query, values, headers, remote_address)
 
     def progress(self, query, body, headers, remote_address):
         project_name = progress_endpoint.project_name(query, self.config.get("project_name") or "")

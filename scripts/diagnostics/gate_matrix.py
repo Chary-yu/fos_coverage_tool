@@ -24,6 +24,7 @@ from app.inheritance.toolchain import parser_toolchain_preflight
 from app.release_identity import generate_release_identity
 from app.time_utils import utc_iso
 from scripts.diagnostics.canonical_ownership_audit import audit_canonical_ownership as audit_canonical
+from scripts.diagnostics.contract_artifact_audit import audit as audit_contract_artifacts
 from scripts.diagnostics.frontend_vnext_api_contract_audit import audit as audit_frontend
 from scripts.diagnostics.inheritance_rules_audit import audit as audit_rules
 from scripts.diagnostics.legacy_retirement_audit import audit as audit_legacy_retirement
@@ -178,6 +179,7 @@ def build(repo_root):
         domain_ddl_path
     )
     canonical = audit_canonical(repo_root)
+    contract_artifacts = audit_contract_artifacts(repo_root)
     legacy = audit_legacy(repo_root)
     legacy_retirement = audit_legacy_retirement(repo_root)
     participation = audit_participation()
@@ -195,10 +197,13 @@ def build(repo_root):
 
     gates = {
         "A": {
-            "local_checks": [_local_check("schema_preflight", {
-                "status": "PASSED" if ddl_safe else "FAILED",
-                "errors": ddl_errors, "warnings": ddl_warnings,
-            })],
+            "local_checks": [
+                _local_check("schema_preflight", {
+                    "status": "PASSED" if ddl_safe else "FAILED",
+                    "errors": ddl_errors, "warnings": ddl_warnings,
+                }),
+                _local_check("contract_artifacts", contract_artifacts),
+            ],
             "external_evidence": [
                 _external("verified_backup_restore", "verified production backup restored into an empty target", "COVERAGE_GATE_A_BACKUP_EVIDENCE", revision, repo_root),
                 _external("mariadb_55_rehearsal", "MariaDB 5.5 compatibility rehearsal", "COVERAGE_GATE_A_MARIADB_EVIDENCE", revision, repo_root),

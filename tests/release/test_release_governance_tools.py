@@ -80,6 +80,10 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
                     )
                 for name in GATE_DIRECTORIES.get(gate, ()):
                     self.assertTrue(os.path.isdir(os.path.join(gate_dir, name)))
+                if gate == "F":
+                    self.assertTrue(os.path.isfile(os.path.join(
+                        gate_dir, "fresh_inventory", "summary.json"
+                    )))
                 self.assertTrue(os.path.isfile(os.path.join(
                     gate_dir, "evidence-manifest-v2.json"
                 )))

@@ -101,6 +101,13 @@ class CppSourceAnalyzer(object):
         scope_stack = []
         pending = []
         for index, tokens in enumerate(token_lines, 1):
+            # A preprocessor directive is a translation-unit boundary for
+            # function-header recovery.  Without this reset, ``#if ...``
+            # tokens leak into the next function header and make an otherwise
+            # valid function look like an unsupported macro/lambda form.
+            preprocessor_line = "#" in tokens
+            if preprocessor_line:
+                pending = []
             for token_index, token in enumerate(tokens):
                 if token == "{":
                     header = list(pending)
@@ -146,6 +153,8 @@ class CppSourceAnalyzer(object):
                     pending.append(token)
                     if token == ";":
                         pending = []
+            if preprocessor_line:
+                pending = []
         # Nested class/namespace braces can produce a non-function range, and
         # declaration-only prototypes have no body.  Keep deterministic order.
         functions.sort(key=lambda item: (item.start_line, item.end_line, item.identity.canonical()))

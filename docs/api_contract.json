@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "contract_id": "vnext-inheritance-api-v1",
+  "runtime": "vnext",
+  "routes": {
+    "scan_create": "POST /api/coverage/scans",
+    "job_detail": "GET /api/coverage/jobs/{job_id}",
+    "inheritance_pending": "GET /api/coverage/scans/{scan_id}/inheritance/pending",
+    "inheritance_decisions": "GET /api/coverage/scans/{scan_id}/inheritance/decisions",
+    "inheritance_confirm": "POST /api/coverage/scans/{scan_id}/inheritance/confirm",
+    "inheritance_edit_confirm": "POST /api/coverage/scans/{scan_id}/inheritance/edit-confirm",
+    "inheritance_reject": "POST /api/coverage/scans/{scan_id}/inheritance/reject",
+    "inheritance_undo": "POST /api/coverage/scans/{scan_id}/inheritance/rejections/{rejection_id}/undo"
+  },
+  "pagination": {
+    "default_limit": 100,
+    "maximum_limit": 500,
+    "cursor_binding": ["scan_id", "data_version", "filter"]
+  },
+  "mutation_identity": [
+    "project",
+    "scan_id",
+    "repository_name",
+    "file_path",
+    "line_id_or_line_number",
+    "expected_relation_revision"
+  ],
+  "mutation_rules": {
+    "current_scan_only": true,
+    "authenticated_operator_is_reviewer": true,
+    "client_suggested_reviewer_is_not_credential": true,
+    "edit_requires_expected_record_revision": true,
+    "undo_requires_expected_rejection_revision": true
+  },
+  "roles": {
+    "viewer": ["read"],
+    "reviewer": ["read", "confirm", "edit_confirm", "reject", "undo"],
+    "importer": ["read", "create_scan"],
+    "admin": ["read", "confirm", "edit_confirm", "reject", "undo", "create_scan"]
+  },
+  "error_codes": [
+    "REPOSITORY_BUSY",
+    "SCAN_NOT_CURRENT_FOR_MUTATION",
+    "STALE_RELATION_REVISION",
+    "STALE_RECORD_REVISION",
+    "STALE_REJECTION_REVISION",
+    "UNDO_NOT_ALLOWED",
+    "INVALID_SCAN_IDENTITY",
+    "PAGINATION_CURSOR_STALE"
+  ],
+  "progress_conservation": [
+    "ordinary_pending_total",
+    "inherited_pending_total",
+    "manual_draft_pending_total",
+    "confirmed_total",
+    "pending_total"
+  ]
+}

@@ -56,6 +56,17 @@ def audit():
             r"class AnalysisRepository",
             r"class ProjectService",
         ]),
+        _check("inheritance_review_service", [
+            "app/api/application.py",
+            "app/api/endpoints/inheritance.py",
+            "app/services/inheritance_review_service.py",
+        ], [
+            r"class InheritanceReviewService",
+            r"self\.inheritance_reviews",
+            r"def confirm",
+            r"def reject",
+            r"def undo",
+        ]),
         _check("vnext_scan_identity", [
             "app/services/project_service.py",
             "app/db/repositories/project_repository.py",

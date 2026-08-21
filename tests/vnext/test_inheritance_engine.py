@@ -44,6 +44,22 @@ class InheritanceEngineTest(unittest.TestCase):
         self.assertIn("if ENABLED && FEATURE", " ".join(result["preprocessor"].get(3, ())))
         self.assertEqual(result["controls"].get(3), result["controls"].get(4))
 
+    def test_parser_discards_preprocessor_tokens_before_function_headers(self):
+        analyzer = CppSourceAnalyzer()
+        old = analyzer.analyze(
+            "#if ENABLED\nint f() { return 1; }\n#endif\n", "a.cpp"
+        )
+        new = analyzer.analyze(
+            "#if FEATURE\nint f() { return 1; }\n#endif\n", "a.cpp"
+        )
+        self.assertEqual([item.identity.name for item in old["functions"]], ["f"])
+        result = InheritanceEngine().compare_line(
+            "int f() { return 1; }", "int f() { return 1; }",
+            old, new, 2, 2,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "PP_CONTEXT_CHANGED")
+
     def test_parser_identity_includes_scope_and_signature(self):
         analyzer = CppSourceAnalyzer()
         result = analyzer.analyze(
