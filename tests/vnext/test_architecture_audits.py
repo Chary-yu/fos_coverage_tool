@@ -248,6 +248,63 @@ class ArchitectureAuditTest(unittest.TestCase):
         self.assertEqual(task_manifest["expected_task_count"], 80)
         self.assertEqual(audit_immutability()["status"], "PASSED")
 
+    def test_cross_layer_release_gate_rejects_synthetic_metrics(self):
+        payload = {
+            "synthetic": True,
+            "release_eligible": False,
+            "coverage_virtual_scroll_100k": {
+                "status": "PASSED", "request_count": 1, "response_bytes": 1,
+                "max_response_bytes": 1, "time_to_first_visible_ms": 1,
+                "time_to_target_line_ms": 1, "logical_line_count": 100000,
+                "resident_js_lines": 1, "resident_js_lines_peak": 1,
+                "dom_line_count": 1, "overlay_db_queries": 1,
+                "overlay_db_rows": 1, "sidecar_decode_count": 1,
+                "p95_expand_ms": 1, "peak_rss_bytes": 1,
+                "telemetry": {
+                    "api_requests": 1, "network_chunks": 1,
+                    "network_lines": 1, "max_dom_lines": 1,
+                },
+            },
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as stream:
+            json.dump(payload, stream)
+            stream.flush()
+            result = audit_performance(
+                stream.name, require_cross_layer=True,
+                require_release_eligible=True,
+            )
+        self.assertEqual(result["status"], "FAILED")
+        self.assertFalse(result["release_eligible"])
+        self.assertIn("synthetic=false", " ".join(result["violations"]))
+
+    def test_cross_layer_release_gate_accepts_explicit_live_evidence(self):
+        payload = {
+            "synthetic": False,
+            "release_eligible": True,
+            "coverage_virtual_scroll_100k": {
+                "status": "PASSED", "request_count": 1, "response_bytes": 1,
+                "max_response_bytes": 1, "time_to_first_visible_ms": 1,
+                "time_to_target_line_ms": 1, "logical_line_count": 100000,
+                "resident_js_lines": 1, "resident_js_lines_peak": 1,
+                "dom_line_count": 1, "overlay_db_queries": 1,
+                "overlay_db_rows": 1, "sidecar_decode_count": 1,
+                "p95_expand_ms": 1, "peak_rss_bytes": 1,
+                "telemetry": {
+                    "api_requests": 1, "network_chunks": 1,
+                    "network_lines": 1, "max_dom_lines": 1,
+                },
+            },
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as stream:
+            json.dump(payload, stream)
+            stream.flush()
+            result = audit_performance(
+                stream.name, require_cross_layer=True,
+                require_release_eligible=True,
+            )
+        self.assertEqual(result["status"], "PASSED")
+        self.assertTrue(result["release_eligible"])
+
 
 if __name__ == "__main__":
     unittest.main()

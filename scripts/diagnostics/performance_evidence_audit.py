@@ -25,7 +25,8 @@ def _sha256(path):
     return digest.hexdigest()
 
 
-def audit(path, allow_partial=False, require_cross_layer=False):
+def audit(path, allow_partial=False, require_cross_layer=False,
+          require_release_eligible=False):
     violations = []
     missing_cross_layer = []
     if not os.path.isfile(path):
@@ -51,6 +52,22 @@ def audit(path, allow_partial=False, require_cross_layer=False):
             "violations": ["performance evidence is not valid JSON: {}".format(exc)],
             "missing_cross_layer_metrics": [],
         })
+
+    # A complete set of measurements is not enough to make an artifact safe
+    # for release decisions.  CI's browser fixture deliberately contains
+    # server-shaped counters, but it is still generated from a disposable
+    # fixture and must remain outside the release gate.  The manual
+    # cross-layer lane and the real Candidate lane opt into this stricter
+    # provenance check explicitly.
+    if require_release_eligible:
+        if evidence.get("synthetic") is not False:
+            violations.append(
+                "release-eligible performance evidence must explicitly set synthetic=false"
+            )
+        if evidence.get("release_eligible") is not True:
+            violations.append(
+                "release-eligible performance evidence must explicitly set release_eligible=true"
+            )
 
     # A release A/B artifact has a stronger contract than the browser-only
     # functional fixture: two independent exact-revision inputs, one workload
@@ -127,7 +144,7 @@ def audit(path, allow_partial=False, require_cross_layer=False):
         "evidence_class": "performance_evidence_audit",
         "path": os.path.abspath(path),
         "release_eligible": evidence.get("synthetic") is False and
-            evidence.get("release_eligible") is not False,
+            evidence.get("release_eligible") is True,
         "browser_status": browser_status,
         "gate": "cross_layer_performance" if require_cross_layer else "browser_functional",
         "browser_workload": workload.get("workload_id", ""),
@@ -147,10 +164,15 @@ def main(argv=None):
         "--require-cross-layer", action="store_true",
         help="fail unless DB/Sidecar/latency/RSS evidence is present",
     )
+    parser.add_argument(
+        "--require-release-eligible", action="store_true",
+        help="fail unless evidence is explicitly non-synthetic and release-eligible",
+    )
     args = parser.parse_args(argv)
     result = audit(
         args.path, allow_partial=args.allow_partial,
         require_cross_layer=args.require_cross_layer,
+        require_release_eligible=args.require_release_eligible,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["browser_status"] == "PASSED" and (

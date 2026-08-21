@@ -398,6 +398,7 @@ jobs:
           mkdir -p .artifacts
           python scripts/diagnostics/performance_evidence_audit.py \
             "${{ inputs.cross_layer_evidence }}" --require-cross-layer \
+            --require-release-eligible \
             | tee .artifacts/cross_layer_performance.json
       - name: Upload cross-layer performance evidence
         if: ${{ always() }}
@@ -441,7 +442,7 @@ jobs:
             --evidence-output .artifacts/real-browser-candidate/performance-evidence.json
           python scripts/diagnostics/performance_evidence_audit.py \
             .artifacts/real-browser-candidate/performance-evidence.json \
-            --require-cross-layer
+            --require-cross-layer --require-release-eligible
       - name: Upload exact-SHA Candidate browser evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
