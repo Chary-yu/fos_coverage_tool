@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "plan_path": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md",
-  "plan_sha256": "fa2b18a3308f979ba38a81f3913b3be309a63128467e79fd764b5f1293d8f5da",
+  "plan_sha256": "12aefc57c4ef701d4efb3e9a8c79822b4174211d37ccf77f7d9dbe1ee019a5bf",
   "tasks": [
     {"task_id":"A-01","root_owner_skill":"fos-coverage-release-governance","secondary_owner_skill":"fos-coverage-change-review","required_evidence_class":"db-integration","upstream_gate_dependencies":[]},
     {"task_id":"A-02","root_owner_skill":"fos-coverage-release-governance","secondary_owner_skill":"fos-coverage-runtime-reliability","required_evidence_class":"db-integration","upstream_gate_dependencies":["A-01"]},
