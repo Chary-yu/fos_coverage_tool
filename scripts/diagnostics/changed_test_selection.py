@@ -103,6 +103,14 @@ def changed_files(repo_root, base=None, before=None, head=None):
 def select(files):
     suites = set()
     for path in files:
+        normalized_path = str(path or "").replace("\\", "/")
+        # A changed test is itself a specialist owner.  Without this direct
+        # mapping, a commit that only edits a test could run an unrelated
+        # fallback suite and leave the changed regression unexecuted.
+        if normalized_path.startswith("tests/") and normalized_path.endswith(".py"):
+            module_path = normalized_path[:-3].replace("/", ".")
+            if not module_path.endswith(".__init__"):
+                suites.add(module_path)
         for patterns, suite in MAPPINGS:
             if any(fnmatch.fnmatch(path, pattern) for pattern in patterns):
                 suites.update(suite.split())

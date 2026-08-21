@@ -74,6 +74,10 @@ class ArchitectureAuditTest(unittest.TestCase):
             changed_files(os.getcwd(), head="revision-does-not-exist")
         self.assertIn("tests.vnext.test_vnext_runtime", select([]))
 
+    def test_changed_test_selection_runs_a_modified_test_module_directly(self):
+        selected = select(["tests/vnext/test_scan_import_lifecycle.py"])
+        self.assertIn("tests.vnext.test_scan_import_lifecycle", selected)
+
     def test_changed_test_selection_covers_inheritance_owners(self):
         inheritance = select(["app/inheritance/engine.py"])
         self.assertIn("tests.vnext.test_inheritance_engine", inheritance)
