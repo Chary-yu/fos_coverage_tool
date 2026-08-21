@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -23,6 +24,11 @@ RETIREMENT_CONDITIONS = [
     "legacy usage telemetry is zero for the agreed deprecation window",
     "the release manifest records the removal commit and rollback plan",
 ]
+
+_FULL_GIT_SHA = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
+_PLACEHOLDER_ROLLBACK_PLANS = {
+    "n/a", "na", "none", "pending", "tbd", "todo", "to be determined",
+}
 
 
 def _load_json(path):
@@ -88,6 +94,7 @@ def _usage_telemetry(path=None):
 def _runtime_mode_checks(repo_root):
     paths = [
         os.path.join(repo_root, "coverage_config.json"),
+        os.path.join(repo_root, "config", "coverage_config.example.json"),
         os.path.join(repo_root, "config", "coverage_config.staging.example.json"),
     ]
     configured = os.environ.get("COVERAGE_CONFIG_PATH")
@@ -138,6 +145,32 @@ def _manifest_check(path, required_keys, expected_values=None,
     }
 
 
+def _retirement_manifest_check(path, expected_candidate_revision=""):
+    """Validate retirement evidence without accepting placeholder values."""
+    result = _manifest_check(
+        path, ("candidate_revision", "removal_commit", "rollback_plan"),
+        expected_candidate_revision=expected_candidate_revision,
+    )
+    values = _load_json(path)
+    if values is not None:
+        removal_commit = str(values.get("removal_commit") or "").strip()
+        if not _FULL_GIT_SHA.fullmatch(removal_commit):
+            result["missing_keys"].append("removal_commit=full_git_sha")
+
+        rollback_plan = values.get("rollback_plan")
+        if isinstance(rollback_plan, str):
+            normalized = rollback_plan.strip().lower()
+            rollback_valid = bool(normalized) and normalized not in _PLACEHOLDER_ROLLBACK_PLANS
+        elif isinstance(rollback_plan, (dict, list, tuple)):
+            rollback_valid = bool(rollback_plan)
+        else:
+            rollback_valid = False
+        if not rollback_valid:
+            result["missing_keys"].append("rollback_plan=non_placeholder")
+    result["passed"] = bool(values is not None and not result["missing_keys"])
+    return result
+
+
 def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None):
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     candidate_revision = _revision(repo_root)
@@ -160,10 +193,8 @@ def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None)
         expected_values={"status": "PASSED"},
         expected_candidate_revision=candidate_revision,
     )
-    release = _manifest_check(
-        retirement_manifest,
-        ("candidate_revision", "removal_commit", "rollback_plan"),
-        expected_candidate_revision=candidate_revision,
+    release = _retirement_manifest_check(
+        retirement_manifest, expected_candidate_revision=candidate_revision,
     )
     checks = {
         "no_legacy_deployment": runtime_modes["passed"],

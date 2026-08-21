@@ -31,6 +31,24 @@ COVERAGE_LEGACY_COMPAT_TESTS_MANIFEST
 COVERAGE_LEGACY_RETIREMENT_MANIFEST
 ```
 
+The retirement manifest must bind to the exact Candidate revision and must not
+use placeholders. Its minimum shape is:
+
+```json
+{
+  "candidate_revision": "<40-character-git-sha>",
+  "removal_commit": "<40-character-git-sha>",
+  "rollback_plan": {
+    "target_release": "<exact previous release identity>",
+    "command_or_action": "<verified rollback action>"
+  }
+}
+```
+
+The audit accepts a structured rollback plan or a non-placeholder string, but
+rejects abbreviated/placeholder removal commits and plans such as `TBD` or
+`pending`.
+
 Compatibility and retirement manifests must carry the current checkout's exact
 `candidate_revision`; a stale artifact is rejected even when its status says
 `PASSED`.

@@ -80,6 +80,52 @@ class ArchitectureAuditTest(unittest.TestCase):
             for item in result["compatibility_evidence"]["missing_keys"]
         ))
 
+    def test_legacy_retirement_rejects_placeholder_release_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = os.path.join(directory, "legacy-retirement.json")
+            revision = audit_legacy_retirement(os.getcwd())["candidate_revision"]
+            with open(manifest, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "candidate_revision": revision,
+                    "removal_commit": "TBD",
+                    "rollback_plan": "pending",
+                }, stream)
+            result = audit_legacy_retirement(
+                os.getcwd(), retirement_manifest=manifest,
+            )
+        self.assertFalse(
+            result["retirement_checks"][
+                "release_manifest_records_removal_and_rollback"
+            ]
+        )
+        self.assertIn(
+            "removal_commit=full_git_sha",
+            result["retirement_manifest"]["missing_keys"],
+        )
+        self.assertIn(
+            "rollback_plan=non_placeholder",
+            result["retirement_manifest"]["missing_keys"],
+        )
+
+    def test_legacy_retirement_accepts_structured_release_evidence_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = os.path.join(directory, "legacy-retirement.json")
+            revision = audit_legacy_retirement(os.getcwd())["candidate_revision"]
+            with open(manifest, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "candidate_revision": revision,
+                    "removal_commit": revision,
+                    "rollback_plan": {
+                        "target_release": "previous exact release",
+                        "command_or_action": "restore the verified previous release",
+                    },
+                }, stream)
+            result = audit_legacy_retirement(
+                os.getcwd(), retirement_manifest=manifest,
+            )
+        self.assertTrue(result["retirement_manifest"]["passed"])
+        self.assertFalse(result["retirement_checks"]["legacy_usage_zero_for_window"])
+
     def test_legacy_retirement_cli_writes_exact_sha_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             output = os.path.join(directory, "legacy-retirement.json")
