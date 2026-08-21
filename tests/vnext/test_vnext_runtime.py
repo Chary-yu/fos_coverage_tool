@@ -177,6 +177,62 @@ class VNextRuntimeTest(unittest.TestCase):
         finally:
             os.remove(info_path)
 
+    def test_api_info_import_enqueues_durable_coordinator_without_publishing_inline(self):
+        self.connection.execute("""
+            INSERT INTO coverage_repository_resources(
+                resource_key, resolved_git_common_dir, resolved_worktree_root,
+                next_fencing_token, observed_at
+            ) VALUES ('api-resource', '/tmp/common', '/tmp/worktree', 0,
+                      CURRENT_TIMESTAMP)
+        """)
+        self.connection.commit()
+        resource_id = self.connection.execute(
+            "SELECT id FROM coverage_repository_resources WHERE resource_key=?",
+            ("api-resource",),
+        ).fetchone()[0]
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".info", delete=False) as stream:
+            stream.write("TN:\nSF:src/api.c\nDA:1,0\nend_of_record\n")
+            info_path = stream.name
+        try:
+            with mock.patch.object(
+                self.runtime.job_service, "submit",
+                return_value={"job_id": "queued-api-import", "state": "queued"},
+            ) as submit:
+                status, body = self.application.dispatch(
+                    "POST", "/api/coverage/scans",
+                    body={
+                        "project_name": "api-import",
+                        "info_path": info_path,
+                        "repositories": [{
+                            "repository_name": "repo",
+                            "physical_resource_id": resource_id,
+                        }],
+                    },
+                )
+                self.assertEqual(status, 202)
+                self.assertEqual(body["job"]["job_id"], "queued-api-import")
+                self.assertNotIn("owner_token", body)
+                self.assertNotIn("locks", body)
+                self.assertEqual(
+                    self.connection.execute(
+                        "SELECT current_scan_id FROM coverage_project_state "
+                        "WHERE project_id=(SELECT id FROM coverage_projects "
+                        "WHERE project_name='api-import')"
+                    ).fetchone()[0], None
+                )
+                submit.assert_called_once()
+                submit.call_args[1]["callback"]()
+            scan_id = body["scan"]["id"]
+            self.assertEqual(
+                self.connection.execute(
+                    "SELECT current_scan_id FROM coverage_project_state "
+                    "WHERE project_id=(SELECT id FROM coverage_projects "
+                    "WHERE project_name='api-import')"
+                ).fetchone()[0], scan_id
+            )
+        finally:
+            os.remove(info_path)
+
     def test_real_stdlib_http_transport_uses_one_api_base(self):
         config = {
             "project_name": "fixture",

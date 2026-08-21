@@ -108,6 +108,44 @@ class AnalysisDomainTest(unittest.TestCase):
         self.connection.commit()
         self.assertEqual(service.audit_consistency(self.connection)["status"], "FAILED")
 
+    def test_shared_record_partial_edit_splits_only_selected_line(self):
+        service = AnalysisService()
+        service.save(
+            self.connection, "domain", self.scan["id"],
+            [{"file_path_hash": "f" * 32, "line_start": 10, "line_end": 11,
+              "status": "可覆盖", "coverage_method": "unit", "reviewer": "alice"}],
+        )
+        line10, line11 = [
+            row[0] for row in self.connection.execute(
+                "SELECT id FROM coverage_lines ORDER BY line_number"
+            ).fetchall()
+        ]
+        original = self.connection.execute(
+            "SELECT analysis_record_id FROM coverage_analysis_line_links "
+            "WHERE line_id=?", (line10,)
+        ).fetchone()[0]
+        service.save(
+            self.connection, "domain", self.scan["id"],
+            [{"line_id": line10, "record_id": original,
+              "expected_record_revision": 1, "status": "无法覆盖",
+              "uncovered_reason": "runtime", "reviewer": "bob"}],
+        )
+        links = {
+            row[0]: row[1] for row in self.connection.execute(
+                "SELECT line_id, analysis_record_id "
+                "FROM coverage_analysis_line_links ORDER BY line_id"
+            ).fetchall()
+        }
+        self.assertNotEqual(links[line10], original)
+        self.assertEqual(links[line11], original)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT content_revision FROM coverage_analysis_records WHERE id=?",
+                (original,),
+            ).fetchone()[0],
+            1,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

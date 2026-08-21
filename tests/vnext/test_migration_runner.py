@@ -10,6 +10,7 @@ from scripts.upgrade.migration_runner import (
     migrate_legacy,
     _split_sql,
 )
+from scripts.upgrade.schema_preflight import PROTECTED_TABLES, analyze_sql_script
 
 
 def legacy_connection():
@@ -63,6 +64,17 @@ def legacy_connection():
 
 
 class MigrationRunnerTest(unittest.TestCase):
+    def test_gate_a_and_domain_tables_are_protected_from_destructive_ddl(self):
+        for table in (
+            "coverage_schema_migrations", "coverage_analysis_records",
+            "coverage_analysis_line_links", "coverage_import_artifacts",
+            "coverage_import_checkpoints", "coverage_import_failures",
+        ):
+            self.assertIn(table, PROTECTED_TABLES)
+            safe, errors, _ = analyze_sql_script("DROP TABLE {};".format(table))
+            self.assertFalse(safe)
+            self.assertTrue(errors)
+
     def test_sql_splitter_strips_comments_without_splitting_string_literals(self):
         statements = _split_sql(
             "-- schema header;\n"

@@ -3,7 +3,7 @@
 """Compatibility entrypoint for the canonical application runtime.
 
 The historical import and CLI name are retained for existing integrations;
-the compatibility implementation is housed under ``app.legacy_runtime`` and
+the compatibility implementation is housed under ``app.compat`` and
 the VNext server path is assembled by ``app.bootstrap``.
 """
 

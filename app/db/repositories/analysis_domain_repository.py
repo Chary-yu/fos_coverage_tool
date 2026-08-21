@@ -77,6 +77,28 @@ class AnalysisDomainRepository(object):
             ORDER BY f.repository_name, f.file_path, l.line_number
         """, (int(scan_id),))
 
+    def read_file(self, connection, scan_id, file_id, ranges=None):
+        clauses = ["q.scan_id=?", "l.file_id=?", "q.is_active=1"]
+        params = [int(scan_id), int(file_id)]
+        for start_line, end_line in (ranges or []):
+            clauses.append("(l.line_number>=? AND l.line_number<=?)")
+            params.extend((int(start_line), int(end_line)))
+        range_clause = ""
+        if ranges:
+            range_items = clauses[3:]
+            clauses = clauses[:3] + ["({})".format(" OR ".join(range_items))]
+        return fetchall(connection, """
+            SELECT q.*, l.line_number, l.file_id,
+                   r.conclusion_status, r.coverage_method,
+                   r.uncovered_reason, r.comment, r.content_revision,
+                   r.content_hash
+            FROM coverage_analysis_line_links q
+            JOIN coverage_lines l ON l.id=q.line_id
+            JOIN coverage_analysis_records r ON r.id=q.analysis_record_id
+            WHERE {where}
+            ORDER BY l.line_number
+        """.format(where=" AND ".join(clauses)), params)
+
     def create_record(self, connection, values, origin="MANUAL", now=None):
         now = now or utc_sql()
         normalized = {

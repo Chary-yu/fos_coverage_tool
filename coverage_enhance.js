@@ -2092,7 +2092,74 @@
             });
         },
 
-        inheritPanel(panel) {
+        async findServerInheritanceCandidate(panel) {
+            if (!panel || !currentScanId || !this.filePath) return null;
+            const query = new URLSearchParams({ limit: '500' });
+            try {
+                const payload = await requestCoverageApi(
+                    `/scans/${encodeURIComponent(currentScanId)}/inheritance/pending?${query.toString()}`,
+                    { method: 'GET' }
+                );
+                const items = payload && Array.isArray(payload.items) ? payload.items : [];
+                return items.find(item =>
+                    Number(item.line_number) === Number(panel.lineNum) &&
+                    String(item.file_path || '') === String(this.filePath || '') &&
+                    String(item.repository_name || '') === String(currentRepositoryName || '')
+                ) || null;
+            } catch (error) {
+                // Older injected pages may not expose the inheritance API;
+                // retain the local draft-copy behavior in that case.
+                return null;
+            }
+        },
+
+        async confirmServerInheritance(panel, candidate) {
+            const lineId = Number(candidate && candidate.candidate_line_id);
+            const revision = Number(candidate && candidate.relation_revision);
+            if (!lineId || !revision) return false;
+            await requestCoverageApi(
+                `/scans/${encodeURIComponent(currentScanId)}/inheritance/confirm`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        selected_line_ids: [lineId],
+                        expected_relation_revisions: { [String(lineId)]: revision }
+                    })
+                }
+            );
+            const reviewer = candidate.reviewed_by ||
+                getStoredPanelValue(panel, 'reviewerInput') || '';
+            setStoredPanelValues(panel, {
+                status: candidate.conclusion_status || '未确认',
+                reviewerInput: reviewer,
+                methodInput: candidate.coverage_method || '',
+                reasonInput: candidate.uncovered_reason || '',
+                isDirty: false,
+                isDraft: false,
+                _origSavedConfirmed: true
+            });
+            clearPanelDirty(panel.lineNum, true);
+            notifyProgressChanged();
+            updateHeaderStatistics();
+            return true;
+        },
+
+        async inheritPanel(panel) {
+            const serverCandidate = await this.findServerInheritanceCandidate(panel);
+            if (serverCandidate) {
+                try {
+                    if (await this.confirmServerInheritance(panel, serverCandidate)) {
+                        showToast(`第 ${panel.lineNum} 行继承结果已确认`);
+                        return;
+                    }
+                } catch (error) {
+                    if (typeof alert === 'function') {
+                        alert(`继承确认失败: ${error.message}`);
+                    }
+                    return;
+                }
+            }
             const previous = findPreviousFilledPanel(panel.lineNum);
             if (!previous) {
                 if (typeof alert === 'function') alert('没有找到上一条已填写的分析结果。');

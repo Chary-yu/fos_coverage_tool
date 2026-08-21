@@ -37,6 +37,8 @@ _REQUIRED_EVIDENCE_SECTIONS = (
     "rollback_evidence",
 )
 
+EVIDENCE_MANIFEST_V2_FILENAME = "evidence-manifest-v2.json"
+
 
 def _sha256_file(path: str) -> str:
     digest = hashlib.sha256()
@@ -87,6 +89,169 @@ def _record_metadata(name: str, payload: Dict[str, Any], repo_root: str) -> Dict
     record.setdefault("repo_root", os.path.abspath(repo_root))
     record.setdefault("runtime", platform.platform())
     return record
+
+
+class EvidenceManifestV2:
+    """Canonical machine-readable evidence ledger for Gate A--F.
+
+    ``ProductionEvidenceManifest`` remains the release-upgrade compatibility
+    ledger.  This smaller record-oriented manifest is the contract used by
+    each Gate bundle, so a static or synthetic result cannot accidentally be
+    mistaken for release evidence merely because a file exists.
+    """
+
+    REQUIRED_RECORD_FIELDS = (
+        "gate", "evidence_id", "evidence_class", "candidate_revision",
+        "host_identity", "command_or_action", "started_at", "finished_at",
+        "exit_code", "artifact_path", "artifact_sha256", "source_inputs_sha256",
+        "status", "synthetic",
+    )
+
+    def __init__(self, repo_root: str, gate: str, candidate_revision: str = "",
+                 release_identity=None, database_runtime_identity=None,
+                 manifest_path: str = ""):
+        self.repo_root = os.path.abspath(repo_root)
+        self.gate = str(gate or "").strip()
+        if not self.gate:
+            raise ValueError("gate is required")
+        self.manifest_path = os.path.abspath(
+            manifest_path or os.path.join(
+                self.repo_root, ".artifacts", self.gate,
+                EVIDENCE_MANIFEST_V2_FILENAME,
+            )
+        )
+        self.data = self._load_or_init(
+            candidate_revision, release_identity, database_runtime_identity
+        )
+
+    def _load_or_init(self, candidate_revision, release_identity,
+                      database_runtime_identity):
+        if os.path.isfile(self.manifest_path):
+            try:
+                with open(self.manifest_path, "r", encoding="utf-8") as stream:
+                    data = json.load(stream)
+                if data.get("evidence_schema_version") == 2 and \
+                        data.get("gate") == self.gate:
+                    return data
+            except (OSError, ValueError, TypeError):
+                pass
+        now = get_utc_iso()
+        return {
+            "evidence_schema_version": 2,
+            "gate": self.gate,
+            "candidate_revision": str(candidate_revision or ""),
+            "release_identity": dict(release_identity or {}),
+            "database_runtime_identity": dict(database_runtime_identity or {}),
+            "created_at": now,
+            "updated_at": now,
+            "evidence": [],
+            "manifest_sha256": "",
+        }
+
+    def record(self, evidence_id: str, evidence_class: str, status: str,
+               command_or_action, exit_code, artifact_path="",
+               source_inputs_sha256=None, candidate_revision="",
+               host_identity=None, database_runtime_identity=None,
+               release_identity=None, started_at="", finished_at="",
+               synthetic=False, **extra):
+        candidate = str(candidate_revision or self.data.get("candidate_revision") or "")
+        if not candidate:
+            raise ValueError("candidate_revision is required")
+        now = get_utc_iso()
+        artifact_path = os.path.abspath(str(artifact_path)) if artifact_path else ""
+        artifact_sha256 = ""
+        if artifact_path:
+            if not os.path.isfile(artifact_path):
+                raise FileNotFoundError(artifact_path)
+            artifact_sha256 = _sha256_file(artifact_path)
+        record = {
+            "gate": self.gate,
+            "evidence_id": str(evidence_id),
+            "evidence_class": str(evidence_class),
+            "candidate_revision": candidate,
+            "release_identity": dict(release_identity or
+                                      self.data.get("release_identity") or {}),
+            "host_identity": host_identity or {
+                "hostname": socket.gethostname(),
+                "runtime": platform.platform(),
+            },
+            "database_runtime_identity": dict(
+                database_runtime_identity or
+                self.data.get("database_runtime_identity") or {}
+            ),
+            "command_or_action": command_or_action,
+            "started_at": started_at or now,
+            "finished_at": finished_at or now,
+            "exit_code": exit_code,
+            "artifact_path": artifact_path,
+            "artifact_sha256": artifact_sha256,
+            "source_inputs_sha256": sorted(set(str(item) for item in
+                                                (source_inputs_sha256 or []))),
+            "status": str(status),
+            "synthetic": bool(synthetic),
+        }
+        record.update(extra)
+        records = [item for item in self.data.setdefault("evidence", [])
+                   if item.get("evidence_id") != str(evidence_id)]
+        records.append(record)
+        self.data["evidence"] = records
+        self.data["candidate_revision"] = candidate
+        if release_identity:
+            self.data["release_identity"] = dict(release_identity)
+        if database_runtime_identity:
+            self.data["database_runtime_identity"] = dict(database_runtime_identity)
+        self.data["updated_at"] = get_utc_iso()
+        self.save()
+        return record
+
+    def validate(self, require_current_revision=False):
+        errors = []
+        unsigned = dict(self.data)
+        observed_manifest_sha = str(unsigned.pop("manifest_sha256", "") or "")
+        expected_manifest_sha = hashlib.sha256(json.dumps(
+            dict(unsigned, manifest_sha256=""), sort_keys=True, indent=2,
+            ensure_ascii=False
+        ).encode("utf-8")).hexdigest()
+        if not observed_manifest_sha or observed_manifest_sha != expected_manifest_sha:
+            errors.append("manifest_sha256 is missing or does not match manifest content")
+        candidate = str(self.data.get("candidate_revision") or "")
+        if not candidate:
+            errors.append("candidate_revision is missing")
+        records = self.data.get("evidence")
+        if not isinstance(records, list) or not records:
+            errors.append("evidence records are missing")
+            records = []
+        for index, record in enumerate(records):
+            for field in self.REQUIRED_RECORD_FIELDS:
+                if field not in record:
+                    errors.append("evidence[{}] missing {}".format(index, field))
+            if record.get("candidate_revision") != candidate:
+                errors.append("evidence[{}] candidate revision mismatch".format(index))
+            artifact_path = record.get("artifact_path") or ""
+            if artifact_path and not record.get("artifact_sha256"):
+                errors.append("evidence[{}] artifact SHA256 missing".format(index))
+            if record.get("status") == "PASSED" and record.get("exit_code") != 0:
+                errors.append("evidence[{}] PASSED without exit_code 0".format(index))
+        if require_current_revision:
+            current = ProductionEvidenceManifest(self.repo_root)._current_commit_sha()
+            if current and current != candidate:
+                errors.append("candidate revision does not match current commit")
+        return not errors, errors
+
+    def save(self):
+        directory = os.path.dirname(self.manifest_path)
+        if not os.path.isdir(directory):
+            os.makedirs(directory)
+        unsigned = dict(self.data)
+        unsigned["manifest_sha256"] = ""
+        encoded = json.dumps(unsigned, sort_keys=True, indent=2,
+                             ensure_ascii=False).encode("utf-8")
+        self.data["manifest_sha256"] = hashlib.sha256(encoded).hexdigest()
+        temporary = self.manifest_path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(self.data, stream, sort_keys=True, indent=2,
+                      ensure_ascii=False)
+        os.replace(temporary, self.manifest_path)
 
 class ProductionEvidenceManifest:
     def __init__(self, repo_root: str):

@@ -8,6 +8,7 @@ from app.db.repositories import (
     ProjectStateRepository,
 )
 from app.db.transaction import transaction
+from app.db.repositories.base import fetchall
 from app.code_detail.source_reader import compute_db_file_path_hash
 
 
@@ -70,8 +71,31 @@ class AnalysisService(object):
         for operation_key in sorted(groups):
             items = groups[operation_key]
             first = items[0]
-            content = self.domain.create_record(connection, first, origin="MANUAL")
             line_ids = [int(item["line_id"]) for item in items]
+            requested_record_id = int(
+                first.get("record_id") or first.get("analysis_record_id") or 0
+            )
+            content = None
+            if requested_record_id:
+                current_refs = fetchall(connection, """
+                    SELECT line_id FROM coverage_analysis_line_links
+                    WHERE analysis_record_id=? AND is_active=1
+                """, (requested_record_id,))
+                current_ids = {int(row["line_id"]) for row in current_refs}
+                if current_ids != set(line_ids):
+                    # A shared record is immutable for a partial edit: only
+                    # the selected physical lines receive a new record.
+                    requested_record_id = 0
+                else:
+                    expected_revision = first.get("expected_record_revision")
+                    if expected_revision is None:
+                        raise ValueError("EXPECTED_RECORD_REVISION_REQUIRED")
+                    content = self.domain.update_record(
+                        connection, requested_record_id, first,
+                        expected_revision=int(expected_revision),
+                    )
+            if content is None:
+                content = self.domain.create_record(connection, first, origin="MANUAL")
             if len(line_ids) == 1:
                 start_line = end_line = int(first.get("line_number") or 0)
             else:

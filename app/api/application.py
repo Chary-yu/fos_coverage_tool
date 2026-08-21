@@ -96,6 +96,7 @@ class VNextApplication(object):
                 "MUTATION_REQUIRES_CURRENT_SCAN": ("SCAN_NOT_CURRENT_FOR_MUTATION", 409),
                 "STALE_RELATION_REVISION": ("STALE_RELATION_REVISION", 409),
                 "STALE_CONTENT_REVISION": ("STALE_RECORD_REVISION", 409),
+                "EXPECTED_RECORD_REVISION_REQUIRED": ("STALE_RECORD_REVISION", 409),
                 "STALE_REJECTION_REVISION": ("STALE_REJECTION_REVISION", 409),
                 "CURRENT_POINTER_CHANGED": ("CURRENT_POINTER_CHANGED", 409),
                 "PREDECESSOR_MISMATCH": ("INVALID_SCAN_IDENTITY", 409),
@@ -417,6 +418,14 @@ class VNextApplication(object):
             records = (body or {}).get("records") or []
             if not records:
                 raise ValueError("records are required")
+            expected_revision = (body or {}).get("expected_record_revision")
+            if expected_revision is not None:
+                records = [
+                    dict(item, expected_record_revision=item.get(
+                        "expected_record_revision", expected_revision
+                    ))
+                    for item in records
+                ]
             result = self.runtime.analysis_service.save(
                 connection, project["project_name"], int(scan_id), records,
                 reviewer=(body or {}).get("reviewer") or identity,
@@ -497,14 +506,32 @@ class VNextApplication(object):
             offset = (page - 1) * page_size
             rows = fetchall(connection, """
                 SELECT l.line_number, l.line_text, l.coverage_state,
-                       l.suggested_reviewer, a.status, a.is_draft, a.reviewer,
-                       a.coverage_method, a.uncovered_reason, a.updated_at
+                       l.suggested_reviewer,
+                       CASE WHEN q.id IS NOT NULL THEN r.conclusion_status
+                            ELSE a.status END AS status,
+                       CASE WHEN q.id IS NOT NULL THEN
+                                CASE WHEN q.review_state IN ('MANUAL_DRAFT', 'INHERITED_PENDING')
+                                     THEN 1 ELSE 0 END
+                            ELSE a.is_draft END AS is_draft,
+                       CASE WHEN q.id IS NOT NULL THEN q.reviewed_by
+                            ELSE a.reviewer END AS reviewer,
+                       CASE WHEN q.id IS NOT NULL THEN r.coverage_method
+                            ELSE a.coverage_method END AS coverage_method,
+                       CASE WHEN q.id IS NOT NULL THEN r.uncovered_reason
+                            ELSE a.uncovered_reason END AS uncovered_reason,
+                       CASE WHEN q.id IS NOT NULL THEN r.updated_at
+                            ELSE a.updated_at END AS updated_at,
+                       q.review_state, q.relation_origin,
+                       q.analysis_record_id, q.relation_revision
                 FROM coverage_lines l
                 LEFT JOIN coverage_analyses a ON a.line_id = l.id
+                LEFT JOIN coverage_analysis_line_links q
+                  ON q.scan_id=? AND q.line_id=l.id AND q.is_active=1
+                LEFT JOIN coverage_analysis_records r ON r.id=q.analysis_record_id
                 WHERE l.file_id = ?
                 ORDER BY l.line_number
                 LIMIT ? OFFSET ?
-            """, (int(file_row["id"]), page_size, offset))
+            """, (int(scan_id), int(file_row["id"]), page_size, offset))
         total = int((total_row or {}).get("total") or 0)
         return 200, {
             "page": page, "page_size": page_size, "total": total,
@@ -642,6 +669,8 @@ class VNextApplication(object):
                     if resource_id is None:
                         raise ValueError("physical repository resource is required")
                     resource_ids.append(int(resource_id))
+                if not resource_ids:
+                    raise ValueError("physical repository resource is required")
                 durable = self.runtime.scan_import_coordinator.create(
                     connection, project_name, body["info_path"],
                     info_sha256=body.get("info_sha256", ""),
@@ -653,7 +682,50 @@ class VNextApplication(object):
                     staging_root=self.runtime.scan_import_staging_root,
                     algorithm_version=body.get("algorithm_version", "vnext-import-v1"),
                 )
-                return 202, durable
+                import_job = durable["job"]
+                import_job_id = str(import_job["job_id"])
+                import_owner = durable.get("owner_token") or ""
+                import_locks = durable.get("locks") or []
+                import_fence = int(
+                    import_locks[0].get("fencing_token")
+                    if import_locks else 0
+                )
+
+                def import_callback():
+                    with self._write_connection() as callback_connection:
+                        return self.runtime.scan_import_coordinator.execute(
+                            callback_connection, import_job_id,
+                            owner_token=import_owner,
+                            fencing_token=import_fence,
+                        )
+
+                try:
+                    queued_job = self.runtime.job_service.submit(
+                        project_id=import_job["project_id"],
+                        scan_id=import_job["scan_id"],
+                        kind="scan_import",
+                        data_version=int(import_job.get("data_version") or 0),
+                        callback=import_callback,
+                        input_payload=json.loads(
+                            import_job.get("input_payload") or "{}"
+                        ),
+                        job_id=import_job_id,
+                        resource_class="database",
+                    )
+                except Exception as exc:
+                    self.runtime.scan_import_recovery.record_failure(
+                        connection, import_job_id, "ENQUEUE", exc.__class__.__name__,
+                        str(exc), fencing_token=import_fence,
+                    )
+                    raise
+                # Internal lock ownership and filesystem paths are not API
+                # credentials.  Keep them out of the response while retaining
+                # the durable job/checkpoint/artifact identity for polling.
+                response = dict(durable)
+                response["job"] = queued_job
+                response.pop("owner_token", None)
+                response.pop("locks", None)
+                return 202, response
             scan = self.runtime.project_service.create_scan(
                 connection, project_name,
                 info_file_name=body.get("info_file_name", ""),

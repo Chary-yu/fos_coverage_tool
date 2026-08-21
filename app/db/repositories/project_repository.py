@@ -308,11 +308,28 @@ class ProjectRepository(object):
                    l.coverage_state, l.block_start_line, l.block_end_line,
                    l.block_type, l.function_name, l.function_hash,
                    l.code_line_hash, l.code_occurrence, l.suggested_reviewer,
-                   a.status, a.is_draft, a.reviewer, a.coverage_method,
-                   a.uncovered_reason, a.comment
+                   CASE WHEN q.id IS NOT NULL THEN r.conclusion_status
+                        ELSE a.status END AS status,
+                   CASE WHEN q.id IS NOT NULL THEN
+                            CASE WHEN q.review_state IN ('MANUAL_DRAFT', 'INHERITED_PENDING')
+                                 THEN 1 ELSE 0 END
+                        ELSE a.is_draft END AS is_draft,
+                   CASE WHEN q.id IS NOT NULL THEN q.reviewed_by
+                        ELSE a.reviewer END AS reviewer,
+                   CASE WHEN q.id IS NOT NULL THEN r.coverage_method
+                        ELSE a.coverage_method END AS coverage_method,
+                   CASE WHEN q.id IS NOT NULL THEN r.uncovered_reason
+                        ELSE a.uncovered_reason END AS uncovered_reason,
+                   CASE WHEN q.id IS NOT NULL THEN r.comment
+                        ELSE a.comment END AS comment,
+                   q.review_state, q.relation_origin,
+                   q.analysis_record_id, q.relation_revision
             FROM coverage_files f
             JOIN coverage_lines l ON l.file_id = f.id
             LEFT JOIN coverage_analyses a ON a.line_id = l.id
+            LEFT JOIN coverage_analysis_line_links q
+              ON q.scan_id=f.scan_id AND q.line_id=l.id AND q.is_active=1
+            LEFT JOIN coverage_analysis_records r ON r.id=q.analysis_record_id
             WHERE f.scan_id = ?
             ORDER BY f.repository_name, f.file_path, l.line_number
         """), (scan_id,))

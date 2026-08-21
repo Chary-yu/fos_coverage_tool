@@ -130,6 +130,7 @@ class InheritanceEngine(object):
             for row in candidate_lines
         }
         decisions = []
+        decided_line_ids = set()
         for relation in source_relations:
             key = (str(relation.get("repository_name") or ""),
                    str(relation.get("file_path") or ""))
@@ -168,6 +169,10 @@ class InheritanceEngine(object):
                                 int(row.get("line_number")) == int(new_line_number)), None)
             if not target_line:
                 continue
+            existing_decision = fetchone(connection, """
+                SELECT * FROM coverage_inheritance_decisions
+                WHERE decision_run_id=? AND candidate_line_id=?
+            """, (run_id, int(target_line["id"])))
             old_analysis = self.parser.analyze(
                 source_snapshot["old_text"], relation.get("file_path") or ""
             )
@@ -198,7 +203,14 @@ class InheritanceEngine(object):
                 mapping=mapping,
             )
             decisions.append(decision)
+            decided_line_ids.add(int(target_line["id"]))
             if result.ok:
+                if (existing_decision and
+                        str(existing_decision.get("decision") or "") == "INHERITED" and
+                        self._active_link_for_line(
+                            connection, candidate_scan_id, target_line["id"]
+                        )):
+                    continue
                 record = self.domain.get_record(connection, relation["analysis_record_id"])
                 state = (CARRIED_COVERED if str(target_line.get("coverage_state") or "").lower()
                          in ("covered", "1") else INHERITED_PENDING)
@@ -220,6 +232,18 @@ class InheritanceEngine(object):
                     source_line_id=relation["line_id"],
                     source_relation_id=relation["id"],
                 )
+        # A predecessor relation is not a license to silently omit a new or
+        # renamed candidate line.  Every uncovered candidate receives an
+        # ordinary, explainable no-inherit decision when no source relation
+        # reached it; covered lines are outside the review-candidate set.
+        for candidate_line in candidate_lines:
+            line_id = int(candidate_line.get("id") or 0)
+            if line_id in decided_line_ids or not self._is_review_candidate(candidate_line):
+                continue
+            decisions.append(self._write_decision(
+                connection, run_id, candidate_scan_id, candidate_line, None,
+                "NO_SOURCE_RELATION", algorithm_version,
+            ))
         return {"status": "PASSED", "decision_run_id": run_id,
                 "decisions": decisions,
                 "inherited": len([item for item in decisions if item.get("decision") == "INHERITED"]),
@@ -233,6 +257,19 @@ class InheritanceEngine(object):
         """, (int(scan_id),))
         return [self._write_decision(connection, run_id, scan_id, row, None,
                                       reason, version) for row in rows]
+
+    @staticmethod
+    def _is_review_candidate(row):
+        return str(row.get("coverage_state") or "").lower() in (
+            "uncovered", "uncovered_line", "uncovered-code", "0", "未覆盖"
+        )
+
+    @staticmethod
+    def _active_link_for_line(connection, scan_id, line_id):
+        return fetchone(connection, """
+            SELECT id FROM coverage_analysis_line_links
+            WHERE scan_id=? AND line_id=? AND is_active=1
+        """, (int(scan_id), int(line_id)))
 
     def _repository_snapshot(self, connection, scan_id, repository_name):
         return fetchone(connection, """

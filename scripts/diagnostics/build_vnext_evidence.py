@@ -20,6 +20,7 @@ from scripts.diagnostics.scan_immutability_audit import audit as audit_scan_immu
 from scripts.diagnostics.active_runtime_audit import audit as audit_active_runtime
 from scripts.diagnostics.configured_runtime_audit import audit as audit_configured_runtime
 from scripts.diagnostics.legacy_retirement_audit import audit as audit_legacy_retirement
+from scripts.upgrade.evidence_manifest import EvidenceManifestV2
 
 
 CAPABILITIES = [
@@ -129,8 +130,29 @@ def main(argv=None):
     if not os.path.isabs(output):
         output = os.path.join(root, output)
     os.makedirs(os.path.dirname(output), exist_ok=True)
+    matrix = build(root)
+    # Keep the architecture matrix and its Gate evidence manifest together so
+    # CI artifacts remain self-describing after the runner is gone.  A
+    # transitional legacy owner is recorded as INCOMPLETE, never relabelled as
+    # a production PASS.
     with open(output, "w", encoding="utf-8") as stream:
-        json.dump(build(root), stream, ensure_ascii=False, indent=2, sort_keys=True)
+        json.dump(matrix, stream, ensure_ascii=False, indent=2, sort_keys=True)
+    legacy_status = (matrix.get("legacy_retirement") or {}).get("gate_status")
+    evidence_status = "PASSED" if legacy_status == "PASSED" else "INCOMPLETE"
+    manifest = EvidenceManifestV2(
+        root, "gate-1-3", candidate_revision=matrix.get("revision") or "",
+        release_identity=matrix.get("release_identity") or {},
+        manifest_path=os.path.join(
+            os.path.dirname(output), "evidence-manifest-v2.json"
+        ),
+    )
+    manifest.record(
+        "architecture-ownership-matrix", "static", evidence_status,
+        command_or_action="python scripts/diagnostics/build_vnext_evidence.py",
+        exit_code=0, artifact_path=output,
+        source_inputs_sha256=[], synthetic=False,
+        legacy_retirement_status=legacy_status or "UNKNOWN",
+    )
     print(output)
     return 0
 

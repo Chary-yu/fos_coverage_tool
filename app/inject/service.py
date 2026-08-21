@@ -26,18 +26,60 @@ class ScanImportService(object):
 
     def import_info(self, connection, project_name, info_path, review_scope="full",
                     repositories=None, report=None, info_file_name=""):
-        reject_relative_traversal(info_path)
-        info_path = os.path.realpath(info_path)
-        if self.allowed_info_roots and not realpath_within(info_path, self.allowed_info_roots):
-            raise ValueError("info_path is outside configured input roots")
-        if not os.path.isfile(info_path):
-            raise FileNotFoundError(info_path)
+        info_path = self._validate_info_path(info_path)
         digest = hashlib.sha256()
         with open(info_path, "rb") as stream:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
         info_sha256 = digest.hexdigest()
         parsed = load_info(info_path)
+        files = self.build_files(parsed, repositories or [])
+        scan = self.projects.create_scan_and_ingest(
+            connection, project_name, files,
+            info_file_name=info_file_name or os.path.basename(info_path),
+            info_sha256=info_sha256, review_scope=review_scope,
+            repositories=repositories or [], report=report,
+        )
+        if report and self.report_registry:
+            report_root = report.get("report_root") or ""
+            directories = report.get("directories") or ([report_root] if report_root else [])
+            self.report_registry.register(
+                report["report_id"], directories,
+                sidecar_required=bool(report.get("sidecar_required", True)),
+                report_root=report_root,
+                scan_id=scan["id"],
+                source_signature=report.get("source_signature", ""),
+            )
+        return {
+            "scan": scan, "files": len(files),
+            "line_count": sum(len(item["lines"]) for item in files),
+            "function_range_fallback_files": sum(
+                1 for item in parsed.values() if item.get("function_range_fallback")
+            ),
+        }
+
+    def _validate_info_path(self, info_path):
+        reject_relative_traversal(info_path)
+        info_path = os.path.realpath(info_path)
+        if self.allowed_info_roots and not realpath_within(info_path, self.allowed_info_roots):
+            raise ValueError("info_path is outside configured input roots")
+        if not os.path.isfile(info_path):
+            raise FileNotFoundError(info_path)
+        return info_path
+
+    def parse_info_file(self, info_path, repositories=None):
+        """Parse a trusted staged artifact into immutable physical line facts."""
+        info_path = os.path.realpath(str(info_path or ""))
+        if not os.path.isfile(info_path):
+            raise FileNotFoundError(info_path)
+        digest = hashlib.sha256()
+        with open(info_path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        parsed = load_info(info_path)
+        return digest.hexdigest(), parsed, self.build_files(parsed, repositories or [])
+
+    def build_files(self, parsed, repositories=None):
         files = []
         for file_path, item in parsed.items():
             normalized = str(file_path or "").replace("\\", "/")
@@ -74,36 +116,7 @@ class ScanImportService(object):
                 "source_file_name": os.path.basename(normalized),
                 "lines": line_records,
             })
-        if report and self.allowed_report_roots:
-            report_directories = report.get("directories") or (
-                [report.get("report_root")] if report.get("report_root") else []
-            )
-            for directory in report_directories:
-                if not realpath_within(directory, self.allowed_report_roots):
-                    raise ValueError("report root is outside configured report roots")
-        scan = self.projects.create_scan_and_ingest(
-            connection, project_name, files,
-            info_file_name=info_file_name or os.path.basename(info_path),
-            info_sha256=info_sha256, review_scope=review_scope,
-            repositories=repositories or [], report=report,
-        )
-        if report and self.report_registry:
-            report_root = report.get("report_root") or ""
-            directories = report.get("directories") or ([report_root] if report_root else [])
-            self.report_registry.register(
-                report["report_id"], directories,
-                sidecar_required=bool(report.get("sidecar_required", True)),
-                report_root=report_root,
-                scan_id=scan["id"],
-                source_signature=report.get("source_signature", ""),
-            )
-        return {
-            "scan": scan, "files": len(files),
-            "line_count": sum(len(item["lines"]) for item in files),
-            "function_range_fallback_files": sum(
-                1 for item in parsed.values() if item.get("function_range_fallback")
-            ),
-        }
+        return files
 
     @staticmethod
     def _repository_name(path, repositories):

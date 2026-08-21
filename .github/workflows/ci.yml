@@ -225,7 +225,7 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - name: Run required real-browser and canonical VNext HTTP suites
-        run: npx playwright test tests/browser
+        run: mkdir -p .artifacts && npx playwright test tests/browser --reporter=json > .artifacts/browser_playwright.json
       - run: mkdir -p .artifacts && npm run perf:synthetic-dom -- .artifacts/synthetic_dom_microbenchmark.json
         env:
           BASELINE_COMMIT: ${{ github.event.before }}
@@ -238,7 +238,9 @@ jobs:
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
         with:
           name: browser-functional-evidence
-          path: .artifacts/synthetic_dom_microbenchmark.json
+          path: |
+            .artifacts/browser_playwright.json
+            .artifacts/synthetic_dom_microbenchmark.json
           if-no-files-found: error
 
   cross-layer-performance:
@@ -253,6 +255,16 @@ jobs:
         with:
           python-version: '3.12'
       - name: Require cross-layer metrics
-        run: >-
-          python scripts/diagnostics/performance_evidence_audit.py
-          "${{ inputs.cross_layer_evidence }}" --require-cross-layer
+        run: |
+          set -o pipefail
+          mkdir -p .artifacts
+          python scripts/diagnostics/performance_evidence_audit.py \
+            "${{ inputs.cross_layer_evidence }}" --require-cross-layer \
+            | tee .artifacts/cross_layer_performance.json
+      - name: Upload cross-layer performance evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: cross-layer-performance-evidence
+          path: .artifacts/cross_layer_performance.json
+          if-no-files-found: error

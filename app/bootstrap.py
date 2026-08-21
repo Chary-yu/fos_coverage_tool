@@ -31,6 +31,7 @@ from app.services.project_service import ProjectService
 from app.services.progress_service import ProgressService
 from app.services.export_service import ExportService
 from app.services.incremental_service import IncrementalReportService
+from app.inheritance.engine import InheritanceEngine
 from app.jobs.bounded_executor import BoundedJobExecutor
 from app.jobs.service import VNextBackgroundJobService
 
@@ -90,7 +91,8 @@ class VNextRuntime(object):
             legacy_path=os.path.join(self.repo_root, ".report_registry.json"),
         )
         self.code_detail = VNextCodeDetailService(
-            self.projects, self.analyses, self.report_registry
+            self.projects, self.analyses, self.report_registry,
+            domain_repo=self.analysis_domain_repository,
         )
         report_roots = []
         for root in self.config.get("report_roots") or []:
@@ -124,7 +126,15 @@ class VNextRuntime(object):
         self.scan_import_coordinator = ScanImportCoordinator(
             project_repository=self.projects, state_repository=self.states,
             publication_service=self.scan_publication_service,
-            stager=None,
+            stager=ImmutableArtifactStager(import_root),
+            repository_repository=self.repository_repository,
+            import_service=self.scan_import_service,
+            inheritance_engine=InheritanceEngine(
+                domain_repository=self.analysis_domain_repository,
+            ),
+            file_state_repository=self.file_states,
+            analysis_domain_service=self.analysis_domain_service,
+            project_service=self.project_service,
         )
         self.scan_import_staging_root = import_root
         self.scan_import_recovery = ScanImportRecoveryService(
@@ -179,6 +189,9 @@ class VNextRuntime(object):
             self.recoverable_scan_imports = self.scan_import_recovery.list_recoverable(
                 recovery_connection
             )
+        self.resumed_scan_imports = []
+        for recoverable in self.recoverable_scan_imports:
+            self._resume_scan_import(recoverable)
         try:
             self.release_identity = get_current_release_identity(self.repo_root)
         except Exception:
@@ -186,6 +199,51 @@ class VNextRuntime(object):
         self.export_service = ExportService(
             self.projects, export_root, release_identity=self.release_identity
         )
+
+    def _resume_scan_import(self, job):
+        """Reclaim and resume one durable import after a process restart."""
+        job_id = str(job.get("job_id") or "")
+        payload = {}
+        try:
+            import json
+            payload = json.loads(job.get("input_payload") or "{}")
+        except (TypeError, ValueError):
+            payload = {}
+
+        def callback():
+            with self.connection_context(read_only=False) as connection:
+                reclaimed = self.scan_import_recovery.reclaim(
+                    connection, job_id, self.scan_import_staging_root,
+                )
+                locks = reclaimed.get("locks") or []
+                fence = int(locks[0].get("fencing_token") if locks else 0)
+                try:
+                    return self.scan_import_coordinator.execute(
+                        connection, job_id,
+                        owner_token=reclaimed.get("owner_token") or "",
+                        fencing_token=fence,
+                    )
+                except Exception as exc:
+                    self.scan_import_recovery.record_failure(
+                        connection, job_id, "RESUME", exc.__class__.__name__,
+                        str(exc), fencing_token=fence,
+                    )
+                    raise
+
+        try:
+            queued = self.job_service.submit(
+                project_id=job.get("project_id"), scan_id=job.get("scan_id"),
+                kind="scan_import", data_version=int(job.get("data_version") or 0),
+                callback=callback, input_payload=payload, job_id=job_id,
+                resource_class="database",
+            )
+            self.resumed_scan_imports.append(queued)
+        except Exception as exc:
+            with self.connection_context(read_only=False) as connection:
+                self.scan_import_recovery.record_failure(
+                    connection, job_id, "RESUME_ENQUEUE", exc.__class__.__name__,
+                    str(exc),
+                )
 
     @contextmanager
     def connection_context(self, read_only: bool = False):

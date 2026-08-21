@@ -22,6 +22,25 @@ RETIREMENT_CONDITIONS = [
 ]
 
 
+def _usage_telemetry():
+    path = str(os.environ.get("COVERAGE_LEGACY_USAGE_FILE") or "").strip()
+    if not path:
+        return {"configured": False, "path": "", "available": False,
+                "usage_counts": {}, "usage_total": None}
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            values = json.load(stream)
+        counts = values if isinstance(values, dict) else {}
+        return {
+            "configured": True, "path": os.path.abspath(path),
+            "available": True, "usage_counts": counts,
+            "usage_total": sum(int(item or 0) for item in counts.values()),
+        }
+    except (OSError, ValueError, TypeError):
+        return {"configured": True, "path": os.path.abspath(path),
+                "available": False, "usage_counts": {}, "usage_total": None}
+
+
 def audit(repo_root=ROOT):
     boundary = audit_boundary(repo_root)
     transitional = boundary.get("classification", {}).get("TRANSITIONAL_LEGACY", [])
@@ -38,6 +57,7 @@ def audit(repo_root=ROOT):
         "transitional_owners": transitional,
         "missing_files": missing_files,
         "retirement_conditions": RETIREMENT_CONDITIONS,
+        "usage_telemetry": _usage_telemetry(),
         "compatibility_tests": [
             "tests.vnext.test_runtime_config",
             "tests.code_detail.test_phase2_core",

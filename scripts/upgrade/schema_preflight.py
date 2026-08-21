@@ -11,6 +11,7 @@ from typing import List, Tuple, Dict, Any
 
 PROTECTED_TABLES = {
     "coverage_schema_meta",
+    "coverage_schema_migrations",
     "coverage_projects",
     "coverage_scans",
     "coverage_scan_repositories",
@@ -23,7 +24,21 @@ PROTECTED_TABLES = {
     "coverage_project_state",
     "coverage_file_state",
     "coverage_background_jobs",
-    "coverage_incremental_results"
+    "coverage_incremental_results",
+    "coverage_legacy_provenance",
+    "coverage_repositories",
+    "coverage_repository_aliases",
+    "coverage_repository_resources",
+    "coverage_analysis_records",
+    "coverage_analysis_blocks",
+    "coverage_inheritance_groups",
+    "coverage_analysis_line_links",
+    "coverage_inheritance_decisions",
+    "coverage_inheritance_rejections",
+    "coverage_repository_resource_locks",
+    "coverage_import_artifacts",
+    "coverage_import_checkpoints",
+    "coverage_import_failures",
 }
 
 FORBIDDEN_KEYWORDS = [

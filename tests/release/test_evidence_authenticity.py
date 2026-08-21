@@ -8,7 +8,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from app.release_identity import get_current_release_identity
-from scripts.upgrade.evidence_manifest import ProductionEvidenceManifest
+from scripts.upgrade.evidence_manifest import EvidenceManifestV2, ProductionEvidenceManifest
 
 
 class TestEvidenceAuthenticity(unittest.TestCase):
@@ -41,6 +41,21 @@ class TestEvidenceAuthenticity(unittest.TestCase):
             passed, unmet = manifest.validate_final_gate()
             self.assertFalse(passed)
             self.assertTrue(any("Browser" in item or "Backup" in item for item in unmet))
+
+    def test_evidence_manifest_v2_binds_record_to_revision_and_artifact_sha(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = os.path.join(root, "evidence.json")
+            with open(artifact, "w") as stream:
+                stream.write("{}")
+            manifest = EvidenceManifestV2(root, "gate-a", candidate_revision="abc")
+            record = manifest.record(
+                "schema", "db-integration", "PASSED", "unit-test", 0,
+                artifact_path=artifact,
+            )
+            self.assertEqual(record["candidate_revision"], "abc")
+            self.assertTrue(record["artifact_sha256"])
+            self.assertEqual(manifest.validate(), (True, []))
+            self.assertTrue(manifest.data["manifest_sha256"])
 
 
 if __name__ == "__main__":

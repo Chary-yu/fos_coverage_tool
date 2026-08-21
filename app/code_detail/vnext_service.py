@@ -8,6 +8,9 @@ from app.code_detail.code_region import FunctionRange, build_code_regions
 from app.code_detail.sidecar_store import SidecarStore
 from app.code_detail.source_reader import calc_sidecar_file_key, compute_db_file_path_hash
 from app.db.repositories.base import fetchall, fetchone
+from app.db.repositories.analysis_domain_repository import (
+    AnalysisDomainRepository, INHERITED_PENDING, MANUAL_DRAFT,
+)
 from app.reports.identity import validate_report_id
 
 
@@ -19,10 +22,12 @@ MAX_BATCH_LOGICAL_LINES = 20000
 
 class VNextCodeDetailService(object):
     def __init__(self, project_repo, analysis_repo, report_registry,
+                 domain_repo=None,
                  max_sidecar_stores=32, max_identity_entries=256,
                  max_overlay_entries=512):
         self.projects = project_repo
         self.analyses = analysis_repo
+        self.domain = domain_repo
         self.registry = report_registry
         # A runtime serves many ranges from the same immutable report. Keep
         # one SidecarStore per report root/asset so metadata and decoded
@@ -157,15 +162,33 @@ class VNextCodeDetailService(object):
                 merged.append((start_line, end_line))
         return tuple(merged)
 
-    def _overlay(self, connection, file_id, ranges=None, data_version=0):
+    @staticmethod
+    def _domain_overlay_row(row):
+        state = str(row.get("review_state") or "")
+        return dict(row, status=row.get("conclusion_status") or "",
+                    is_draft=1 if state in (MANUAL_DRAFT, INHERITED_PENDING) else 0,
+                    reviewer=row.get("reviewed_by") or "",
+                    analysis_state=row.get("conclusion_status") or "",
+                    review_state=state)
+
+    def _overlay(self, connection, file_id, ranges=None, data_version=0,
+                 scan_id=None):
         range_key = self._overlay_ranges(ranges)
-        cache_key = (int(file_id), int(data_version or 0), range_key)
+        cache_key = (int(scan_id or 0), int(file_id), int(data_version or 0), range_key)
         with self._cache_lock:
             cached = self._overlay_cache.get(cache_key)
             if cached is not None:
                 self._overlay_cache.move_to_end(cache_key)
                 return cached
-        if range_key:
+        if self.domain is not None and scan_id is not None:
+            rows = self.domain.read_file(connection, scan_id, file_id, range_key)
+            if rows:
+                rows = [self._domain_overlay_row(row) for row in rows]
+            elif range_key:
+                rows = self.analyses.get_by_file_ranges(connection, file_id, range_key)
+            else:
+                rows = self.analyses.get_by_file(connection, file_id)
+        elif range_key:
             rows = self.analyses.get_by_file_ranges(connection, file_id, range_key)
         else:
             rows = self.analyses.get_by_file(connection, file_id)
@@ -231,7 +254,8 @@ class VNextCodeDetailService(object):
             elif isinstance(item, (list, tuple)) and len(item) >= 2:
                 ranges.append(FunctionRange(item[0], item[1], item[2] if len(item) > 2 else ""))
         overlay = self._overlay(
-            connection, file_row["id"], data_version=file_row.get("data_version", 0)
+            connection, file_row["id"], data_version=file_row.get("data_version", 0),
+            scan_id=scan_id,
         )
         pending = []
         confirmed = 0
@@ -318,6 +342,7 @@ class VNextCodeDetailService(object):
         overlay = self._overlay(
             connection, file_row["id"], normalized,
             data_version=file_row.get("data_version", 0),
+            scan_id=scan_id,
         )
         batches = []
         for (start_line, end_line), rows in zip(normalized, rows_batches):
