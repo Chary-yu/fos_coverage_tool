@@ -23,6 +23,7 @@ from app.db.repositories import (
     ProjectStateRepository,
 )
 from app.db.repositories.base import adapt_sql, fetchall, fetchone, is_sqlite, insert_id
+from app.db.identity_keys import stable_identity_hash
 from app.db.transaction import transaction
 from app.time_utils import utc_iso, utc_sql
 from scripts.upgrade.database_identity import (
@@ -106,9 +107,9 @@ CREATE TABLE IF NOT EXISTS coverage_background_jobs (
 CREATE TABLE IF NOT EXISTS coverage_incremental_results (
     id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL,
     report_id TEXT NOT NULL DEFAULT '', repository_name TEXT NOT NULL,
+    incremental_key_hash TEXT NOT NULL,
     old_commit_sha TEXT NOT NULL DEFAULT '', new_commit_sha TEXT NOT NULL DEFAULT '',
-    payload TEXT NOT NULL, generated_at TEXT NOT NULL,
-    UNIQUE(scan_id, report_id, repository_name)
+    payload TEXT NOT NULL, generated_at TEXT NOT NULL, UNIQUE(incremental_key_hash)
 );
 """
 
@@ -231,8 +232,9 @@ CREATE TABLE IF NOT EXISTS coverage_import_checkpoints (
 CREATE TABLE IF NOT EXISTS coverage_import_failures (
     id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL, scan_id INTEGER,
     phase TEXT NOT NULL, error_class TEXT NOT NULL, error_fingerprint TEXT NOT NULL,
+    failure_key_hash TEXT NOT NULL,
     message_redacted TEXT, fencing_token INTEGER, occurred_at TEXT NOT NULL,
-    UNIQUE(job_id, phase, error_fingerprint)
+    UNIQUE(failure_key_hash)
 );
 """
 
@@ -240,6 +242,9 @@ CREATE TABLE IF NOT EXISTS coverage_import_failures (
 SQLITE_ADDITIVE_COLUMNS = {
     "coverage_schema_meta": [
         ("migration_id", "TEXT NOT NULL DEFAULT ''"),
+    ],
+    "coverage_incremental_results": [
+        ("incremental_key_hash", "TEXT NOT NULL DEFAULT ''"),
     ],
     "coverage_scans": [
         ("predecessor_scan_id", "INTEGER"),
@@ -358,6 +363,100 @@ def _ensure_legacy_provenance_key_hash(connection):
             cursor.execute(adapt_sql(connection, """
                 ALTER TABLE coverage_legacy_provenance
                 ADD UNIQUE KEY uq_legacy_provenance_hash (provenance_key_hash)
+            """))
+    finally:
+        cursor.close()
+
+
+def _ensure_incremental_result_key_hash(connection):
+    table_name = "coverage_incremental_results"
+    column_name = "incremental_key_hash"
+    if not _table_exists(connection, table_name) or not _column_exists(
+            connection, table_name, column_name):
+        return
+    rows = fetchall(connection, """
+        SELECT id, scan_id, report_id, repository_name, incremental_key_hash
+        FROM coverage_incremental_results
+    """)
+    updates = []
+    for row in rows:
+        expected = stable_identity_hash(
+            int(row.get("scan_id") or 0), row.get("report_id") or "",
+            row.get("repository_name") or "",
+        )
+        if str(row.get(column_name) or "") != expected:
+            updates.append((expected, int(row.get("id") or 0)))
+    if updates:
+        cursor = connection.cursor()
+        try:
+            cursor.executemany(adapt_sql(connection, """
+                UPDATE coverage_incremental_results
+                SET incremental_key_hash=? WHERE id=?
+            """), updates)
+        finally:
+            cursor.close()
+    index_name = "uq_incremental_key_hash"
+    if _index_exists(connection, table_name, index_name):
+        return
+    cursor = connection.cursor()
+    try:
+        if is_sqlite(connection):
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({})".format(
+                    index_name, table_name, column_name
+                )
+            )
+        else:
+            cursor.execute(adapt_sql(connection, """
+                ALTER TABLE coverage_incremental_results
+                ADD UNIQUE KEY uq_incremental_key_hash (incremental_key_hash)
+            """))
+    finally:
+        cursor.close()
+
+
+def _ensure_import_failure_key_hash(connection):
+    table_name = "coverage_import_failures"
+    column_name = "failure_key_hash"
+    if not _table_exists(connection, table_name) or not _column_exists(
+            connection, table_name, column_name):
+        return
+    rows = fetchall(connection, """
+        SELECT id, job_id, phase, error_fingerprint, failure_key_hash
+        FROM coverage_import_failures
+    """)
+    updates = []
+    for row in rows:
+        expected = stable_identity_hash(
+            row.get("job_id") or "", row.get("phase") or "",
+            row.get("error_fingerprint") or "",
+        )
+        if str(row.get(column_name) or "") != expected:
+            updates.append((expected, int(row.get("id") or 0)))
+    if updates:
+        cursor = connection.cursor()
+        try:
+            cursor.executemany(adapt_sql(connection, """
+                UPDATE coverage_import_failures
+                SET failure_key_hash=? WHERE id=?
+            """), updates)
+        finally:
+            cursor.close()
+    index_name = "uq_import_failure_hash"
+    if _index_exists(connection, table_name, index_name):
+        return
+    cursor = connection.cursor()
+    try:
+        if is_sqlite(connection):
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({})".format(
+                    index_name, table_name, column_name
+                )
+            )
+        else:
+            cursor.execute(adapt_sql(connection, """
+                ALTER TABLE coverage_import_failures
+                ADD UNIQUE KEY uq_import_failure_hash (failure_key_hash)
             """))
     finally:
         cursor.close()
@@ -928,7 +1027,17 @@ def create_sqlite_schema(connection):
             "ALTER TABLE coverage_legacy_provenance "
             "ADD COLUMN provenance_key_hash TEXT NOT NULL DEFAULT ''"
         )
+    if not _column_exists(
+            connection, "coverage_import_failures", "failure_key_hash"):
+        connection.execute(
+            "ALTER TABLE coverage_import_failures "
+            "ADD COLUMN failure_key_hash TEXT NOT NULL DEFAULT ''"
+        )
     _ensure_legacy_provenance_key_hash(connection)
+    for ensure_key_hash in (
+            _ensure_incremental_result_key_hash,
+            _ensure_import_failure_key_hash):
+        ensure_key_hash(connection)
     connection.commit()
 
 
@@ -1182,6 +1291,8 @@ def apply_schema(connection, ddl_path, release_sha=""):
                 )))
                 cursor.close()
         _ensure_legacy_provenance_key_hash(connection)
+        _ensure_incremental_result_key_hash(connection)
+        _ensure_import_failure_key_hash(connection)
         # Keep the historical key for old health checks while introducing the
         # stage-specific metadata required by Gate A.
         meta_rows = [

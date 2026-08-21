@@ -216,12 +216,14 @@ CREATE TABLE IF NOT EXISTS coverage_incremental_results (
     scan_id BIGINT NOT NULL,
     report_id VARCHAR(64) NOT NULL DEFAULT '',
     repository_name VARCHAR(128) NOT NULL,
+    incremental_key_hash CHAR(64) NOT NULL,
     old_commit_sha CHAR(40) NOT NULL DEFAULT '',
     new_commit_sha CHAR(40) NOT NULL DEFAULT '',
     payload LONGTEXT NOT NULL,
     generated_at DATETIME NOT NULL,
     PRIMARY KEY (id),
-    UNIQUE KEY uq_incremental_scan_repo (scan_id, report_id, repository_name),
+    UNIQUE KEY uq_incremental_key_hash (incremental_key_hash),
+    KEY idx_incremental_scan_repo (scan_id, report_id(64), repository_name(125)),
     CONSTRAINT fk_incremental_result_scan FOREIGN KEY (scan_id)
         REFERENCES coverage_scans(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -503,11 +505,13 @@ CREATE TABLE IF NOT EXISTS coverage_import_failures (
     phase VARCHAR(64) NOT NULL,
     error_class VARCHAR(64) NOT NULL,
     error_fingerprint CHAR(64) NOT NULL,
+    failure_key_hash CHAR(64) NOT NULL,
     message_redacted TEXT NULL,
     fencing_token BIGINT NULL,
     occurred_at DATETIME NOT NULL,
     PRIMARY KEY (id),
-    UNIQUE KEY uq_import_failure (job_id, phase, error_fingerprint),
+    UNIQUE KEY uq_import_failure_hash (failure_key_hash),
+    KEY idx_import_failure_lookup (job_id(63), phase(64), error_fingerprint(64)),
     CONSTRAINT fk_import_failure_scan FOREIGN KEY (scan_id)
         REFERENCES coverage_scans(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

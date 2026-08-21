@@ -235,6 +235,12 @@ class CanonicalIncrementalTest(unittest.TestCase):
             )
             self.assertEqual(loaded["scan_id"], scan["id"])
             self.assertEqual(loaded["report_id"], "report-a")
+            stored_key = connection.execute(
+                "SELECT incremental_key_hash FROM coverage_incremental_results "
+                "WHERE scan_id=? AND report_id=? AND repository_name=?",
+                (scan["id"], "report-a", "repo-a"),
+            ).fetchone()[0]
+            self.assertEqual(len(stored_key), 64)
             with self.assertRaises(ValueError):
                 service.build_and_persist(
                     connection, "fixture", scan["id"], root, "0" * 40, newgit,

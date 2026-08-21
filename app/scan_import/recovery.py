@@ -13,6 +13,7 @@ import json
 import uuid
 
 from app.db.repositories import JobRepository, ProjectRepository
+from app.db.identity_keys import stable_identity_hash
 from app.db.repositories.base import adapt_sql, execute, fetchall, fetchone, is_sqlite
 from app.db.transaction import transaction
 from app.scan_import.artifacts import ImmutableArtifactStager
@@ -115,6 +116,9 @@ class ScanImportRecoveryService(object):
         fingerprint = hashlib.sha256(
             "{}\n{}\n{}".format(phase, error_class, message).encode("utf-8")
         ).hexdigest()
+        failure_key_hash = stable_identity_hash(
+            str(job_id), str(phase), fingerprint
+        )
         redacted = str(message or "")[:512]
         with transaction(connection) as conn:
             job = self.jobs.get(conn, job_id)
@@ -125,13 +129,15 @@ class ScanImportRecoveryService(object):
             insert_sql = """
                     {prefix} INTO coverage_import_failures(
                         job_id, scan_id, phase, error_class, error_fingerprint,
-                        message_redacted, fencing_token, occurred_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        failure_key_hash, message_redacted, fencing_token,
+                        occurred_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """.format(prefix=insert_prefix)
             cursor = conn.cursor()
             cursor.execute(adapt_sql(conn, insert_sql), (
                 str(job_id), scan_id, str(phase), str(error_class),
-                fingerprint, redacted, fencing_token, utc_sql(),
+                fingerprint, failure_key_hash, redacted, fencing_token,
+                utc_sql(),
             ))
             cursor.close()
             cursor = execute(conn, """

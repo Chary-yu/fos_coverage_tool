@@ -262,6 +262,11 @@ class ScanImportLifecycleTest(unittest.TestCase):
                 (result["job"]["job_id"],),
             ).fetchone()[0:2], ("PUBLISH", "ValueError")
         )
+        failure_key = self.connection.execute(
+            "SELECT failure_key_hash FROM coverage_import_failures WHERE job_id=?",
+            (result["job"]["job_id"],),
+        ).fetchone()[0]
+        self.assertEqual(len(failure_key), 64)
 
     def test_enqueue_failure_aborts_candidate_and_releases_lock(self):
         coordinator = ScanImportCoordinator()

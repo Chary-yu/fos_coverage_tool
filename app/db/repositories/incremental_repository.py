@@ -2,6 +2,7 @@
 
 import json
 
+from app.db.identity_keys import stable_identity_hash
 from app.db.repositories.base import execute, fetchone
 from app.time_utils import utc_sql
 
@@ -18,6 +19,9 @@ class IncrementalRepository(object):
         payload = json.dumps(report, ensure_ascii=False, sort_keys=True, default=str)
         repositories = report.get("repositories") or []
         item = repositories[0] if repositories else {}
+        identity_hash = stable_identity_hash(
+            int(scan_id), report_id or "", repository_name or ""
+        )
         values = (
             report.get("oldgit") or item.get("old_commit_sha") or "",
             report.get("newgit") or item.get("new_commit_sha") or "",
@@ -26,18 +30,21 @@ class IncrementalRepository(object):
         )
         if existing:
             cursor = execute(connection, """
-                UPDATE coverage_incremental_results SET old_commit_sha = ?,
+                UPDATE coverage_incremental_results SET incremental_key_hash = ?,
+                    old_commit_sha = ?,
                     new_commit_sha = ?, payload = ?, generated_at = ?
                 WHERE id = ?
-            """, values + (existing["id"],))
+            """, (identity_hash,) + values + (existing["id"],))
             cursor.close()
             return self.get(connection, scan_id, report_id, repository_name)
         cursor = execute(connection, """
             INSERT INTO coverage_incremental_results(
-                scan_id, report_id, repository_name, old_commit_sha,
+                scan_id, report_id, repository_name, incremental_key_hash,
+                old_commit_sha,
                 new_commit_sha, payload, generated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (int(scan_id), report_id or "", repository_name or "") + values)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (int(scan_id), report_id or "", repository_name or "",
+               identity_hash) + values)
         cursor.close()
         return self.get(connection, scan_id, report_id, repository_name)
 

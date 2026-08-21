@@ -1239,6 +1239,9 @@ data_version 不倒退
 - 冗余 `scan_id/repository_id/file_id/line_id` 字段的一致性校验；
 - bulk query 所需联合索引；
 - schema migration id/checksum。
+- MariaDB 5.5 `utf8mb4` 767-byte 索引上限；无法完整放入联合索引的业务身份
+  必须使用规范化 SHA-256 identity key，前缀索引只能用于候选定位，不能承担
+  业务唯一性。
 
 应用写入必须验证：`link.scan_id == line.file.scan_id`、`block.scan/file/repository` 与 line 一致。冗余字段只做查询/证据加速，不可形成第二权威。
 
@@ -1695,10 +1698,12 @@ coverage_import_failures
   phase VARCHAR(64) NOT NULL
   error_class VARCHAR(64) NOT NULL
   error_fingerprint CHAR(64) NOT NULL
+  failure_key_hash CHAR(64) NOT NULL
   message_redacted TEXT NULL
   fencing_token BIGINT NULL
   occurred_at DATETIME NOT NULL
-  UNIQUE(job_id, phase, error_fingerprint)
+  UNIQUE(failure_key_hash)
+  KEY(job_id(63), phase(64), error_fingerprint(64))
 ```
 
 普通“不继承”不属于 Gate C failure。
