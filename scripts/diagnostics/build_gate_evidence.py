@@ -88,7 +88,13 @@ TEST_GROUPS = {
     "A": ["tests.vnext.test_migration_runner", "tests.vnext.test_legacy_migration_contract"],
     "B": ["tests.vnext.test_analysis_domain", "tests.vnext.test_migration_runner"],
     "C": ["tests.vnext.test_scan_import_lifecycle", "tests.vnext.test_jobs"],
-    "D": ["tests.vnext.test_inheritance_engine", "tests.vnext.test_parser_toolchain"],
+    "D": [
+        "tests.vnext.test_inheritance_engine",
+        "tests.vnext.test_parser_toolchain",
+        "tests.vnext.test_analysis_domain",
+        "tests.vnext.test_scan_import_lifecycle",
+        "tests.vnext.test_api_export_security",
+    ],
     "E": ["tests.vnext.test_api_export_security", "tests.vnext.test_registry_and_api_contract"],
     "F": ["tests.release.test_upgrade_manifest", "tests.release.test_evidence_authenticity"],
 }

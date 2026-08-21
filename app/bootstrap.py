@@ -32,6 +32,7 @@ from app.services.progress_service import ProgressService
 from app.services.export_service import ExportService
 from app.services.incremental_service import IncrementalReportService
 from app.inheritance.engine import InheritanceEngine
+from app.inheritance.toolchain import parser_from_config
 from app.jobs.bounded_executor import BoundedJobExecutor
 from app.jobs.service import VNextBackgroundJobService
 
@@ -123,6 +124,7 @@ class VNextRuntime(object):
         )
         if not os.path.isabs(import_root):
             import_root = os.path.join(self.repo_root, import_root)
+        self.inheritance_parser = parser_from_config(self.config)
         self.scan_import_coordinator = ScanImportCoordinator(
             project_repository=self.projects, state_repository=self.states,
             publication_service=self.scan_publication_service,
@@ -130,6 +132,7 @@ class VNextRuntime(object):
             repository_repository=self.repository_repository,
             import_service=self.scan_import_service,
             inheritance_engine=InheritanceEngine(
+                parser=self.inheritance_parser,
                 domain_repository=self.analysis_domain_repository,
             ),
             file_state_repository=self.file_states,

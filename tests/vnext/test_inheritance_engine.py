@@ -148,6 +148,11 @@ class InheritanceEngineTest(unittest.TestCase):
         result = audit_rules(os.getcwd())
         self.assertEqual(result["status"], "PASSED")
         self.assertEqual(result["rule_count"], 83)
+        self.assertEqual(result["test_id_count"], 83)
+        self.assertEqual(result["mapped_test_id_count"], 83)
+        self.assertEqual(result["missing_owner_modules"], [])
+        self.assertEqual(result["invalid_test_selectors"], [])
+        self.assertTrue(result["plan_sha256_match"])
 
 
 if __name__ == "__main__":

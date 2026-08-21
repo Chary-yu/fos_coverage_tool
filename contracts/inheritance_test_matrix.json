@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "rule_contract": "contracts/inheritance_rules_v1.json",
+  "targeted_suites": [
+    "tests.vnext.test_inheritance_engine",
+    "tests.vnext.test_parser_toolchain",
+    "tests.vnext.test_analysis_domain",
+    "tests.vnext.test_scan_import_lifecycle",
+    "tests.vnext.test_api_export_security"
+  ],
+  "cases": [
+    {
+      "selector": "tests.vnext.test_scan_import_lifecycle.ScanImportLifecycleTest.test_staged_import_has_fixed_predecessor_checkpoint_and_atomic_publish",
+      "test_ids": [
+        "D-PRE-01", "D-PRE-02", "D-PRE-04", "D-PRE-05", "D-PRE-06",
+        "C-IMPORT-01", "C-IMPORT-02", "C-CP-01", "C-LOCK-01", "C-LOCK-02",
+        "C-LOCK-03", "C-LOCK-04", "C-PUB-01", "C-PUB-02", "C-PUB-03",
+        "C-PUB-04", "C-PUB-05", "C-REC-01", "C-REC-02", "C-REC-03",
+        "C-REC-04"
+      ],
+      "kind": "durable_lifecycle"
+    },
+    {
+      "selector": "tests.vnext.test_scan_import_lifecycle.ScanImportLifecycleTest.test_execute_imports_staged_info_computes_inheritance_and_publishes",
+      "test_ids": [
+        "D-GIT-01", "D-DEC-01", "D-DEC-02", "D-DEC-03",
+        "D-DEC-04", "D-DEC-05", "D-DEC-06", "D-DEC-07", "D-ENG-01",
+        "D-ENG-02", "D-ENG-03"
+      ],
+      "kind": "durable_engine_wiring"
+    },
+    {
+      "selector": "tests.vnext.test_inheritance_engine.InheritanceEngineTest.test_durable_run_requires_verified_git_snapshot_identity",
+      "test_ids": ["D-GIT-02", "D-GIT-03"],
+      "kind": "technical_failure_boundary"
+    },
+    {
+      "selector": "tests.vnext.test_scan_import_lifecycle.ScanImportLifecycleTest.test_repository_master_rename_alias_and_retire_preserve_identity",
+      "test_ids": ["B-REPO-01", "B-REPO-02"],
+      "kind": "repository_identity"
+    },
+    {
+      "selector": "tests.vnext.test_inheritance_engine.InheritanceEngineTest.test_line_map_is_one_to_one_and_fail_closed_for_replacement",
+      "test_ids": ["D-MAP-01", "D-MAP-02", "D-MAP-03", "D-MAP-06", "D-MAP-07", "D-MAP-08"],
+      "kind": "line_mapping"
+    },
+    {
+      "selector": "tests.vnext.test_inheritance_engine.InheritanceEngineTest.test_compare_line_allows_comment_only_change_and_rejects_control_change",
+      "test_ids": ["D-MAP-04", "D-MAP-05"],
+      "kind": "line_decision"
+    },
+    {
+      "selector": "tests.vnext.test_inheritance_engine.InheritanceEngineTest.test_lexer_preserves_literals_and_ignores_comments",
+      "test_ids": ["D-TOK-01", "D-TOK-02"],
+      "kind": "token_normalization"
+    },
+    {
+      "selector": "tests.vnext.test_inheritance_engine.InheritanceEngineTest.test_lexer_handles_encoded_raw_strings_and_line_splicing",
+      "test_ids": ["D-TOK-03"],
+      "kind": "token_normalization"
+    },
+    {
+      "selector": "tests.vnext.test_inheritance_engine.InheritanceEngineTest.test_parser_identity_includes_scope_and_signature",
+      "test_ids": ["D-FN-01", "D-FN-02", "D-FN-03", "D-FN-04"],
+      "kind": "function_identity"
+    },
+    {
+      "selector": "tests.vnext.test_inheritance_engine.InheritanceEngineTest.test_parser_preserves_spliced_control_and_preprocessor_context",
+      "test_ids": ["D-CTX-01", "D-CTX-02", "D-CTX-03", "D-CTX-04"],
+      "kind": "control_preprocessor_context"
+    },
+    {
+      "selector": "tests.vnext.test_inheritance_engine.InheritanceEngineTest.test_dependency_index_checks_same_repository_helper_in_another_file",
+      "test_ids": ["D-DEP-01", "D-DEP-02", "D-DEP-03", "D-DEP-04", "D-DEP-05", "D-DEP-06", "D-DEP-07", "D-DEP-08"],
+      "kind": "dependency_resolution"
+    },
+    {
+      "selector": "tests.vnext.test_analysis_domain.AnalysisDomainTest.test_manual_save_creates_record_exact_block_and_one_current_link_per_line",
+      "test_ids": ["D-BLOCK-01", "D-BLOCK-02", "D-REVIEW-02", "D-REVIEW-04"],
+      "kind": "analysis_record_and_block"
+    },
+    {
+      "selector": "tests.vnext.test_analysis_domain.AnalysisDomainTest.test_backfill_is_idempotent_and_does_not_fabricate_verified_block",
+      "test_ids": ["D-BLOCK-03"],
+      "kind": "analysis_backfill"
+    },
+    {
+      "selector": "tests.vnext.test_analysis_domain.AnalysisDomainTest.test_progress_pending_partition_is_conserved",
+      "test_ids": ["D-PROG-01", "D-PROG-02", "D-PROG-03", "D-PROG-04", "D-PROG-05", "D-REVIEW-01"],
+      "kind": "progress_conservation"
+    },
+    {
+      "selector": "tests.vnext.test_analysis_domain.AnalysisDomainTest.test_reject_and_undo_preserve_lineage_without_active_overlay",
+      "test_ids": ["D-REVIEW-03", "D-REJECT-01", "D-REJECT-02", "D-REJECT-03", "D-REJECT-04", "D-REJECT-06"],
+      "kind": "rejection_lineage"
+    },
+    {
+      "selector": "tests.vnext.test_api_export_security.VNextApiExportSecurityTest.test_inheritance_reject_and_undo_api_is_current_and_revision_bound",
+      "test_ids": ["D-REJECT-05"],
+      "kind": "api_mutation_contract"
+    },
+    {
+      "selector": "tests.vnext.test_parser_toolchain.ParserToolchainTest.test_missing_external_parser_fails_closed",
+      "test_ids": ["D-PARSE-01", "D-PARSE-02"],
+      "kind": "parser_toolchain_preflight"
+    }
+  ]
+}

@@ -3775,7 +3775,7 @@ Gate D 的机器权威来源为 `contracts/inheritance_rules_v1.json`。发布�
 
 ```text
 rules_contract_version = 1
-rules_contract_sha256 = <由 canonical JSON 生成>
+rules_contract_sha256 = f85a441535fd67ba13eb21eeaf2cba4acbfb1fe906b7ee36161d02c31e7f8975
 ```
 
 上游 v2.0《Deterministic Inheritance Contract v1》和本附录是该 JSON 的人类可读镜像。
