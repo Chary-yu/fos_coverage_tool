@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "plan_path": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md",
+  "items": [
+    {"dod_id":"DOD-01","title":"Legacy source to Empty VNext target migration evidence","required_tasks":["A-09","A-10"],"evidence_class":"production-database"},
+    {"dod_id":"DOD-02","title":"Legacy to VNext zero-loss reconciliation","required_tasks":["A-09","B-06","F-07"],"evidence_class":"semantic-audit"},
+    {"dod_id":"DOD-03","title":"Repository, Scan, File and Line identity is unambiguous","required_tasks":["B-02","B-11"],"evidence_class":"semantic-audit"},
+    {"dod_id":"DOD-04","title":"Analysis domain has four non-overlapping authorities","required_tasks":["B-03","B-04","B-05","B-07","D-07"],"evidence_class":"db-integration"},
+    {"dod_id":"DOD-05","title":"Analysis save never changes CURRENT","required_tasks":["B-07","E-03"],"evidence_class":"api-contract"},
+    {"dod_id":"DOD-06","title":"PublicationService is the sole CURRENT writer","required_tasks":["C-01","C-02","C-11"],"evidence_class":"runtime"},
+    {"dod_id":"DOD-07","title":"Physical resource lock and monotonic fencing are atomic","required_tasks":["C-03","C-04"],"evidence_class":"db-integration"},
+    {"dod_id":"DOD-08","title":"Import uses immutable staged input, checkpoint CAS and handler recovery","required_tasks":["C-05","C-06","C-07","C-10"],"evidence_class":"runtime"},
+    {"dod_id":"DOD-09","title":"Historical comparison does not mutate the main Git worktree","required_tasks":["C-08","D-02"],"evidence_class":"runtime"},
+    {"dod_id":"DOD-10","title":"R01-R83 have owners, tests, traceability and results","required_tasks":["D-17","D-19"],"evidence_class":"inheritance"},
+    {"dod_id":"DOD-11","title":"Deterministic corpus has no known false-positive inheritance","required_tasks":["D-18","D-19"],"evidence_class":"parser"},
+    {"dod_id":"DOD-12","title":"Pending conservation is strict","required_tasks":["E-05","E-14"],"evidence_class":"progress"},
+    {"dod_id":"DOD-13","title":"Covered bridge/delete/reject/undo behavior follows the contract","required_tasks":["D-12","D-13","E-04"],"evidence_class":"api-contract"},
+    {"dod_id":"DOD-14","title":"API exposes explicit identity and fails closed","required_tasks":["E-01","E-11"],"evidence_class":"api-contract"},
+    {"dod_id":"DOD-15","title":"Real Chromium completes the inheritance review workflow","required_tasks":["E-12"],"evidence_class":"browser"},
+    {"dod_id":"DOD-16","title":"Candidate and Current environments are isolated","required_tasks":["F-02","F-03","F-08"],"evidence_class":"release"},
+    {"dod_id":"DOD-17","title":"Verified recoverable backup exists","required_tasks":["A-09","F-05"],"evidence_class":"production-database"},
+    {"dod_id":"DOD-18","title":"Final production migration semantic reconciliation passes","required_tasks":["F-07"],"evidence_class":"production-database"},
+    {"dod_id":"DOD-19","title":"Rollback rehearses the exact before-release identity","required_tasks":["F-10"],"evidence_class":"rollback"},
+    {"dod_id":"DOD-20","title":"Skill Drift Audit is complete","required_tasks":["F-12"],"evidence_class":"skill-drift"},
+    {"dod_id":"DOD-21","title":"No unresolved P0/P1 risk remains","required_tasks":["F-13"],"evidence_class":"gate-matrix"},
+    {"dod_id":"DOD-22","title":"Final exact-SHA source, security and canonical review passes","required_tasks":["F-08"],"evidence_class":"release"},
+    {"dod_id":"DOD-23","title":"Target parser/toolchain passes dependency preflight","required_tasks":["D-18","F-04"],"evidence_class":"parser"},
+    {"dod_id":"DOD-24","title":"Evidence Manifest v2 provenance is complete and verifiable","required_tasks":["F-13"],"evidence_class":"gate-matrix"}
+  ]
+}

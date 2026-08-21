@@ -32,6 +32,8 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("--evidence-output", workflow)
         self.assertIn("gate_task_status.py", workflow)
         self.assertIn("gate-task-status.json", workflow)
+        self.assertIn("dod_status.py", workflow)
+        self.assertIn("gate-dod-status.json", workflow)
         self.assertIn("release_readiness.py", workflow)
         self.assertIn("release-readiness.json", workflow)
         self.assertIn("actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808", workflow)

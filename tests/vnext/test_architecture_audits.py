@@ -146,6 +146,13 @@ class ArchitectureAuditTest(unittest.TestCase):
         self.assertIn("tests.database.test_phase0_baseline", maintenance)
         self.assertIn("tests.release.test_verified_backup_rehearsal", maintenance)
 
+    def test_changed_test_selection_covers_definition_of_done_governance(self):
+        selected = select(["scripts/diagnostics/dod_status.py"])
+        self.assertIn("tests.release.test_dod_status", selected)
+        self.assertIn("tests.release.test_release_readiness", selected)
+        selected_manifest = select(["docs/gate_dod_manifest.json"])
+        self.assertIn("tests.release.test_dod_status", selected_manifest)
+
     def test_cross_layer_performance_gate_rejects_browser_only_evidence(self):
         payload = {
             "coverage_virtual_scroll_100k": {

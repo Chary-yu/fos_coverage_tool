@@ -24,6 +24,7 @@ from app.release_identity import generate_release_identity
 from app.time_utils import utc_iso
 from scripts.diagnostics.contract import with_contract
 from scripts.diagnostics.task_manifest_audit import EXPECTED_TASKS
+from scripts.diagnostics.dod_status import EXPECTED_DOD_IDS
 
 
 DECISIONS = ("READY", "READY_WITH_ACCEPTED_RISK", "NOT_READY")
@@ -176,8 +177,55 @@ def _risk_findings(risk_register, candidate_revision):
     return blockers, accepted
 
 
+def _dod_blockers(dod_status, candidate_revision):
+    blockers = []
+    if not isinstance(dod_status, dict):
+        return [{"type": "dod_status", "reason": "DoD status artifact is missing"}]
+    if str(dod_status.get("candidate_revision") or "") != str(candidate_revision or ""):
+        blockers.append({
+            "type": "dod_status",
+            "reason": "candidate_revision does not match Gate Matrix",
+        })
+    if dod_status.get("dod_count") != len(EXPECTED_DOD_IDS):
+        blockers.append({
+            "type": "dod_status",
+            "reason": "dod_count must be {}".format(len(EXPECTED_DOD_IDS)),
+        })
+    observed_ids = []
+    for item in dod_status.get("items") or []:
+        if not isinstance(item, dict):
+            blockers.append({"type": "dod", "reason": "DoD entry is invalid"})
+            continue
+        dod_id = item.get("dod_id")
+        observed_ids.append(dod_id)
+        status = str(item.get("status") or "INCOMPLETE").upper()
+        if status != "PASSED":
+            blockers.append({
+                "type": "dod", "dod_id": dod_id, "status": status,
+                "blockers": item.get("blockers") or [],
+            })
+    missing = sorted(set(EXPECTED_DOD_IDS) - set(observed_ids))
+    unexpected = sorted(set(observed_ids) - set(EXPECTED_DOD_IDS))
+    if missing:
+        blockers.append({"type": "dod_status", "reason": "missing DoD IDs",
+                         "dod_ids": missing})
+    if unexpected or len(observed_ids) != len(set(observed_ids)):
+        blockers.append({
+            "type": "dod_status",
+            "reason": "duplicate or unexpected DoD IDs",
+            "dod_ids": unexpected,
+        })
+    if str(dod_status.get("status") or "INCOMPLETE").upper() != "PASSED":
+        blockers.append({
+            "type": "dod_status",
+            "status": str(dod_status.get("status") or "INCOMPLETE").upper(),
+        })
+    return blockers
+
+
 def build(repo_root=ROOT, matrix=None, task_status=None, risk_register=None,
-          matrix_path="", task_status_path="", risk_register_path=""):
+          dod_status=None, matrix_path="", task_status_path="",
+          dod_status_path="", risk_register_path=""):
     repo_root = os.path.abspath(repo_root)
     current_revision = _revision(repo_root)
     matrix = matrix if isinstance(matrix, dict) else {}
@@ -193,6 +241,7 @@ def build(repo_root=ROOT, matrix=None, task_status=None, risk_register=None,
 
     blockers.extend(_gate_blockers(matrix))
     blockers.extend(_task_blockers(task_status, candidate_revision))
+    blockers.extend(_dod_blockers(dod_status, candidate_revision))
     risk_blockers, accepted_risks = _risk_findings(risk_register, candidate_revision)
     blockers.extend(risk_blockers)
 
@@ -215,6 +264,7 @@ def build(repo_root=ROOT, matrix=None, task_status=None, risk_register=None,
         "evaluated_at": utc_iso(),
         "matrix_path": os.path.abspath(matrix_path) if matrix_path else "",
         "task_status_path": os.path.abspath(task_status_path) if task_status_path else "",
+        "dod_status_path": os.path.abspath(dod_status_path) if dod_status_path else "",
         "risk_register_path": os.path.abspath(risk_register_path) if risk_register_path else "",
         "accepted_risks": accepted_risks,
         "blockers": blockers,
@@ -230,6 +280,7 @@ def main(argv=None):
     parser.add_argument("--repo-root", default=ROOT)
     parser.add_argument("--matrix", required=True)
     parser.add_argument("--task-status", required=True)
+    parser.add_argument("--dod-status", required=True)
     parser.add_argument("--risk-register", required=True)
     parser.add_argument("--output", default=".artifacts/vnext/release-readiness.json")
     parser.add_argument("--allow-not-ready", action="store_true")
@@ -237,15 +288,18 @@ def main(argv=None):
     repo_root = os.path.abspath(args.repo_root)
     matrix_path = os.path.abspath(args.matrix)
     task_path = os.path.abspath(args.task_status)
+    dod_path = os.path.abspath(args.dod_status)
     risk_path = os.path.abspath(args.risk_register)
     try:
         result = build(
             repo_root,
             matrix=_load(matrix_path),
             task_status=_load(task_path),
+            dod_status=_load(dod_path),
             risk_register=_load(risk_path),
             matrix_path=matrix_path,
             task_status_path=task_path,
+            dod_status_path=dod_path,
             risk_register_path=risk_path,
         )
     except (OSError, ValueError, TypeError) as exc:

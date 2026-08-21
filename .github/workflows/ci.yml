@@ -131,6 +131,13 @@ jobs:
           --matrix .artifacts/vnext/gate-matrix.json
           --output .artifacts/vnext/gate-task-status.json
           --allow-incomplete
+      - name: Build Definition-of-Done status
+        run: >-
+          python scripts/diagnostics/dod_status.py
+          --matrix .artifacts/vnext/gate-matrix.json
+          --task-status .artifacts/vnext/gate-task-status.json
+          --output .artifacts/vnext/gate-dod-status.json
+          --allow-incomplete
       - name: Evaluate release readiness decision
         run: |
           python - <<'PY'
@@ -145,6 +152,7 @@ jobs:
           python scripts/diagnostics/release_readiness.py \
             --matrix .artifacts/vnext/gate-matrix.json \
             --task-status .artifacts/vnext/gate-task-status.json \
+            --dod-status .artifacts/vnext/gate-dod-status.json \
             --risk-register .artifacts/vnext/release-risk-register.json \
             --output .artifacts/vnext/release-readiness.json \
             --allow-not-ready

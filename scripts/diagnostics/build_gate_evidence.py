@@ -23,6 +23,8 @@ if ROOT not in sys.path:
 from app.release_identity import generate_release_identity
 from app.time_utils import utc_iso
 from scripts.diagnostics.gate_matrix import build as build_gate_matrix
+from scripts.diagnostics.gate_task_status import build_from_matrix as build_task_status
+from scripts.diagnostics.dod_status import build as build_dod_status
 from scripts.diagnostics.contract import with_contract
 from scripts.diagnostics.deterministic_inheritance_corpus import (
     DEFAULT_FIXTURE as DETERMINISTIC_FIXTURE,
@@ -78,7 +80,7 @@ GATE_FILES = {
         "final_migration.json", "final_semantic_reconciliation.json",
         "runtime_verification.json", "browser_smoke.json", "cutover_record.json",
         "rollback_rehearsal.json", "acceptance_window_checks.json", "skill_drift_audit.json",
-        "legacy_retirement.json",
+        "legacy_retirement.json", "gate-task-status.json", "gate-dod-status.json",
     ),
 }
 
@@ -365,6 +367,8 @@ def build(repo_root, output_root, run_tests=True):
     revision = _revision(repo_root)
     identity = generate_release_identity(repo_root=repo_root)
     matrix = build_gate_matrix(repo_root)
+    task_status = build_task_status(repo_root, matrix=matrix)
+    dod_status = build_dod_status(repo_root, matrix=matrix, task_status=task_status)
     sqlite_result = _sqlite_migration(repo_root)
     all_gate_results = {}
 
@@ -572,6 +576,8 @@ def build(repo_root, output_root, run_tests=True):
                     "legacy_retirement", "legacy retirement audit is unavailable"
                 ),
             )
+            _write(os.path.join(gate_dir, "gate-task-status.json"), task_status)
+            _write(os.path.join(gate_dir, "gate-dod-status.json"), dod_status)
             _write(os.path.join(gate_dir, "release_identity.json"), identity)
             _write(
                 os.path.join(gate_dir, "database_runtime_identity.json"),

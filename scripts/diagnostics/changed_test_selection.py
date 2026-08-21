@@ -42,13 +42,15 @@ MAPPINGS = [
      # dedicated browser job; this selector is consumed by Python unittest.
      "tests.vnext.test_vnext_runtime"),
     ({"scripts/diagnostics/*", "scripts/release/*", "scripts/upgrade/*"},
-     "tests.vnext.test_architecture_audits tests.release.test_upgrade_manifest tests.release.test_rollback_rehearsal tests.release.test_verified_backup_rehearsal tests.release.test_evidence_authenticity"),
+     "tests.vnext.test_architecture_audits tests.release.test_dod_status tests.release.test_release_readiness tests.release.test_upgrade_manifest tests.release.test_rollback_rehearsal tests.release.test_verified_backup_rehearsal tests.release.test_evidence_authenticity"),
     ({"scripts/maintenance/mysql_backup.py"},
      "tests.database.test_phase0_baseline tests.release.test_verified_backup_rehearsal"),
     ({"docs/*", "schema/*", "evidence/*"},
      "tests.vnext.test_architecture_audits tests.release.test_release_governance_tools tests.release.test_evidence_authenticity"),
     ({"scripts/upgrade/*", "app/release_identity.py", ".github/workflows/ci.yml"},
      "tests.vnext.test_migration_runner tests.release.test_upgrade_manifest tests.release.test_evidence_authenticity"),
+    ({"docs/gate_dod_manifest.json"},
+     "tests.release.test_dod_status tests.release.test_release_readiness"),
 ]
 
 

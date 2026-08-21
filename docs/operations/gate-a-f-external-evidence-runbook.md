@@ -198,10 +198,16 @@ python3 scripts/diagnostics/gate_task_status.py \
   --repo-root "$PWD" \
   --matrix /secure/evidence/gate-matrix.json \
   --output /secure/evidence/gate-task-status.json
+python3 scripts/diagnostics/dod_status.py \
+  --repo-root "$PWD" \
+  --matrix /secure/evidence/gate-matrix.json \
+  --task-status /secure/evidence/gate-task-status.json \
+  --output /secure/evidence/gate-dod-status.json
 python3 scripts/diagnostics/release_readiness.py \
   --repo-root "$PWD" \
   --matrix /secure/evidence/gate-matrix.json \
   --task-status /secure/evidence/gate-task-status.json \
+  --dod-status /secure/evidence/gate-dod-status.json \
   --risk-register /secure/evidence/gate-f/release-risk-register.json \
   --output /secure/evidence/release-readiness.json
 ```
@@ -212,6 +218,11 @@ python3 scripts/diagnostics/release_readiness.py \
 Gate 和全部上游任务均为 `PASSED` 时，任务才会标记为 `PASSED`；缺失的真实
 Candidate/MariaDB/生产证据会在每个受影响任务的 `blockers` 中保留，不能被总 Gate
 状态折叠隐藏。
+
+`dod_status.py` 会继续按第 19 节的 24 条 Definition of Done 展开结果；每条 DoD
+都必须消费同一 exact-SHA task status 中列出的全部 required tasks。DoD artifact
+缺失、版本不一致或任一 required task 未通过时，最终 readiness 必须保持
+`NOT_READY`。
 
 `release-risk-register.json` 必须显式绑定同一 `candidate_revision`，格式为
 `{"candidate_revision":"<sha>","risks":[]}` 或列出已批准的 P2/Info 风险。
