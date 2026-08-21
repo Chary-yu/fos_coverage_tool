@@ -48,7 +48,10 @@ class TestEvidenceAuthenticity(unittest.TestCase):
             artifact = os.path.join(root, "evidence.json")
             with open(artifact, "w") as stream:
                 stream.write("{}")
-            manifest = EvidenceManifestV2(root, "gate-a", candidate_revision="abc")
+            manifest = EvidenceManifestV2(
+                root, "gate-a", candidate_revision="abc",
+                release_identity={"commit_sha": "abc"},
+            )
             record = manifest.record(
                 "schema", "db-integration", "PASSED", "unit-test", 0,
                 artifact_path=artifact,

@@ -102,6 +102,7 @@ class EvidenceManifestV2:
 
     REQUIRED_RECORD_FIELDS = (
         "gate", "evidence_id", "evidence_class", "candidate_revision",
+        "release_identity",
         "host_identity", "command_or_action", "started_at", "finished_at",
         "exit_code", "artifact_path", "artifact_sha256", "source_inputs_sha256",
         "status", "synthetic",
@@ -206,6 +207,10 @@ class EvidenceManifestV2:
 
     def validate(self, require_current_revision=False):
         errors = []
+        if self.data.get("evidence_schema_version") != 2:
+            errors.append("evidence_schema_version must be 2")
+        if self.data.get("gate") != self.gate:
+            errors.append("manifest gate does not match the requested gate")
         unsigned = dict(self.data)
         observed_manifest_sha = str(unsigned.pop("manifest_sha256", "") or "")
         expected_manifest_sha = hashlib.sha256(json.dumps(
@@ -217,20 +222,40 @@ class EvidenceManifestV2:
         candidate = str(self.data.get("candidate_revision") or "")
         if not candidate:
             errors.append("candidate_revision is missing")
+        release_identity = self.data.get("release_identity") or {}
+        if not isinstance(release_identity, dict):
+            errors.append("release_identity must be an object")
+        elif not release_identity.get("commit_sha"):
+            errors.append("manifest release identity commit_sha is missing")
+        elif release_identity.get("commit_sha") != candidate:
+            errors.append("manifest release identity revision mismatch")
         records = self.data.get("evidence")
         if not isinstance(records, list) or not records:
             errors.append("evidence records are missing")
             records = []
         for index, record in enumerate(records):
+            if not isinstance(record, dict):
+                errors.append("evidence[{}] must be an object".format(index))
+                continue
             for field in self.REQUIRED_RECORD_FIELDS:
                 if field not in record:
                     errors.append("evidence[{}] missing {}".format(index, field))
+            if record.get("gate") != self.gate:
+                errors.append("evidence[{}] gate mismatch".format(index))
+            if not record.get("evidence_id"):
+                errors.append("evidence[{}] evidence_id is missing".format(index))
+            if not record.get("evidence_class"):
+                errors.append("evidence[{}] evidence_class is missing".format(index))
             if record.get("candidate_revision") != candidate:
                 errors.append("evidence[{}] candidate revision mismatch".format(index))
             if not isinstance(record.get("host_identity"), dict) or not record.get("host_identity"):
                 errors.append("evidence[{}] host identity is missing".format(index))
             if not record.get("command_or_action"):
                 errors.append("evidence[{}] command/action is missing".format(index))
+            if not record.get("started_at") or not record.get("finished_at"):
+                errors.append("evidence[{}] timestamps are missing".format(index))
+            if type(record.get("exit_code")) not in (int, type(None)):
+                errors.append("evidence[{}] exit_code must be an integer or null".format(index))
             if record.get("status") not in (
                     "PASSED", "INCOMPLETE", "BLOCKED", "FAILED", "PARTIAL",
                     "UNAVAILABLE", "SKIPPED"):
@@ -251,10 +276,13 @@ class EvidenceManifestV2:
                 errors.append("evidence[{}] PASSED without exit_code 0".format(index))
             if record.get("status") == "PASSED" and record.get("synthetic"):
                 errors.append("evidence[{}] synthetic evidence cannot be PASSED".format(index))
+            if record.get("status") == "PASSED":
+                if not record.get("artifact_path") or not record.get("artifact_sha256"):
+                    errors.append("evidence[{}] PASSED evidence artifact path/SHA256 is missing".format(index))
             release_identity = record.get("release_identity") or {}
-            if isinstance(release_identity, dict) and \
-                    release_identity.get("commit_sha") and \
-                    release_identity.get("commit_sha") != candidate:
+            if not isinstance(release_identity, dict) or not release_identity.get("commit_sha"):
+                errors.append("evidence[{}] release identity commit_sha is missing".format(index))
+            elif release_identity.get("commit_sha") != candidate:
                 errors.append("evidence[{}] release identity revision mismatch".format(index))
             evidence_class = str(record.get("evidence_class") or "").lower()
             if ("database" in evidence_class or "mariadb" in evidence_class or

@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import tempfile
 import unittest
@@ -29,8 +30,54 @@ class GateMatrixEvidenceTest(unittest.TestCase):
             else:
                 os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = old
 
-    def test_external_pass_requires_candidate_identity_and_non_synthetic_record(self):
+    def test_external_pass_requires_complete_provenance_and_artifact(self):
         fd, path = tempfile.mkstemp(prefix="coverage-gate-evidence-", suffix=".json")
+        os.close(fd)
+        artifact = path + ".payload"
+        old = os.environ.get("COVERAGE_GATE_TEST_EVIDENCE")
+        try:
+            with open(artifact, "w", encoding="utf-8") as stream:
+                stream.write("verified external result\n")
+            with open(artifact, "rb") as stream:
+                artifact_sha = hashlib.sha256(stream.read()).hexdigest()
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "status": "PASSED",
+                    "candidate_revision": self.revision,
+                    "host_identity": {"hostname": "test"},
+                    "evidence_class": "external_test",
+                    "command_or_action": "test evidence",
+                    "started_at": "2026-08-21T00:00:00Z",
+                    "finished_at": "2026-08-21T00:00:01Z",
+                    "exit_code": 0,
+                    "artifact_path": artifact,
+                    "artifact_sha256": artifact_sha,
+                    "release_identity": {"commit_sha": self.revision},
+                    "synthetic": False,
+                }, stream)
+            os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = path
+            result = _external(
+                "test", "test evidence", "COVERAGE_GATE_TEST_EVIDENCE",
+                self.revision, self.repo_root,
+            )
+            self.assertEqual(result["status"], "PASSED")
+            self.assertEqual(result["violations"], [])
+        finally:
+            if old is None:
+                os.environ.pop("COVERAGE_GATE_TEST_EVIDENCE", None)
+            else:
+                os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = old
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            try:
+                os.remove(artifact)
+            except OSError:
+                pass
+
+    def test_external_pass_without_provenance_is_incomplete(self):
+        fd, path = tempfile.mkstemp(prefix="coverage-gate-incomplete-", suffix=".json")
         os.close(fd)
         old = os.environ.get("COVERAGE_GATE_TEST_EVIDENCE")
         try:
@@ -47,8 +94,9 @@ class GateMatrixEvidenceTest(unittest.TestCase):
                 "test", "test evidence", "COVERAGE_GATE_TEST_EVIDENCE",
                 self.revision, self.repo_root,
             )
-            self.assertEqual(result["status"], "PASSED")
-            self.assertEqual(result["violations"], [])
+            self.assertEqual(result["status"], "INCOMPLETE")
+            self.assertTrue(any("timestamps" in item for item in result["violations"]))
+            self.assertTrue(any("artifact" in item for item in result["violations"]))
         finally:
             if old is None:
                 os.environ.pop("COVERAGE_GATE_TEST_EVIDENCE", None)

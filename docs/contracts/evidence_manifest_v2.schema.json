@@ -16,7 +16,11 @@
     "evidence_schema_version": {"const": 2},
     "gate": {"type": "string", "minLength": 1},
     "candidate_revision": {"type": "string", "minLength": 1},
-    "release_identity": {"type": "object"},
+    "release_identity": {
+      "type": "object",
+      "required": ["commit_sha"],
+      "properties": {"commit_sha": {"type": "string", "minLength": 1}}
+    },
     "database_runtime_identity": {"type": "object"},
     "evidence": {
       "type": "array",
@@ -29,6 +33,7 @@
       "type": "object",
       "required": [
         "gate", "evidence_id", "evidence_class", "candidate_revision",
+        "release_identity",
         "host_identity", "command_or_action", "started_at", "finished_at",
         "exit_code", "artifact_path", "artifact_sha256",
         "source_inputs_sha256", "status", "synthetic"
@@ -38,6 +43,11 @@
         "evidence_id": {"type": "string", "minLength": 1},
         "evidence_class": {"type": "string", "minLength": 1},
         "candidate_revision": {"type": "string", "minLength": 1},
+        "release_identity": {
+          "type": "object",
+          "required": ["commit_sha"],
+          "properties": {"commit_sha": {"type": "string", "minLength": 1}}
+        },
         "host_identity": {"type": "object", "minProperties": 1},
         "command_or_action": {},
         "started_at": {"type": "string", "minLength": 1},
@@ -48,7 +58,24 @@
         "source_inputs_sha256": {"type": "array", "items": {"type": "string"}},
         "status": {"enum": ["PASSED", "INCOMPLETE", "BLOCKED", "FAILED", "PARTIAL", "UNAVAILABLE", "SKIPPED"]},
         "synthetic": {"type": "boolean"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"status": {"const": "PASSED"}}},
+          "then": {
+            "required": ["artifact_path", "artifact_sha256"],
+            "properties": {
+              "exit_code": {"const": 0},
+              "synthetic": {"const": false},
+              "artifact_path": {"minLength": 1},
+              "artifact_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{64}$"
+              }
+            }
+          }
+        }
+      ]
       }
     }
   }
-}

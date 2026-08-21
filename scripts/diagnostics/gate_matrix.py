@@ -138,13 +138,44 @@ def _external(name, requirement, env_name=None, candidate_revision="",
             if observed_status not in _KNOWN_STATUSES:
                 violations.append("external evidence status is unknown")
                 observed_status = "INCOMPLETE"
+            # A flat external artifact is accepted only when it carries the
+            # same provenance that Evidence Manifest v2 requires.  In
+            # particular, a hand-written ``status=PASSED`` file must not be
+            # enough to advance a release gate.
             if not isinstance(evidence_payload.get("host_identity"), dict) or \
                     not evidence_payload.get("host_identity"):
                 violations.append("external evidence host_identity is missing")
             if not evidence_payload.get("command_or_action"):
                 violations.append("external evidence command_or_action is missing")
+            if not evidence_payload.get("evidence_class"):
+                violations.append("external evidence evidence_class is missing")
+            if not evidence_payload.get("started_at") or \
+                    not evidence_payload.get("finished_at"):
+                violations.append("external evidence timestamps are missing")
+            exit_code = evidence_payload.get("exit_code")
+            if type(exit_code) is not int:
+                violations.append("external evidence exit_code is missing or not an integer")
+            elif observed_status == "PASSED" and exit_code != 0:
+                violations.append("PASSED external evidence must have exit_code=0")
             if evidence_payload.get("synthetic") is not False:
                 violations.append("external evidence must explicitly set synthetic=false")
+            if observed_status == "PASSED":
+                release_identity = evidence_payload.get("release_identity")
+                if not isinstance(release_identity, dict) or not release_identity.get("commit_sha"):
+                    violations.append("PASSED external evidence release_identity is missing")
+                artifact_ref = evidence_payload.get("artifact_path")
+                artifact_sha = str(evidence_payload.get("artifact_sha256") or "")
+                if not artifact_ref or not artifact_sha:
+                    violations.append("PASSED external evidence artifact path/SHA256 is missing")
+                else:
+                    referenced = str(artifact_ref)
+                    if not os.path.isabs(referenced):
+                        referenced = os.path.join(os.path.dirname(artifact_path), referenced)
+                    referenced = os.path.abspath(referenced)
+                    if not os.path.isfile(referenced):
+                        violations.append("PASSED external evidence referenced artifact is missing")
+                    elif _sha256(referenced) != artifact_sha:
+                        violations.append("PASSED external evidence artifact SHA256 does not match")
         observed_candidate = str(evidence_payload.get("candidate_revision") or "")
         if not observed_candidate or observed_candidate != str(candidate_revision or ""):
             violations.append("external evidence candidate revision mismatch")
