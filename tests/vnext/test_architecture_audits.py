@@ -90,6 +90,7 @@ class ArchitectureAuditTest(unittest.TestCase):
                          audit_legacy_retirement(os.getcwd())["candidate_revision"])
         self.assertEqual(result["evidence_class"], "legacy_retirement_gate")
         self.assertEqual(result["gate_status"], "INCOMPLETE")
+        self.assertEqual(result["exit_code"], 0)
         self.assertEqual(result["legacy_implementation_status"], "TRANSITIONAL_LEGACY")
 
     def test_legacy_compatibility_smoke_exercises_import_and_cli_surfaces(self):

@@ -225,6 +225,8 @@ def main(argv=None):
         compatibility_manifest=args.compatibility_manifest,
         retirement_manifest=args.retirement_manifest,
     )
+    exit_code = 0 if result["status"] == "PASSED" or not args.strict else 1
+    result["exit_code"] = exit_code
     encoded = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
     if args.output:
         output = args.output if os.path.isabs(args.output) else os.path.join(os.getcwd(), args.output)
@@ -235,7 +237,7 @@ def main(argv=None):
             stream.write(encoded)
             stream.write("\n")
     print(encoded)
-    return 0 if result["status"] == "PASSED" or not args.strict else 1
+    return exit_code
 
 
 if __name__ == "__main__":
