@@ -32,7 +32,9 @@ MAPPINGS = [
     ({"app/services/analysis_service.py", "app/services/project_service.py", "app/reports/*"},
      "tests.vnext.test_vnext_runtime tests.vnext.test_registry_and_api_contract tests.vnext.test_api_export_security"),
     ({"web/templates/*", "coverage_progress.js", "coverage_enhance.js", "incremental_developer_tasks.js", "package.json", "package-lock.json"},
-     "tests.browser.coverage_real_browser tests.vnext.test_vnext_runtime"),
+     # Browser specs are JavaScript/Playwright and are executed by the
+     # dedicated browser job; this selector is consumed by Python unittest.
+     "tests.vnext.test_vnext_runtime"),
     ({"scripts/diagnostics/*", "scripts/release/*", "scripts/upgrade/*"},
      "tests.vnext.test_architecture_audits tests.release.test_upgrade_manifest tests.release.test_evidence_authenticity"),
     ({"scripts/upgrade/*", "app/release_identity.py", ".github/workflows/ci.yml"},

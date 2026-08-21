@@ -118,7 +118,9 @@ class VNextRuntimeTest(unittest.TestCase):
 
         self.runtime.progress_service.rebuild(self.connection, "fixture", scan_id)
         progress_trace = []
-        self.connection.set_trace_callback(progress_trace.append)
+        def trace_progress(statement):
+            progress_trace.append(statement)
+        self.connection.set_trace_callback(trace_progress)
         summary = self.application.dispatch(
             "GET", "/api/coverage/progress", query={"project": "fixture"}
         )[1]
@@ -275,7 +277,9 @@ class VNextRuntimeTest(unittest.TestCase):
                     }],
                 )
                 trace = []
-                connection.set_trace_callback(trace.append)
+                def trace_statement(statement):
+                    trace.append(statement)
+                connection.set_trace_callback(trace_statement)
                 batches = self.runtime.code_detail.lines_batch(
                     connection, scan["id"], "report_batch", "src/batch.c",
                     [(1, 1), (2, 2), (3, 4)],

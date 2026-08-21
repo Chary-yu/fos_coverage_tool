@@ -210,7 +210,9 @@ class VNextApiExportSecurityTest(unittest.TestCase):
             "line_number": line_number, "status": "可覆盖",
         } for line_number in (10, 11, 12)]
         trace = []
-        self.connection.set_trace_callback(trace.append)
+        def trace_statement(statement):
+            trace.append(statement)
+        self.connection.set_trace_callback(trace_statement)
         result = AnalysisService().save(
             self.connection, "bulk-analysis", scan["id"], records, reviewer="alice"
         )
