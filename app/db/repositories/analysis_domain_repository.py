@@ -16,6 +16,50 @@ CARRIED_COVERED = "CARRIED_COVERED"
 CONFIRMED_STATUSES = ("可覆盖", "无法覆盖", "冗余代码")
 
 
+def _chunks(values, size=500):
+    values = list(values or [])
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def _bulk_insert_ids(connection, statement_prefix, rows, chunk_size=500):
+    """Insert rows as bounded multi-value statements and return their IDs.
+
+    The VNext schema uses auto-increment integer identities.  MariaDB returns
+    the first generated ID for a multi-row INSERT while SQLite returns the
+    last one; both engines allocate the rows contiguously for one statement.
+    Keeping this detail here lets domain services do one DB round trip per
+    bounded batch while preserving the existing ordered readback contract.
+    """
+    rows = [tuple(row) for row in (rows or [])]
+    if not rows:
+        return []
+    width = len(rows[0])
+    if width < 1 or any(len(row) != width for row in rows):
+        raise ValueError("bulk insert rows have inconsistent widths")
+
+    inserted_ids = []
+    for batch in _chunks(rows, size=chunk_size):
+        placeholders = "(" + ", ".join("?" for _ in range(width)) + ")"
+        sql = "{} VALUES {}".format(
+            statement_prefix, ", ".join(placeholders for _ in batch)
+        )
+        params = tuple(value for row in batch for value in row)
+        cursor = connection.cursor()
+        try:
+            cursor.execute(adapt_sql(connection, sql), params)
+            last_id = insert_id(cursor)
+        finally:
+            cursor.close()
+        if not last_id:
+            raise RuntimeError("bulk insert did not return an auto-increment identity")
+        first_id = last_id - len(batch) + 1 if is_sqlite(connection) else last_id
+        if first_id < 1:
+            raise RuntimeError("bulk insert returned an invalid identity range")
+        inserted_ids.extend(range(first_id, first_id + len(batch)))
+    return inserted_ids
+
+
 def content_hash(values):
     payload = {
         "conclusion_status": values.get("conclusion_status", values.get("status", "")) or "",
@@ -210,6 +254,143 @@ class AnalysisDomainRepository(object):
             raise RuntimeError("bulk analysis record readback is incomplete")
         return [by_source[source_id] for source_id in source_ids]
 
+    def create_manual_records_many(self, connection, values, origin="MANUAL", now=None):
+        """Create manual content records with bounded multi-row INSERTs.
+
+        Manual records do not have a legacy source identity that can be used
+        for readback.  The repository therefore uses the auto-increment range
+        returned by each bounded INSERT and then reads the rows by those
+        identities.  The returned order is exactly the input order so the
+        service can attach each record to its operation without another
+        per-record lookup.
+        """
+        items = [dict(item or {}) for item in (values or [])]
+        if not items:
+            return []
+        stamp = now or utc_sql()
+        params = []
+        for item in items:
+            normalized = {
+                "conclusion_status": item.get(
+                    "conclusion_status", item.get("status", "")
+                ) or "",
+                "coverage_method": item.get(
+                    "coverage_method", item.get("method", "")
+                ) or "",
+                "uncovered_reason": item.get(
+                    "uncovered_reason", item.get("reason", "")
+                ) or "",
+                "comment": item.get("comment", "") or "",
+            }
+            params.append((
+                normalized["conclusion_status"],
+                normalized["coverage_method"],
+                normalized["uncovered_reason"],
+                normalized["comment"],
+                content_hash(normalized), origin,
+                item.get("legacy_source_analysis_id"),
+                item.get("legacy_source_created_at"),
+                item.get("legacy_source_updated_at"),
+                item.get("legacy_raw_status"),
+                item.get("legacy_raw_is_draft"), stamp, stamp,
+            ))
+        ids = _bulk_insert_ids(connection, """
+            INSERT INTO coverage_analysis_records(
+                conclusion_status, coverage_method, uncovered_reason, comment,
+                content_hash, content_origin,
+                legacy_source_analysis_id, legacy_source_created_at,
+                legacy_source_updated_at, legacy_raw_status, legacy_raw_is_draft,
+                created_at, updated_at
+            )""", params)
+        rows = []
+        for batch in _chunks(ids):
+            placeholders = ", ".join("?" for _ in batch)
+            rows.extend(fetchall(connection, """
+                SELECT * FROM coverage_analysis_records
+                WHERE id IN ({})
+            """.format(placeholders), batch))
+        by_id = {int(row["id"]): row for row in rows}
+        if len(by_id) != len(ids):
+            raise RuntimeError("bulk manual record readback is incomplete")
+        return [by_id[int(record_id)] for record_id in ids]
+
+    def update_records_many(self, connection, values, now=None):
+        """CAS-update existing content records with one bounded batch."""
+        items = [dict(item or {}) for item in (values or [])]
+        if not items:
+            return []
+        record_ids = [int(item.get("record_id") or 0) for item in items]
+        if any(record_id <= 0 for record_id in record_ids):
+            raise ValueError("analysis record id is required")
+        if len(set(record_ids)) != len(record_ids):
+            raise ValueError("duplicate analysis record in update batch")
+        rows = []
+        for batch in _chunks(sorted(record_ids)):
+            placeholders = ", ".join("?" for _ in batch)
+            rows.extend(fetchall(connection, """
+                SELECT * FROM coverage_analysis_records
+                WHERE id IN ({})
+            """.format(placeholders), batch))
+        current_by_id = {int(row["id"]): row for row in rows}
+        if len(current_by_id) != len(record_ids):
+            raise KeyError("analysis record not found")
+
+        stamp = now or utc_sql()
+        params = []
+        for item in items:
+            record_id = int(item["record_id"])
+            current = current_by_id[record_id]
+            expected = item.get("expected_record_revision")
+            if expected is None:
+                raise ValueError("EXPECTED_RECORD_REVISION_REQUIRED")
+            revision = int(current.get("content_revision") or 0)
+            if revision != int(expected):
+                raise ValueError("STALE_CONTENT_REVISION")
+            normalized = {
+                "conclusion_status": item.get(
+                    "conclusion_status", item.get("status", "")
+                ) or "",
+                "coverage_method": item.get(
+                    "coverage_method", item.get("method", "")
+                ) or "",
+                "uncovered_reason": item.get(
+                    "uncovered_reason", item.get("reason", "")
+                ) or "",
+                "comment": item.get("comment", "") or "",
+            }
+            params.append((
+                normalized["conclusion_status"],
+                normalized["coverage_method"],
+                normalized["uncovered_reason"],
+                normalized["comment"], revision + 1,
+                content_hash(normalized), stamp, record_id, revision,
+            ))
+
+        cursor = connection.cursor()
+        try:
+            cursor.executemany(adapt_sql(connection, """
+                UPDATE coverage_analysis_records
+                SET conclusion_status=?, coverage_method=?, uncovered_reason=?, comment=?,
+                    content_revision=?, content_hash=?, updated_at=?
+                WHERE id=? AND content_revision=?
+            """), params)
+            if int(getattr(cursor, "rowcount", 0) or 0) != len(params):
+                raise ValueError("STALE_CONTENT_REVISION")
+        finally:
+            cursor.close()
+
+        result = []
+        for batch in _chunks(record_ids):
+            placeholders = ", ".join("?" for _ in batch)
+            result.extend(fetchall(connection, """
+                SELECT * FROM coverage_analysis_records
+                WHERE id IN ({})
+            """.format(placeholders), batch))
+        updated_by_id = {int(row["id"]): row for row in result}
+        if len(updated_by_id) != len(record_ids):
+            raise RuntimeError("bulk analysis record readback is incomplete")
+        return [updated_by_id[record_id] for record_id in record_ids]
+
     def update_record(self, connection, record_id, values, expected_revision=None):
         current = self.get_record(connection, record_id)
         if not current:
@@ -257,6 +438,27 @@ class AnalysisDomainRepository(object):
         cursor.close()
         return count
 
+    def close_active_rejections_many(self, connection, scan_id, line_ids,
+                                     terminal_reason="MANUAL_REANALYSIS"):
+        """Close rejection lineage for a batch of physical lines."""
+        line_ids = sorted({int(line_id) for line_id in (line_ids or [])})
+        if not line_ids:
+            return 0
+        resolved = 0
+        stamp = utc_sql()
+        for batch in _chunks(line_ids):
+            placeholders = ", ".join("?" for _ in batch)
+            cursor = execute(connection, """
+                UPDATE coverage_inheritance_rejections
+                SET is_active=0, terminal_reason=?, resolved_at=?,
+                    rejection_revision=rejection_revision+1
+                WHERE scan_id=? AND line_id IN ({}) AND is_active=1
+            """.format(placeholders),
+                (str(terminal_reason), stamp, int(scan_id)) + tuple(batch))
+            resolved += int(getattr(cursor, "rowcount", 0) or 0)
+            cursor.close()
+        return resolved
+
     def create_block(self, connection, scan_id, file_id, start_line, end_line,
                      record_id=None, created_by="", repository_id=None,
                      verified=True, content_hash_value=None):
@@ -288,6 +490,90 @@ class AnalysisDomainRepository(object):
         cursor.close()
         return fetchone(connection, "SELECT * FROM coverage_analysis_blocks WHERE id=?",
                         (block_id,))
+
+    def create_blocks_many(self, connection, blocks, origin="MANUAL", now=None):
+        """Validate and create analysis blocks in bounded multi-row batches."""
+        items = [dict(item or {}) for item in (blocks or [])]
+        if not items:
+            return []
+        scan_ids = {int(item.get("scan_id") or 0) for item in items}
+        if len(scan_ids) != 1 or 0 in scan_ids:
+            raise ValueError("ANALYSIS_BLOCK_BATCH_SCAN_IDENTITY_MISMATCH")
+        scan_id = next(iter(scan_ids))
+        file_ids = sorted({int(item.get("file_id") or 0) for item in items})
+        if any(file_id <= 0 for file_id in file_ids):
+            raise ValueError("ANALYSIS_BLOCK_FILE_REQUIRED")
+        placeholders = ", ".join("?" for _ in file_ids)
+        file_rows = fetchall(connection, """
+            SELECT id, scan_id FROM coverage_files
+            WHERE id IN ({})
+        """.format(placeholders), file_ids)
+        files_by_id = {int(row["id"]): row for row in file_rows}
+        if len(files_by_id) != len(file_ids) or any(
+                int(files_by_id[file_id].get("scan_id") or 0) != scan_id
+                for file_id in file_ids):
+            raise ValueError("ANALYSIS_BLOCK_FILE_SCAN_IDENTITY_MISMATCH")
+
+        repository_ids = sorted({int(item["repository_id"])
+                                 for item in items
+                                 if item.get("repository_id") is not None})
+        if repository_ids:
+            placeholders = ", ".join("?" for _ in repository_ids)
+            repository_rows = fetchall(connection, """
+                SELECT repository_id FROM coverage_scan_repositories
+                WHERE scan_id=? AND repository_id IN ({})
+            """.format(placeholders), [scan_id] + repository_ids)
+            observed = {int(row["repository_id"]) for row in repository_rows}
+            if observed != set(repository_ids):
+                raise ValueError("ANALYSIS_BLOCK_REPOSITORY_IDENTITY_MISMATCH")
+
+        record_ids = sorted({int(item.get("record_id") or 0) for item in items})
+        if any(record_id <= 0 for record_id in record_ids):
+            raise ValueError("ANALYSIS_BLOCK_RECORD_REQUIRED")
+        placeholders = ", ".join("?" for _ in record_ids)
+        record_rows = fetchall(connection, """
+            SELECT id FROM coverage_analysis_records
+            WHERE id IN ({})
+        """.format(placeholders), record_ids)
+        if {int(row["id"]) for row in record_rows} != set(record_ids):
+            raise ValueError("ANALYSIS_RECORD_NOT_FOUND")
+
+        stamp = now or utc_sql()
+        params = []
+        for item in items:
+            start_line = int(item.get("start_line") or 0)
+            end_line = int(item.get("end_line") or 0)
+            if start_line < 1 or end_line < start_line:
+                raise ValueError("invalid analysis block range")
+            params.append((
+                scan_id,
+                item.get("repository_id"),
+                int(item["file_id"]), start_line, end_line,
+                int(bool(item.get("verified", True))),
+                int(item["record_id"]), item.get("content_hash"),
+                item.get("created_by") or "", stamp,
+            ))
+        ids = _bulk_insert_ids(connection, """
+            INSERT INTO coverage_analysis_blocks(
+                scan_id, repository_id, file_id, start_line, end_line, origin,
+                block_identity_verified, originating_record_id, initial_content_hash,
+                created_by, created_at
+            )""", [
+                (row[0], row[1], row[2], row[3], row[4], origin,
+                 row[5], row[6], row[7], row[8], row[9])
+                for row in params
+            ])
+        rows = []
+        for batch in _chunks(ids):
+            placeholders = ", ".join("?" for _ in batch)
+            rows.extend(fetchall(connection, """
+                SELECT * FROM coverage_analysis_blocks
+                WHERE id IN ({})
+            """.format(placeholders), batch))
+        by_id = {int(row["id"]): row for row in rows}
+        if len(by_id) != len(ids):
+            raise RuntimeError("bulk analysis block readback is incomplete")
+        return [by_id[int(block_id)] for block_id in ids]
 
     def create_link(self, connection, scan_id, line_id, record_id, block_id=None,
                     review_state=MANUAL_DRAFT, relation_origin="MANUAL",

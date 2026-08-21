@@ -53,10 +53,11 @@ class AnalysisService(object):
             resolved = self._resolve_records(conn, int(scan_id), records, reviewer)
             self._validate_concurrency(conn, int(scan_id), resolved)
             self._save_domain_records(conn, int(scan_id), resolved)
-            for line_id in sorted({int(item["line_id"]) for item in resolved}):
-                self.domain.close_active_rejection(
-                    conn, int(scan_id), line_id, "MANUAL_REANALYSIS"
-                )
+            self.domain.close_active_rejections_many(
+                conn, int(scan_id),
+                sorted({int(item["line_id"]) for item in resolved}),
+                "MANUAL_REANALYSIS",
+            )
             # The old table is a compatibility projection for old readers. It
             # is written only after the canonical Record/LineLink transaction
             # and is never read to decide current review state by new code.
@@ -98,16 +99,30 @@ class AnalysisService(object):
                     raise ValueError("STALE_CONTENT_REVISION")
 
     def _save_domain_records(self, connection, scan_id, resolved):
-        """Persist content, exact human range and per-line relation together."""
+        """Persist content, exact human ranges and line relations in batches.
+
+        Identity resolution and CAS validation happen before this method.  New
+        content records and blocks are collected first and written with bounded
+        multi-row INSERTs; the relation repository already performs one bulk
+        CAS insert/update.  This keeps one user save at a fixed number of SQL
+        phases instead of one Record/Block write per physical line.
+        """
         line_rows = {
             int(row["id"]): row for row in self.lines.get_by_ids(
                 connection, [item["line_id"] for item in resolved]
             )
         }
+        line_file_ids = {
+            line_id: int(row["file_id"])
+            for line_id, row in line_rows.items()
+        }
         groups = {}
         for item in resolved:
-            key = (int(item["_operation_key"]), int(item["line_id"]))
             groups.setdefault(int(item["_operation_key"]), []).append(item)
+
+        plans = []
+        new_record_values = []
+        update_record_values = []
         for operation_key in sorted(groups):
             items = groups[operation_key]
             first = items[0]
@@ -116,72 +131,132 @@ class AnalysisService(object):
                 first.get("record_id") or first.get("analysis_record_id") or 0
             )
             content = None
+            record_id = 0
             if requested_record_id:
                 current_refs = fetchall(connection, """
                     SELECT line_id FROM coverage_analysis_line_links
                     WHERE analysis_record_id=? AND is_active=1
                 """, (requested_record_id,))
                 current_ids = {int(row["line_id"]) for row in current_refs}
-                if current_ids != set(line_ids):
-                    # A shared record is immutable for a partial edit: only
-                    # the selected physical lines receive a new record.
-                    requested_record_id = 0
-                else:
+                if current_ids == set(line_ids):
                     expected_revision = first.get("expected_record_revision")
                     if expected_revision is None:
                         raise ValueError("EXPECTED_RECORD_REVISION_REQUIRED")
-                    content = self.domain.update_record(
-                        connection, requested_record_id, first,
-                        expected_revision=int(expected_revision),
-                    )
-            if content is None:
-                content = self.domain.create_record(connection, first, origin="MANUAL")
-            if len(line_ids) == 1:
-                start_line = end_line = int(first.get("line_number") or 0)
-            else:
-                start_line = int(first.get("_range_start") or first.get("line_number"))
-                end_line = int(first.get("_range_end") or first.get("line_number"))
-            file_ids = set()
-            for item in items:
-                line = line_rows[int(item["line_id"])]
-                file_ids.add(int(line["file_id"]))
-            if len(file_ids) != 1:
-                # One user operation cannot create a cross-file human block.
-                # Split into exact one-line blocks while retaining per-line
-                # content; this is safer than inventing a cross-file range.
-                links = []
-                for item in items:
-                    line = line_rows[int(item["line_id"])]
-                    block = self.domain.create_block(
-                        connection, scan_id, line["file_id"], item["line_number"],
-                        item["line_number"], record_id=content["id"],
-                        created_by=item.get("reviewer", ""), verified=True,
-                        content_hash_value=content.get("content_hash"),
-                    )
-                    links.append({
-                        "scan_id": scan_id, "line_id": item["line_id"],
-                        "record_id": content["id"], "block_id": block["id"],
-                        "review_state": self._review_state(item),
-                        "relation_origin": "MANUAL",
-                        "reviewed_by": item.get("reviewer", ""),
-                        "reviewed_at": item.get("reviewed_at"),
-                        "expected_relation_revision": item.get(
-                            "expected_relation_revision"
-                        ),
-                    })
-                self.domain.create_links_many(connection, links)
-                continue
-            file_id = next(iter(file_ids))
-            block = self.domain.create_block(
-                connection, scan_id, file_id, start_line, end_line,
-                record_id=content["id"], created_by=first.get("reviewer", ""),
-                verified=True, content_hash_value=content.get("content_hash"),
+                    record_id = requested_record_id
+                    update_record_values.append(dict(
+                        first,
+                        record_id=requested_record_id,
+                        expected_record_revision=int(expected_revision),
+                        _operation_key=operation_key,
+                    ))
+                # A shared record is immutable for a partial edit: only the
+                # selected physical lines receive a new content record.
+            if not record_id:
+                new_record_values.append({
+                    "_operation_key": operation_key,
+                    "status": first.get("status"),
+                    "coverage_method": first.get("coverage_method"),
+                    "uncovered_reason": first.get("uncovered_reason"),
+                    "comment": first.get("comment"),
+                })
+            file_ids = {
+                line_file_ids[int(item["line_id"])]
+                for item in items
+            }
+            plans.append({
+                "operation_key": operation_key,
+                "items": items,
+                "line_ids": line_ids,
+                "file_ids": file_ids,
+                "record_id": record_id,
+                "content": content,
+            })
+
+        plans_by_operation = {
+            plan["operation_key"]: plan for plan in plans
+        }
+        if update_record_values:
+            updated = self.domain.update_records_many(
+                connection, update_record_values
             )
-            links = []
-            for item in items:
+            if len(updated) != len(update_record_values):
+                raise RuntimeError("bulk analysis record update is incomplete")
+            updated_by_operation = {
+                int(item["_operation_key"]): record
+                for item, record in zip(update_record_values, updated)
+            }
+            for operation_key, record in updated_by_operation.items():
+                next_plan = plans_by_operation.get(operation_key)
+                if next_plan is not None:
+                    next_plan["content"] = record
+
+        if new_record_values:
+            created = self.domain.create_manual_records_many(
+                connection, new_record_values, origin="MANUAL"
+            )
+            if len(created) != len(new_record_values):
+                raise RuntimeError("bulk manual record creation is incomplete")
+            for item, record in zip(new_record_values, created):
+                plan = plans_by_operation[item["_operation_key"]]
+                plan["record_id"] = int(record["id"])
+                plan["content"] = record
+
+        block_values = []
+        block_keys = []
+        links = []
+        for plan in plans:
+            items = plan["items"]
+            record = plan["content"]
+            if not record or not plan["record_id"]:
+                raise RuntimeError("analysis operation has no content record")
+            file_ids = plan["file_ids"]
+            if len(file_ids) == 1:
+                first = items[0]
+                block_keys.append((plan["operation_key"], None))
+                block_values.append({
+                    "scan_id": scan_id,
+                    "file_id": next(iter(file_ids)),
+                    "start_line": int(first.get("_range_start") or first["line_number"]),
+                    "end_line": int(first.get("_range_end") or first["line_number"]),
+                    "record_id": plan["record_id"],
+                    "created_by": first.get("reviewer", ""),
+                    "verified": True,
+                    "content_hash": record.get("content_hash"),
+                })
+            else:
+                # One user operation cannot create a cross-file human block.
+                # Split into exact one-line blocks while retaining content.
+                for item in items:
+                    key = (plan["operation_key"], int(item["line_id"]))
+                    block_keys.append(key)
+                    block_values.append({
+                        "scan_id": scan_id,
+                        "file_id": line_file_ids[int(item["line_id"])],
+                        "start_line": int(item["line_number"]),
+                        "end_line": int(item["line_number"]),
+                        "record_id": plan["record_id"],
+                        "created_by": item.get("reviewer", ""),
+                        "verified": True,
+                        "content_hash": record.get("content_hash"),
+                    })
+
+        created_blocks = self.domain.create_blocks_many(
+            connection, block_values, origin="MANUAL"
+        )
+        if len(created_blocks) != len(block_keys):
+            raise RuntimeError("bulk analysis block creation is incomplete")
+        block_by_key = {
+            key: block for key, block in zip(block_keys, created_blocks)
+        }
+        for plan in plans:
+            for item in plan["items"]:
+                key = (plan["operation_key"], None)
+                if len(plan["file_ids"]) != 1:
+                    key = (plan["operation_key"], int(item["line_id"]))
+                block = block_by_key[key]
                 links.append({
                     "scan_id": scan_id, "line_id": item["line_id"],
-                    "record_id": content["id"], "block_id": block["id"],
+                    "record_id": plan["record_id"], "block_id": block["id"],
                     "review_state": self._review_state(item),
                     "relation_origin": "MANUAL",
                     "reviewed_by": item.get("reviewer", ""),
@@ -190,7 +265,7 @@ class AnalysisService(object):
                         "expected_relation_revision"
                     ),
                 })
-            self.domain.create_links_many(connection, links)
+        self.domain.create_links_many(connection, links)
 
     @staticmethod
     def _review_state(item):

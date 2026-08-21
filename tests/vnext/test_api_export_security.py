@@ -230,6 +230,18 @@ class VNextApiExportSecurityTest(unittest.TestCase):
             1,
         )
         self.assertEqual(
+            len([statement for statement in trace
+                 if "INSERT INTO coverage_analysis_records" in statement]),
+            1,
+            "canonical manual records must use one bounded multi-row insert",
+        )
+        self.assertEqual(
+            len([statement for statement in trace
+                 if "INSERT INTO coverage_analysis_blocks" in statement]),
+            1,
+            "canonical analysis blocks must use one bounded multi-row insert",
+        )
+        self.assertEqual(
             self.connection.execute("SELECT COUNT(*) FROM coverage_analyses").fetchone()[0],
             3,
         )
