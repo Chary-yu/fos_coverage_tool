@@ -50,5 +50,17 @@ implementations are unused or safe to delete.
 It reports each condition separately. Missing compatibility/deprecation-window
 or release evidence keeps the result `INCOMPLETE`; `--strict` exits non-zero.
 
+The CI job also writes `legacy-retirement.json` by invoking:
+
+```text
+python scripts/diagnostics/legacy_retirement_audit.py \
+  --output .artifacts/vnext/legacy-retirement.json
+```
+
+That artifact is bound to the checkout revision and records the host, command,
+timestamps, transitional owners, and each retirement condition. It remains
+`INCOMPLETE` until the compatibility manifest, zero-usage deprecation window,
+and removal/rollback manifest are supplied for the same release revision.
+
 Until those conditions are proven, the audit reports `INCOMPLETE` instead of
 calling the large legacy owners retired.

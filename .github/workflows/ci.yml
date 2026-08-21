@@ -105,6 +105,12 @@ jobs:
         run: >-
           python scripts/diagnostics/legacy_compatibility_smoke.py
           --output .artifacts/vnext/legacy-compatibility.json
+      - name: Build legacy retirement gate evidence
+        env:
+          COVERAGE_LEGACY_COMPAT_TESTS_MANIFEST: .artifacts/vnext/legacy-compatibility.json
+        run: >-
+          python scripts/diagnostics/legacy_retirement_audit.py
+          --output .artifacts/vnext/legacy-retirement.json
       - name: Verify changed-path specialist mapping
         env:
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}

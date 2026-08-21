@@ -14,6 +14,7 @@ from scripts.diagnostics.configured_runtime_audit import audit as audit_configur
 from scripts.diagnostics.frontend_vnext_api_contract_audit import audit as audit_frontend
 from scripts.diagnostics.scan_immutability_audit import audit as audit_immutability
 from scripts.diagnostics.legacy_retirement_audit import audit as audit_legacy_retirement
+from scripts.diagnostics.legacy_retirement_audit import main as legacy_retirement_main
 from scripts.diagnostics.contract_artifact_audit import audit as audit_contract_artifacts
 from scripts.diagnostics.task_manifest_audit import audit as audit_task_manifest
 from scripts.diagnostics.changed_test_selection import DiffResolutionError, changed_files, select
@@ -78,6 +79,18 @@ class ArchitectureAuditTest(unittest.TestCase):
             item.startswith("candidate_revision=")
             for item in result["compatibility_evidence"]["missing_keys"]
         ))
+
+    def test_legacy_retirement_cli_writes_exact_sha_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "legacy-retirement.json")
+            self.assertEqual(legacy_retirement_main(["--output", output]), 0)
+            with open(output, "r", encoding="utf-8") as stream:
+                result = json.load(stream)
+        self.assertEqual(result["candidate_revision"],
+                         audit_legacy_retirement(os.getcwd())["candidate_revision"])
+        self.assertEqual(result["evidence_class"], "legacy_retirement_gate")
+        self.assertEqual(result["gate_status"], "INCOMPLETE")
+        self.assertEqual(result["legacy_implementation_status"], "TRANSITIONAL_LEGACY")
 
     def test_legacy_compatibility_smoke_exercises_import_and_cli_surfaces(self):
         result = audit_legacy_compatibility(os.getcwd())

@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import platform
 import subprocess
 import sys
 import time
@@ -138,6 +139,7 @@ def _manifest_check(path, required_keys, expected_values=None,
 
 
 def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None):
+    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     candidate_revision = _revision(repo_root)
     boundary = audit_boundary(repo_root)
     transitional = boundary.get("classification", {}).get("TRANSITIONAL_LEGACY", [])
@@ -180,7 +182,16 @@ def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None)
         "status": "PASSED" if gate_complete else (
             "FAILED" if not boundary_clean else "INCOMPLETE"
         ),
+        "candidate_revision": candidate_revision,
         "evidence_class": "legacy_retirement_gate",
+        "synthetic": False,
+        "host_identity": {
+            "hostname": platform.node(),
+            "platform": platform.platform(),
+        },
+        "command_or_action": "python scripts/diagnostics/legacy_retirement_audit.py",
+        "started_at": started_at,
+        "finished_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "gate_status": "PASSED" if gate_complete else "INCOMPLETE",
         "legacy_implementation_status": "TRANSITIONAL_LEGACY" if transitional else "RETIRED",
         "transitional_owners": transitional,
@@ -205,12 +216,25 @@ def main(argv=None):
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--compatibility-manifest")
     parser.add_argument("--retirement-manifest")
+    parser.add_argument(
+        "--output",
+        help="write the exact-SHA retirement audit JSON to this path",
+    )
     args = parser.parse_args(argv)
     result = audit(
         compatibility_manifest=args.compatibility_manifest,
         retirement_manifest=args.retirement_manifest,
     )
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    encoded = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
+    if args.output:
+        output = args.output if os.path.isabs(args.output) else os.path.join(os.getcwd(), args.output)
+        directory = os.path.dirname(os.path.abspath(output))
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory)
+        with open(output, "w", encoding="utf-8") as stream:
+            stream.write(encoded)
+            stream.write("\n")
+    print(encoded)
     return 0 if result["status"] == "PASSED" or not args.strict else 1
 
 
