@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.diagnostics.runtime_legacy_dependency_audit import audit as audit_legacy
 from scripts.diagnostics.runtime_participation_audit import audit as audit_participation
@@ -125,6 +126,53 @@ class ArchitectureAuditTest(unittest.TestCase):
             )
         self.assertTrue(result["retirement_manifest"]["passed"])
         self.assertFalse(result["retirement_checks"]["legacy_usage_zero_for_window"])
+
+    def test_legacy_retirement_can_reach_retired_after_proven_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            revision = audit_legacy_retirement(os.getcwd())["candidate_revision"]
+            compatibility = os.path.join(directory, "legacy-compatibility.json")
+            retirement = os.path.join(directory, "legacy-retirement.json")
+            usage = os.path.join(directory, "legacy-usage.json")
+            with open(compatibility, "w", encoding="utf-8") as stream:
+                json.dump({"status": "PASSED", "candidate_revision": revision}, stream)
+            with open(retirement, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "candidate_revision": revision,
+                    "removal_commit": revision,
+                    "rollback_plan": {
+                        "target_release": "previous exact release",
+                        "command_or_action": "restore the verified previous release",
+                    },
+                }, stream)
+            with open(usage, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "window_started_at": "2026-08-01T00:00:00Z",
+                    "window_ends_at": "2000-01-01T00:00:00Z",
+                }, stream)
+            boundary = {
+                "status": "PASSED",
+                "classification": {
+                    "TRANSITIONAL_LEGACY": [],
+                    "RETIRED": [
+                        {"path": "app/compat/legacy_runtime_impl.py"},
+                        {"path": "app/compat/incremental_impl.py"},
+                    ],
+                },
+            }
+            with mock.patch(
+                    "scripts.diagnostics.legacy_retirement_audit.audit_boundary",
+                    return_value=boundary):
+                with mock.patch.dict(
+                        os.environ, {"COVERAGE_LEGACY_USAGE_FILE": usage},
+                        clear=False):
+                    result = audit_legacy_retirement(
+                        os.getcwd(), compatibility_manifest=compatibility,
+                        retirement_manifest=retirement,
+                    )
+        self.assertTrue(result["removal_proven"])
+        self.assertEqual(result["legacy_implementation_status"], "RETIRED")
+        self.assertEqual(result["gate_status"], "PASSED")
+        self.assertTrue(result["retirement_checks"]["legacy_usage_zero_for_window"])
 
     def test_legacy_retirement_cli_writes_exact_sha_evidence(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -69,6 +69,15 @@ def audit(repo_root):
                     "module": match.group(1),
                     "line": text[:match.start()].count("\n") + 1,
                 })
+    transitional = []
+    retired = []
+    for item in TRANSITIONAL_LEGACY:
+        entry = dict(item, classification="TRANSITIONAL_LEGACY")
+        if os.path.isfile(os.path.join(repo_root, item["path"])):
+            transitional.append(entry)
+        else:
+            retired.append(dict(item, classification="RETIRED"))
+
     classification = {
         "CANONICAL_ONLY": [
             {"path": path, "classification": "CANONICAL_ONLY"}
@@ -78,17 +87,16 @@ def audit(repo_root):
             {"path": path, "classification": "COMPATIBILITY_SHIM"}
             for path in COMPATIBILITY_SHIMS
         ],
-        "TRANSITIONAL_LEGACY": [
-            dict(item, classification="TRANSITIONAL_LEGACY")
-            for item in TRANSITIONAL_LEGACY
-        ],
-        "RETIRED": [],
+        "TRANSITIONAL_LEGACY": transitional,
+        "RETIRED": retired,
     }
     return with_contract({
         "status": "PASSED" if not findings else "FAILED",
         "evidence_class": "architecture_audit",
         "legacy_imports": findings,
-        "legacy_implementation_status": "TRANSITIONAL_LEGACY",
+        "legacy_implementation_status": (
+            "TRANSITIONAL_LEGACY" if transitional else "RETIRED"
+        ),
         "classification": classification,
         "legacy_implementations": classification["TRANSITIONAL_LEGACY"],
         "is_valid": not findings,

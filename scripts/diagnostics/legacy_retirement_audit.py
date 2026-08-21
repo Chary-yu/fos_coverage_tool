@@ -175,11 +175,11 @@ def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None)
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     candidate_revision = _revision(repo_root)
     boundary = audit_boundary(repo_root)
-    transitional = boundary.get("classification", {}).get("TRANSITIONAL_LEGACY", [])
-    missing_files = [
-        item["path"] for item in transitional
-        if not os.path.isfile(os.path.join(repo_root, item["path"]))
-    ]
+    classification = boundary.get("classification", {})
+    observed_transitional = list(classification.get("TRANSITIONAL_LEGACY", []) or [])
+    observed_retired = list(classification.get("RETIRED", []) or [])
+    expected_legacy = observed_transitional + observed_retired
+    missing_files = [item["path"] for item in observed_retired]
     compatibility_manifest = compatibility_manifest or os.environ.get(
         "COVERAGE_LEGACY_COMPAT_TESTS_MANIFEST", ""
     )
@@ -196,6 +196,23 @@ def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None)
     release = _retirement_manifest_check(
         retirement_manifest, expected_candidate_revision=candidate_revision,
     )
+    removal_proven = bool(
+        expected_legacy and not observed_transitional and
+        release["passed"] and
+        {item.get("path") for item in observed_retired} == {
+            item.get("path") for item in expected_legacy
+        }
+    )
+    # A missing implementation is not silently treated as retired.  It only
+    # transitions to RETIRED after the exact-SHA removal/rollback manifest is
+    # present.  This keeps accidental deletion visible while making the final
+    # retirement gate reachable.
+    transitional = observed_transitional
+    if not transitional and expected_legacy and not removal_proven:
+        transitional = [
+            dict(item, classification="TRANSITIONAL_LEGACY")
+            for item in expected_legacy
+        ]
     checks = {
         "no_legacy_deployment": runtime_modes["passed"],
         "compatibility_tests": compatibility["passed"],
@@ -206,7 +223,9 @@ def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None)
         ),
         "release_manifest_records_removal_and_rollback": release["passed"],
     }
-    boundary_clean = boundary.get("status") == "PASSED" and not missing_files
+    boundary_clean = boundary.get("status") == "PASSED" and (
+        not missing_files or removal_proven
+    )
     conditions_satisfied = all(checks.values())
     gate_complete = not transitional and boundary_clean and conditions_satisfied
     return with_contract({
@@ -226,6 +245,8 @@ def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None)
         "gate_status": "PASSED" if gate_complete else "INCOMPLETE",
         "legacy_implementation_status": "TRANSITIONAL_LEGACY" if transitional else "RETIRED",
         "transitional_owners": transitional,
+        "observed_retired_owners": observed_retired,
+        "removal_proven": removal_proven,
         "missing_files": missing_files,
         "retirement_conditions": RETIREMENT_CONDITIONS,
         "retirement_checks": checks,
