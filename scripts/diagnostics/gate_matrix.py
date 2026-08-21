@@ -20,7 +20,11 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from app.inheritance.toolchain import parser_toolchain_preflight
+from app.config.runtime_config import load_application_config
+from app.inheritance.toolchain import (
+    ParserAdapterError, parser_toolchain_preflight,
+    parser_toolchain_preflight_from_config,
+)
 from app.release_identity import generate_release_identity
 from app.time_utils import utc_iso
 from scripts.diagnostics.canonical_ownership_audit import audit_canonical_ownership as audit_canonical
@@ -276,7 +280,33 @@ def _external(name, requirement, env_name=None, candidate_revision="",
     }
 
 
-def build(repo_root):
+def _configured_parser_preflight(repo_root, runtime_config_path=None):
+    """Probe the parser bound to the selected runtime config when supplied."""
+    config_path = runtime_config_path or os.environ.get("COVERAGE_CONFIG_PATH")
+    if not config_path:
+        result = parser_toolchain_preflight()
+        result["runtime_config_path"] = ""
+        return result
+    if not os.path.isabs(config_path):
+        config_path = os.path.join(repo_root, config_path)
+    config_path = os.path.realpath(config_path)
+    try:
+        config = load_application_config(config_path, base_dir=repo_root)
+        result = parser_toolchain_preflight_from_config(config)
+    except (OSError, ParserAdapterError, TypeError, ValueError) as exc:
+        result = {
+            "status": "FAILED",
+            "backend": "runtime-config",
+            "production_ready": False,
+            "violations": [
+                "runtime config parser preflight could not load config: {}".format(exc)
+            ],
+        }
+    result["runtime_config_path"] = config_path
+    return result
+
+
+def build(repo_root, runtime_config_path=None):
     repo_root = os.path.abspath(repo_root)
     revision = _revision(repo_root)
     identity = generate_release_identity(repo_root=repo_root)
@@ -298,7 +328,7 @@ def build(repo_root):
     active = audit_active(repo_root)
     rules = audit_rules(repo_root)
     frontend = audit_frontend(repo_root)
-    parser = parser_toolchain_preflight()
+    parser = _configured_parser_preflight(repo_root, runtime_config_path)
     performance_path = os.environ.get("COVERAGE_PERFORMANCE_EVIDENCE", "")
     performance = audit_performance(performance_path) if performance_path else {
         "status": "INCOMPLETE", "evidence_class": "cross_layer_performance",
@@ -406,6 +436,10 @@ def build(repo_root):
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-root", default=ROOT)
+    parser.add_argument(
+        "--runtime-config", default="",
+        help="exact runtime config whose parser selection must be preflighted",
+    )
     parser.add_argument("--output", default=".artifacts/gates/gate-matrix.json")
     parser.add_argument("--allow-incomplete", action="store_true")
     args = parser.parse_args(argv)
@@ -415,7 +449,7 @@ def main(argv=None):
         output = os.path.join(repo_root, args.output)
     if not os.path.isdir(os.path.dirname(output)):
         os.makedirs(os.path.dirname(output))
-    matrix = build(repo_root)
+    matrix = build(repo_root, runtime_config_path=args.runtime_config or None)
     with open(output, "w", encoding="utf-8") as stream:
         json.dump(matrix, stream, ensure_ascii=False, indent=2, sort_keys=True)
     for gate in GATES:

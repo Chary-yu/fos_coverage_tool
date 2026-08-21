@@ -19,10 +19,11 @@ stdout. The request is:
 The response may contain the analysis directly or wrap it in an `analysis`
 property. It must contain `functions`; each function has `name`, `scope`,
 `parameters`, `qualifiers`, `trailing_return`, `start_line`, and `end_line`.
-`controls`, `preprocessor`, `macros`, `constants`, and `calls` are objects
-keyed by physical line number. A parser that cannot determine a range must
-return `uncertain: true` or omit that range so the engine produces an ordinary
-pending decision.
+`controls`, `preprocessor`, and `calls` are objects keyed by physical line
+number. `macros` and `constants` are objects keyed by definition name; each
+value is `[definition_line, normalized_tokens]`. A parser that cannot
+determine a range must return `uncertain: true` or omit that range so the
+engine produces an ordinary pending decision.
 
 A configured helper must pass both:
 

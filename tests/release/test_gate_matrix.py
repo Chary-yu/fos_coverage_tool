@@ -2,10 +2,13 @@ import json
 import hashlib
 import gzip
 import os
+import sys
 import tempfile
 import unittest
 
-from scripts.diagnostics.gate_matrix import _external, _revision, build
+from scripts.diagnostics.gate_matrix import (
+    _configured_parser_preflight, _external, _revision, build,
+)
 from scripts.upgrade.evidence_manifest import EvidenceManifestV2
 
 
@@ -354,5 +357,55 @@ class GateMatrixEvidenceTest(unittest.TestCase):
             checks["final_security_review"]["evidence_class"],
             "exact_sha_security_review",
         )
+
+    def test_parser_preflight_uses_the_runtime_configured_adapter(self):
+        helper_source = r'''
+import json
+import sys
+
+if "--version" in sys.argv:
+    print("fixture-parser 1")
+    raise SystemExit(0)
+if "--analyze-json" not in sys.argv:
+    raise SystemExit(2)
+request = json.load(sys.stdin)
+print(json.dumps({
+    "protocol": "coverage-cpp-parser-v1",
+    "analysis": {
+        "supported": True,
+        "path": request["path"],
+        "functions": [{
+            "identity": {"path": request["path"], "scope": [],
+                         "name": "preflight_function", "parameters": [],
+                         "qualifiers": [], "trailing_return": []},
+            "start_line": 1, "end_line": 1,
+        }],
+        "controls": {}, "preprocessor": {}, "macros": {},
+        "constants": {}, "calls": {}, "uncertain": False,
+    },
+}))
+'''
+        with tempfile.TemporaryDirectory(prefix="gate-parser-config-") as directory:
+            helper = os.path.join(directory, "helper.py")
+            with open(helper, "w") as stream:
+                stream.write(helper_source)
+            config = os.path.join(directory, "candidate.json")
+            with open(config, "w") as stream:
+                json.dump({
+                    "runtime_mode": "vnext",
+                    "schema_version": 1,
+                    "server": {"host": "127.0.0.1", "port": 19528},
+                    "auth": {"mode": "disabled"},
+                    "inheritance_parser": {
+                        "adapter": "json-cli-v1",
+                        "command": [sys.executable, helper],
+                        "require_external": True,
+                    },
+                }, stream)
+            result = _configured_parser_preflight(self.repo_root, config)
+        self.assertEqual(result["status"], "PASSED")
+        self.assertEqual(result["backend"], "json-cli-v1")
+        self.assertEqual(result["configuration_source"], "inheritance_parser")
+        self.assertTrue(result["runtime_config_path"].endswith("candidate.json"))
 if __name__ == "__main__":
     unittest.main()

@@ -361,12 +361,14 @@ def _gate_detail(repo_root, matrix, gate, sqlite_result=None, test_result=None):
     return detail
 
 
-def build(repo_root, output_root, run_tests=True):
+def build(repo_root, output_root, run_tests=True, runtime_config_path=None):
     repo_root = os.path.abspath(repo_root)
     output_root = os.path.abspath(output_root)
     revision = _revision(repo_root)
     identity = generate_release_identity(repo_root=repo_root)
-    matrix = build_gate_matrix(repo_root)
+    matrix = build_gate_matrix(
+        repo_root, runtime_config_path=runtime_config_path
+    )
     task_status = build_task_status(repo_root, matrix=matrix)
     dod_status = build_dod_status(repo_root, matrix=matrix, task_status=task_status)
     sqlite_result = _sqlite_migration(repo_root)
@@ -750,6 +752,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo-root", default=ROOT)
     parser.add_argument("--output-root", default=".artifacts/gates")
+    parser.add_argument(
+        "--runtime-config", default="",
+        help="exact runtime config whose parser selection is included in the bundle",
+    )
     parser.add_argument("--no-tests", action="store_true")
     parser.add_argument(
         "--allow-incomplete", action="store_true",
@@ -760,7 +766,10 @@ def main(argv=None):
     output_root = args.output_root
     if not os.path.isabs(output_root):
         output_root = os.path.join(os.path.abspath(args.repo_root), output_root)
-    result = build(args.repo_root, output_root, run_tests=not args.no_tests)
+    result = build(
+        args.repo_root, output_root, run_tests=not args.no_tests,
+        runtime_config_path=args.runtime_config or None,
+    )
     encoded = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
     if args.output:
         output = args.output if os.path.isabs(args.output) else os.path.join(

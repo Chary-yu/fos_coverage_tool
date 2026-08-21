@@ -116,6 +116,23 @@ backup workflow 会把这两个值和 attestation 时间写入 manifest；未设
 
 仓库内的 `parser_toolchain_preflight` 在没有真实 helper 时会保持 `INCOMPLETE`，不能通过设置环境变量把 builtin parser 伪装成生产 parser。
 
+如果 Candidate runtime 通过配置文件选择 parser，应先对同一份配置执行：
+
+```bash
+python3 scripts/diagnostics/parser_toolchain_preflight.py \
+  --config /secure/coverage-candidate.json \
+  --require-external
+```
+
+Gate Matrix 也应绑定这份配置，确保审计对象就是实际 runtime 选择的 adapter：
+
+```bash
+python3 scripts/diagnostics/gate_matrix.py \
+  --runtime-config /secure/coverage-candidate.json \
+  --allow-incomplete \
+  --output /secure/evidence/gate-matrix.json
+```
+
 目标主机上的 parser 应通过同一版本化 JSON adapter 执行 corpus；例如：
 
 ```bash

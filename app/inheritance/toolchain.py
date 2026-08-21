@@ -105,6 +105,23 @@ class ExternalJsonCppParserAdapter(CppParserAdapter):
         return _canonicalize_analysis(analysis, path)
 
 
+def _parser_settings(config=None):
+    """Return the parser selection fields from one runtime config mapping."""
+    config = config or {}
+    parser_config = config.get("inheritance_parser") or \
+        (config.get("inheritance") or {}).get("parser") or {}
+    if not isinstance(parser_config, dict):
+        raise ParserAdapterError("inheritance parser configuration must be an object")
+    adapter_name = str(
+        parser_config.get("adapter") or
+        os.environ.get("COVERAGE_CPP_PARSER_ADAPTER") or
+        "builtin-conservative"
+    )
+    command = parser_config.get("command") or os.environ.get("COVERAGE_CPP_PARSER", "")
+    require_external = bool(parser_config.get("require_external"))
+    return parser_config, adapter_name, command, require_external
+
+
 def _as_tuple(value, field_name, allow_string=False):
     if value is None:
         return ()
@@ -265,18 +282,7 @@ def parser_from_config(config=None):
     command/adapter is declared, startup fails closed unless the same command
     passes both executable and protocol smoke checks.
     """
-    config = config or {}
-    parser_config = config.get("inheritance_parser") or \
-        (config.get("inheritance") or {}).get("parser") or {}
-    if not isinstance(parser_config, dict):
-        raise ParserAdapterError("inheritance parser configuration must be an object")
-    adapter_name = str(
-        parser_config.get("adapter") or
-        os.environ.get("COVERAGE_CPP_PARSER_ADAPTER") or
-        "builtin-conservative"
-    )
-    command = parser_config.get("command") or os.environ.get("COVERAGE_CPP_PARSER", "")
-    require_external = bool(parser_config.get("require_external"))
+    parser_config, adapter_name, command, require_external = _parser_settings(config)
     if adapter_name == "builtin-conservative" and not command and not require_external:
         return create_parser_adapter(adapter_name=adapter_name)
     if adapter_name == "builtin-conservative" and command:
@@ -295,6 +301,38 @@ def parser_from_config(config=None):
     return create_parser_adapter(
         command=command, adapter_name=adapter_name, require_external=True
     )
+
+
+def parser_toolchain_preflight_from_config(config=None, require_external=False):
+    """Preflight the parser selected by the runtime configuration.
+
+    This is intentionally separate from :func:`parser_toolchain_preflight`,
+    whose arguments are useful for a standalone helper probe.  Gate tooling
+    must be able to prove that it inspected the same adapter/command the
+    VNext runtime will construct, rather than a different environment-level
+    default.
+    """
+    parser_config, adapter_name, command, configured_requirement = _parser_settings(
+        config
+    )
+    external_requested = bool(
+        require_external or configured_requirement or
+        adapter_name != "builtin-conservative"
+    )
+    result = parser_toolchain_preflight(
+        command=command,
+        adapter_name=adapter_name,
+        require_external=external_requested,
+    )
+    result["configured"] = bool(parser_config)
+    result["configuration_source"] = (
+        "inheritance_parser" if config and config.get("inheritance_parser")
+        else "inheritance.parser" if config and
+        isinstance(config.get("inheritance"), dict) and
+        config.get("inheritance", {}).get("parser") else "default"
+    )
+    result["configured_require_external"] = bool(configured_requirement)
+    return result
 
 
 class ParserToolchainPreflight(object):

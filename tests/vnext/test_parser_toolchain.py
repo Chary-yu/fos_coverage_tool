@@ -7,7 +7,7 @@ import unittest
 from app.bootstrap import VNextRuntime
 from app.inheritance.toolchain import (
     ExternalJsonCppParserAdapter, parser_from_config,
-    parser_toolchain_preflight,
+    parser_toolchain_preflight, parser_toolchain_preflight_from_config,
 )
 from scripts.upgrade.migration_runner import create_sqlite_schema
 
@@ -78,6 +78,17 @@ print(json.dumps({
             self.assertEqual(result["status"], "PASSED")
             self.assertTrue(result["production_ready"])
             self.assertEqual(result["smoke_test"], "PASSED")
+            configured = parser_toolchain_preflight_from_config({
+                "inheritance_parser": {
+                    "adapter": "json-cli-v1", "command": command,
+                    "require_external": True,
+                },
+            })
+            self.assertEqual(configured["status"], "PASSED")
+            self.assertTrue(configured["configured"])
+            self.assertEqual(
+                configured["configuration_source"], "inheritance_parser"
+            )
             parser = parser_from_config({
                 "inheritance_parser": {
                     "adapter": "json-cli-v1", "command": command,
