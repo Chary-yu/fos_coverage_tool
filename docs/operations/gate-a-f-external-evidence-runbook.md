@@ -65,7 +65,7 @@ python3 scripts/upgrade/run_verified_backup_rehearsal.py \
 5. 检查 MariaDB runtime identity、semantic hash、重跑幂等和目标表清单；
 6. 只删除本次创建的两个数据库。
 
-`scripts/diagnostics/mysql_vnext_integration.py --create-disposable --migration-rehearsal` 仍可用于 MariaDB SQL/事务/fixture 回归，但输出明确标记 `synthetic=true`，不能填充 `COVERAGE_GATE_A_BACKUP_EVIDENCE`。
+`scripts/diagnostics/mysql_vnext_integration.py --create-disposable --migration-rehearsal` 仍可用于 MariaDB SQL/事务/fixture 回归，但输出明确标记 `synthetic=true`，不能填充 `COVERAGE_GATE_A_BACKUP_EVIDENCE`。需要同时验证 Gate C durable import 时追加 `--scan-import-rehearsal`；该项会覆盖 busy zero-residue、staged artifact recovery、fencing CAS、CURRENT 原子发布和重复恢复幂等，但同样只属于本地 synthetic rehearsal。
 
 ## Gate B～D：目标库、重启和解析器证据
 

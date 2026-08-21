@@ -190,6 +190,7 @@ jobs:
           python scripts/diagnostics/mysql_vnext_integration.py \
             --create-disposable --host 127.0.0.1 --port 3306 \
             --user root --password root --migration-rehearsal \
+            --scan-import-rehearsal \
             --migration-lines 90000 --migration-analyses 51000 \
             --migration-jobs 1 | tee .artifacts/mariadb_vnext_integration.json
       - name: Upload MariaDB integration evidence

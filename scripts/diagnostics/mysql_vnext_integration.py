@@ -45,6 +45,7 @@ from app.code_detail.source_reader import (
 )
 from app.db.manager import DatabaseManager
 from app.db.repositories.base import fetchone
+from app.scan_import import RepositoryBusyError
 from scripts.upgrade.migration_runner import apply_schema
 from scripts.upgrade.migration_runner import (
     capture_vnext_semantic_snapshot,
@@ -89,6 +90,18 @@ def _connect(host, port, user, password, database=None, autocommit=True):
 
 def _database_name():
     return "coverage_vnext_audit_{}".format(uuid.uuid4().hex[:12])
+
+
+def _command_or_action(args):
+    parts = [
+        "python scripts/diagnostics/mysql_vnext_integration.py",
+        "--create-disposable",
+    ]
+    if getattr(args, "migration_rehearsal", False):
+        parts.append("--migration-rehearsal")
+    if getattr(args, "scan_import_rehearsal", False):
+        parts.append("--scan-import-rehearsal")
+    return " ".join(parts)
 
 
 def _line_records():
@@ -275,6 +288,207 @@ def _run_legacy_migration_rehearsal(args):
         _drop_database(args.host, args.port, args.user, args.password, target_database)
 
 
+def _run_scan_import_rehearsal(args, runtime, root):
+    """Exercise durable Scan Import recovery on the real MariaDB engine.
+
+    The repository and LCOV input are generated disposable fixtures.  This
+    rehearsal is therefore useful for SQL/transaction/fencing compatibility,
+    but it is deliberately not production Gate C evidence.
+    """
+    coordinator = runtime.scan_import_coordinator
+    recovery = runtime.scan_import_recovery
+    project_name = "MySQLScanImportAudit_{}".format(os.getpid())
+    info_path = os.path.join(root, "scan-import-recovery.info")
+    staging_root = runtime.scan_import_staging_root
+    common_dir = os.path.join(root, "git-common")
+    worktree_root = os.path.join(root, "git-worktree")
+    os.makedirs(common_dir)
+    os.makedirs(worktree_root)
+    with open(info_path, "w") as stream:
+        stream.write("TN:\nSF:src/recovery.c\nDA:1,0\nend_of_record\n")
+
+    def counts(connection):
+        result = {}
+        for table in (
+                "coverage_scans", "coverage_background_jobs",
+                "coverage_import_artifacts", "coverage_import_checkpoints"):
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT COUNT(*) FROM `{}`".format(table))
+                result[table] = int(cursor.fetchone()[0])
+        return result
+
+    repositories = [{
+        "repository_name": "repo-recovery",
+        "repository_path": worktree_root,
+        "branch_name": "main",
+        "physical_resource_id": None,
+        "verified": True,
+    }]
+    with runtime.connection_context(read_only=False) as connection:
+        resource = runtime.repository_repository.ensure_resource(
+            connection, common_dir, worktree_root
+        )
+        connection.commit()
+        resource_id = int(resource["id"])
+        repositories[0]["physical_resource_id"] = resource_id
+        result = coordinator.create(
+            connection, project_name, info_path,
+            repository_resource_ids=[resource_id], repositories=repositories,
+            staging_root=staging_root, requested_by="mariadb-rehearsal",
+        )
+        initial_counts = counts(connection)
+        initial_state = fetchone(
+            connection, "SELECT current_scan_id FROM coverage_project_state "
+            "WHERE project_id=?", (result["scan"]["project_id"],)
+        )
+
+        busy_rejected = False
+        busy_error = ""
+        busy_info_path = os.path.join(root, "scan-import-busy.info")
+        with open(busy_info_path, "w") as stream:
+            stream.write("TN:\nSF:src/busy.c\nDA:1,0\nend_of_record\n")
+        try:
+            coordinator.create(
+                connection, project_name + "_busy", busy_info_path,
+                repository_resource_ids=[resource_id], repositories=repositories,
+                staging_root=staging_root, requested_by="mariadb-rehearsal",
+            )
+        except RepositoryBusyError as exc:
+            busy_rejected = True
+            busy_error = str(exc)
+        busy_counts = counts(connection)
+        _assert(busy_rejected, "MariaDB busy repository was not rejected")
+        _assert(initial_counts == busy_counts,
+                "busy import left MariaDB Scan/job/artifact residue")
+
+        old_fence = int(result["locks"][0]["fencing_token"])
+        checkpoint = coordinator.advance(
+            connection, result["job"]["job_id"], 0, old_fence, "SCAN_CREATED"
+        )
+        checkpoint = coordinator.advance(
+            connection, result["job"]["job_id"], checkpoint["checkpoint_seq"],
+            old_fence, "INFO_STAGED"
+        )
+        checkpoint_before_reclaim = dict(checkpoint)
+
+    os.remove(info_path)
+
+    # The next connection/owner represents the worker restart boundary.
+    with runtime.connection_context(read_only=False) as connection:
+        validated = recovery.validate(connection, result["job"]["job_id"])
+        reclaimed = recovery.reclaim(
+            connection, result["job"]["job_id"], staging_root,
+            owner_token="restarted-owner-{}".format(uuid.uuid4().hex),
+        )
+        new_fence = int(reclaimed["locks"][0]["fencing_token"])
+        _assert(new_fence > old_fence,
+                "MariaDB recovery did not advance the fencing token")
+        stale_rejected = False
+        stale_error = ""
+        try:
+            coordinator.advance(
+                connection, result["job"]["job_id"],
+                checkpoint_before_reclaim["checkpoint_seq"], old_fence,
+                "COVERAGE_IMPORTED",
+            )
+        except ValueError as exc:
+            stale_rejected = str(exc) == "STALE_IMPORT_CHECKPOINT"
+            stale_error = str(exc)
+        _assert(stale_rejected,
+                "stale MariaDB worker checkpoint write was not rejected")
+
+    with runtime.connection_context(read_only=False) as connection:
+        published_state = coordinator.execute(
+            connection, result["job"]["job_id"],
+            owner_token=reclaimed["owner_token"], fencing_token=new_fence,
+        )
+        replay_state = coordinator.execute(
+            connection, result["job"]["job_id"],
+            owner_token=reclaimed["owner_token"], fencing_token=new_fence,
+        )
+        scan = fetchone(
+            connection, "SELECT status FROM coverage_scans WHERE id=?",
+            (result["scan"]["id"],)
+        )
+        job = fetchone(
+            connection, "SELECT state FROM coverage_background_jobs WHERE job_id=?",
+            (result["job"]["job_id"],)
+        )
+        final_checkpoint = fetchone(
+            connection, "SELECT phase, fencing_token FROM coverage_import_checkpoints "
+            "WHERE job_id=?", (result["job"]["job_id"],)
+        )
+        final_state = fetchone(
+            connection, "SELECT current_scan_id FROM coverage_project_state "
+            "WHERE project_id=?", (result["scan"]["project_id"],)
+        )
+        line_count = fetchone(
+            connection, "SELECT COUNT(*) AS total FROM coverage_lines l "
+            "JOIN coverage_files f ON f.id=l.file_id WHERE f.scan_id=?",
+            (result["scan"]["id"],)
+        )
+        lock_count = fetchone(
+            connection, "SELECT COUNT(*) AS total FROM coverage_repository_resource_locks"
+        )
+
+    _assert(initial_state["current_scan_id"] is None,
+            "durable Scan Import changed CURRENT before publish")
+    _assert(validated["artifact"]["sha256"] == result["artifact"]["sha256"],
+            "recovery did not validate the immutable staged artifact")
+    _assert(published_state["current_scan_id"] == result["scan"]["id"],
+            "durable Scan Import did not publish CURRENT atomically")
+    _assert(replay_state["current_scan_id"] == result["scan"]["id"],
+            "replaying a published import changed CURRENT")
+    _assert(str(scan["status"]).upper() == "SEALED", "scan was not sealed")
+    _assert(str(job["state"]).lower() == "completed", "import job was not completed")
+    _assert(str(final_checkpoint["phase"]) == "PUBLISHED", "checkpoint was not published")
+    _assert(int(final_checkpoint["fencing_token"]) == new_fence,
+            "published checkpoint lost its fencing token")
+    _assert(int(final_state["current_scan_id"]) == int(result["scan"]["id"]),
+            "project CURRENT does not identify the published Scan")
+    _assert(int(line_count["total"]) == 1, "recovered import did not ingest one line")
+    _assert(int(lock_count["total"]) == 0, "published import did not release its lock")
+
+    return with_contract({
+        "status": "PASSED",
+        "evidence_class": "real_mariadb_scan_import_rehearsal",
+        "database_engine": "MariaDB",
+        "database_version": _database_version(args),
+        "synthetic": True,
+        "synthetic_reason": "generated LCOV/repository fixture; not production Gate C evidence",
+        "candidate_revision": _revision(),
+        "host_identity": {
+            "hostname": socket.gethostname(),
+            "platform": platform.platform(),
+        },
+        "command_or_action": _command_or_action(args),
+        "checks": {
+            "busy_repository_rejected": busy_rejected,
+            "busy_error": busy_error,
+            "busy_path_zero_residue": initial_counts == busy_counts,
+            "current_unchanged_until_publish": initial_state["current_scan_id"] is None,
+            "immutable_artifact_validated_after_original_deleted": True,
+            "checkpoint_phase_before_reclaim": checkpoint_before_reclaim["phase"],
+            "recovery_handler_version_validated": True,
+            "fencing_token_monotonic": new_fence > old_fence,
+            "stale_checkpoint_write_rejected": stale_rejected,
+            "stale_checkpoint_error": stale_error,
+            "atomic_current_publish": True,
+            "repeated_recovery_idempotent": replay_state["current_scan_id"] == result["scan"]["id"],
+            "scan_sealed": str(scan["status"]).upper() == "SEALED",
+            "job_completed": str(job["state"]).lower() == "completed",
+            "locks_released": int(lock_count["total"]) == 0,
+        },
+        "workload": {
+            "project": project_name,
+            "scan_id": result["scan"]["id"],
+            "line_count": int(line_count["total"]),
+            "old_fencing_token": old_fence,
+            "reclaimed_fencing_token": new_fence,
+        },
+    })
+
+
 def run(args):
     admin = None
     manager = None
@@ -359,6 +573,10 @@ def run(args):
         }
         manager = DatabaseManager(config)
         runtime = VNextRuntime(config, root, database_manager=manager)
+        if getattr(args, "scan_import_rehearsal", False):
+            checks["durable_scan_import_rehearsal"] = _run_scan_import_rehearsal(
+                args, runtime, root
+            )
         context = _source_context()
         file_path = "src/mysql_audit.c"
         file_key = calc_sidecar_file_key(file_path, "repo-a")
@@ -539,10 +757,7 @@ def run(args):
                 "hostname": socket.gethostname(),
                 "platform": platform.platform(),
             },
-            "command_or_action": (
-                "python scripts/diagnostics/mysql_vnext_integration.py "
-                "--create-disposable --migration-rehearsal"
-            ),
+            "command_or_action": _command_or_action(args),
             "started_at": started_at,
             "finished_at": utc_iso(),
             "exit_code": 0,
@@ -625,6 +840,10 @@ def main(argv=None):
         "--migration-rehearsal", action="store_true",
         help="also run a generated Legacy -> Empty VNext MariaDB rehearsal",
     )
+    parser.add_argument(
+        "--scan-import-rehearsal", action="store_true",
+        help="also run a generated durable Scan Import restart/fencing rehearsal",
+    )
     parser.add_argument("--migration-lines", type=int, default=90000)
     parser.add_argument("--migration-analyses", type=int, default=51000)
     parser.add_argument("--migration-jobs", type=int, default=1)
@@ -644,10 +863,7 @@ def main(argv=None):
                 "hostname": socket.gethostname(),
                 "platform": platform.platform(),
             },
-            "command_or_action": (
-                "python scripts/diagnostics/mysql_vnext_integration.py "
-                "--create-disposable --migration-rehearsal"
-            ),
+            "command_or_action": _command_or_action(args),
             "started_at": utc_iso(),
             "finished_at": utc_iso(),
             "exit_code": 1,

@@ -5,6 +5,7 @@ import unittest
 
 from app.scan_import import (
     RepositoryBusyError, RepositoryResourceLockService, ScanImportCoordinator,
+    ScanImportRecoveryService,
 )
 from app.db.repositories import (
     AnalysisDomainRepository, FileStateRepository, LineIndexRepository,
@@ -109,6 +110,59 @@ class ScanImportLifecycleTest(unittest.TestCase):
         service.release(self.connection, "job-1", "owner-1")
         second = service.acquire(self.connection, [self.resource_id], "job-2", "owner-2")
         self.assertGreater(second[0]["fencing_token"], first[0]["fencing_token"])
+
+    def test_recovery_revalidates_staged_artifact_and_rejects_stale_worker(self):
+        coordinator = ScanImportCoordinator()
+        result = coordinator.create(
+            self.connection, "recovery", self.info_path,
+            repository_resource_ids=[self.resource_id],
+            staging_root=os.path.join(self.temp.name, "recovery-stage"),
+        )
+        old_fence = result["locks"][0]["fencing_token"]
+        checkpoint = coordinator.advance(
+            self.connection, result["job"]["job_id"], 0, old_fence, "SCAN_CREATED"
+        )
+        checkpoint = coordinator.advance(
+            self.connection, result["job"]["job_id"], checkpoint["checkpoint_seq"],
+            old_fence, "INFO_STAGED"
+        )
+        os.remove(self.info_path)
+
+        recovery = ScanImportRecoveryService(coordinator=coordinator)
+        validated = recovery.validate(self.connection, result["job"]["job_id"])
+        self.assertEqual(
+            validated["artifact"]["sha256"], result["artifact"]["sha256"]
+        )
+        reclaimed = recovery.reclaim(
+            self.connection, result["job"]["job_id"],
+            os.path.join(self.temp.name, "recovery-stage"),
+            owner_token="restarted-owner",
+        )
+        new_fence = reclaimed["locks"][0]["fencing_token"]
+        self.assertGreater(new_fence, old_fence)
+        with self.assertRaises(ValueError) as raised:
+            coordinator.advance(
+                self.connection, result["job"]["job_id"],
+                checkpoint["checkpoint_seq"], old_fence, "COVERAGE_IMPORTED",
+            )
+        self.assertEqual(str(raised.exception), "STALE_IMPORT_CHECKPOINT")
+
+    def test_recovery_handler_version_mismatch_fails_closed(self):
+        coordinator = ScanImportCoordinator()
+        result = coordinator.create(
+            self.connection, "handler-mismatch", self.info_path,
+            repository_resource_ids=[self.resource_id],
+            staging_root=os.path.join(self.temp.name, "handler-stage"),
+        )
+        self.connection.execute(
+            "UPDATE coverage_background_jobs SET handler_version=? WHERE job_id=?",
+            ("UNSUPPORTED_HANDLER", result["job"]["job_id"]),
+        )
+        self.connection.commit()
+        recovery = ScanImportRecoveryService(coordinator=coordinator)
+        with self.assertRaises(ValueError) as raised:
+            recovery.validate(self.connection, result["job"]["job_id"])
+        self.assertEqual(str(raised.exception), "UNSUPPORTED_SCAN_IMPORT_HANDLER")
 
     def test_repository_master_rename_alias_and_retire_preserve_identity(self):
         projects = ProjectRepository()
