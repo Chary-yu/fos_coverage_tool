@@ -106,6 +106,47 @@ TEST_GROUPS = {
     "F": ["tests.release.test_upgrade_manifest", "tests.release.test_evidence_authenticity"],
 }
 
+_KNOWN_EVIDENCE_STATUSES = {
+    "PASSED", "INCOMPLETE", "BLOCKED", "FAILED", "PARTIAL",
+    "UNAVAILABLE", "SKIPPED",
+}
+
+
+def _manifest_artifact_attributes(name, path, tests):
+    """Read an artifact's declared status without losing authenticity flags."""
+    synthetic = name in {
+        "source_semantic.json", "target_semantic.json", "semantic_hashes.json",
+        "anomalies.json", "migration_run_1.json", "migration_run_2_idempotency.json",
+        "analysis_backfill_before.json", "analysis_backfill_after.json",
+        "analysis_semantic_hashes.json", "deterministic_fixture_manifest.json",
+        "decisions_run_1.json", "decisions_run_2.json", "determinism_diff.json",
+        "false_positive_check.json", "parser_uncertainty_report.json",
+        "dependency_resolution_report.json",
+    }
+    payload = None
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (ValueError, OSError):
+        pass
+
+    observed_status = ""
+    if isinstance(payload, dict):
+        observed_status = str(payload.get("status") or "").upper()
+        if payload.get("synthetic") is True:
+            synthetic = True
+
+    if observed_status in _KNOWN_EVIDENCE_STATUSES:
+        status = observed_status
+    else:
+        status = "PASSED" if name == "targeted_tests.txt" and \
+            tests.get("status") == "PASSED" else "INCOMPLETE"
+    # A synthetic result may be useful as a regression artifact, but it must
+    # never be represented as a production-advancing PASS in the manifest.
+    if synthetic and status == "PASSED":
+        status = "INCOMPLETE"
+    return status, synthetic, observed_status
+
 
 def _revision(repo_root):
     try:
@@ -500,33 +541,15 @@ def build(repo_root, output_root, run_tests=True):
             path = os.path.join(gate_dir, name)
             if not os.path.isfile(path):
                 continue
-            synthetic = name in {
-                "source_semantic.json", "target_semantic.json", "semantic_hashes.json",
-                "anomalies.json", "migration_run_1.json", "migration_run_2_idempotency.json",
-                "analysis_backfill_before.json", "analysis_backfill_after.json",
-                "analysis_semantic_hashes.json", "deterministic_fixture_manifest.json",
-                "decisions_run_1.json", "decisions_run_2.json", "determinism_diff.json",
-                "false_positive_check.json", "parser_uncertainty_report.json",
-                "dependency_resolution_report.json",
-            }
-            status = "PASSED" if name == "targeted_tests.txt" and tests["status"] == "PASSED" else "INCOMPLETE"
-            payload = None
-            try:
-                with open(path, "r", encoding="utf-8") as stream:
-                    payload = json.load(stream)
-                if isinstance(payload, dict) and payload.get("status") in (
-                        "FAILED", "BLOCKED", "INCOMPLETE", "PARTIAL", "UNAVAILABLE"):
-                    status = payload.get("status")
-            except (ValueError, OSError):
-                pass
-            if synthetic and status == "PASSED":
-                status = "INCOMPLETE"
+            status, synthetic, observed_status = _manifest_artifact_attributes(
+                name, path, tests
+            )
             manifest.record(
                 "{}-{}".format(gate.lower(), name.replace("/", "-").replace(".", "-")),
                 "synthetic_fixture" if synthetic else "repository_or_release_audit",
                 status, "build_gate_evidence.py", 0 if tests["status"] == "PASSED" else 1,
                 artifact_path=path, source_inputs_sha256=[], synthetic=synthetic,
-                observed_status=(payload or {}).get("status") if isinstance(payload, dict) else "",
+                observed_status=observed_status,
             )
         all_gate_results[gate] = detail
 

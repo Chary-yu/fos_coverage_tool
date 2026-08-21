@@ -96,6 +96,21 @@ python3 scripts/diagnostics/final_security_review.py \
 
 这两个结果只证明 exact SHA 的 source/canonical/runtime 与静态 trust-boundary 检查；它们不能替代后续的生产进程、Target DB、反向代理和 traffic-closed read-only 证据。
 
+随后必须针对实际运行中的 Candidate 进程执行 active-runtime audit，并显式绑定同一个
+SHA；该审计会把 HTTP release endpoint 的 `commit_sha` 与候选 SHA 做 exact 比较：
+
+```bash
+python3 scripts/diagnostics/active_runtime_audit.py \
+  --url http://127.0.0.1:19528 \
+  --pid-file /srv/fos-coverage/candidate/.runtime-state/api.pid \
+  --config /srv/fos-coverage/candidate/config/coverage_config.staging.example.json \
+  --expected-revision "$(git rev-parse HEAD)" \
+  --probe-database --require-live \
+  > /secure/evidence/gate-f/active_runtime_audit.json
+```
+
+`configured_runtime_audit.py` 只验证配置文件，不能代替这条 live process/service、绑定配置、监听端口、release、DB identity 和 HTTP route 证据。
+
 Acceptance window 必须在窗口结束后运行：
 
 ```bash

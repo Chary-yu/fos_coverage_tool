@@ -7,6 +7,7 @@ from scripts.diagnostics.runtime_legacy_dependency_audit import audit as audit_l
 from scripts.diagnostics.runtime_participation_audit import audit as audit_participation
 from scripts.diagnostics.active_runtime_audit import (
     _bound_config,
+    _release_matches_revision,
     audit as audit_active_runtime,
 )
 from scripts.diagnostics.configured_runtime_audit import audit as audit_configured_runtime
@@ -79,6 +80,12 @@ class ArchitectureAuditTest(unittest.TestCase):
             )),
         )
         self.assertTrue(result["matches_requested"])
+
+    def test_active_runtime_requires_exact_release_revision(self):
+        release = {"commit_sha": "candidate-sha", "build_id": "candidate-build"}
+        self.assertTrue(_release_matches_revision(release, "candidate-sha"))
+        self.assertFalse(_release_matches_revision(release, "different-sha"))
+        self.assertFalse(_release_matches_revision(release, ""))
 
     def test_changed_test_selection_fails_closed_when_revision_is_unavailable(self):
         with self.assertRaises(DiffResolutionError):

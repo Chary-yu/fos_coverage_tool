@@ -8,6 +8,7 @@ import unittest
 from scripts.diagnostics.acceptance_window_audit import _parse_time, audit as audit_window
 from scripts.diagnostics.build_gate_evidence import (
     GATE_DIRECTORIES, GATE_FILES, build as build_gate_evidence,
+    _manifest_artifact_attributes,
 )
 from scripts.diagnostics.production_inventory import required_free_bytes
 from scripts.diagnostics.skill_drift_audit import REQUIRED_FIELDS, REQUIRED_SKILLS, audit as audit_skills
@@ -155,6 +156,28 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
                 self.assertTrue(os.path.isfile(os.path.join(
                     gate_dir, "evidence-manifest-v2.json"
                 )))
+
+    def test_manifest_artifact_attributes_preserve_status_and_synthetic_boundary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            passed = os.path.join(directory, "passed.json")
+            with open(passed, "w", encoding="utf-8") as stream:
+                json.dump({"status": "PASSED", "synthetic": False}, stream)
+            status, synthetic, observed = _manifest_artifact_attributes(
+                "final_source_review.json", passed, {"status": "PASSED"}
+            )
+            self.assertEqual(status, "PASSED")
+            self.assertFalse(synthetic)
+            self.assertEqual(observed, "PASSED")
+
+            fixture = os.path.join(directory, "fixture.json")
+            with open(fixture, "w", encoding="utf-8") as stream:
+                json.dump({"status": "PASSED", "synthetic": True}, stream)
+            status, synthetic, observed = _manifest_artifact_attributes(
+                "performance_metrics.json", fixture, {"status": "PASSED"}
+            )
+            self.assertEqual(status, "INCOMPLETE")
+            self.assertTrue(synthetic)
+            self.assertEqual(observed, "PASSED")
 
 
 if __name__ == "__main__":

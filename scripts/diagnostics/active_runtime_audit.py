@@ -28,6 +28,25 @@ from scripts.diagnostics.configured_runtime_audit import audit as audit_configur
 from scripts.diagnostics.contract import with_contract
 
 
+def _git_revision(repo_root):
+    """Return the exact checkout revision used as the runtime expectation."""
+    try:
+        return subprocess.check_output(
+            ["git", "-C", repo_root, "rev-parse", "HEAD"],
+            stderr=subprocess.STDOUT,
+        ).decode("ascii").strip()
+    except (OSError, subprocess.CalledProcessError, UnicodeError):
+        return ""
+
+
+def _release_matches_revision(release, expected_revision):
+    """Require the live release endpoint to identify the expected SHA."""
+    release = release if isinstance(release, dict) else {}
+    actual = str(release.get("commit_sha") or "").strip()
+    expected = str(expected_revision or "").strip()
+    return bool(actual and expected and actual == expected)
+
+
 def _read_proc(pid):
     proc_root = "/proc/{}".format(int(pid))
     result = {"pid": int(pid), "available": False, "cmdline": [], "environment": {}}
@@ -214,7 +233,11 @@ def _database_identity(config):
 
 
 def audit(repo_root=ROOT, url=None, pid=None, pid_file=None, service=None, config_path=None,
-          require_live=False, probe_database=False):
+          require_live=False, probe_database=False, expected_revision=None):
+    expected_revision = str(
+        expected_revision or os.environ.get("COVERAGE_EXPECTED_REVISION") or
+        _git_revision(repo_root)
+    ).strip()
     configured = audit_configured(repo_root)
     service_state = _service_state(service)
     resolved_pid = pid or _read_pid_file(pid_file)
@@ -257,6 +280,7 @@ def audit(repo_root=ROOT, url=None, pid=None, pid_file=None, service=None, confi
         }
 
     release = (http.get("release") or {}).get("payload", {}).get("release") or {}
+    release_matches_revision = _release_matches_revision(release, expected_revision)
     route_payload = (http.get("routes") or {}).get("payload") or {}
     database = _database_identity(config) if probe_database else {
         "status": "NOT_PROBED",
@@ -283,7 +307,10 @@ def audit(repo_root=ROOT, url=None, pid=None, pid_file=None, service=None, confi
             configured_port in listening_ports and
             (requested_url_port is None or requested_url_port == configured_port)
         ),
-        "release_identity": bool(release.get("commit_sha") and release.get("build_id")),
+        "release_identity": bool(
+            release.get("commit_sha") and release.get("build_id") and
+            release_matches_revision
+        ),
         "database_identity": database.get("status") == "PASSED" and
             bool(database.get("schema_ready")),
         "http_routes": bool(
@@ -310,6 +337,8 @@ def audit(repo_root=ROOT, url=None, pid=None, pid_file=None, service=None, confi
         "bound_configuration": bound_config,
         "http": http,
         "release": release,
+        "expected_revision": expected_revision,
+        "release_matches_revision": release_matches_revision,
         "database": database,
         "listening_ports": listening_ports,
         "config_load_error": config_error,
@@ -328,11 +357,15 @@ def main(argv=None):
     parser.add_argument("--config")
     parser.add_argument("--probe-database", action="store_true")
     parser.add_argument("--require-live", action="store_true")
+    parser.add_argument(
+        "--expected-revision",
+        help="exact commit SHA that the live release endpoint must report; defaults to HEAD",
+    )
     args = parser.parse_args(argv)
     result = audit(
         url=args.url, pid=args.pid, pid_file=args.pid_file, service=args.service,
         config_path=args.config, require_live=args.require_live,
-        probe_database=args.probe_database,
+        probe_database=args.probe_database, expected_revision=args.expected_revision,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["status"] == "PASSED" or (
