@@ -18,6 +18,7 @@ from scripts.diagnostics.contract_artifact_audit import audit as audit_contract_
 from scripts.diagnostics.task_manifest_audit import audit as audit_task_manifest
 from scripts.diagnostics.changed_test_selection import DiffResolutionError, changed_files, select
 from scripts.diagnostics.performance_evidence_audit import audit as audit_performance
+from scripts.diagnostics.legacy_compatibility_smoke import audit as audit_legacy_compatibility
 
 
 class ArchitectureAuditTest(unittest.TestCase):
@@ -63,6 +64,36 @@ class ArchitectureAuditTest(unittest.TestCase):
             )
         self.assertFalse(result["retirement_checks"]["compatibility_tests"])
         self.assertIn("status=PASSED", result["compatibility_evidence"]["missing_keys"])
+
+    def test_legacy_retirement_rejects_stale_compatibility_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = os.path.join(directory, "legacy-compatibility.json")
+            with open(manifest, "w", encoding="utf-8") as stream:
+                json.dump({"status": "PASSED", "candidate_revision": "stale"}, stream)
+            result = audit_legacy_retirement(
+                os.getcwd(), compatibility_manifest=manifest,
+            )
+        self.assertFalse(result["retirement_checks"]["compatibility_tests"])
+        self.assertTrue(any(
+            item.startswith("candidate_revision=")
+            for item in result["compatibility_evidence"]["missing_keys"]
+        ))
+
+    def test_legacy_compatibility_smoke_exercises_import_and_cli_surfaces(self):
+        result = audit_legacy_compatibility(os.getcwd())
+        self.assertEqual(result["status"], "PASSED")
+        self.assertEqual(
+            {item["surface"] for item in result["surfaces"]},
+            {
+                "enhance_coverage", "coverage_check", "code_detail_service",
+                "code_region", "source_reader",
+            },
+        )
+        self.assertEqual(
+            {item["surface"] for item in result["cli_surfaces"]},
+            {"enhance_coverage.py", "coverage_check.py"},
+        )
+        self.assertTrue(all(item["exit_code"] == 0 for item in result["cli_surfaces"]))
 
     def test_active_runtime_binding_uses_process_candidate_config(self):
         process = {

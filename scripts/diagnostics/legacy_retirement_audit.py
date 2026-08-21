@@ -3,6 +3,7 @@
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -32,6 +33,16 @@ def _load_json(path):
         return value if isinstance(value, dict) else None
     except (OSError, ValueError, TypeError):
         return None
+
+
+def _revision(repo_root):
+    try:
+        return subprocess.check_output(
+            ["git", "-C", os.path.abspath(repo_root), "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        ).decode("ascii").strip()
+    except (OSError, subprocess.CalledProcessError, UnicodeError):
+        return ""
 
 
 def _usage_telemetry(path=None):
@@ -103,13 +114,20 @@ def _runtime_mode_checks(repo_root):
     }
 
 
-def _manifest_check(path, required_keys, expected_values=None):
+def _manifest_check(path, required_keys, expected_values=None,
+                    expected_candidate_revision=""):
     values = _load_json(path)
     expected_values = dict(expected_values or {})
     missing_keys = [key for key in required_keys if not values or not values.get(key)]
     for key, expected in expected_values.items():
         if not values or values.get(key) != expected:
             missing_keys.append("{}={}".format(key, expected))
+    if expected_candidate_revision and (
+            not values or values.get("candidate_revision") != expected_candidate_revision
+    ):
+        missing_keys.append(
+            "candidate_revision={}".format(expected_candidate_revision)
+        )
     return {
         "configured": bool(path),
         "path": os.path.abspath(path) if path else "",
@@ -120,6 +138,7 @@ def _manifest_check(path, required_keys, expected_values=None):
 
 
 def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None):
+    candidate_revision = _revision(repo_root)
     boundary = audit_boundary(repo_root)
     transitional = boundary.get("classification", {}).get("TRANSITIONAL_LEGACY", [])
     missing_files = [
@@ -137,8 +156,13 @@ def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None)
     compatibility = _manifest_check(
         compatibility_manifest, ("status", "candidate_revision"),
         expected_values={"status": "PASSED"},
+        expected_candidate_revision=candidate_revision,
     )
-    release = _manifest_check(retirement_manifest, ("removal_commit", "rollback_plan"))
+    release = _manifest_check(
+        retirement_manifest,
+        ("candidate_revision", "removal_commit", "rollback_plan"),
+        expected_candidate_revision=candidate_revision,
+    )
     checks = {
         "no_legacy_deployment": runtime_modes["passed"],
         "compatibility_tests": compatibility["passed"],
@@ -168,6 +192,7 @@ def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None)
         "retirement_manifest": release,
         "usage_telemetry": telemetry,
         "compatibility_tests": [
+            "scripts.diagnostics.legacy_compatibility_smoke",
             "tests.vnext.test_runtime_config",
             "tests.code_detail.test_phase2_core",
             "tests.incremental.test_phase5_inject_path",

@@ -31,6 +31,10 @@ COVERAGE_LEGACY_COMPAT_TESTS_MANIFEST
 COVERAGE_LEGACY_RETIREMENT_MANIFEST
 ```
 
+Compatibility and retirement manifests must carry the current checkout's exact
+`candidate_revision`; a stale artifact is rejected even when its status says
+`PASSED`.
+
 CI produces the compatibility-surface portion with:
 
 ```text
@@ -38,8 +42,10 @@ python scripts/diagnostics/legacy_compatibility_smoke.py \
   --output .artifacts/vnext/legacy-compatibility.json
 ```
 
-That artifact proves the import surface only. It does not prove that the
-large compatibility implementations are unused or safe to delete.
+That artifact proves the import surface and runs `--help` through both public
+CLI shims (`enhance_coverage.py` and `coverage_check.py`) without starting a
+server or opening a database. It does not prove that the large compatibility
+implementations are unused or safe to delete.
 
 It reports each condition separately. Missing compatibility/deprecation-window
 or release evidence keeps the result `INCOMPLETE`; `--strict` exits non-zero.

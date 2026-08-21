@@ -27,6 +27,16 @@ SURFACES = (
 )
 
 
+# ``--help`` exercises the public CLI dispatch without starting a server,
+# opening a database, or reading a user supplied report.  Keep this separate
+# from the import list so the evidence makes it explicit which compatibility
+# contract was actually exercised.
+CLI_SURFACES = (
+    "enhance_coverage.py",
+    "coverage_check.py",
+)
+
+
 def _revision(repo_root):
     try:
         return subprocess.check_output(
@@ -54,6 +64,42 @@ def audit(repo_root=ROOT):
                 "surface": public_name, "owner": owner,
                 "status": "FAILED", "error": str(exc),
             })
+    cli_results = []
+    for script_name in CLI_SURFACES:
+        script_path = os.path.join(repo_root, script_name)
+        try:
+            completed = subprocess.run(
+                [sys.executable, script_path, "--help"],
+                cwd=repo_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=30,
+            )
+            status = "PASSED" if completed.returncode == 0 else "FAILED"
+            result = {
+                "surface": script_name,
+                "operation": "--help",
+                "status": status,
+                "exit_code": completed.returncode,
+            }
+            if status != "PASSED":
+                result["stderr"] = (completed.stderr or "")[-1000:]
+                failures.append(
+                    "{} --help exited with {}".format(
+                        script_name, completed.returncode
+                    )
+                )
+            cli_results.append(result)
+        except (OSError, subprocess.SubprocessError) as exc:
+            failures.append("{} --help failed: {}".format(script_name, exc))
+            cli_results.append({
+                "surface": script_name,
+                "operation": "--help",
+                "status": "FAILED",
+                "exit_code": None,
+                "error": str(exc),
+            })
     started = utc_iso()
     return with_contract({
         "status": "PASSED" if not failures else "FAILED",
@@ -67,6 +113,7 @@ def audit(repo_root=ROOT):
         "exit_code": 0 if not failures else 1,
         "synthetic": False,
         "surfaces": results,
+        "cli_surfaces": cli_results,
         "violations": failures,
         "legacy_implementation_status": "TRANSITIONAL_LEGACY",
     })
