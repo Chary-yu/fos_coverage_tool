@@ -5,9 +5,11 @@ import unittest
 
 from app.services.analysis_domain_service import AnalysisDomainService
 from app.services.analysis_service import AnalysisService
+from app.inheritance.rejections import InheritanceRejectionService
+from app.db.repositories.analysis_domain_repository import INHERITED_PENDING
 from scripts.upgrade.domain_migration import apply_analysis_domain
 from scripts.upgrade.migration_runner import create_sqlite_schema
-from app.db.repositories import ProjectRepository, LineIndexRepository
+from app.db.repositories import ProjectRepository, LineIndexRepository, ProjectStateRepository
 
 
 class AnalysisDomainTest(unittest.TestCase):
@@ -145,6 +147,65 @@ class AnalysisDomainTest(unittest.TestCase):
             ).fetchone()[0],
             1,
         )
+
+    def test_reject_and_undo_preserve_lineage_without_active_overlay(self):
+        project_id = self.connection.execute(
+            "SELECT project_id FROM coverage_scans WHERE id=?", (self.scan["id"],)
+        ).fetchone()[0]
+        ProjectStateRepository().ensure(
+            self.connection, project_id, current_scan_id=self.scan["id"]
+        )
+        self.connection.execute(
+            "UPDATE coverage_project_state SET current_scan_id=? WHERE project_id=?",
+            (self.scan["id"], project_id),
+        )
+        record = AnalysisDomainService().repository.create_record(
+            self.connection, {"status": "可覆盖", "coverage_method": "unit"},
+            origin="INHERITED",
+        )
+        line_id = self.connection.execute(
+            "SELECT id FROM coverage_lines WHERE line_number=10"
+        ).fetchone()[0]
+        link = AnalysisDomainService().repository.create_link(
+            self.connection, self.scan["id"], line_id, record["id"],
+            review_state=INHERITED_PENDING, relation_origin="INHERITED",
+            source_scan_id=self.scan["id"], source_line_id=line_id,
+        )
+        self.connection.commit()
+
+        rejections = InheritanceRejectionService()
+        rejection = rejections.reject(
+            self.connection, project_id, self.scan["id"], line_id, "alice",
+            int(link["relation_revision"]),
+        )
+        self.connection.commit()
+        rejected_link = self.connection.execute(
+            "SELECT is_active, relation_revision FROM coverage_analysis_line_links "
+            "WHERE id=?", (link["id"],)
+        ).fetchone()
+        self.assertEqual(tuple(rejected_link), (0, 2))
+        overlay = AnalysisDomainService().repository.read_file(
+            self.connection, self.scan["id"], self.file_id, [(10, 10)]
+        )
+        self.assertEqual(len(overlay), 1)
+        self.assertEqual(overlay[0]["rejection_id"], rejection["id"])
+
+        undone = rejections.undo(
+            self.connection, project_id, self.scan["id"], line_id,
+            rejection["id"], int(rejection["rejection_revision"]), 2,
+        )
+        self.connection.commit()
+        active_link = self.connection.execute(
+            "SELECT is_active, review_state, relation_revision "
+            "FROM coverage_analysis_line_links WHERE id=?", (link["id"],)
+        ).fetchone()
+        self.assertEqual(tuple(active_link), (1, INHERITED_PENDING, 3))
+        self.assertEqual(undone["terminal_reason"], "UNDONE")
+        active_overlay = AnalysisDomainService().repository.read_file(
+            self.connection, self.scan["id"], self.file_id, [(10, 10)]
+        )
+        self.assertEqual(active_overlay[0]["review_state"], INHERITED_PENDING)
+        self.assertEqual(active_overlay[0]["relation_is_active"], 1)
 
 
 if __name__ == "__main__":

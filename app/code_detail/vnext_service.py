@@ -165,6 +165,18 @@ class VNextCodeDetailService(object):
     @staticmethod
     def _domain_overlay_row(row):
         state = str(row.get("review_state") or "")
+        relation_active = int(row.get("relation_is_active") or 0)
+        rejected = bool(row.get("rejection_id")) and not relation_active
+        if rejected:
+            # A rejection deliberately removes the inherited relation from the
+            # active overlay. Keep only its lineage/CAS metadata visible so a
+            # current-scan UI can offer undo without resurrecting the content
+            # as a confirmed analysis.
+            return dict(row, status="", is_draft=1,
+                        reviewer="", analysis_state="未确认",
+                        coverage_method="", uncovered_reason="",
+                        review_state="INHERITANCE_REJECTED",
+                        relation_is_active=0)
         return dict(row, status=row.get("conclusion_status") or "",
                     is_draft=1 if state in (MANUAL_DRAFT, INHERITED_PENDING) else 0,
                     reviewer=row.get("reviewed_by") or "",

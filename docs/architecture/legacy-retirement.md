@@ -23,5 +23,16 @@ window:
 4. Legacy usage telemetry is zero for the agreed deprecation window.
 5. The release manifest records the removal commit and rollback plan.
 
+The audit consumes optional machine evidence through:
+
+```text
+COVERAGE_LEGACY_USAGE_FILE
+COVERAGE_LEGACY_COMPAT_TESTS_MANIFEST
+COVERAGE_LEGACY_RETIREMENT_MANIFEST
+```
+
+It reports each condition separately. Missing compatibility/deprecation-window
+or release evidence keeps the result `INCOMPLETE`; `--strict` exits non-zero.
+
 Until those conditions are proven, the audit reports `INCOMPLETE` instead of
 calling the large legacy owners retired.

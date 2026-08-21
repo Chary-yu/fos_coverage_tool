@@ -150,6 +150,46 @@
         };
     }
 
+    function inheritanceMetadata(lineData) {
+        const analysis = lineData && lineData.analysis && typeof lineData.analysis === 'object'
+            ? lineData.analysis : lineData;
+        const state = String(
+            (lineData && (lineData.analysis_relation_state || lineData.review_state)) ||
+            (analysis && analysis.review_state) || ''
+        );
+        const relationActive = analysis && analysis.relation_is_active !== undefined
+            ? Number(analysis.relation_is_active) === 1
+            : Number(lineData && lineData.relation_is_active) !== 0;
+        return {
+            lineId: Number((analysis && analysis.line_id) || (lineData && lineData.line_id) || 0),
+            relationRevision: Number(
+                (analysis && analysis.relation_revision) || (lineData && lineData.relation_revision) || 0
+            ),
+            state,
+            relationActive,
+            rejectionId: Number(
+                (analysis && analysis.rejection_id) || (lineData && lineData.rejection_id) || 0
+            ),
+            rejectionRevision: Number(
+                (analysis && analysis.rejection_revision) || (lineData && lineData.rejection_revision) || 0
+            ),
+            inheritedPending: relationActive &&
+                (state === 'INHERITED_PENDING' || state === 'CARRIED_COVERED'),
+            rejected: !relationActive && state === 'INHERITANCE_REJECTED'
+        };
+    }
+
+    function updateInheritanceControls(panel) {
+        if (!panel) return;
+        const meta = panel.inheritance || {};
+        if (panel.rejectBtn) {
+            panel.rejectBtn.style.display = meta.inheritedPending ? '' : 'none';
+        }
+        if (panel.undoRejectBtn) {
+            panel.undoRejectBtn.style.display = meta.rejected ? '' : 'none';
+        }
+    }
+
     function registerReviewPanelMetadata(lineData) {
         if (!lineData || !lineData.is_block_entry) return null;
         const startLineNum = Number(lineData.block_start_line || lineData.line_no);
@@ -159,12 +199,14 @@
             panelState = {
                 select: null, reviewerInput: null, methodInput: null,
                 reasonInput: null, saveBtn: null, previousBtn: null,
+                rejectBtn: null, undoRejectBtn: null,
                 nextBtn: null, block: {
                     startLine: startLineNum, endLine: endLineNum,
                     length: Math.max(1, endLineNum - startLineNum + 1)
                 },
                 lineNum: startLineNum,
                 expanded: false,
+                inheritance: inheritanceMetadata(lineData),
                 values: initialPanelValues(lineData, startLineNum)
             };
             panelsMap.set(startLineNum, panelState);
@@ -174,7 +216,9 @@
             panelState.block.startLine = startLineNum;
             panelState.block.endLine = endLineNum;
             panelState.block.length = Math.max(1, endLineNum - startLineNum + 1);
+            panelState.inheritance = inheritanceMetadata(lineData);
         }
+        updateInheritanceControls(panelState);
         return panelState;
     }
 
@@ -256,9 +300,33 @@
 
     function responseLines(payload) {
         if (!payload) return [];
-        if (Array.isArray(payload.lines)) return payload.lines;
-        if (payload.data && Array.isArray(payload.data.lines)) return payload.data.lines;
-        return [];
+        const lines = Array.isArray(payload.lines) ? payload.lines
+            : (payload.data && Array.isArray(payload.data.lines) ? payload.data.lines : []);
+        return lines.map(line => {
+            const analysis = line && line.analysis;
+            if (!analysis || typeof analysis !== 'object') return line;
+            // VNext keeps the overlay nested to preserve the source-line DTO.
+            // The renderer consumes one flat view, so copy only review fields
+            // and never allow DB identity columns to overwrite line identity.
+            return Object.assign({}, line, {
+                analysis_state: analysis.analysis_state || analysis.conclusion_status || line.analysis_state,
+                reviewer: analysis.reviewer || line.reviewer || '',
+                coverage_method: analysis.coverage_method || line.coverage_method || '',
+                uncovered_reason: analysis.uncovered_reason || line.uncovered_reason || '',
+                is_draft: analysis.is_draft !== undefined ? analysis.is_draft : line.is_draft,
+                review_state: analysis.review_state || line.review_state || '',
+                analysis_relation_state: analysis.review_state || line.analysis_relation_state || '',
+                relation_origin: analysis.relation_origin || line.relation_origin || '',
+                relation_is_active: analysis.relation_is_active !== undefined
+                    ? analysis.relation_is_active : line.relation_is_active,
+                line_id: analysis.line_id || line.line_id,
+                relation_revision: analysis.relation_revision || line.relation_revision,
+                source_scan_id: analysis.source_scan_id || line.source_scan_id,
+                source_line_id: analysis.source_line_id || line.source_line_id,
+                rejection_id: analysis.rejection_id || line.rejection_id,
+                rejection_revision: analysis.rejection_revision || line.rejection_revision
+            });
+        });
     }
     async function requestCoverageApi(pathSuffix, options) {
         const attempted = [];
@@ -1543,6 +1611,7 @@
             const blockLength = endLineNum - startLineNum + 1;
             const isMultiLine = blockLength > 1;
             const existingPanelState = registerReviewPanelMetadata(lineData);
+            const inheritance = inheritanceMetadata(lineData);
 
             // Merge draft store if user had unsaved edits
             const draft = ReviewDraftStore.getDraft(startLineNum);
@@ -1625,6 +1694,22 @@
             batchInheritBtn.title = '从上方最近已填写控件继承到它之后至当前控件的整段内容';
             batchInheritBtn.setAttribute('data-panel-action', 'batch-inherit');
 
+            const rejectBtn = document.createElement('button');
+            rejectBtn.className = 'coverage-inherit-btn reject coverage-inherit-reject-btn';
+            rejectBtn.type = 'button';
+            rejectBtn.innerText = '拒绝继承';
+            rejectBtn.title = '拒绝本次自动继承，不让旧结论继续传递';
+            rejectBtn.setAttribute('data-panel-action', 'reject-inheritance');
+            rejectBtn.style.display = inheritance.inheritedPending ? '' : 'none';
+
+            const undoRejectBtn = document.createElement('button');
+            undoRejectBtn.className = 'coverage-inherit-btn undo coverage-inherit-undo-btn';
+            undoRejectBtn.type = 'button';
+            undoRejectBtn.innerText = '撤销拒绝';
+            undoRejectBtn.title = '恢复本次继承并回到待复核状态';
+            undoRejectBtn.setAttribute('data-panel-action', 'undo-rejection');
+            undoRejectBtn.style.display = inheritance.rejected ? '' : 'none';
+
             // Reviewer input
             const reviewerInput = document.createElement('input');
             reviewerInput.type = 'text';
@@ -1682,6 +1767,8 @@
             panel.appendChild(nextBtn);
             panel.appendChild(inheritBtn);
             panel.appendChild(batchInheritBtn);
+            panel.appendChild(rejectBtn);
+            panel.appendChild(undoRejectBtn);
             panel.appendChild(reviewerInput);
             panel.appendChild(methodInput);
             if (methodGrip) panel.appendChild(methodGrip);
@@ -1704,9 +1791,12 @@
                 saveBtn,
                 previousBtn,
                 nextBtn,
+                rejectBtn,
+                undoRejectBtn,
                 block: blockObj,
                 lineNum: startLineNum,
                 expanded: true,
+                inheritance: inheritance,
                 values: {
                     status: initialStatus,
                     reviewerInput: initialReviewer,
@@ -1724,9 +1814,13 @@
             panelState.saveBtn = saveBtn;
             panelState.previousBtn = previousBtn;
             panelState.nextBtn = nextBtn;
+            panelState.rejectBtn = rejectBtn;
+            panelState.undoRejectBtn = undoRejectBtn;
             panelState.block = blockObj;
             panelState.lineNum = startLineNum;
             panelState.expanded = true;
+            panelState.inheritance = inheritance;
+            updateInheritanceControls(panelState);
             panelState.values = Object.assign({}, panelState.values || {}, {
                 status: initialStatus,
                 reviewerInput: initialReviewer,
@@ -2001,6 +2095,8 @@
             else if (action === 'next') navigateReviewPanel(panel.lineNum, 1);
             else if (action === 'inherit') this.inheritPanel(panel);
             else if (action === 'batch-inherit') this.batchInheritPanel(panel);
+            else if (action === 'reject-inheritance') this.rejectServerInheritance(panel);
+            else if (action === 'undo-rejection') this.undoServerInheritance(panel);
         },
 
         handlePanelChange(event) {
@@ -2139,10 +2235,108 @@
                 isDraft: false,
                 _origSavedConfirmed: true
             });
+            panel.inheritance = {
+                lineId: lineId,
+                relationRevision: revision + 1,
+                state: 'MANUAL_CONFIRMED',
+                relationActive: true,
+                rejectionId: 0,
+                rejectionRevision: 0,
+                inheritedPending: false,
+                rejected: false
+            };
+            updateInheritanceControls(panel);
             clearPanelDirty(panel.lineNum, true);
             notifyProgressChanged();
             updateHeaderStatistics();
             return true;
+        },
+
+        async rejectServerInheritance(panel) {
+            const meta = panel && panel.inheritance;
+            if (!meta || !meta.inheritedPending || !meta.lineId || !meta.relationRevision) return false;
+            if (typeof window !== 'undefined' && typeof window.confirm === 'function' &&
+                    !window.confirm('拒绝后，该旧结论不会继续自动传递到后续版本。确定拒绝吗？')) {
+                return false;
+            }
+            const payload = await requestCoverageApi(
+                `/scans/${encodeURIComponent(currentScanId)}/inheritance/reject`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        line_id: meta.lineId,
+                        expected_relation_revision: meta.relationRevision
+                    })
+                }
+            );
+            const rejection = payload && payload.rejection ? payload.rejection : {};
+            panel.inheritance = {
+                lineId: meta.lineId,
+                relationRevision: meta.relationRevision + 1,
+                state: 'INHERITANCE_REJECTED',
+                relationActive: false,
+                rejectionId: Number(rejection.id || meta.rejectionId || 0),
+                rejectionRevision: Number(rejection.rejection_revision || 1),
+                inheritedPending: false,
+                rejected: true
+            };
+            setStoredPanelValues(panel, {
+                status: '未确认', reviewerInput: '', methodInput: '', reasonInput: '',
+                isDraft: false, isDirty: false, _origSavedConfirmed: false
+            });
+            updateInheritanceControls(panel);
+            clearPanelDirty(panel.lineNum, true);
+            notifyProgressChanged();
+            updateHeaderStatistics();
+            showToast(`第 ${panel.lineNum} 行已拒绝自动继承`);
+            return true;
+        },
+
+        async undoServerInheritance(panel) {
+            const meta = panel && panel.inheritance;
+            if (!meta || !meta.rejected || !meta.lineId || !meta.rejectionId ||
+                    !meta.rejectionRevision || !meta.relationRevision) return false;
+            const payload = await requestCoverageApi(
+                `/scans/${encodeURIComponent(currentScanId)}/inheritance/rejections/` +
+                    `${encodeURIComponent(meta.rejectionId)}/undo`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        line_id: meta.lineId,
+                        rejection_id: meta.rejectionId,
+                        expected_rejection_revision: meta.rejectionRevision,
+                        expected_relation_revision: meta.relationRevision
+                    })
+                }
+            );
+            const candidate = await this.findServerInheritanceCandidate(panel);
+            panel.inheritance = {
+                lineId: meta.lineId,
+                relationRevision: meta.relationRevision + 1,
+                state: 'INHERITED_PENDING',
+                relationActive: true,
+                rejectionId: 0,
+                rejectionRevision: 0,
+                inheritedPending: true,
+                rejected: false
+            };
+            if (candidate) {
+                setStoredPanelValues(panel, {
+                    status: candidate.conclusion_status || '未确认',
+                    reviewerInput: candidate.reviewed_by || '',
+                    methodInput: candidate.coverage_method || '',
+                    reasonInput: candidate.uncovered_reason || '',
+                    isDraft: true, isDirty: false, _origSavedConfirmed: false
+                });
+            }
+            updateInheritanceControls(panel);
+            clearPanelDirty(panel.lineNum, true);
+            notifyProgressChanged();
+            updateHeaderStatistics();
+            showToast(`第 ${panel.lineNum} 行已撤销拒绝，恢复待复核继承`);
+            return Boolean(payload);
         },
 
         async inheritPanel(panel) {

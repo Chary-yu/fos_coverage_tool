@@ -10,6 +10,7 @@ from app.code_detail.sidecar_store import SidecarStore
 from app.services.analysis_service import AnalysisService
 from app.services.export_service import ExportService
 from app.services.project_service import ProjectService
+from app.db.repositories.analysis_domain_repository import INHERITED_PENDING
 from scripts.upgrade.migration_runner import create_sqlite_schema
 
 
@@ -246,6 +247,73 @@ class VNextApiExportSecurityTest(unittest.TestCase):
             store = SidecarStore([root])
             self.assertIsNone(store.load_metadata("report-a", "file-key"))
             self.assertIsNone(store.load_lines_range("report-a", "file-key", 1, 2))
+
+    def test_inheritance_reject_and_undo_api_is_current_and_revision_bound(self):
+        runtime = self._runtime()
+        scan = runtime.project_service.create_scan_and_ingest(
+            self.connection, "inheritance-api", [{
+                "repository_name": "repo-a",
+                "file_path": "src/inherit.c",
+                "file_path_hash": "i" * 32,
+                "lines": [{
+                    "line_number": 10, "line_text": "return 0;",
+                    "coverage_state": "uncovered",
+                }],
+            }],
+            info_sha256="i" * 64,
+        )
+        project_id = self.connection.execute(
+            "SELECT project_id FROM coverage_scans WHERE id=?", (scan["id"],)
+        ).fetchone()[0]
+        line_id = self.connection.execute(
+            "SELECT id FROM coverage_lines WHERE line_number=10"
+        ).fetchone()[0]
+        record = runtime.analysis_domain_repository.create_record(
+            self.connection, {"status": "可覆盖", "coverage_method": "unit"},
+            origin="INHERITED",
+        )
+        link = runtime.analysis_domain_repository.create_link(
+            self.connection, scan["id"], line_id, record["id"],
+            review_state=INHERITED_PENDING, relation_origin="INHERITED",
+            source_scan_id=scan["id"], source_line_id=line_id,
+        )
+        self.connection.commit()
+
+        app = runtime.application()
+        status, rejected = app.dispatch(
+            "POST", "/api/coverage/scans/{}/inheritance/reject".format(scan["id"]),
+            body={"line_id": line_id, "expected_relation_revision": link["relation_revision"]},
+        )
+        self.assertEqual(status, 200)
+        rejection_id = rejected["rejection"]["id"]
+        current_revision = self.connection.execute(
+            "SELECT relation_revision FROM coverage_analysis_line_links WHERE id=?",
+            (link["id"],),
+        ).fetchone()[0]
+        status, _ = app.dispatch(
+            "POST", "/api/coverage/scans/{}/inheritance/rejections/{}/undo".format(
+                scan["id"], rejection_id
+            ),
+            body={
+                "line_id": line_id,
+                "rejection_id": rejection_id,
+                "expected_rejection_revision": 1,
+                "expected_relation_revision": current_revision,
+            },
+        )
+        self.assertEqual(status, 200)
+        restored = self.connection.execute(
+            "SELECT is_active, review_state, relation_revision "
+            "FROM coverage_analysis_line_links WHERE id=?", (link["id"],)
+        ).fetchone()
+        self.assertEqual(tuple(restored), (1, INHERITED_PENDING, current_revision + 1))
+
+        status, payload = app.dispatch(
+            "POST", "/api/coverage/scans/{}/inheritance/reject".format(scan["id"]),
+            body={"line_id": line_id, "expected_relation_revision": link["relation_revision"]},
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"], "STALE_RELATION_REVISION")
 
 
 if __name__ == "__main__":

@@ -44,6 +44,8 @@ class ArchitectureAuditTest(unittest.TestCase):
         retirement = audit_legacy_retirement(os.getcwd())
         self.assertEqual(retirement["gate_status"], "INCOMPLETE")
         self.assertEqual(retirement["legacy_implementation_status"], "TRANSITIONAL_LEGACY")
+        self.assertTrue(retirement["retirement_checks"]["no_legacy_deployment"])
+        self.assertFalse(retirement["retirement_checks"]["legacy_usage_zero_for_window"])
 
     def test_changed_test_selection_fails_closed_when_revision_is_unavailable(self):
         with self.assertRaises(DiffResolutionError):

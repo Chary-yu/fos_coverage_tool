@@ -9,11 +9,11 @@ const CLIENT_JS = fs.readFileSync(path.join(ROOT, 'web/assets/js/coverage_enhanc
 const CLIENT_CSS = fs.readFileSync(path.join(ROOT, 'web/assets/css/coverage_enhance.css'), 'utf8');
 const TASK_JS = fs.readFileSync(path.join(ROOT, 'web/assets/js/incremental_developer_tasks.js'), 'utf8');
 
-function makeLines(start, end, withPanels, savedReviewers) {
+function makeLines(start, end, withPanels, savedReviewers, inheritance = null) {
   const lines = [];
   for (let lineNo = start; lineNo <= end; lineNo += 1) {
     const suggestedReviewer = lineNo === start ? 'Alice' : (lineNo === start + 1 ? 'Bob' : '');
-    lines.push({
+    const line = {
       line_no: lineNo,
       source: `int fixture_line_${lineNo} = ${lineNo};`,
       coverage_state: 'uncovered',
@@ -27,7 +27,22 @@ function makeLines(start, end, withPanels, savedReviewers) {
       coverage_method: '',
       uncovered_reason: '',
       is_pending_analysis: true,
-    });
+    };
+    if (inheritance && lineNo === start) {
+      line.analysis = {
+        line_id: inheritance.lineId,
+        review_state: 'INHERITED_PENDING',
+        relation_origin: 'INHERITED',
+        relation_is_active: 1,
+        relation_revision: inheritance.relationRevision,
+        conclusion_status: '可覆盖',
+        reviewed_by: 'git-alice',
+        coverage_method: 'unit',
+        uncovered_reason: '',
+        is_draft: 1,
+      };
+    }
+    lines.push(line);
   }
   return lines;
 }
@@ -57,7 +72,8 @@ function makeLayout(large) {
   };
 }
 
-function createHarness({ large = false, failOnce = false, taskPendingLines = null } = {}) {
+function createHarness({ large = false, failOnce = false, taskPendingLines = null,
+  inheritanceLifecycle = false } = {}) {
   const layout = makeLayout(large);
   const requests = [];
   const failedRequests = [];
@@ -66,6 +82,20 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
   let failureUsed = false;
   const savedReviewers = new Map();
   let currentTaskPendingLines = taskPendingLines;
+  let inheritanceRejected = false;
+  let inheritanceRevision = 1;
+  const inheritanceLineId = 9001;
+  const inheritanceCandidate = () => ({
+    candidate_line_id: inheritanceLineId,
+    line_number: 1,
+    file_path: 'src/fixture.c',
+    repository_name: '',
+    relation_revision: inheritanceRevision,
+    conclusion_status: '可覆盖',
+    reviewed_by: 'git-alice',
+    coverage_method: 'unit',
+    uncovered_reason: '',
+  });
 
   const server = http.createServer((req, res) => {
     const parsed = new URL(req.url, 'http://127.0.0.1');
@@ -135,7 +165,9 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
         const batches = (payload.ranges || []).map(range => ({
           start_line: Number(range.start_line),
           end_line: Number(range.end_line),
-          lines: makeLines(Number(range.start_line), Number(range.end_line), !large, savedReviewers),
+          lines: makeLines(Number(range.start_line), Number(range.end_line), !large, savedReviewers,
+            inheritanceLifecycle && !inheritanceRejected
+              ? { lineId: inheritanceLineId, relationRevision: inheritanceRevision } : null),
         }));
         json(200, { scan_id: 1, report_id: 'report_browser_fixture', batches });
       });
@@ -158,9 +190,28 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
         }
         return json(200, {
           status: 'success',
-          data: { start_line: start, end_line: end, lines: makeLines(start, end, !large, savedReviewers) },
+          data: { start_line: start, end_line: end, lines: makeLines(start, end, !large, savedReviewers,
+            inheritanceLifecycle && !inheritanceRejected
+              ? { lineId: inheritanceLineId, relationRevision: inheritanceRevision } : null) },
         });
       }, delay);
+    }
+    if (inheritanceLifecycle && pathname === '/api/coverage/scans/1/inheritance/pending' && req.method === 'GET') {
+      return json(200, { items: inheritanceRejected ? [] : [inheritanceCandidate()], has_more: false });
+    }
+    if (inheritanceLifecycle && pathname === '/api/coverage/scans/1/inheritance/reject' && req.method === 'POST') {
+      inheritanceRejected = true;
+      inheritanceRevision += 1;
+      return json(200, {
+        rejection: { id: 7001, rejection_revision: 1, rejected_relation_revision: inheritanceRevision - 1 },
+      });
+    }
+    if (inheritanceLifecycle && pathname === '/api/coverage/scans/1/inheritance/rejections/7001/undo' && req.method === 'POST') {
+      inheritanceRejected = false;
+      inheritanceRevision += 1;
+      return json(200, {
+        rejection: { id: 7001, rejection_revision: 2, terminal_reason: 'UNDONE' },
+      });
     }
     if (pathname === '/api/coverage/analysis' && req.method === 'POST') {
       let body = '';
@@ -308,6 +359,33 @@ test('real Chromium incremental reviewer suggestions split adjacent blocks and s
     await page.locator('.coverage-region-collapse-btn').first().click();
     await page.locator('.coverage-region-placeholder').nth(0).click();
     await expect(page.locator('.coverage-analysis-panel').first().locator('input.reviewer-input')).toHaveValue('database-owner');
+  } finally {
+    await stopHarness(harness);
+  }
+});
+
+test('real Chromium inheritance reject and undo keep the relation reviewable', async ({ page, browserName }) => {
+  expect(browserName).toBe('chromium');
+  const harness = await startHarness({ inheritanceLifecycle: true });
+  page.on('dialog', dialog => dialog.accept());
+  try {
+    await page.goto(`${harness.baseUrl}/fixture.c.gcov.html`, { waitUntil: 'networkidle' });
+    await page.locator('.coverage-region-placeholder').nth(0).click();
+    await expect(page.locator('#L600')).toBeVisible({ timeout: 15000 });
+
+    const panel = page.locator('.coverage-analysis-panel').first();
+    await expect(panel.locator('.coverage-inherit-reject-btn')).toBeVisible();
+    await expect(panel.locator('select')).toHaveValue('可覆盖');
+    await panel.locator('.coverage-inherit-reject-btn').click();
+    await expect(panel.locator('.coverage-inherit-undo-btn')).toBeVisible();
+    await expect(panel.locator('.coverage-inherit-reject-btn')).toBeHidden();
+    await expect(panel.locator('select')).toHaveValue('未确认');
+
+    await panel.locator('.coverage-inherit-undo-btn').click();
+    await expect(panel.locator('.coverage-inherit-reject-btn')).toBeVisible();
+    await expect(panel.locator('.coverage-inherit-undo-btn')).toBeHidden();
+    await expect(panel.locator('select')).toHaveValue('可覆盖');
+    await expect(panel.locator('textarea').first()).toHaveValue('unit');
   } finally {
     await stopHarness(harness);
   }

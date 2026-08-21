@@ -507,31 +507,42 @@ class VNextApplication(object):
             rows = fetchall(connection, """
                 SELECT l.line_number, l.line_text, l.coverage_state,
                        l.suggested_reviewer,
-                       CASE WHEN q.id IS NOT NULL THEN r.conclusion_status
+                       CASE WHEN x.id IS NOT NULL THEN ''
+                            WHEN q.id IS NOT NULL THEN r.conclusion_status
                             ELSE a.status END AS status,
-                       CASE WHEN q.id IS NOT NULL THEN
+                       CASE WHEN x.id IS NOT NULL THEN 1
+                            WHEN q.id IS NOT NULL THEN
                                 CASE WHEN q.review_state IN ('MANUAL_DRAFT', 'INHERITED_PENDING')
                                      THEN 1 ELSE 0 END
                             ELSE a.is_draft END AS is_draft,
-                       CASE WHEN q.id IS NOT NULL THEN q.reviewed_by
+                       CASE WHEN x.id IS NOT NULL THEN ''
+                            WHEN q.id IS NOT NULL THEN q.reviewed_by
                             ELSE a.reviewer END AS reviewer,
-                       CASE WHEN q.id IS NOT NULL THEN r.coverage_method
+                       CASE WHEN x.id IS NOT NULL THEN ''
+                            WHEN q.id IS NOT NULL THEN r.coverage_method
                             ELSE a.coverage_method END AS coverage_method,
-                       CASE WHEN q.id IS NOT NULL THEN r.uncovered_reason
+                       CASE WHEN x.id IS NOT NULL THEN ''
+                            WHEN q.id IS NOT NULL THEN r.uncovered_reason
                             ELSE a.uncovered_reason END AS uncovered_reason,
-                       CASE WHEN q.id IS NOT NULL THEN r.updated_at
+                       CASE WHEN x.id IS NOT NULL THEN x.rejected_at
+                            WHEN q.id IS NOT NULL THEN r.updated_at
                             ELSE a.updated_at END AS updated_at,
-                       q.review_state, q.relation_origin,
-                       q.analysis_record_id, q.relation_revision
+                       CASE WHEN x.id IS NOT NULL THEN 'INHERITANCE_REJECTED'
+                            ELSE q.review_state END AS review_state,
+                       q.relation_origin, q.analysis_record_id, q.relation_revision,
+                       q.is_active AS relation_is_active,
+                       x.id AS rejection_id, x.rejection_revision
                 FROM coverage_lines l
                 LEFT JOIN coverage_analyses a ON a.line_id = l.id
-                LEFT JOIN coverage_analysis_line_links q
-                  ON q.scan_id=? AND q.line_id=l.id AND q.is_active=1
+                  LEFT JOIN coverage_analysis_line_links q
+                  ON q.scan_id=? AND q.line_id=l.id
                 LEFT JOIN coverage_analysis_records r ON r.id=q.analysis_record_id
+                LEFT JOIN coverage_inheritance_rejections x
+                  ON x.scan_id=? AND x.line_id=l.id AND x.is_active=1
                 WHERE l.file_id = ?
                 ORDER BY l.line_number
                 LIMIT ? OFFSET ?
-            """, (int(scan_id), int(file_row["id"]), page_size, offset))
+            """, (int(scan_id), int(scan_id), int(file_row["id"]), page_size, offset))
         total = int((total_row or {}).get("total") or 0)
         return 200, {
             "page": page, "page_size": page_size, "total": total,

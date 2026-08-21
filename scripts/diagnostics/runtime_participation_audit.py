@@ -112,11 +112,6 @@ def audit():
             r"parse_once = staticmethod",
             r"class ParsedSourceArtifact",
         ]),
-        _check("directory_signature", ["app/compat/legacy_runtime_impl.py", "app/inject/directory_signature.py"], [
-            r"from app\.inject\.directory_signature import calculate_directory_signature_incremental",
-            r"calculate_directory_signature_incremental\(",
-            r"manifest_path=manifest_path",
-        ]),
         _check("lcov_path_index", ["app/incremental/orchestrator.py", "app/incremental/path_index.py"], [
             r"from app\.incremental\.path_index import LCOVPathLookupIndex",
             r"LCOVPathLookupIndex\(\{repository_name: list\(lcov\.keys\(\)\)\}\)",
@@ -158,6 +153,11 @@ def audit():
         "status": "PASSED" if all(item["status"] == "RUNTIME_WIRED" for item in checks) else "FAILED",
         "evidence_class": "architecture_audit",
         "provider_only": [item["name"] for item in checks if item["status"] != "RUNTIME_WIRED"],
+        "compatibility_only": [{
+            "name": "directory_signature",
+            "paths": ["app/compat/legacy_runtime_impl.py", "app/inject/directory_signature.py"],
+            "reason": "retained for the legacy HTML-injection compatibility surface; not a VNext runtime dependency",
+        }],
         "checks": checks,
     }
     return with_contract(result)

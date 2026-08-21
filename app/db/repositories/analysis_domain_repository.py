@@ -78,26 +78,36 @@ class AnalysisDomainRepository(object):
         """, (int(scan_id),))
 
     def read_file(self, connection, scan_id, file_id, ranges=None):
-        clauses = ["q.scan_id=?", "l.file_id=?", "q.is_active=1"]
-        params = [int(scan_id), int(file_id)]
+        clauses = ["l.file_id=?"]
+        params = [int(file_id)]
         for start_line, end_line in (ranges or []):
             clauses.append("(l.line_number>=? AND l.line_number<=?)")
             params.extend((int(start_line), int(end_line)))
-        range_clause = ""
         if ranges:
-            range_items = clauses[3:]
-            clauses = clauses[:3] + ["({})".format(" OR ".join(range_items))]
+            range_items = clauses[1:]
+            clauses = clauses[:1] + ["({})".format(" OR ".join(range_items))]
         return fetchall(connection, """
             SELECT q.*, l.line_number, l.file_id,
+                   q.is_active AS relation_is_active,
                    r.conclusion_status, r.coverage_method,
                    r.uncovered_reason, r.comment, r.content_revision,
-                   r.content_hash
-            FROM coverage_analysis_line_links q
-            JOIN coverage_lines l ON l.id=q.line_id
-            JOIN coverage_analysis_records r ON r.id=q.analysis_record_id
+                   r.content_hash,
+                   x.id AS rejection_id, x.rejection_revision,
+                   x.rejected_relation_revision, x.rejected_relation_id,
+                   x.rejected_source_scan_id, x.rejected_source_line_id,
+                   x.rejected_source_relation_id
+            FROM coverage_lines l
+            LEFT JOIN coverage_analysis_line_links q
+              ON q.scan_id=? AND q.line_id=l.id
+            LEFT JOIN coverage_analysis_records r
+              ON r.id=q.analysis_record_id
+            LEFT JOIN coverage_inheritance_rejections x
+              ON x.scan_id=? AND x.line_id=l.id AND x.is_active=1
             WHERE {where}
+              AND (q.is_active=1 OR x.id IS NOT NULL)
             ORDER BY l.line_number
-        """.format(where=" AND ".join(clauses)), params)
+        """.format(where=" AND ".join(clauses)),
+                    (int(scan_id), int(scan_id)) + tuple(params))
 
     def create_record(self, connection, values, origin="MANUAL", now=None):
         now = now or utc_sql()

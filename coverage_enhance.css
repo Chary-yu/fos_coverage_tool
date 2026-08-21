@@ -382,6 +382,30 @@ textarea.coverage-analysis-input.multiline {
     border-color: #c084fc;
 }
 
+.coverage-inherit-btn.reject {
+    color: #a33a2b;
+    background-color: #fff3ef;
+    border-color: #f2b8aa;
+}
+
+.coverage-inherit-btn.reject:hover {
+    color: #842c20;
+    background-color: #ffe5df;
+    border-color: #e58c7a;
+}
+
+.coverage-inherit-btn.undo {
+    color: #26743a;
+    background-color: #eef9f0;
+    border-color: #a9d5b0;
+}
+
+.coverage-inherit-btn.undo:hover {
+    color: #1b5d2c;
+    background-color: #dcf3df;
+    border-color: #77ba83;
+}
+
 .coverage-navigation-btn {
     display: inline-flex !important;
     visibility: visible !important;
