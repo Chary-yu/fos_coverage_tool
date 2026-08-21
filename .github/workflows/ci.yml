@@ -310,7 +310,7 @@ jobs:
           if-no-files-found: error
 
   py36-compat:
-    name: Python 3.6 compatibility (changed runtime)
+    name: Python 3.6 compatibility (VNext minimum behavior)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -328,6 +328,10 @@ jobs:
             python -m unittest \
             tests.code_detail.test_phase2_core \
             tests.incremental.test_phase5_inject_path \
+            tests.vnext.test_api_export_security \
+            tests.vnext.test_analysis_domain \
+            tests.vnext.test_jobs \
+            tests.vnext.test_migration_runner \
             tests.vnext.test_runtime_config \
             tests.vnext.test_vnext_runtime -v
 
