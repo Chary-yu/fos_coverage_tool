@@ -251,6 +251,64 @@ jobs:
           path: .artifacts/mariadb_vnext_integration.json
           if-no-files-found: error
 
+  mysql55-compatibility:
+    name: MariaDB 5.5 compatibility rehearsal
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb@sha256:8665c074af5a5fb7e04b9570fcf8551e9d82955182be50375d5013838d4f9137 # 5.5.64
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: mysql
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=18
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-py36.txt
+          pip install pymysql
+      - name: Run disposable MariaDB 5.5 compatibility rehearsal
+        run: |
+          set -o pipefail
+          mkdir -p .artifacts
+          python scripts/diagnostics/mysql_vnext_integration.py \
+            --create-disposable --host 127.0.0.1 --port 3306 \
+            --user root --password root --require-version-prefix 5.5 \
+            --migration-rehearsal \
+            --migration-lines 20000 --migration-analyses 10000 \
+            --migration-jobs 1 | tee .artifacts/mariadb55_compatibility.json
+      - name: Verify compatibility evidence identity
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          evidence = json.loads(Path('.artifacts/mariadb55_compatibility.json').read_text())
+          assert evidence['status'] == 'PASSED'
+          assert evidence['synthetic'] is True
+          assert evidence['required_version_prefix'] == '5.5'
+          assert evidence['database_version'].startswith('5.5')
+          assert evidence['candidate_revision']
+          PY
+      - name: Upload MariaDB 5.5 compatibility evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: mariadb55-compatibility-evidence
+          path: .artifacts/mariadb55_compatibility.json
+          if-no-files-found: error
+
   py36-compat:
     name: Python 3.6 compatibility (changed runtime)
     runs-on: ubuntu-latest

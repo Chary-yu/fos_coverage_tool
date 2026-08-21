@@ -101,6 +101,9 @@ def _command_or_action(args):
         parts.append("--migration-rehearsal")
     if getattr(args, "scan_import_rehearsal", False):
         parts.append("--scan-import-rehearsal")
+    required_version = str(getattr(args, "require_version_prefix", "") or "")
+    if required_version:
+        parts.append("--require-version-prefix {}".format(required_version))
     return " ".join(parts)
 
 
@@ -502,8 +505,17 @@ def run(args):
     report_root = os.path.join(root, "report")
     os.makedirs(report_root)
     project_name = "MySQLAudit_{}".format(os.getpid())
+    required_version_prefix = str(
+        getattr(args, "require_version_prefix", "") or ""
+    )
+    observed_database_version = ""
 
     try:
+        if required_version_prefix:
+            observed_database_version = _database_version(args)
+            checks["runtime_version_requirement"] = validate_runtime_version(
+                observed_database_version, required_version_prefix
+            )
         migration_rehearsal = None
         if args.migration_rehearsal:
             migration_rehearsal = _run_legacy_migration_rehearsal(args)
@@ -748,7 +760,8 @@ def run(args):
             "status": "PASSED",
             "evidence_class": "real_mariadb_vnext_integration",
             "database_engine": "MariaDB",
-            "database_version": _database_version(args),
+            "database_version": observed_database_version or _database_version(args),
+            "required_version_prefix": required_version_prefix,
             "synthetic": True,
             "synthetic_reason": "generated disposable input/report; real database runtime only",
             "candidate_revision": _revision(),
@@ -826,6 +839,23 @@ def _database_version(args):
         connection.close()
 
 
+def validate_runtime_version(observed_version, required_prefix=""):
+    """Fail closed when a compatibility rehearsal reaches the wrong engine."""
+    observed = str(observed_version or "")
+    required = str(required_prefix or "")
+    if required and not observed.startswith(required):
+        raise ValueError(
+            "database version {!r} does not satisfy required prefix {!r}".format(
+                observed, required
+            )
+        )
+    return {
+        "status": "PASSED",
+        "required_version_prefix": required,
+        "observed_version": observed,
+    }
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default=_env("COVERAGE_MYSQL_HOST", "127.0.0.1"))
@@ -847,6 +877,10 @@ def main(argv=None):
     parser.add_argument("--migration-lines", type=int, default=90000)
     parser.add_argument("--migration-analyses", type=int, default=51000)
     parser.add_argument("--migration-jobs", type=int, default=1)
+    parser.add_argument(
+        "--require-version-prefix", default="",
+        help="fail unless SELECT VERSION() starts with this prefix",
+    )
     args = parser.parse_args(argv)
     try:
         result = run(args)
@@ -855,6 +889,9 @@ def main(argv=None):
             "status": "FAILED",
             "evidence_class": "real_mariadb_vnext_integration",
             "database_engine": "MariaDB",
+            "required_version_prefix": str(
+                getattr(args, "require_version_prefix", "") or ""
+            ),
             "synthetic": True,
             "synthetic_reason": "generated disposable input/report; real database runtime only",
             "candidate_revision": _revision(),
