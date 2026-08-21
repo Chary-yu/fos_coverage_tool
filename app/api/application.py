@@ -626,6 +626,18 @@ class VNextApplication(object):
     def _code_detail_args(self, source):
         return code_detail_endpoint.identity(source)
 
+    def _read_code_lines_batch(self, scan_id, report_id, repository_name,
+                               file_path, ranges):
+        """Keep DB leases out of Sidecar reads and JSON decoding."""
+        with self._read_connection() as connection:
+            plan = self.runtime.code_detail.resolve_lines_batch(
+                connection, scan_id, report_id, repository_name, file_path, ranges
+            )
+        plan = self.runtime.code_detail.prepare_lines_batch(plan)
+        with self._read_connection() as connection:
+            overlay = self.runtime.code_detail.load_lines_batch_overlay(connection, plan)
+        return self.runtime.code_detail.render_lines_batch(plan, overlay)
+
     def code_layout(self, query, body, headers, remote_address):
         scan_id, report_id, repository_name, file_path = self._code_detail_args(query)
         with self._read_connection() as connection:
@@ -637,11 +649,11 @@ class VNextApplication(object):
         scan_id, report_id, repository_name, file_path = self._code_detail_args(query)
         start_line = int(query.get("start_line") or 1)
         end_line = int(query.get("end_line") or start_line)
-        with self._read_connection() as connection:
-            return 200, self.runtime.code_detail.lines(
-                connection, scan_id, report_id, repository_name, file_path,
-                start_line, end_line
-            )
+        result = self._read_code_lines_batch(
+            scan_id, report_id, repository_name, file_path,
+            [(start_line, end_line)],
+        )
+        return 200, result[0]
 
     def code_lines_batch(self, query, body, headers, remote_address):
         scan_id, report_id, repository_name, file_path = self._code_detail_args(body)
@@ -654,10 +666,9 @@ class VNextApplication(object):
                 "repository_name": repository_name, "file_path": file_path,
                 "batches": [],
             }
-        with self._read_connection() as connection:
-            result = self.runtime.code_detail.lines_batch(
-                connection, scan_id, report_id, repository_name, file_path, ranges
-            )
+        result = self._read_code_lines_batch(
+            scan_id, report_id, repository_name, file_path, ranges
+        )
         return 200, {
             "scan_id": scan_id, "report_id": report_id,
             "repository_name": repository_name, "file_path": file_path,

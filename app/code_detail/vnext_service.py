@@ -20,6 +20,29 @@ MAX_BATCH_RANGES = 1000
 MAX_BATCH_LOGICAL_LINES = 20000
 
 
+class _LinesBatchPlan(object):
+    """Connection-free plan for a code-lines batch request.
+
+    Identity and analysis overlay are resolved with a short-lived database
+    lease.  The plan then lets the caller perform Sidecar metadata/chunk IO
+    after that lease has been returned to the pool.
+    """
+
+    def __init__(self, scan_id, report_id, repository_name, file_path,
+                 report, file_row, key, sidecar, ranges):
+        self.scan_id = int(scan_id)
+        self.report_id = report_id
+        self.repository_name = str(repository_name or "")
+        self.file_path = file_path
+        self.report = report
+        self.file_row = file_row
+        self.key = key
+        self.sidecar = sidecar
+        self.ranges = tuple(ranges or ())
+        self.meta = None
+        self.normalized_ranges = None
+
+
 class VNextCodeDetailService(object):
     def __init__(self, project_repo, analysis_repo, report_registry,
                  domain_repo=None,
@@ -310,24 +333,33 @@ class VNextCodeDetailService(object):
             [(int(start_line), int(end_line))],
         )[0]
 
-    def lines_batch(self, connection, scan_id, report_id, repository_name="", file_path=None,
-                    ranges=None):
+    def resolve_lines_batch(self, connection, scan_id, report_id, repository_name="",
+                            file_path=None, ranges=None):
+        """Resolve DB identity without reading Sidecar files.
+
+        This is the first phase of the batch API.  It intentionally does not
+        call ``load_metadata`` so a pooled DB connection is not held while
+        filesystem IO or JSON decoding is in progress.
+        """
         if ranges is None:
             # Compatibility with the pre-repository identity call shape:
             # (connection, scan_id, report_id, file_path, ranges).
             ranges = file_path
             file_path, repository_name = repository_name, ""
-        """Resolve identity/overlay once and split shared sidecar chunks per range."""
         if not ranges:
-            return []
+            return None
         if len(ranges) > MAX_BATCH_RANGES:
             raise ValueError("too many line ranges")
         report, file_row, key, sidecar = self._identity(
             connection, scan_id, report_id, repository_name, file_path
         )
-        meta = sidecar.load_metadata(report_id, key)
-        if not meta:
-            raise FileNotFoundError("report sidecar metadata is unavailable")
+        return _LinesBatchPlan(
+            scan_id, report_id, repository_name, file_path,
+            report, file_row, key, sidecar, ranges,
+        )
+
+    @staticmethod
+    def _normalize_batch_ranges(meta, ranges):
         total_lines = int(meta.get("total_lines") or 0)
         normalized = []
         logical_lines = 0
@@ -348,16 +380,40 @@ class VNextCodeDetailService(object):
             logical_lines += end_line - start_line + 1
         if logical_lines > MAX_BATCH_LOGICAL_LINES:
             raise ValueError("requested line span is too large")
-        rows_batches = sidecar.load_lines_ranges(report_id, key, normalized)
+        return tuple(normalized)
+
+    def prepare_lines_batch(self, plan):
+        """Read and validate immutable Sidecar metadata without a DB lease."""
+        if plan is None:
+            return None
+        meta = plan.sidecar.load_metadata(plan.report_id, plan.key)
+        if not meta:
+            raise FileNotFoundError("report sidecar metadata is unavailable")
+        plan.meta = meta
+        plan.normalized_ranges = self._normalize_batch_ranges(meta, plan.ranges)
+        return plan
+
+    def load_lines_batch_overlay(self, connection, plan):
+        """Load the analysis overlay in a short DB-only phase."""
+        if plan is None or plan.normalized_ranges is None:
+            raise ValueError("line batch metadata has not been prepared")
+        return self._overlay(
+            connection, plan.file_row["id"], plan.normalized_ranges,
+            data_version=plan.file_row.get("data_version", 0),
+            scan_id=plan.scan_id,
+        )
+
+    def render_lines_batch(self, plan, overlay):
+        """Read/decode Sidecar chunks and compose the response without DB IO."""
+        if plan is None:
+            return []
+        rows_batches = plan.sidecar.load_lines_ranges(
+            plan.report_id, plan.key, plan.normalized_ranges
+        )
         if rows_batches is None:
             raise FileNotFoundError("report sidecar lines are unavailable")
-        overlay = self._overlay(
-            connection, file_row["id"], normalized,
-            data_version=file_row.get("data_version", 0),
-            scan_id=scan_id,
-        )
         batches = []
-        for (start_line, end_line), rows in zip(normalized, rows_batches):
+        for (start_line, end_line), rows in zip(plan.normalized_ranges, rows_batches):
             result = []
             for row in rows:
                 item = dict(row)
@@ -366,12 +422,24 @@ class VNextCodeDetailService(object):
                     item["analysis"] = analysis
                 result.append(item)
             batches.append({
-                "scan_id": int(scan_id), "report_id": report_id,
-                "repository_name": str(repository_name or ""), "file_path": file_path,
+                "scan_id": plan.scan_id, "report_id": plan.report_id,
+                "repository_name": plan.repository_name, "file_path": plan.file_path,
                 "start_line": start_line, "end_line": end_line,
                 "lines": result,
             })
         return batches
+
+    def lines_batch(self, connection, scan_id, report_id, repository_name="", file_path=None,
+                    ranges=None):
+        """Resolve identity/overlay once and split shared sidecar chunks per range."""
+        plan = self.resolve_lines_batch(
+            connection, scan_id, report_id, repository_name, file_path, ranges
+        )
+        if plan is None:
+            return []
+        self.prepare_lines_batch(plan)
+        overlay = self.load_lines_batch_overlay(connection, plan)
+        return self.render_lines_batch(plan, overlay)
 
     @staticmethod
     def _project_id(connection, scan_id):

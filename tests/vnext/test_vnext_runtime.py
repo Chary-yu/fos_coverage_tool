@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 import urllib.request
+from contextlib import contextmanager
 from unittest import mock
 from decimal import Decimal
 from datetime import datetime
@@ -358,6 +359,55 @@ class VNextRuntimeTest(unittest.TestCase):
                 len(analysis_reads), 1,
                 "batch code detail should load the file overlay once",
             )
+
+            leases = []
+
+            @contextmanager
+            def tracked_read_context(read_only=False):
+                lease = {"active": True}
+                leases.append(lease)
+                try:
+                    yield self.connection
+                finally:
+                    lease["active"] = False
+
+            sidecar = next(iter(self.runtime.code_detail._sidecar_stores.values()))
+            original_metadata = sidecar.load_metadata
+            original_ranges = sidecar.load_lines_ranges
+
+            def assert_metadata_outside_db_lease(*args, **kwargs):
+                self.assertFalse(
+                    any(item["active"] for item in leases),
+                    "Sidecar metadata must not be read while a DB lease is active",
+                )
+                return original_metadata(*args, **kwargs)
+
+            def assert_ranges_outside_db_lease(*args, **kwargs):
+                self.assertFalse(
+                    any(item["active"] for item in leases),
+                    "Sidecar chunks must not be decoded while a DB lease is active",
+                )
+                return original_ranges(*args, **kwargs)
+
+            with mock.patch.object(
+                self.runtime, "connection_context", tracked_read_context
+            ), mock.patch.object(
+                sidecar, "load_metadata", side_effect=assert_metadata_outside_db_lease
+            ), mock.patch.object(
+                sidecar, "load_lines_ranges", side_effect=assert_ranges_outside_db_lease
+            ):
+                status, response = self.application.dispatch(
+                    "POST", "/api/coverage/code-lines/batch",
+                    body={
+                        "scan_id": scan["id"], "report_id": "report_batch",
+                        "file_path": "src/batch.c",
+                        "ranges": [{"start_line": 1, "end_line": 4}],
+                    },
+                )
+            self.assertEqual(status, 200)
+            self.assertEqual(len(response["batches"]), 1)
+            self.assertEqual(len(leases), 2)
+            self.assertTrue(all(not item["active"] for item in leases))
 
     def test_sidecar_shared_physical_chunk_is_decoded_once(self):
         with tempfile.TemporaryDirectory(prefix="vnext-sidecar-cache-") as root:
