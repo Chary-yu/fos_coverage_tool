@@ -26,6 +26,11 @@ COVERAGE_GATE_F_CUTOVER_EVIDENCE
 COVERAGE_GATE_F_ACCEPTANCE_EVIDENCE
 ```
 
+`build_gate_evidence.py` 会把已提供的 Gate A MariaDB、Gate B backfill、Gate C
+restart、Gate D corpus、Gate E browser/performance 和 Gate F cutover/acceptance
+JSON 复制到对应 bundle 文件，并在 Evidence Manifest v2 中记录外部输入 SHA256。
+缺失或不合法的输入仍保持 `INCOMPLETE`，不会被复制动作提升为 PASS。
+
 优先使用 `Evidence Manifest v2`。每个 manifest 必须声明正确的 `gate-a`～`gate-f`，并绑定当前 `candidate_revision` 与 `release_identity.commit_sha`。每条 PASS 记录必须带：
 
 - 非空 `host_identity`、`command_or_action`、`started_at`、`finished_at`；

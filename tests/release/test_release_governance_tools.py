@@ -325,6 +325,54 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
             else:
                 os.environ["COVERAGE_GATE_F_INVENTORY_EVIDENCE"] = old
 
+    def test_gate_bundle_consumes_external_gate_a_and_c_artifacts(self):
+        names = {
+            "COVERAGE_GATE_A_MARIADB_EVIDENCE": "mariadb55_preflight.json",
+            "COVERAGE_GATE_C_RESTART_EVIDENCE": "checkpoint_resume_tests.json",
+        }
+        old = {name: os.environ.get(name) for name in names}
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                for env_name in names:
+                    path = os.path.join(directory, env_name + ".json")
+                    with open(path, "w", encoding="utf-8") as stream:
+                        json.dump({
+                            "status": "INCOMPLETE",
+                            "evidence_class": "external_fixture",
+                            "synthetic": False,
+                            "marker": env_name,
+                        }, stream)
+                    os.environ[env_name] = path
+                output_root = os.path.join(directory, "bundle")
+                build_gate_evidence(".", output_root, run_tests=False)
+                for env_name, artifact_name in names.items():
+                    gate = "a" if "A_" in env_name else "c"
+                    artifact = os.path.join(output_root, "gate-" + gate, artifact_name)
+                    with open(artifact, encoding="utf-8") as stream:
+                        payload = json.load(stream)
+                    self.assertEqual(payload["marker"], env_name)
+                    manifest = EvidenceManifestV2(
+                        os.getcwd(), "gate-" + gate,
+                        manifest_path=os.path.join(
+                            output_root, "gate-" + gate,
+                            "evidence-manifest-v2.json",
+                        ),
+                    )
+                    record_id = "{}-{}".format(
+                        gate, artifact_name.replace("/", "-").replace(".", "-")
+                    )
+                    record = next(
+                        item for item in manifest.data["evidence"]
+                        if item["evidence_id"] == record_id
+                    )
+                    self.assertTrue(record["source_inputs_sha256"])
+        finally:
+            for env_name, value in old.items():
+                if value is None:
+                    os.environ.pop(env_name, None)
+                else:
+                    os.environ[env_name] = value
+
     def test_manifest_artifact_attributes_preserve_status_and_synthetic_boundary(self):
         with tempfile.TemporaryDirectory() as directory:
             passed = os.path.join(directory, "passed.json")

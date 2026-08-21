@@ -417,10 +417,13 @@ def build(repo_root, output_root, run_tests=True):
                 "idempotent": sqlite_result["idempotent"],
                 "synthetic": True,
             })
-            _write(os.path.join(gate_dir, "mariadb55_preflight.json"), _missing(
-                "mariadb55_preflight",
+            mariadb55, mariadb55_inputs = _external_json(
+                "COVERAGE_GATE_A_MARIADB_EVIDENCE",
                 "static fixture/DDL is present; real MariaDB 5.5 runtime is not verified",
-            ))
+            )
+            _write(os.path.join(gate_dir, "mariadb55_preflight.json"), mariadb55)
+            if mariadb55_inputs:
+                artifact_source_inputs["mariadb55_preflight.json"] = mariadb55_inputs
         elif gate == "B":
             domain_schema = os.path.join(
                 repo_root, "scripts", "upgrade", "vnext_domain_constraints.sql"
@@ -446,10 +449,20 @@ def build(repo_root, output_root, run_tests=True):
                 "status": "INCOMPLETE", "synthetic": True,
                 "source": "SQLite fixture before Analysis Domain backfill",
             })
-            _write(os.path.join(gate_dir, "analysis_backfill_after.json"), {
+            analysis_backfill = {
                 "status": "INCOMPLETE", "synthetic": True,
                 "analysis_domain": sqlite_result["domain"],
-            })
+            }
+            analysis_backfill, analysis_backfill_inputs = _external_json(
+                "COVERAGE_GATE_B_DB_EVIDENCE",
+                "target DB backfill/orphan/semantic hash evidence is unavailable",
+            ) if os.environ.get("COVERAGE_GATE_B_DB_EVIDENCE") else (
+                analysis_backfill, []
+            )
+            _write(os.path.join(gate_dir, "analysis_backfill_after.json"),
+                   analysis_backfill)
+            if analysis_backfill_inputs:
+                artifact_source_inputs["analysis_backfill_after.json"] = analysis_backfill_inputs
             _write(os.path.join(gate_dir, "analysis_semantic_hashes.json"), {
                 "source": sqlite_result["source_hash"],
                 "target": sqlite_result["target_hash"], "synthetic": True,
@@ -461,13 +474,17 @@ def build(repo_root, output_root, run_tests=True):
             _write(os.path.join(gate_dir, "canonical_read_write_audit.json"),
                    matrix["gates"]["B"]["local_checks"][0])
         elif gate == "C":
+            restart_evidence, restart_inputs = _external_json(
+                "COVERAGE_GATE_C_RESTART_EVIDENCE",
+                "durable import restart/fencing/read-set evidence is external",
+            )
             for name, value in {
                 "scan_state_machine.json": {"status": "PASSED", "states": [
                     "CREATED", "STAGING", "IMPORTING", "SEALED", "PUBLISHED", "ABORTED"
                 ]},
                 "repository_lock_tests.json": _missing("resource_lock_rehearsal", "live DB lock/fencing rehearsal is external"),
                 "fencing_tests.json": _missing("fencing_rehearsal", "live DB fencing evidence is external"),
-                "checkpoint_resume_tests.json": _missing("checkpoint_resume", "durable restart evidence is external"),
+                "checkpoint_resume_tests.json": restart_evidence,
                 "current_pointer_audit.json": _missing("current_pointer", "final read-set evidence is external"),
                 "worktree_head_before_after.txt": "production worktree evidence is external; status=INCOMPLETE\n",
                 "atomic_publish_tests.json": matrix["gates"]["C"]["local_checks"][1],
@@ -475,6 +492,8 @@ def build(repo_root, output_root, run_tests=True):
             }.items():
                 _write(os.path.join(gate_dir, name), value,
                        text=name.endswith(".txt"))
+            if restart_inputs:
+                artifact_source_inputs["checkpoint_resume_tests.json"] = restart_inputs
         elif gate == "D":
             rules = matrix["gates"]["D"]["local_checks"][0]
             parser = matrix["gates"]["D"]["local_checks"][1]
@@ -493,7 +512,7 @@ def build(repo_root, output_root, run_tests=True):
             _write(os.path.join(gate_dir, "reason_code_catalog.json"), {
                 "status": "PASSED", "source": "contracts/inheritance_rules_v1.json",
             })
-            _write(os.path.join(gate_dir, "deterministic_fixture_manifest.json"), {
+            deterministic_manifest = {
                 "status": "INCOMPLETE", "synthetic": True,
                 "release_eligible": False,
                 "fixture_path": os.path.relpath(DETERMINISTIC_FIXTURE, repo_root),
@@ -503,7 +522,16 @@ def build(repo_root, output_root, run_tests=True):
                 "passed_cases": corpus_run_1.get("passed_cases"),
                 "failed_cases": corpus_run_1.get("failed_cases"),
                 "reason": "local corpus is synthetic until target parser/toolchain is verified",
-            })
+            }
+            external_corpus, corpus_inputs = _external_json(
+                "COVERAGE_GATE_D_CORPUS_EVIDENCE",
+                "deterministic parser/callee/header corpus evidence is external",
+            )
+            if corpus_inputs:
+                deterministic_manifest = external_corpus
+                artifact_source_inputs["deterministic_fixture_manifest.json"] = corpus_inputs
+            _write(os.path.join(gate_dir, "deterministic_fixture_manifest.json"),
+                   deterministic_manifest)
             _write(os.path.join(gate_dir, "decisions_run_1.json"), corpus_run_1)
             _write(os.path.join(gate_dir, "decisions_run_2.json"), corpus_run_2)
             _write(os.path.join(gate_dir, "determinism_diff.json"), {
@@ -545,6 +573,13 @@ def build(repo_root, output_root, run_tests=True):
             _write(os.path.join(gate_dir, "console_errors.json"), browser)
             _write(os.path.join(gate_dir, "network_trace_summary.json"), browser)
             _write(os.path.join(gate_dir, "performance_metrics.json"), performance)
+            if browser_inputs:
+                artifact_source_inputs["browser_scenarios.json"] = browser_inputs
+                artifact_source_inputs["console_errors.json"] = browser_inputs
+                artifact_source_inputs["network_trace_summary.json"] = browser_inputs
+                artifact_source_inputs["playwright_report/summary.json"] = browser_inputs
+            if performance_inputs:
+                artifact_source_inputs["performance_metrics.json"] = performance_inputs
             _write(os.path.join(gate_dir, "legacy_fallback_audit.json"), _missing(
                 "legacy_fallback_audit", "exact release runtime fallback evidence is external"))
             report_dir = os.path.join(gate_dir, "playwright_report")
@@ -612,6 +647,14 @@ def build(repo_root, output_root, run_tests=True):
             }
             _write(os.path.join(gate_dir, "candidate_config_audit.json"),
                    matrix["gates"]["F"]["local_checks"][0])
+            cutover_evidence, cutover_inputs = _external_json(
+                "COVERAGE_GATE_F_CUTOVER_EVIDENCE",
+                "production cutover evidence is external",
+            )
+            acceptance_evidence, acceptance_inputs = _external_json(
+                "COVERAGE_GATE_F_ACCEPTANCE_EVIDENCE",
+                "48-hour acceptance and skill-drift evidence is external",
+            )
             for name, reason in {
                 "verified_backup.json": "verified production backup restore evidence is external",
                 "pre_freeze_semantic.json": "freeze stability evidence is external",
@@ -619,12 +662,17 @@ def build(repo_root, output_root, run_tests=True):
                 "final_semantic_reconciliation.json": "final target semantic reconciliation is external",
                 "runtime_verification.json": "traffic-closed runtime verification is external",
                 "browser_smoke.json": "traffic-closed browser smoke is external",
-                "cutover_record.json": "production cutover record is external",
+                "cutover_record.json": cutover_evidence,
                 "rollback_rehearsal.json": "exact before-release rollback evidence is external",
-                "acceptance_window_checks.json": "48-hour acceptance-window evidence is external",
+                "acceptance_window_checks.json": acceptance_evidence,
                 "skill_drift_audit.json": "operator Skill Drift manifest is external",
             }.items():
-                _write(os.path.join(gate_dir, name), _missing(name[:-5], reason))
+                value = reason if isinstance(reason, dict) else _missing(name[:-5], reason)
+                _write(os.path.join(gate_dir, name), value)
+            if cutover_inputs:
+                artifact_source_inputs["cutover_record.json"] = cutover_inputs
+            if acceptance_inputs:
+                artifact_source_inputs["acceptance_window_checks.json"] = acceptance_inputs
 
         detail = _gate_detail(repo_root, matrix, gate,
                               sqlite_result if gate in ("A", "B") else None,
