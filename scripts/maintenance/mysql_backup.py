@@ -21,6 +21,220 @@ from typing import Dict, Any, Optional, Tuple
 
 from scripts.diagnostics.data_hash_gate import capture_database_snapshot
 
+
+_DATABASE_IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+
+
+def _is_within(path: str, root: str) -> bool:
+    """Return whether *path* is equal to or below *root* after resolution."""
+    try:
+        return os.path.commonpath([
+            os.path.realpath(os.path.abspath(path)),
+            os.path.realpath(os.path.abspath(root)),
+        ]) == os.path.realpath(os.path.abspath(root))
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def _client_settings(config: Dict[str, Any]):
+    """Return a CLI client, safe connection arguments, and its environment."""
+    client = shutil.which("mariadb") or shutil.which("mysql")
+    if not client:
+        return None, [], None
+    cfg = dict(config or {})
+    env = os.environ.copy()
+    password = cfg.get("backup_restore_password", cfg.get("password", ""))
+    if password:
+        env["MYSQL_PWD"] = str(password)
+    else:
+        env.pop("MYSQL_PWD", None)
+    common = [
+        "--host={}".format(cfg.get("backup_restore_host", cfg.get("host", "127.0.0.1"))),
+        "--port={}".format(int(cfg.get("backup_restore_port", cfg.get("port", 3306)))),
+        "--user={}".format(cfg.get("backup_restore_user", cfg.get("user", "root"))),
+    ]
+    return client, common, env
+
+
+def _run_client(client, common, env, sql, database=None):
+    command = [client] + list(common)
+    if database:
+        command.append("--database={}".format(database))
+    command.extend(["--batch", "--skip-column-names", "--execute", sql])
+    return subprocess.run(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+    )
+
+
+def _runtime_identity(client, common, env, database):
+    """Capture non-secret server identity for restore evidence."""
+    result = _run_client(
+        client, common, env,
+        "SELECT VERSION(), @@hostname, @@port, DATABASE()",
+        database=database,
+    )
+    if result.returncode != 0:
+        return False, {}, result.stderr.decode("utf-8", errors="replace")
+    line = result.stdout.decode("utf-8", errors="replace").strip().splitlines()
+    if not line or len(line[0].split("\t")) < 4:
+        return False, {}, "database runtime identity query returned incomplete data"
+    version, hostname, port, selected_database = line[0].split("\t", 3)
+    return True, {
+        "database": selected_database or database,
+        "version": version,
+        "hostname": hostname,
+        "port": int(port) if str(port).isdigit() else port,
+        "client": os.path.basename(client),
+    }, ""
+
+
+def _restore_into_empty_database(
+    full_sql_gz: str,
+    schema_tables,
+    config: Dict[str, Any],
+    restore_database: str,
+) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+    """Restore a verified dump into a newly-created, isolated database.
+
+    The target must not exist before this function starts.  It is dropped in a
+    finally block only when this function created it, so an operator typo can
+    never make the verifier delete an unrelated existing database.
+    """
+    result = {
+        "restore_database": restore_database,
+        "restore_target_empty_before_restore": False,
+        "restore_smoke": "NOT_REQUESTED",
+    }
+    source_database = str((config or {}).get("database") or "")
+    if not _DATABASE_IDENTIFIER.match(restore_database):
+        return False, result, "restore database name is unsafe"
+    if not source_database or not _DATABASE_IDENTIFIER.match(source_database):
+        return False, result, "source database name is missing or unsafe"
+    if restore_database.lower() == source_database.lower():
+        return False, result, "restore target must differ from source database"
+
+    client, common, env = _client_settings(config)
+    if not client:
+        return False, result, "mariadb/mysql client is unavailable for restore smoke"
+
+    created = False
+    success = False
+    error = None
+    try:
+        exists = _run_client(
+            client, common, env,
+            "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA "
+            "WHERE SCHEMA_NAME = '{}'".format(restore_database),
+        )
+        if exists.returncode != 0:
+            error = "restore target existence check failed: {}".format(
+                exists.stderr.decode("utf-8", errors="replace")
+            )
+        elif exists.stdout.decode("utf-8", errors="replace").strip():
+            error = "restore target database already exists; an empty target is required"
+        else:
+            create = _run_client(
+                client, common, env,
+                "CREATE DATABASE `{}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci".format(
+                    restore_database
+                ),
+            )
+            if create.returncode != 0:
+                error = "restore target database creation failed: {}".format(
+                    create.stderr.decode("utf-8", errors="replace")
+                )
+            else:
+                created = True
+                result["restore_target_empty_before_restore"] = True
+
+        if error is None:
+            source_ok, source_identity, source_error = _runtime_identity(
+                client, common, env, source_database
+            )
+            if not source_ok:
+                error = "source database identity query failed: {}".format(source_error)
+            else:
+                result["source_database_runtime_identity"] = source_identity
+
+        if error is None:
+            restore = subprocess.Popen(
+                [client] + common + ["--database={}".format(restore_database)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, env=env,
+            )
+            try:
+                with gzip.open(full_sql_gz, "rb") as stream:
+                    for chunk in iter(lambda: stream.read(65536), b""):
+                        restore.stdin.write(chunk)
+                restore.stdin.close()
+                restore.stdin = None
+                _stdout, stderr = restore.communicate()
+            except Exception as exc:
+                try:
+                    restore.kill()
+                except OSError:
+                    pass
+                _stdout, stderr = restore.communicate()
+                error = "restore smoke process failed: {} ({})".format(
+                    exc, stderr.decode("utf-8", errors="replace")
+                )
+            if error is None and restore.returncode != 0:
+                error = "restore smoke failed: {}".format(
+                    stderr.decode("utf-8", errors="replace")
+                )
+
+        if error is None:
+            tables_check = _run_client(
+                client, common, env, "SHOW TABLES", database=restore_database,
+            )
+            if tables_check.returncode != 0:
+                error = "restored schema inspection failed: {}".format(
+                    tables_check.stderr.decode("utf-8", errors="replace")
+                )
+            else:
+                restored_tables = sorted(set(
+                    line.strip() for line in tables_check.stdout.decode(
+                        "utf-8", errors="replace"
+                    ).splitlines() if line.strip()
+                ))
+                result["restored_table_inventory"] = restored_tables
+                result["schema_table_inventory"] = sorted(schema_tables)
+                missing_tables = sorted(set(schema_tables) - set(restored_tables))
+                result["missing_restored_tables"] = missing_tables
+                if missing_tables:
+                    error = "restored schema is missing expected tables: {}".format(
+                        ", ".join(missing_tables)
+                    )
+
+        if error is None:
+            target_ok, target_identity, target_error = _runtime_identity(
+                client, common, env, restore_database
+            )
+            if not target_ok:
+                error = "restored database identity query failed: {}".format(target_error)
+            else:
+                result["restore_database_runtime_identity"] = target_identity
+                result["restore_smoke"] = "PASSED"
+                success = True
+    except Exception as exc:
+        error = "restore verification failed: {}: {}".format(type(exc).__name__, exc)
+    finally:
+        if created:
+            dropped = _run_client(
+                client, common, env,
+                "DROP DATABASE `{}`".format(restore_database),
+            )
+            result["restore_target_cleanup"] = "PASSED" if dropped.returncode == 0 else "FAILED"
+            if dropped.returncode != 0:
+                cleanup_error = "restore target cleanup failed: {}".format(
+                    dropped.stderr.decode("utf-8", errors="replace")
+                )
+                error = "{}{}".format(
+                    (error + "; ") if error else "", cleanup_error
+                )
+                success = False
+    return success, result, error
+
 def compute_file_sha256(filepath: str) -> str:
     """Compute SHA256 checksum of any file."""
     hasher = hashlib.sha256()
@@ -76,67 +290,12 @@ def verify_mysql_backup(
     }
 
     if restore_database:
-        if not re.match(r"^[A-Za-z][A-Za-z0-9_]{0,63}$", str(restore_database)):
-            return False, result, "restore database name is unsafe"
-        cfg = dict(db_config or {})
-        client = shutil.which("mariadb") or shutil.which("mysql")
-        if not client:
-            return False, result, "mariadb/mysql client is unavailable for restore smoke"
-        env = os.environ.copy()
-        if cfg.get("password"):
-            env["MYSQL_PWD"] = str(cfg.get("password"))
-        common = [
-            "--host={}".format(cfg.get("backup_restore_host", cfg.get("host", "127.0.0.1"))),
-            "--port={}".format(int(cfg.get("backup_restore_port", cfg.get("port", 3306)))),
-            "--user={}".format(cfg.get("backup_restore_user", cfg.get("user", "root"))),
-        ]
-        restore_password = cfg.get("backup_restore_password", cfg.get("password", ""))
-        if restore_password:
-            env["MYSQL_PWD"] = str(restore_password)
-        else:
-            env.pop("MYSQL_PWD", None)
-        create = subprocess.run(
-            [client] + common + ["--execute", "CREATE DATABASE IF NOT EXISTS `{}`".format(restore_database)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+        restored, restore_result, restore_error = _restore_into_empty_database(
+            full_sql_gz, tables, dict(db_config or {}), str(restore_database),
         )
-        if create.returncode != 0:
-            return False, result, "restore scratch database creation failed: {}".format(
-                create.stderr.decode("utf-8", errors="replace")
-            )
-        restore = subprocess.Popen(
-            [client] + common + ["--database={}".format(restore_database)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-        )
-        try:
-            with gzip.open(full_sql_gz, "rb") as stream:
-                for chunk in iter(lambda: stream.read(65536), b""):
-                    restore.stdin.write(chunk)
-            restore.stdin.close()
-            restore.stdin = None
-            stdout, stderr = restore.communicate()
-        except Exception:
-            try:
-                restore.kill()
-            except OSError:
-                pass
-            raise
-        if restore.returncode != 0:
-            return False, result, "restore smoke failed: {}".format(stderr.decode("utf-8", errors="replace"))
-        tables_check = subprocess.run(
-            [client] + common + ["--database={}".format(restore_database), "--batch", "--skip-column-names",
-                                  "--execute", "SHOW TABLES"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-        )
-        if tables_check.returncode != 0:
-            return False, result, "restored schema inspection failed"
-        restored_tables = [line.strip() for line in tables_check.stdout.decode("utf-8", errors="replace").splitlines() if line.strip()]
-        result["restored_table_inventory"] = sorted(restored_tables)
-        result["restore_smoke"] = "PASSED"
-        # Cleanup is restricted to the caller-provided scratch database.
-        subprocess.run(
-            [client] + common + ["--execute", "DROP DATABASE `{}`".format(restore_database)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
-        )
+        result.update(restore_result)
+        if not restored:
+            return False, result, restore_error or "backup restore verification failed"
     return True, result, None
 
 def perform_database_backup(
@@ -149,13 +308,21 @@ def perform_database_backup(
     Execute full backup workflow and verify all safety gates.
     Returns (success, backup_manifest, error_message).
     """
+    config = dict(db_config or {})
+    deployment_roots = list(config.get("deployment_roots") or [])
+    for deployment_root in deployment_roots:
+        if deployment_root and _is_within(backup_dir, deployment_root):
+            return False, {}, (
+                "backup root must be outside the Current/Candidate deployment root: {}"
+                .format(os.path.abspath(backup_dir))
+            )
     os.makedirs(backup_dir, exist_ok=True)
     
-    host = db_config.get("host", "127.0.0.1")
-    port = db_config.get("port", 3306)
-    user = db_config.get("user", "root")
-    password = db_config.get("password", "")
-    database = db_config.get("database", "coverage_tool")
+    host = config.get("host", "127.0.0.1")
+    port = config.get("port", 3306)
+    user = config.get("user", "root")
+    password = config.get("password", "")
+    database = config.get("database", "coverage_tool")
     
     full_sql_gz = os.path.join(backup_dir, "full.sql.gz")
     schema_sql = os.path.join(backup_dir, "schema.sql")
@@ -261,8 +428,8 @@ def perform_database_backup(
         full_sql_gz,
         schema_sql,
         expected_sha256=gz_sha256,
-        db_config=db_config,
-        restore_database=db_config.get("backup_restore_database"),
+        db_config=config,
+        restore_database=config.get("backup_restore_database"),
     )
     if not verified_dump:
         return False, {}, verification_error or "backup verification failed"
@@ -270,8 +437,12 @@ def perform_database_backup(
     manifest = {
         "status": "BACKUP_VERIFIED",
         "evidence_class": "mock" if use_mock or (allow_mock_in_test and not has_mysqldump) else "production_backup",
+        "synthetic": bool(use_mock or (allow_mock_in_test and not has_mysqldump)),
         "database": database,
         "backup_dir": backup_dir,
+        "backup_root_external": not any(
+            _is_within(backup_dir, root) for root in deployment_roots if root
+        ),
         "full_sql_gz_size": os.path.getsize(full_sql_gz),
         "full_sql_gz_sha256": gz_sha256,
         "schema_sql_size": os.path.getsize(schema_sql) if os.path.isfile(schema_sql) else 0,

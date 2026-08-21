@@ -537,6 +537,13 @@ class ProductionEvidenceManifest:
             unmet.append("Backup evidence has no verified schema/table inventory")
         if verification.get("restore_smoke") != "PASSED":
             unmet.append("Backup restore smoke was not verified")
+        if bk.get("backup_root_external") is not True:
+            unmet.append("Backup root is not proven to be outside deployment roots")
+        if verification.get("restore_target_empty_before_restore") is not True:
+            unmet.append("Backup restore target was not proven empty before restore")
+        if not verification.get("source_database_runtime_identity") or \
+                not verification.get("restore_database_runtime_identity"):
+            unmet.append("Backup restore database runtime identities are incomplete")
             
         # A checked-in/old ledger must never certify the current release.
         if rel.get("commit_sha") != self._current_commit_sha():

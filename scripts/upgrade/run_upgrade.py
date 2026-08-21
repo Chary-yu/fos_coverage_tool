@@ -51,6 +51,36 @@ from app.upgrade.lifecycle import UpgradeLifecycle
 logger = logging.getLogger(__name__)
 
 
+def _path_is_within(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath([
+            os.path.realpath(os.path.abspath(path)),
+            os.path.realpath(os.path.abspath(root)),
+        ]) == os.path.realpath(os.path.abspath(root))
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def resolve_backup_root(repo_root: str, configured_root: Optional[str] = None) -> str:
+    """Resolve a recoverable backup root outside the active deployment tree."""
+    raw = configured_root or os.environ.get("COVERAGE_BACKUP_ROOT")
+    if raw:
+        candidate = str(raw)
+        if not os.path.isabs(candidate):
+            # Relative backup roots are deliberately relative to the deploy
+            # parent, not the deploy tree itself.
+            candidate = os.path.join(os.path.dirname(os.path.abspath(repo_root)), candidate)
+    else:
+        candidate = os.path.join(
+            os.path.dirname(os.path.abspath(repo_root)),
+            ".coverage-backups", os.path.basename(os.path.abspath(repo_root)),
+        )
+    candidate = os.path.realpath(os.path.abspath(candidate))
+    if _path_is_within(candidate, repo_root):
+        raise ValueError("backup root must be outside the active deployment root")
+    return candidate
+
+
 def _sha256_file(path: str) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as stream:
@@ -197,13 +227,25 @@ def connect_live_database(db_config: Dict[str, Any]):
     )
 
 class UpgradeOrchestrator:
-    def __init__(self, repo_root: Optional[str] = None):
+    def __init__(self, repo_root: Optional[str] = None,
+                 backup_root: Optional[str] = None):
         self.repo_root = repo_root or _REPO_ROOT
         self.manifest = ProductionEvidenceManifest(self.repo_root)
-        self.backup_dir = os.path.join(self.repo_root, "backup_pre_upgrade")
+        self.backup_dir = resolve_backup_root(self.repo_root, backup_root)
         self.cutover = CutoverController(self.repo_root, os.path.join(self.backup_dir, "files"))
         self.logs: List[str] = []
         self._cutover_applied = False
+
+    def _configure_backup_root(self, configured_root: Optional[str]):
+        resolved = resolve_backup_root(self.repo_root, configured_root)
+        if resolved == self.backup_dir:
+            return
+        if self._cutover_applied:
+            raise RuntimeError("backup root cannot change after file cutover")
+        self.backup_dir = resolved
+        self.cutover = CutoverController(
+            self.repo_root, os.path.join(self.backup_dir, "files")
+        )
 
     def log(self, msg: str):
         print(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -314,6 +356,7 @@ class UpgradeOrchestrator:
         self.log("✔ Schema preflight check passed (Additive & Idempotent).")
 
         upgrade_config = (runtime_config or {}).get("upgrade") or {}
+        self._configure_backup_root(upgrade_config.get("backup_root"))
         previous_release = upgrade_config.get("previous_release")
         if not isinstance(previous_release, dict) or not previous_release:
             # A target release must never be used as its own rollback proof.
@@ -341,8 +384,17 @@ class UpgradeOrchestrator:
 
         # Step 3: MySQL Backup (fails closed if mysqldump missing unless test mock)
         self.log("[Step 3/10] Creating Pre-upgrade Full MySQL Backup & Checksum...")
+        backup_db_config = dict(db_config or {"database": "coverage_tool"})
+        configured_deploy_roots = list(
+            backup_db_config.get("deployment_roots") or []
+        )
+        configured_deploy_roots.append(self.repo_root)
+        for root_key in ("current_root", "candidate_root", "deployment_root"):
+            if upgrade_config.get(root_key):
+                configured_deploy_roots.append(upgrade_config.get(root_key))
+        backup_db_config["deployment_roots"] = configured_deploy_roots
         ok_bk, bk_manifest, bk_err = perform_database_backup(
-            db_config=db_config or {"database": "coverage_tool"},
+            db_config=backup_db_config,
             backup_dir=self.backup_dir,
             connection=connection,
             allow_mock_in_test=False
@@ -763,7 +815,9 @@ if __name__ == "__main__":
         target = json.load(stream)
     with open(args.config, "r", encoding="utf-8") as stream:
         config = json.load(stream)
-    orchestrator = UpgradeOrchestrator()
+    orchestrator = UpgradeOrchestrator(
+        backup_root=(config.get("upgrade") or {}).get("backup_root")
+    )
     mysql_config = config.get("mysql", config)
     connection = None
     try:

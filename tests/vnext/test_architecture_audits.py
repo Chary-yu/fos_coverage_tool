@@ -81,6 +81,13 @@ class ArchitectureAuditTest(unittest.TestCase):
         review = select(["app/services/inheritance_review_service.py"])
         self.assertIn("tests.vnext.test_api_export_security", review)
 
+    def test_changed_test_selection_covers_backup_ownership(self):
+        upgrade = select(["scripts/upgrade/run_verified_backup_rehearsal.py"])
+        self.assertIn("tests.release.test_verified_backup_rehearsal", upgrade)
+        maintenance = select(["scripts/maintenance/mysql_backup.py"])
+        self.assertIn("tests.database.test_phase0_baseline", maintenance)
+        self.assertIn("tests.release.test_verified_backup_rehearsal", maintenance)
+
     def test_cross_layer_performance_gate_rejects_browser_only_evidence(self):
         payload = {
             "coverage_virtual_scroll_100k": {

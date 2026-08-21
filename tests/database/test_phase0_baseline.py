@@ -8,6 +8,7 @@ import sys
 import tempfile
 import shutil
 import json
+import gzip
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if _REPO_ROOT not in sys.path:
@@ -16,7 +17,10 @@ if _REPO_ROOT not in sys.path:
 from app.release_identity import generate_release_identity, save_release_manifest, load_release_manifest
 from app.db.connection_pool import close_global_pool, get_global_pool
 from scripts.diagnostics.data_hash_gate import verify_data_integrity
-from scripts.maintenance.mysql_backup import perform_database_backup, compute_file_sha256
+from scripts.maintenance.mysql_backup import (
+    perform_database_backup, compute_file_sha256, verify_mysql_backup,
+)
+from scripts.upgrade.run_upgrade import resolve_backup_root
 from scripts.upgrade.schema_preflight import analyze_sql_script
 from scripts.diagnostics.path_mapping_audit import (
     PathLookupIndex, audit_path_mappings, normalize_path,
@@ -97,6 +101,49 @@ class TestPhase0Baseline(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(backup_dir, "full.sql.gz")))
         self.assertTrue(os.path.isfile(os.path.join(backup_dir, "full.sql.gz.sha256")))
         self.assertEqual(manifest["status"], "BACKUP_VERIFIED")
+        self.assertTrue(manifest["synthetic"])
+
+    def test_backup_root_must_not_be_inside_deployment_root(self):
+        deployment_root = os.path.join(self.test_dir, "candidate")
+        backup_dir = os.path.join(deployment_root, "backup")
+        ok, manifest, err = perform_database_backup(
+            db_config={
+                "database": "test_db",
+                "deployment_roots": [deployment_root],
+            },
+            backup_dir=backup_dir,
+            allow_mock_in_test=True,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(manifest, {})
+        self.assertIn("outside", err)
+        self.assertFalse(os.path.exists(backup_dir))
+
+    def test_backup_restore_rejects_source_target_alias(self):
+        dump_path = os.path.join(self.test_dir, "full.sql.gz")
+        schema_path = os.path.join(self.test_dir, "schema.sql")
+        with gzip.open(dump_path, "wb") as stream:
+            stream.write(b"-- fixture dump\n")
+        with open(schema_path, "w") as stream:
+            stream.write("CREATE TABLE `coverage_example` (id INT);\n")
+        ok, result, err = verify_mysql_backup(
+            dump_path,
+            schema_path,
+            expected_sha256=compute_file_sha256(dump_path),
+            db_config={"database": "same_database"},
+            restore_database="same_database",
+        )
+        self.assertFalse(ok)
+        self.assertEqual(result["restore_smoke"], "NOT_REQUESTED")
+        self.assertIn("differ", err)
+
+    def test_backup_root_resolution_rejects_deployment_child(self):
+        with self.assertRaises(ValueError):
+            resolve_backup_root(self.test_dir, os.path.join(self.test_dir, "backup"))
+        resolved = resolve_backup_root(self.test_dir, "../outside-backups")
+        self.assertFalse(os.path.commonpath([
+            os.path.realpath(resolved), os.path.realpath(self.test_dir),
+        ]) == os.path.realpath(self.test_dir))
 
     def test_item_21_schema_preflight_rules(self):
         """Verify schema preflight blocks destructive DDL while allowing additive migrations."""
