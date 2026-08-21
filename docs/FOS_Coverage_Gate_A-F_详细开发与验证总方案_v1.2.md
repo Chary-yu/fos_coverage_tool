@@ -625,7 +625,7 @@ coverage_legacy_provenance
   raw_payload_sha256 CHAR(64) NOT NULL
   created_at DATETIME NOT NULL
   UNIQUE(provenance_key_hash)
-  KEY(source_table(31), source_identity(160))
+  KEY(source_table(30), source_identity(159))
 ```
 
 `provenance_key_hash` 是
@@ -1703,7 +1703,7 @@ coverage_import_failures
   fencing_token BIGINT NULL
   occurred_at DATETIME NOT NULL
   UNIQUE(failure_key_hash)
-  KEY(job_id(63), phase(64), error_fingerprint(64))
+  KEY(job_id(61), phase(64), error_fingerprint(64))
 ```
 
 普通“不继承”不属于 Gate C failure。

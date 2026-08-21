@@ -223,7 +223,7 @@ CREATE TABLE IF NOT EXISTS coverage_incremental_results (
     generated_at DATETIME NOT NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uq_incremental_key_hash (incremental_key_hash),
-    KEY idx_incremental_scan_repo (scan_id, report_id(64), repository_name(125)),
+    KEY idx_incremental_scan_repo (scan_id, report_id(64), repository_name(123)),
     CONSTRAINT fk_incremental_result_scan FOREIGN KEY (scan_id)
         REFERENCES coverage_scans(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -247,7 +247,7 @@ CREATE TABLE IF NOT EXISTS coverage_legacy_provenance (
     created_at DATETIME NOT NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uq_legacy_provenance_hash (provenance_key_hash),
-    KEY idx_legacy_provenance_source (source_table(31), source_identity(160))
+    KEY idx_legacy_provenance_source (source_table(30), source_identity(159))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Gate B: stable logical repositories and their physical Git resources.
@@ -511,7 +511,7 @@ CREATE TABLE IF NOT EXISTS coverage_import_failures (
     occurred_at DATETIME NOT NULL,
     PRIMARY KEY (id),
     UNIQUE KEY uq_import_failure_hash (failure_key_hash),
-    KEY idx_import_failure_lookup (job_id(63), phase(64), error_fingerprint(64)),
+    KEY idx_import_failure_lookup (job_id(61), phase(64), error_fingerprint(64)),
     CONSTRAINT fk_import_failure_scan FOREIGN KEY (scan_id)
         REFERENCES coverage_scans(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
