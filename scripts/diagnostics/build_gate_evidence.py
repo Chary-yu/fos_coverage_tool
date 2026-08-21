@@ -42,26 +42,29 @@ GATE_FILES = {
         "mariadb55_preflight.json", "targeted_tests.txt",
     ),
     "B": (
-        "schema_diff.json", "repository_identity_matrix.json", "backfill_before.json",
-        "backfill_after.json", "semantic_hashes.json", "orphan_checks.json",
-        "canonical_ownership_audit.json", "targeted_tests.txt",
+        "schema_diff.sql", "repository_identity_matrix.json",
+        "analysis_backfill_before.json", "analysis_backfill_after.json",
+        "analysis_semantic_hashes.json", "orphan_checks.json",
+        "canonical_read_write_audit.json", "targeted_tests.txt",
     ),
     "C": (
-        "state_machine.json", "resource_locks.json", "fencing_tests.json",
-        "checkpoint_resume_tests.json", "current_pointer_tests.json",
-        "worktree_before_after.json", "publish_tests.json", "runtime_job_audit.json",
+        "scan_state_machine.json", "repository_lock_tests.json", "fencing_tests.json",
+        "checkpoint_resume_tests.json", "current_pointer_audit.json",
+        "worktree_head_before_after.txt", "atomic_publish_tests.json",
+        "runtime_job_audit.json",
         "targeted_tests.txt",
     ),
     "D": (
-        "rule_traceability.json", "reason_catalog.json", "fixture_manifest.json",
-        "decision_run_1.json", "decision_run_2.json", "determinism_diff.json",
-        "false_positive_report.json", "parser_toolchain.json", "dependency_report.json",
+        "rule_traceability.json", "reason_code_catalog.json",
+        "deterministic_fixture_manifest.json", "decisions_run_1.json",
+        "decisions_run_2.json", "determinism_diff.json", "false_positive_check.json",
+        "parser_uncertainty_report.json", "dependency_resolution_report.json",
         "targeted_tests.txt",
     ),
     "E": (
-        "api_contract.json", "http_acceptance.json", "browser_acceptance.json",
-        "asset_cache_parity.json", "parity_matrix.json", "performance_evidence.json",
-        "targeted_tests.txt",
+        "api_contract.json", "route_inventory.json", "progress_conservation.json",
+        "browser_scenarios.json", "console_errors.json", "network_trace_summary.json",
+        "performance_metrics.json", "legacy_fallback_audit.json", "targeted_tests.txt",
     ),
     "F": (
         "final_source_review.json", "final_security_review.json", "release_identity.json",
@@ -71,6 +74,14 @@ GATE_FILES = {
         "runtime_verification.json", "browser_smoke.json", "cutover_record.json",
         "rollback_rehearsal.json", "acceptance_window_checks.json", "skill_drift_audit.json",
     ),
+}
+
+
+# Gate E deliberately contains a directory entry in the v1.2 contract.  Keep
+# it separate from GATE_FILES so callers can distinguish a report directory
+# from a hashable file artifact.
+GATE_DIRECTORIES = {
+    "E": ("playwright_report",),
 }
 
 TEST_GROUPS = {
@@ -132,7 +143,7 @@ def _run_tests(repo_root, modules, enabled=True):
             "output": output}
 
 
-def _sqlite_migration():
+def _sqlite_migration(repo_root):
     source = sqlite3.connect(":memory:")
     target = sqlite3.connect(":memory:")
     source.row_factory = sqlite3.Row
@@ -146,7 +157,7 @@ def _sqlite_migration():
         create_sqlite_schema(target)
         apply_schema(
             target,
-            os.path.join(ROOT, "scripts", "upgrade", "vnext_schema.sql"),
+            os.path.join(repo_root, "scripts", "upgrade", "vnext_schema.sql"),
             release_sha="bundle-fixture",
         )
         source_semantic = capture_legacy_semantic_snapshot(source)
@@ -227,7 +238,7 @@ def build(repo_root, output_root, run_tests=True):
     revision = _revision(repo_root)
     identity = generate_release_identity(repo_root=repo_root)
     matrix = build_gate_matrix(repo_root)
-    sqlite_result = _sqlite_migration()
+    sqlite_result = _sqlite_migration(repo_root)
     all_gate_results = {}
 
     fixture_source = os.path.join(repo_root, "tests", "fixtures",
@@ -285,28 +296,35 @@ def build(repo_root, output_root, run_tests=True):
                 "static fixture/DDL is present; real MariaDB 5.5 runtime is not verified",
             ))
         elif gate == "B":
-            _write(os.path.join(gate_dir, "schema_diff.json"), {
-                "core_schema_sha256": _sha(vnext_schema),
-                "domain_schema_sha256": _sha(os.path.join(
-                    repo_root, "scripts", "upgrade", "vnext_domain_constraints.sql"
-                )),
-                "status": "PASSED",
-            })
+            domain_schema = os.path.join(
+                repo_root, "scripts", "upgrade", "vnext_domain_constraints.sql"
+            )
+            _write(
+                os.path.join(gate_dir, "schema_diff.sql"),
+                "-- Gate B schema evidence\n"
+                "-- core_schema_sha256={}\n"
+                "-- domain_schema_sha256={}\n"
+                "-- status=PASSED\n"
+                "-- No destructive DDL is introduced by this evidence bundle.\n".format(
+                    _sha(vnext_schema), _sha(domain_schema)
+                ),
+                text=True,
+            )
             _write(os.path.join(gate_dir, "repository_identity_matrix.json"), {
                 "logical_repository": "coverage_repositories.id",
                 "physical_resource": "coverage_repository_resources.resource_key",
                 "scan_snapshot": "coverage_scan_repositories",
                 "status": "PASSED",
             })
-            _write(os.path.join(gate_dir, "backfill_before.json"), {
+            _write(os.path.join(gate_dir, "analysis_backfill_before.json"), {
                 "status": "INCOMPLETE", "synthetic": True,
                 "source": "SQLite fixture before Analysis Domain backfill",
             })
-            _write(os.path.join(gate_dir, "backfill_after.json"), {
+            _write(os.path.join(gate_dir, "analysis_backfill_after.json"), {
                 "status": "INCOMPLETE", "synthetic": True,
                 "analysis_domain": sqlite_result["domain"],
             })
-            _write(os.path.join(gate_dir, "semantic_hashes.json"), {
+            _write(os.path.join(gate_dir, "analysis_semantic_hashes.json"), {
                 "source": sqlite_result["source_hash"],
                 "target": sqlite_result["target_hash"], "synthetic": True,
             })
@@ -314,44 +332,45 @@ def build(repo_root, output_root, run_tests=True):
                    sqlite_result["domain"].get("consistency", _missing(
                        "orphan_checks", "target DB backfill evidence is unavailable"
                    )))
-            _write(os.path.join(gate_dir, "canonical_ownership_audit.json"),
+            _write(os.path.join(gate_dir, "canonical_read_write_audit.json"),
                    matrix["gates"]["B"]["local_checks"][0])
         elif gate == "C":
             for name, value in {
-                "state_machine.json": {"status": "PASSED", "states": [
+                "scan_state_machine.json": {"status": "PASSED", "states": [
                     "CREATED", "STAGING", "IMPORTING", "SEALED", "PUBLISHED", "ABORTED"
                 ]},
-                "resource_locks.json": _missing("resource_lock_rehearsal", "live DB lock/fencing rehearsal is external"),
+                "repository_lock_tests.json": _missing("resource_lock_rehearsal", "live DB lock/fencing rehearsal is external"),
                 "fencing_tests.json": _missing("fencing_rehearsal", "live DB fencing evidence is external"),
                 "checkpoint_resume_tests.json": _missing("checkpoint_resume", "durable restart evidence is external"),
-                "current_pointer_tests.json": _missing("current_pointer", "final read-set evidence is external"),
-                "worktree_before_after.json": _missing("worktree_identity", "production worktree evidence is external"),
-                "publish_tests.json": matrix["gates"]["C"]["local_checks"][1],
+                "current_pointer_audit.json": _missing("current_pointer", "final read-set evidence is external"),
+                "worktree_head_before_after.txt": "production worktree evidence is external; status=INCOMPLETE\n",
+                "atomic_publish_tests.json": matrix["gates"]["C"]["local_checks"][1],
                 "runtime_job_audit.json": _missing("runtime_job_audit", "production job recovery evidence is external"),
             }.items():
-                _write(os.path.join(gate_dir, name), value)
+                _write(os.path.join(gate_dir, name), value,
+                       text=name.endswith(".txt"))
         elif gate == "D":
             rules = matrix["gates"]["D"]["local_checks"][0]
             parser = matrix["gates"]["D"]["local_checks"][1]
             _write(os.path.join(gate_dir, "rule_traceability.json"), rules)
-            _write(os.path.join(gate_dir, "reason_catalog.json"), {
+            _write(os.path.join(gate_dir, "reason_code_catalog.json"), {
                 "status": "PASSED", "source": "contracts/inheritance_rules_v1.json",
             })
-            _write(os.path.join(gate_dir, "fixture_manifest.json"), {
+            _write(os.path.join(gate_dir, "deterministic_fixture_manifest.json"), {
                 "status": "INCOMPLETE", "synthetic": True,
                 "reason": "generated corpus is auxiliary until target parser/toolchain is verified",
             })
-            _write(os.path.join(gate_dir, "decision_run_1.json"), _missing(
+            _write(os.path.join(gate_dir, "decisions_run_1.json"), _missing(
                 "decision_run", "production deterministic corpus is external"))
-            _write(os.path.join(gate_dir, "decision_run_2.json"), _missing(
+            _write(os.path.join(gate_dir, "decisions_run_2.json"), _missing(
                 "decision_run", "production deterministic corpus is external"))
             _write(os.path.join(gate_dir, "determinism_diff.json"), _missing(
                 "determinism_diff", "two independent production corpus runs are external"))
-            _write(os.path.join(gate_dir, "false_positive_report.json"), _missing(
-                "false_positive_report", "verified production corpus is external"))
-            _write(os.path.join(gate_dir, "parser_toolchain.json"), parser)
-            _write(os.path.join(gate_dir, "dependency_report.json"), _missing(
-                "dependency_report", "same-repository production dependency evidence is external"))
+            _write(os.path.join(gate_dir, "false_positive_check.json"), _missing(
+                "false_positive_check", "verified production corpus is external"))
+            _write(os.path.join(gate_dir, "parser_uncertainty_report.json"), parser)
+            _write(os.path.join(gate_dir, "dependency_resolution_report.json"), _missing(
+                "dependency_resolution_report", "same-repository production dependency evidence is external"))
         elif gate == "E":
             _write(os.path.join(gate_dir, "api_contract.json"),
                    matrix["gates"]["E"]["local_checks"][0])
@@ -363,13 +382,18 @@ def build(repo_root, output_root, run_tests=True):
                 "COVERAGE_GATE_E_PERF_EVIDENCE",
                 "cross-layer performance evidence is not supplied",
             )
-            _write(os.path.join(gate_dir, "http_acceptance.json"), browser)
-            _write(os.path.join(gate_dir, "browser_acceptance.json"), browser)
-            _write(os.path.join(gate_dir, "asset_cache_parity.json"), _missing(
-                "asset_cache_parity", "exact release asset parity evidence is external"))
-            _write(os.path.join(gate_dir, "parity_matrix.json"), _missing(
-                "parity_matrix", "full VNext parity evidence is external"))
-            _write(os.path.join(gate_dir, "performance_evidence.json"), performance)
+            _write(os.path.join(gate_dir, "route_inventory.json"), _missing(
+                "route_inventory", "exact Candidate route inventory is external"))
+            _write(os.path.join(gate_dir, "progress_conservation.json"), _missing(
+                "progress_conservation", "fresh production progress conservation evidence is external"))
+            _write(os.path.join(gate_dir, "browser_scenarios.json"), browser)
+            _write(os.path.join(gate_dir, "console_errors.json"), browser)
+            _write(os.path.join(gate_dir, "network_trace_summary.json"), browser)
+            _write(os.path.join(gate_dir, "performance_metrics.json"), performance)
+            _write(os.path.join(gate_dir, "legacy_fallback_audit.json"), _missing(
+                "legacy_fallback_audit", "exact release runtime fallback evidence is external"))
+            report_dir = os.path.join(gate_dir, "playwright_report")
+            _write(os.path.join(report_dir, "summary.json"), browser)
         elif gate == "F":
             _write(os.path.join(gate_dir, "final_source_review.json"), _missing(
                 "final_source_review", "exact-SHA production review is external"))
@@ -399,7 +423,9 @@ def build(repo_root, output_root, run_tests=True):
         detail = _gate_detail(repo_root, matrix, gate,
                               sqlite_result if gate in ("A", "B") else None,
                               tests)
-        detail["artifacts"] = list(GATE_FILES[gate]) + [
+        detail["artifacts"] = list(GATE_FILES[gate]) + list(
+            GATE_DIRECTORIES.get(gate, ())
+        ) + [
             "evidence-manifest-v2.json", "gate_{}_result.json".format(gate.lower())
         ]
         result_path = os.path.join(gate_dir, "gate_{}_result.json".format(gate.lower()))
@@ -409,14 +435,20 @@ def build(repo_root, output_root, run_tests=True):
             candidate_revision=revision, release_identity=identity,
             manifest_path=os.path.join(gate_dir, "evidence-manifest-v2.json"),
         )
-        for name in GATE_FILES[gate]:
+        manifest_files = list(GATE_FILES[gate])
+        if gate == "E":
+            # The contract names the Playwright report as a directory, while
+            # the manifest still needs one concrete, hashable report artifact.
+            manifest_files.append(os.path.join("playwright_report", "summary.json"))
+        for name in manifest_files:
             path = os.path.join(gate_dir, name)
             if not os.path.isfile(path):
                 continue
             synthetic = name in {
                 "source_semantic.json", "target_semantic.json", "semantic_hashes.json",
                 "anomalies.json", "migration_run_1.json", "migration_run_2_idempotency.json",
-                "backfill_before.json", "backfill_after.json", "fixture_manifest.json",
+                "analysis_backfill_before.json", "analysis_backfill_after.json",
+                "analysis_semantic_hashes.json", "deterministic_fixture_manifest.json",
             }
             status = "PASSED" if name == "targeted_tests.txt" and tests["status"] == "PASSED" else "INCOMPLETE"
             payload = None

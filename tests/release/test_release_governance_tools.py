@@ -3,7 +3,9 @@ import tempfile
 import unittest
 
 from scripts.diagnostics.acceptance_window_audit import _parse_time, audit as audit_window
-from scripts.diagnostics.build_gate_evidence import GATE_FILES, build as build_gate_evidence
+from scripts.diagnostics.build_gate_evidence import (
+    GATE_DIRECTORIES, GATE_FILES, build as build_gate_evidence,
+)
 from scripts.diagnostics.production_inventory import required_free_bytes
 from scripts.diagnostics.skill_drift_audit import REQUIRED_FIELDS, REQUIRED_SKILLS, audit as audit_skills
 
@@ -76,6 +78,8 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
                         os.path.isfile(os.path.join(gate_dir, name)),
                         "missing {} for Gate {}".format(name, gate),
                     )
+                for name in GATE_DIRECTORIES.get(gate, ()):
+                    self.assertTrue(os.path.isdir(os.path.join(gate_dir, name)))
                 self.assertTrue(os.path.isfile(os.path.join(
                     gate_dir, "evidence-manifest-v2.json"
                 )))
