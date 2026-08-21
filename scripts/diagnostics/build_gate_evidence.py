@@ -252,6 +252,78 @@ def _external_json(env_name, reason):
         return _missing("external_release_evidence", str(exc)), []
 
 
+def _external_fresh_inventory(repo_root):
+    """Load F3 inventory from a raw artifact or a validated Manifest v2.
+
+    ``build_gate_evidence`` keeps the raw inventory as the bundle's readable
+    ``fresh_inventory/summary.json``.  When the operator supplies a Manifest
+    v2, the wrapper and its referenced raw artifact are both validated and
+    hash-bound before the raw payload is copied into the bundle.
+    """
+    path = os.environ.get("COVERAGE_GATE_F_INVENTORY_EVIDENCE", "")
+    reason = "fresh production inventory is external"
+    if not path or not os.path.isfile(path):
+        return _missing("fresh_inventory", reason), []
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, ValueError, TypeError) as exc:
+        return _missing("external_release_evidence", str(exc)), []
+    inputs = [_sha(path)]
+    if not isinstance(payload, dict):
+        return _missing("external_release_evidence", "inventory evidence must be a JSON object"), inputs
+    if payload.get("evidence_schema_version") != 2:
+        return payload, inputs
+
+    manifest = EvidenceManifestV2(
+        repo_root, "gate-f", manifest_path=os.path.abspath(path)
+    )
+    valid, errors = manifest.validate()
+    if not valid:
+        return _missing(
+            "external_release_evidence",
+            "inventory manifest validation failed: {}".format("; ".join(errors)),
+        ), inputs
+    expected_revision = _revision(repo_root)
+    if expected_revision and manifest.data.get("candidate_revision") != expected_revision:
+        return _missing(
+            "external_release_evidence",
+            "inventory manifest candidate_revision does not match the bundle checkout",
+        ), inputs
+    records = [
+        item for item in (manifest.data.get("evidence") or [])
+        if isinstance(item, dict) and (
+            item.get("evidence_class") == "fresh_production_inventory"
+            or "fresh-production-inventory" in str(item.get("evidence_id") or "")
+        )
+    ]
+    if len(records) != 1:
+        return _missing(
+            "external_release_evidence",
+            "inventory manifest must contain exactly one fresh inventory record",
+        ), inputs
+    artifact = str(records[0].get("artifact_path") or "")
+    if not os.path.isabs(artifact):
+        artifact = os.path.join(os.path.dirname(os.path.abspath(path)), artifact)
+    artifact = os.path.abspath(artifact)
+    if not os.path.isfile(artifact):
+        return _missing(
+            "external_release_evidence",
+            "inventory manifest raw artifact is missing",
+        ), inputs
+    try:
+        with open(artifact, "r", encoding="utf-8") as stream:
+            raw = json.load(stream)
+    except (OSError, ValueError, TypeError) as exc:
+        return _missing("external_release_evidence", str(exc)), inputs
+    if not isinstance(raw, dict):
+        return _missing(
+            "external_release_evidence", "inventory raw artifact must be a JSON object"
+        ), inputs
+    inputs.append(_sha(artifact))
+    return raw, inputs
+
+
 def _gate_detail(repo_root, matrix, gate, sqlite_result=None, test_result=None):
     gate_payload = matrix["gates"][gate]
     detail = {
@@ -311,6 +383,7 @@ def build(repo_root, output_root, run_tests=True):
         tests = _run_tests(repo_root, TEST_GROUPS[gate], enabled=run_tests)
         _write(os.path.join(gate_dir, "targeted_tests.txt"),
                json.dumps(tests, ensure_ascii=False, indent=2), text=True)
+        artifact_source_inputs = {}
         if gate == "A":
             _write(os.path.join(gate_dir, "source_schema.txt"),
                    _read_text(fixture_source), text=True)
@@ -476,6 +549,7 @@ def build(repo_root, output_root, run_tests=True):
                 item.get("name"): item
                 for item in matrix["gates"]["F"].get("local_checks", [])
             }
+            fresh_inventory, fresh_inventory_inputs = _external_fresh_inventory(repo_root)
             source_review = local_checks.get("final_source_review") or {}
             security_review = local_checks.get("final_security_review") or {}
             _write(
@@ -491,12 +565,37 @@ def build(repo_root, output_root, run_tests=True):
                 ),
             )
             _write(os.path.join(gate_dir, "release_identity.json"), identity)
-            _write(os.path.join(gate_dir, "database_runtime_identity.json"), _missing(
-                "database_runtime_identity", "final target DB identity is external"))
-            _write(os.path.join(gate_dir, "candidate_layout.json"), _missing(
-                "candidate_layout", "fresh dual-environment inventory is external"))
-            _write(os.path.join(gate_dir, "fresh_inventory", "summary.json"), _missing(
-                "fresh_inventory", "fresh production inventory is external"))
+            _write(
+                os.path.join(gate_dir, "database_runtime_identity.json"),
+                fresh_inventory.get("database_runtime_identity") or _missing(
+                    "database_runtime_identity", "final target DB identity is external"
+                ),
+            )
+            if fresh_inventory.get("status") in ("PASSED", "INCOMPLETE", "PARTIAL", "FAILED", "BLOCKED"):
+                layout = {
+                    "status": fresh_inventory.get("status"),
+                    "evidence_class": "candidate_layout",
+                    "synthetic": bool(fresh_inventory.get("synthetic", False)),
+                    "roots": fresh_inventory.get("roots") or {},
+                    "configs": fresh_inventory.get("configs") or {},
+                    "repositories": fresh_inventory.get("repositories") or [],
+                    "ports": fresh_inventory.get("ports") or {},
+                    "services": fresh_inventory.get("services") or {},
+                    "backup": fresh_inventory.get("backup") or {},
+                    "auth_boundary": fresh_inventory.get("auth_boundary") or {},
+                    "completeness": fresh_inventory.get("completeness") or {},
+                    "violations": fresh_inventory.get("violations") or [],
+                }
+            else:
+                layout = _missing(
+                    "candidate_layout", "fresh dual-environment inventory is external"
+                )
+            _write(os.path.join(gate_dir, "candidate_layout.json"), layout)
+            _write(os.path.join(gate_dir, "fresh_inventory", "summary.json"),
+                   fresh_inventory)
+            artifact_source_inputs = {
+                "fresh_inventory/summary.json": fresh_inventory_inputs,
+            }
             _write(os.path.join(gate_dir, "candidate_config_audit.json"),
                    matrix["gates"]["F"]["local_checks"][0])
             for name, reason in {
@@ -558,7 +657,9 @@ def build(repo_root, output_root, run_tests=True):
                 "{}-{}".format(gate.lower(), name.replace("/", "-").replace(".", "-")),
                 "synthetic_fixture" if synthetic else "repository_or_release_audit",
                 status, "build_gate_evidence.py", artifact_exit_code,
-                artifact_path=path, source_inputs_sha256=[], synthetic=synthetic,
+                artifact_path=path,
+                source_inputs_sha256=artifact_source_inputs.get(name, []),
+                synthetic=synthetic,
                 observed_status=observed_status,
             )
         all_gate_results[gate] = detail

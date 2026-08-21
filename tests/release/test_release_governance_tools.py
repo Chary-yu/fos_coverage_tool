@@ -244,6 +244,59 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
                 valid, errors = manifest.validate()
                 self.assertTrue(valid, "invalid Gate {} manifest: {}".format(gate, errors))
 
+    def test_gate_bundle_consumes_external_fresh_inventory_manifest(self):
+        old = os.environ.get("COVERAGE_GATE_F_INVENTORY_EVIDENCE")
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                raw = os.path.join(directory, "fresh-inventory.json")
+                external_manifest = os.path.join(directory, "evidence-manifest-v2.json")
+                with open(raw, "w", encoding="utf-8") as stream:
+                    json.dump({
+                        "status": "INCOMPLETE",
+                        "evidence_class": "fresh_production_inventory",
+                        "synthetic": False,
+                        "violations": ["external test fixture is intentionally incomplete"],
+                    }, stream)
+                from app.release_identity import generate_release_identity
+                write_evidence_manifest({
+                    "status": "INCOMPLETE", "exit_code": 1,
+                    "release_identity": generate_release_identity(os.getcwd()),
+                    "host_identity": {"hostname": "test"},
+                    "started_at": "2026-08-21T00:00:00Z",
+                    "finished_at": "2026-08-21T00:00:01Z",
+                    "command_or_action": "external inventory fixture",
+                    "database_runtime_identity": {},
+                }, raw, external_manifest)
+                os.environ["COVERAGE_GATE_F_INVENTORY_EVIDENCE"] = external_manifest
+                output_root = os.path.join(directory, "bundle")
+                result = build_gate_evidence(".", output_root, run_tests=False)
+                with open(os.path.join(
+                        output_root, "gate-f", "fresh_inventory", "summary.json"),
+                        encoding="utf-8") as stream:
+                    summary = json.load(stream)
+                self.assertEqual(summary["status"], "INCOMPLETE")
+                with open(os.path.join(
+                        output_root, "gate-f", "candidate_layout.json"),
+                        encoding="utf-8") as stream:
+                    layout = json.load(stream)
+                self.assertEqual(layout["status"], "INCOMPLETE")
+                manifest = EvidenceManifestV2(
+                    os.getcwd(), "gate-f", manifest_path=os.path.join(
+                        output_root, "gate-f", "evidence-manifest-v2.json"
+                    )
+                )
+                records = [
+                    item for item in manifest.data["evidence"]
+                    if item.get("evidence_id") == "f-fresh_inventory-summary-json"
+                ]
+                self.assertEqual(len(records), 1)
+                self.assertTrue(records[0]["source_inputs_sha256"])
+        finally:
+            if old is None:
+                os.environ.pop("COVERAGE_GATE_F_INVENTORY_EVIDENCE", None)
+            else:
+                os.environ["COVERAGE_GATE_F_INVENTORY_EVIDENCE"] = old
+
     def test_manifest_artifact_attributes_preserve_status_and_synthetic_boundary(self):
         with tempfile.TemporaryDirectory() as directory:
             passed = os.path.join(directory, "passed.json")
