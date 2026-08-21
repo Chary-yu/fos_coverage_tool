@@ -85,6 +85,37 @@ python3 scripts/upgrade/run_verified_backup_rehearsal.py \
 
 正式切换前重新生成 fresh inventory，至少覆盖 process/service、release identity、Current/Candidate roots、DB fingerprint、schema/table counts、jobs、磁盘公式、Nginx/auth boundary 和 backup location。再执行 freeze → final backup → Candidate rehearsal → traffic-closed verification → cutover → forced rollback rehearsal，并保留完整 before/target/rollback release identity。
 
+使用仓库内的 observation-only inventory 工具时，Current/Candidate 配置、服务、进程、持久化目录、外置 backup 根和代理配置都必须显式提供；缺少任一项命令都会非零退出并保持 `INCOMPLETE`。`--config` 仍是 `--candidate-config` 的兼容别名：
+
+```bash
+python3 scripts/diagnostics/production_inventory.py \
+  --current-root /srv/fos-coverage/current \
+  --candidate-root /srv/fos-coverage/candidate \
+  --current-config /srv/fos-coverage/current/coverage_config.json \
+  --candidate-config /srv/fos-coverage/candidate/config/coverage_config.staging.example.json \
+  --current-repository-root /srv/fos-coverage/current \
+  --candidate-repository-root /srv/fos-coverage/candidate \
+  --service fos-coverage-current \
+  --service fos-coverage-candidate \
+  --process-pattern enhance_coverage \
+  --process-pattern coverage \
+  --persistent-root /srv/fos-coverage/current/.runtime-state \
+  --persistent-root /srv/fos-coverage/candidate/.runtime-state-staging \
+  --jobs-root /srv/fos-coverage/current/.runtime-state/jobs \
+  --jobs-root /srv/fos-coverage/candidate/.runtime-state-staging/jobs \
+  --backup-root /secure/backups/fos-coverage \
+  --proxy-config /etc/nginx/sites-enabled/fos-coverage.conf \
+  --current-release-bytes <current_release_bytes> \
+  --candidate-release-bytes <candidate_release_bytes> \
+  --final-target-db-estimate <final_target_db_estimate> \
+  --verified-backup-bytes <verified_backup_bytes> \
+  --max-temp-worktree-bytes <max_temp_worktree_bytes> \
+  --migration-temp-bytes <migration_temp_bytes> \
+  --output /secure/evidence/gate-f/fresh_inventory/summary.json
+```
+
+该工具会读取两个 DB 的 runtime fingerprint、schema/table counts、`data_version` 和 job state，并检查配置端口是否实际监听、服务 `MainPID` 是否能与进程命令行对应、backup 根是否在两个部署根之外，以及代理是否显式设置 Candidate 配置中的认证用户 header。它不会创建数据库、启动服务、修改配置或删除文件；`--output` 仅用于保存本次盘点结果。
+
 在 traffic-closed verification 前，先在最终 exact checkout 执行仓库内 source/security review：
 
 ```bash

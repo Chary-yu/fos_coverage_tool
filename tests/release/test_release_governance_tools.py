@@ -1,4 +1,5 @@
 import os
+import argparse
 import json
 import subprocess
 import sys
@@ -10,7 +11,7 @@ from scripts.diagnostics.build_gate_evidence import (
     GATE_DIRECTORIES, GATE_FILES, build as build_gate_evidence,
     _manifest_artifact_attributes,
 )
-from scripts.diagnostics.production_inventory import required_free_bytes
+from scripts.diagnostics.production_inventory import collect_inventory, required_free_bytes
 from scripts.diagnostics.skill_drift_audit import REQUIRED_FIELDS, REQUIRED_SKILLS, audit as audit_skills
 from scripts.upgrade.evidence_manifest import EvidenceManifestV2
 
@@ -23,6 +24,57 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertEqual(result["required_free_bytes"], 10 * (1024 ** 3) + 2100)
         with self.assertRaises(ValueError):
             required_free_bytes(-1, 0, 0, 0, 0, 0)
+
+    def test_production_inventory_fails_closed_without_live_release_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            current = os.path.join(directory, "current")
+            candidate = os.path.join(directory, "candidate")
+            backup = os.path.join(directory, "backups")
+            for path in (current, candidate, backup):
+                os.makedirs(path)
+            current_config = os.path.join(current, "coverage_config.json")
+            candidate_config = os.path.join(candidate, "coverage_config.json")
+            payload = {
+                "mysql": {"host": "127.0.0.1", "port": 3306,
+                          "user": "coverage", "password": "secret",
+                          "database": "coverage"},
+                "server": {"host": "127.0.0.1", "port": 9528},
+                "auth": {"mode": "reverse_proxy", "user_header": "X-Remote-User",
+                         "trusted_proxy_addresses": ["127.0.0.1"]},
+                "runtime_state": {"root": ".runtime-state", "jobs_dir": "jobs"},
+                "runtime_mode": "vnext", "schema_version": 1,
+            }
+            for path in (current_config, candidate_config):
+                with open(path, "w", encoding="utf-8") as stream:
+                    json.dump(payload, stream)
+            args = argparse.Namespace(
+                current_root=current, candidate_root=candidate,
+                disk_root=directory, current_config=current_config,
+                candidate_config=candidate_config, current_repository_root=None,
+                candidate_repository_root=None, repository_root=[], service=[],
+                process_pattern=[], port=[], persistent_root=[], jobs_root=[],
+                backup_root=backup, proxy_config=[],
+                current_release_bytes=1, candidate_release_bytes=1,
+                final_target_db_estimate=1, verified_backup_bytes=1,
+                max_temp_worktree_bytes=1, migration_temp_bytes=1,
+            )
+            result = collect_inventory(args)
+            self.assertIn(result["status"], ("INCOMPLETE", "FAILED"))
+            self.assertIn("service_process_inventory", result["completeness"]["missing"])
+            self.assertIn("current_db_identity", result["completeness"]["missing"])
+            self.assertNotEqual(result["exit_code"], 0)
+            encoded = json.dumps(result["configs"], ensure_ascii=False)
+            self.assertNotIn("secret", encoded)
+
+    def test_production_inventory_proxy_boundary_requires_explicit_auth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proxy = os.path.join(directory, "coverage.conf")
+            with open(proxy, "w", encoding="utf-8") as stream:
+                stream.write("proxy_pass http://127.0.0.1:19528;\n")
+            from scripts.diagnostics.production_inventory import _proxy_observation
+            result = _proxy_observation([proxy])
+            self.assertEqual(result["status"], "INCOMPLETE")
+            self.assertFalse(result["signals"]["remote_user_header"])
 
     def test_acceptance_window_fails_closed_without_exit_conditions(self):
         result = audit_window({
