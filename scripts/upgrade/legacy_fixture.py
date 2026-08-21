@@ -47,8 +47,15 @@ def create_legacy_fixture_schema(connection, fixture_path=None):
             statement = statement.replace("BIGINT NOT NULL AUTO_INCREMENT", "INTEGER")
             statement = statement.replace(" ENGINE=InnoDB DEFAULT CHARSET=utf8mb4", "")
         cursor = connection.cursor()
-        cursor.execute(adapt_sql(connection, statement))
-        cursor.close()
+        try:
+            cursor.execute(adapt_sql(connection, statement))
+        except Exception as exc:
+            compact = " ".join(str(statement).split())
+            raise RuntimeError(
+                "legacy fixture DDL statement failed: {}".format(compact[:2000])
+            ) from exc
+        finally:
+            cursor.close()
     connection.commit()
 
 

@@ -42,7 +42,8 @@ CREATE TABLE coverage_line_index (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE coverage_project_state (
-    project_name VARCHAR(255) NOT NULL,
+    -- 191 utf8mb4 characters fit MariaDB 5.5's 767-byte index limit.
+    project_name VARCHAR(191) NOT NULL,
     data_version BIGINT NULL,
     file_state_version BIGINT NULL,
     current_scan_key VARCHAR(128) NULL,
