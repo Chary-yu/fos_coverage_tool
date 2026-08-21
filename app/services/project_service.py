@@ -134,8 +134,7 @@ class ProjectService(object):
                     provenance=snapshot.get("provenance", ""),
                     repository_id=repository_id,
                     commit_sha=snapshot.get("commit_sha"),
-                    identity_verified=int(bool(snapshot.get("identity_verified",
-                                                     snapshot.get("verified")))),
+                    identity_verified=int(bool(snapshot.get("identity_verified", False))),
                     identity_provenance=snapshot.get("identity_provenance", ""),
                 )
             if report:
@@ -218,8 +217,7 @@ class ProjectService(object):
                     provenance=snapshot.get("provenance", ""),
                     repository_id=repository_id,
                     commit_sha=snapshot.get("commit_sha"),
-                    identity_verified=int(bool(snapshot.get("identity_verified",
-                                                     snapshot.get("verified")))),
+                    identity_verified=int(bool(snapshot.get("identity_verified", False))),
                     identity_provenance=snapshot.get("identity_provenance", ""),
                 )
             if report:

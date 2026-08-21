@@ -7,6 +7,6 @@
   "scripts": {
     "test:browser": "playwright test",
     "perf:synthetic-dom": "node scripts/diagnostics/synthetic_dom_microbenchmark.js",
-    "perf:browser-ab": "npm run perf:synthetic-dom"
+    "perf:browser-ab": "node scripts/diagnostics/release_performance_ab.js"
   }
 }

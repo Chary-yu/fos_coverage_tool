@@ -3,7 +3,7 @@
 > 文档版本：v1.2（Skill 联合审计闭环版）  
 > 更新日期：2026-08-21  
 > 适用项目：`Chary-yu/fos_coverage_tool`  
-> 代码基线：`main@bc989ec38b1260252f4081ec935aa7cce9a7a5a7`  
+> 代码基线：`main`（具体 Candidate SHA 由本次 Evidence Manifest v2 的 `candidate_revision` 固定）
 > 上游设计基线：`FOS_Coverage_数据库兼容与分析继承升级方案_v2.0.md`  
 > 生产证据基线：`fos_full_inventory_20260820_135937`  
 > 首要硬约束：**兼容旧库是数据库设计最高级硬约束。任何 Gate、DDL、Migration、Repository、Service、API、Job、Inheritance Engine、UI 或发布脚本均不得破坏 Legacy → VNext 的零损失迁移契约。**
@@ -274,6 +274,7 @@ Git/DB/事务/流程完整性失败 → TECHNICAL_FAILURE / Scan 不发布
 
 - `scripts/upgrade/migration_runner.py`
 - `scripts/upgrade/vnext_schema.sql`
+- `scripts/upgrade/vnext_domain_constraints.sql`
 - `scripts/upgrade/schema_preflight.py`
 - `scripts/upgrade/run_upgrade.py`
 - `scripts/upgrade/cutover_controller.py`
@@ -780,6 +781,7 @@ Gate A PASS 必须至少执行一次 **verified production backup 的恢复副�
 ```text
 scripts/upgrade/migration_runner.py
 scripts/upgrade/vnext_schema.sql
+scripts/upgrade/vnext_domain_constraints.sql
 scripts/upgrade/schema_preflight.py
 scripts/upgrade/evidence_manifest.py
 app/db/repositories/project_repository.py
@@ -2840,6 +2842,25 @@ DOM nodes after settle    <= baseline * 1.20
 
 任何超过 budget 的结果默认 Gate E `BLOCKED`；若性能指标受新增必要信息影响，需要先做根因拆分和书面 P2 风险接受，不能直接把阈值改宽。
 
+`scripts/diagnostics/synthetic_dom_microbenchmark.js` 只输出同一版本内的
+DOM 微基准和浏览器功能数据，不能作为发布 A/B。发布性能证据必须先在两个
+隔离且精确绑定 commit 的 checkout 中分别产生
+`release_performance_revision`，再使用：
+
+```text
+npm run perf:browser-ab -- \
+  --baseline-artifact <before.json> \
+  --candidate-artifact <candidate.json> \
+  --baseline-commit <before-sha> \
+  --candidate-commit <candidate-sha> \
+  --workload-hash <固定 workload hash> \
+  --output <release-performance-ab.json>
+```
+
+合并器会校验两个源产物的 SHA256、workload/environment identity、A-D 固定
+规模和 100k 虚拟滚动预算；`run_upgrade.py` 只接受该
+`release_performance_ab` 产物。
+
 
 ## 9.17 Gate E 主要修改文件
 
@@ -4063,4 +4084,3 @@ Gate F：用隔离 Candidate 完成迁移、验证、切换、回滚和 Skill �
 **R83** 当前 Scan 的拒绝继承，在尚未形成新的人工分析结果前允许人工显式撤销；撤销只恢复当前 Scan 的 `INHERITED_PENDING`，系统不得自动撤销；已经计算完成的后续 Scan 不做追溯重写。
 
 ---
-

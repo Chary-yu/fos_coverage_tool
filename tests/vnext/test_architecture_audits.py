@@ -5,7 +5,10 @@ import unittest
 
 from scripts.diagnostics.runtime_legacy_dependency_audit import audit as audit_legacy
 from scripts.diagnostics.runtime_participation_audit import audit as audit_participation
-from scripts.diagnostics.active_runtime_audit import audit as audit_active_runtime
+from scripts.diagnostics.active_runtime_audit import (
+    _bound_config,
+    audit as audit_active_runtime,
+)
 from scripts.diagnostics.configured_runtime_audit import audit as audit_configured_runtime
 from scripts.diagnostics.frontend_vnext_api_contract_audit import audit as audit_frontend
 from scripts.diagnostics.scan_immutability_audit import audit as audit_immutability
@@ -46,6 +49,23 @@ class ArchitectureAuditTest(unittest.TestCase):
         self.assertEqual(retirement["legacy_implementation_status"], "TRANSITIONAL_LEGACY")
         self.assertTrue(retirement["retirement_checks"]["no_legacy_deployment"])
         self.assertFalse(retirement["retirement_checks"]["legacy_usage_zero_for_window"])
+
+    def test_active_runtime_binding_uses_process_candidate_config(self):
+        process = {
+            "available": True,
+            "repo_root": os.getcwd(),
+            "cmdline": ["python", "enhance_coverage.py", "server", "--config",
+                         "config/coverage_config.staging.example.json"],
+            "environment": {},
+        }
+        result = _bound_config(process)
+        self.assertEqual(
+            result["selected_realpath"],
+            os.path.realpath(os.path.join(
+                os.getcwd(), "config/coverage_config.staging.example.json"
+            )),
+        )
+        self.assertTrue(result["matches_requested"])
 
     def test_changed_test_selection_fails_closed_when_revision_is_unavailable(self):
         with self.assertRaises(DiffResolutionError):

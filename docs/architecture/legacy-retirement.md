@@ -31,6 +31,16 @@ COVERAGE_LEGACY_COMPAT_TESTS_MANIFEST
 COVERAGE_LEGACY_RETIREMENT_MANIFEST
 ```
 
+CI produces the compatibility-surface portion with:
+
+```text
+python scripts/diagnostics/legacy_compatibility_smoke.py \
+  --output .artifacts/vnext/legacy-compatibility.json
+```
+
+That artifact proves the import surface only. It does not prove that the
+large compatibility implementations are unused or safe to delete.
+
 It reports each condition separately. Missing compatibility/deprecation-window
 or release evidence keeps the result `INCOMPLETE`; `--strict` exits non-zero.
 

@@ -76,7 +76,7 @@ def build_directory_detail_workbook(
     ws = wb.create_sheet(title="未覆盖代码明细")
     
     headers = [
-        "文件路径", "行号", "分析状态", "确认人",
+        "文件路径", "行号", "分析状态", "确认 Reviewer", "Suggested Reviewer",
         "条件覆盖方法", "无条件覆盖原因", "代码内容"
     ]
     ws.append(headers)
@@ -87,6 +87,7 @@ def build_directory_detail_workbook(
             r.get("line_number", 0),
             r.get("status", "未确认"),
             r.get("reviewer", ""),
+            r.get("suggested_reviewer", ""),
             r.get("coverage_method", ""),
             r.get("uncovered_reason", ""),
             r.get("code_line", "")

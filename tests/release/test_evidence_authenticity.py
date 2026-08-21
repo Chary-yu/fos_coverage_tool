@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+import json
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
@@ -51,11 +52,39 @@ class TestEvidenceAuthenticity(unittest.TestCase):
             record = manifest.record(
                 "schema", "db-integration", "PASSED", "unit-test", 0,
                 artifact_path=artifact,
+                database_runtime_identity={"engine": "sqlite", "database": "test"},
             )
             self.assertEqual(record["candidate_revision"], "abc")
             self.assertTrue(record["artifact_sha256"])
             self.assertEqual(manifest.validate(), (True, []))
             self.assertTrue(manifest.data["manifest_sha256"])
+
+    def test_evidence_manifest_v2_rejects_changed_artifact_and_synthetic_pass(self):
+        with tempfile.TemporaryDirectory() as root:
+            artifact = os.path.join(root, "evidence.json")
+            with open(artifact, "w") as stream:
+                stream.write("original")
+            manifest = EvidenceManifestV2(root, "gate-a", candidate_revision="abc")
+            manifest.record(
+                "artifact", "repository_audit", "PASSED", "unit-test", 0,
+                artifact_path=artifact,
+            )
+            with open(artifact, "w") as stream:
+                stream.write("changed")
+            self.assertFalse(manifest.validate()[0])
+            manifest.record(
+                "synthetic", "microbenchmark", "PASSED", "unit-test", 0,
+                synthetic=True,
+            )
+            valid, errors = manifest.validate()
+            self.assertFalse(valid)
+            self.assertTrue(any("synthetic" in item for item in errors))
+
+    def test_evidence_manifest_v2_schema_is_versioned(self):
+        path = os.path.join(ROOT, "docs", "contracts", "evidence_manifest_v2.schema.json")
+        with open(path, "r", encoding="utf-8") as stream:
+            schema = json.load(stream)
+        self.assertEqual(schema["properties"]["evidence_schema_version"]["const"], 2)
 
 
 if __name__ == "__main__":

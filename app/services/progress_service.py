@@ -29,7 +29,10 @@ class ProgressService(object):
                 "data_version": int(state.get("data_version") or 0),
                 "file_state_version": int(state.get("file_state_version") or 0),
                 "total_uncovered": 0, "filled_total": 0, "draft_total": 0,
-                "confirmed_total": 0, "pending_total": 0, "pending_line_references": [],
+                "confirmed_total": 0, "pending_total": 0,
+                "ordinary_pending_total": 0, "inherited_pending_total": 0,
+                "manual_draft_pending_total": 0, "pending_line_references": [],
+                "pending_conservation": {"status": "PASSED", "mismatched_files": 0},
             }
         ready = (
             int(state.get("file_state_version") or 0) == int(state.get("data_version") or 0)
@@ -38,15 +41,27 @@ class ProgressService(object):
         if ready:
             aggregate = self.file_states.scan_aggregate(connection, scan_id)
             if aggregate and int(aggregate.get("file_count") or 0) > 0:
-                return self._aggregate_file_state_summary(
+                result = self._aggregate_file_state_summary(
                     project_name, scan_id, state, aggregate
                 )
+                result["pending_conservation"] = self.file_states.pending_conservation(
+                    connection, int(scan_id)
+                )
+                return result
         result = self.file_states.scan_summary_from_facts(connection, scan_id)
         result.update({
             "project_name": project_name,
             "source": "authoritative",
             "data_version": int(state.get("data_version") or 0),
             "file_state_version": int(state.get("file_state_version") or 0),
+            "pending_conservation": {
+                "status": "PASSED" if int(result.get("pending_total") or 0) == (
+                    int(result.get("ordinary_pending_total") or 0)
+                    + int(result.get("inherited_pending_total") or 0)
+                    + int(result.get("manual_draft_pending_total") or 0)
+                ) else "FAILED",
+                "mismatched_files": 0,
+            },
         })
         return result
 
@@ -64,6 +79,9 @@ class ProgressService(object):
             "draft_total": int(aggregate.get("draft_total") or 0),
             "confirmed_total": int(aggregate.get("confirmed_total") or 0),
             "pending_total": int(aggregate.get("pending_total") or 0),
+            "ordinary_pending_total": int(aggregate.get("ordinary_pending_total") or 0),
+            "inherited_pending_total": int(aggregate.get("inherited_pending_total") or 0),
+            "manual_draft_pending_total": int(aggregate.get("manual_draft_pending_total") or 0),
             # Pending references are intentionally served by the separate
             # /incremental/unanalyzed endpoint so the progress homepage stays
             # an O(1) aggregate query.

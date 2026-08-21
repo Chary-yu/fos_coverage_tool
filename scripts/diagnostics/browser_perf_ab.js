@@ -1,4 +1,3 @@
 #!/usr/bin/env node
-// Compatibility command. The canonical evidence producer is now named
-// synthetic_dom_microbenchmark.js because this workload is not release A/B.
-require('./synthetic_dom_microbenchmark.js');
+// Compatibility entry point for the release A/B evidence combiner.
+require('./release_performance_ab.js');

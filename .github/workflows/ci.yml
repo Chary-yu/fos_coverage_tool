@@ -91,6 +91,10 @@ jobs:
         run: python scripts/diagnostics/connection_pool_audit.py
       - name: Verify durable job lifecycle contract
         run: python scripts/diagnostics/job_lifecycle_audit.py
+      - name: Verify legacy compatibility surfaces
+        run: >-
+          python scripts/diagnostics/legacy_compatibility_smoke.py
+          --output .artifacts/vnext/legacy-compatibility.json
       - name: Verify changed-path specialist mapping
         env:
           GITHUB_EVENT_BEFORE: ${{ github.event.before }}
@@ -102,7 +106,15 @@ jobs:
           --head "${GITHUB_SHA}" --run-tests
           --manifest .artifacts/vnext/changed_test_selection.json
       - name: Build machine-readable VNext evidence matrix
+        env:
+          COVERAGE_LEGACY_COMPAT_TESTS_MANIFEST: .artifacts/vnext/legacy-compatibility.json
         run: mkdir -p .artifacts/vnext && python scripts/diagnostics/build_vnext_evidence.py .artifacts/vnext/architecture_ownership_matrix.json
+      - name: Build fail-closed Gate A-F evidence matrix
+        env:
+          COVERAGE_LEGACY_COMPAT_TESTS_MANIFEST: .artifacts/vnext/legacy-compatibility.json
+        run: >-
+          python scripts/diagnostics/gate_matrix.py --allow-incomplete
+          --output .artifacts/vnext/gate-matrix.json
       - name: Upload VNext machine evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
@@ -227,10 +239,6 @@ jobs:
       - name: Run required real-browser and canonical VNext HTTP suites
         run: mkdir -p .artifacts && npx playwright test tests/browser --reporter=json > .artifacts/browser_playwright.json
       - run: mkdir -p .artifacts && npm run perf:synthetic-dom -- .artifacts/synthetic_dom_microbenchmark.json
-        env:
-          BASELINE_COMMIT: ${{ github.event.before }}
-          CANDIDATE_COMMIT: ${{ github.sha }}
-          WORKLOAD_HASH: chromium-dom-batch-v1
       - name: Validate browser performance evidence boundary
         run: python scripts/diagnostics/performance_evidence_audit.py .artifacts/synthetic_dom_microbenchmark.json --allow-partial
       - name: Upload browser functional evidence

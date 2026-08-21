@@ -6,6 +6,9 @@ import os
 import subprocess
 
 
+SOURCE_EXTENSIONS = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx")
+
+
 class GitTechnicalFailure(RuntimeError):
     pass
 
@@ -72,3 +75,16 @@ class GitSnapshotProvider(object):
         if os.path.isabs(str(relative_path)) or ".." in str(relative_path).replace("\\", "/").split("/"):
             raise ValueError("source path must be repository-relative")
         return self._run(["show", "{}:{}".format(commit, relative_path)])
+
+    def list_source_files(self, commit):
+        """List the repository C/C++ universe for dependency resolution."""
+        output = self._run(["ls-tree", "-r", "--name-only", str(commit)])
+        paths = []
+        for value in output.splitlines():
+            path = value.strip().replace("\\", "/")
+            if (not path or os.path.isabs(path) or
+                    ".." in path.split("/") or
+                    not path.lower().endswith(SOURCE_EXTENSIONS)):
+                continue
+            paths.append(path)
+        return sorted(set(paths))

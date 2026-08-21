@@ -86,7 +86,13 @@ def build_fixture():
 
     config = {
         "project_name": "HttpFixture",
-        "auth": {"mode": "disabled"},
+        "auth": {
+            "mode": "reverse_proxy",
+            "trusted_proxy_addresses": ["127.0.0.1"],
+            "user_header": "X-Remote-User",
+            "role_header": "X-Remote-Role",
+            "roles": {"browser-reviewer": "reviewer"},
+        },
         "runtime_state": {"root": state_root},
         "report_roots": [report_root],
         "input_roots": [root],
@@ -148,6 +154,13 @@ def build_fixture():
     class FixtureHandler(VNextHTTPRequestHandler):
         application = runtime.application()
 
+        def _inject_fixture_identity(self):
+            # The disposable HTTP fixture represents a trusted reverse proxy.
+            # This keeps the browser lane on the same authenticated-reviewer
+            # contract as production without requiring a real proxy process.
+            self.headers["X-Remote-User"] = "browser-reviewer"
+            self.headers["X-Remote-Role"] = "reviewer"
+
         @staticmethod
         def _asset(path):
             with open(os.path.join(ROOT, path), "rb") as stream:
@@ -161,6 +174,7 @@ def build_fixture():
             self.wfile.write(data)
 
         def do_GET(self):
+            self._inject_fixture_identity()
             path = urlsplit(self.path).path
             if path == "/coverage_enhance.js":
                 return self._send_static(
@@ -193,6 +207,10 @@ def build_fixture():
                 ).encode("utf-8")
                 return self._send_static(html, "text/html; charset=utf-8")
             return super(FixtureHandler, self).do_GET()
+
+        def do_POST(self):
+            self._inject_fixture_identity()
+            return super(FixtureHandler, self).do_POST()
 
     server.RequestHandlerClass = FixtureHandler
     original_server_close = server.server_close

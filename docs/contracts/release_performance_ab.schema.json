@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fos-coverage-tool.invalid/contracts/release-performance-ab.schema.json",
+  "title": "FOS Coverage release performance A/B evidence",
+  "type": "object",
+  "required": [
+    "status",
+    "evidence_class",
+    "comparison_type",
+    "workload_id",
+    "workload_hash",
+    "baseline_commit",
+    "candidate_commit",
+    "environment_identity",
+    "baseline_artifact",
+    "candidate_artifact",
+    "Tier_A_1k",
+    "Tier_B_10k",
+    "Tier_C_50k",
+    "Tier_D_100k",
+    "coverage_virtual_scroll_100k"
+  ],
+  "properties": {
+    "status": {"const": "PASSED"},
+    "evidence_class": {"const": "release_performance_ab"},
+    "comparison_type": {"const": "release_revision_ab"},
+    "workload_id": {"type": "string", "minLength": 1},
+    "workload_hash": {"type": "string", "minLength": 1},
+    "baseline_commit": {"type": "string", "minLength": 1},
+    "candidate_commit": {"type": "string", "minLength": 1},
+    "environment_identity": {"type": "object", "minProperties": 1},
+    "baseline_artifact": {"$ref": "#/$defs/sourceArtifact"},
+    "candidate_artifact": {"$ref": "#/$defs/sourceArtifact"},
+    "Tier_A_1k": {"$ref": "#/$defs/tier"},
+    "Tier_B_10k": {"$ref": "#/$defs/tier"},
+    "Tier_C_50k": {"$ref": "#/$defs/tier"},
+    "Tier_D_100k": {"$ref": "#/$defs/tier"},
+    "coverage_virtual_scroll_100k": {
+      "type": "object",
+      "required": ["status", "candidate_elapsed_ms", "baseline_elapsed_ms"],
+      "properties": {
+        "status": {"const": "PASSED"},
+        "baseline_elapsed_ms": {"type": "number"},
+        "candidate_elapsed_ms": {"type": "number"},
+        "regression_percent": {"type": "number"}
+      }
+    }
+  },
+  "$defs": {
+    "sourceArtifact": {
+      "type": "object",
+      "required": ["path", "sha256", "revision"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
+        "revision": {"type": "string", "minLength": 1}
+      }
+    },
+    "tier": {
+      "type": "object",
+      "required": ["status", "baseline_ms", "candidate_ms", "regression_percent"],
+      "properties": {
+        "status": {"const": "PASSED"},
+        "baseline_ms": {"type": "number"},
+        "candidate_ms": {"type": "number"},
+        "regression_percent": {"type": "number"},
+        "regression_budget_percent": {"type": "number"}
+      }
+    }
+  }
+}

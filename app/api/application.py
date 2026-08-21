@@ -275,7 +275,7 @@ class VNextApplication(object):
                          "scans": self.runtime.project_service.list_scans(connection, project_name)}
 
     @staticmethod
-    def _decode_cursor(value):
+    def _decode_cursor(value, scan_id, data_version, filter_key):
         if not value:
             return None
         try:
@@ -283,16 +283,24 @@ class VNextApplication(object):
             payload = json.loads(raw.decode("utf-8"))
             if not isinstance(payload, dict) or "id" not in payload:
                 raise ValueError
+            if (int(payload.get("scan_id")) != int(scan_id) or
+                    int(payload.get("data_version")) != int(data_version) or
+                    str(payload.get("filter") or "") != str(filter_key)):
+                raise ValueError("stale")
             return int(payload["id"])
         except Exception:
-            # Do not let malformed opaque cursors become an unbounded query.
-            raise ValueError("invalid inheritance cursor")
+            # A cursor is bound to the exact Scan snapshot and filter.  Never
+            # silently reuse an old id against a new data version.
+            raise ValueError("PAGINATION_CURSOR_STALE")
 
     @staticmethod
-    def _encode_cursor(identifier):
+    def _encode_cursor(identifier, scan_id, data_version, filter_key):
         if identifier is None:
             return None
-        raw = json.dumps({"id": int(identifier)}, sort_keys=True).encode("utf-8")
+        raw = json.dumps({
+            "id": int(identifier), "scan_id": int(scan_id),
+            "data_version": int(data_version), "filter": str(filter_key),
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return base64.urlsafe_b64encode(raw).decode("ascii")
 
     def _inheritance_scan(self, connection, scan_id):
@@ -306,10 +314,18 @@ class VNextApplication(object):
 
     def inheritance_pending(self, scan_id, query, body, headers, remote_address):
         limit = min(500, max(1, int(query.get("limit") or 100)))
-        cursor = self._decode_cursor(query.get("cursor"))
+        filter_key = "pending"
         with self._read_connection() as connection:
-            self._inheritance_scan(connection, int(scan_id))
-            clauses = ["d.candidate_scan_id=?", "d.decision='INHERITED'"]
+            _, project = self._inheritance_scan(connection, int(scan_id))
+            state = self.runtime.states.get(connection, int(project["id"])) or {}
+            data_version = int(state.get("data_version") or 0)
+            cursor = self._decode_cursor(
+                query.get("cursor"), scan_id, data_version, filter_key
+            )
+            clauses = [
+                "d.candidate_scan_id=?", "d.decision='INHERITED'",
+                "q.is_active=1", "q.review_state='INHERITED_PENDING'",
+            ]
             params = [int(scan_id)]
             if cursor is not None:
                 clauses.append("d.id>?" )
@@ -335,18 +351,29 @@ class VNextApplication(object):
         rows = rows[:limit]
         return 200, {
             "scan_id": int(scan_id), "limit": limit,
+            "data_version": data_version,
             "items": rows, "next_cursor": self._encode_cursor(
-                rows[-1]["decision_id"] if has_more and rows else None
+                rows[-1]["decision_id"] if has_more and rows else None,
+                scan_id, data_version, filter_key,
             ), "has_more": has_more,
         }
 
     def inheritance_decisions(self, scan_id, query, body, headers, remote_address):
         limit = min(500, max(1, int(query.get("limit") or 100)))
-        cursor = self._decode_cursor(query.get("cursor"))
+        reason_code = str(query.get("reason_code") or "").strip()
+        filter_key = "decisions:" + reason_code
         with self._read_connection() as connection:
-            self._inheritance_scan(connection, int(scan_id))
+            _, project = self._inheritance_scan(connection, int(scan_id))
+            state = self.runtime.states.get(connection, int(project["id"])) or {}
+            data_version = int(state.get("data_version") or 0)
+            cursor = self._decode_cursor(
+                query.get("cursor"), scan_id, data_version, filter_key
+            )
             clauses = ["candidate_scan_id=?"]
             params = [int(scan_id)]
+            if reason_code:
+                clauses.append("reason_code=?")
+                params.append(reason_code)
             if cursor is not None:
                 clauses.append("id>?" )
                 params.append(cursor)
@@ -356,8 +383,12 @@ class VNextApplication(object):
             """.format(where=" AND ".join(clauses)), params + [limit + 1])
         has_more = len(rows) > limit
         rows = rows[:limit]
-        return 200, {"scan_id": int(scan_id), "items": rows,
-                     "next_cursor": self._encode_cursor(rows[-1]["id"] if has_more and rows else None),
+        return 200, {"scan_id": int(scan_id), "data_version": data_version,
+                     "reason_code": reason_code, "items": rows,
+                     "next_cursor": self._encode_cursor(
+                         rows[-1]["id"] if has_more and rows else None,
+                         scan_id, data_version, filter_key,
+                     ),
                      "has_more": has_more}
 
     def _current_scan_context(self, connection, scan_id):
@@ -419,6 +450,16 @@ class VNextApplication(object):
             if not records:
                 raise ValueError("records are required")
             expected_revision = (body or {}).get("expected_record_revision")
+            expected_relation = (body or {}).get("expected_relation_revision")
+            expected_relation_map = (body or {}).get("expected_relation_revisions") or {}
+            if expected_revision is None and any(
+                    item.get("expected_record_revision") is None
+                    for item in records if isinstance(item, dict)):
+                raise ValueError("EXPECTED_RECORD_REVISION_REQUIRED")
+            if expected_relation is None and not expected_relation_map and any(
+                    item.get("expected_relation_revision") is None
+                    for item in records if isinstance(item, dict)):
+                raise ValueError("STALE_RELATION_REVISION")
             if expected_revision is not None:
                 records = [
                     dict(item, expected_record_revision=item.get(
@@ -426,9 +467,24 @@ class VNextApplication(object):
                     ))
                     for item in records
                 ]
+            if expected_relation is not None or expected_relation_map:
+                records = [
+                    dict(item, expected_relation_revision=item.get(
+                        "expected_relation_revision",
+                        expected_relation_map.get(str(item.get("line_id")),
+                                                  expected_relation_map.get(
+                                                      item.get("line_id"), expected_relation)),
+                    ))
+                    for item in records
+                ]
+            # The client-side reviewer field is a UI convenience/suggestion,
+            # never an identity credential. Persist the authenticated
+            # operator that performed the mutation for every selected line.
+            records = [dict(item, reviewer=identity) for item in records]
             result = self.runtime.analysis_service.save(
                 connection, project["project_name"], int(scan_id), records,
-                reviewer=(body or {}).get("reviewer") or identity,
+                reviewer=identity,
+                enforce_current=True,
             )
         return 200, result
 
@@ -750,10 +806,15 @@ class VNextApplication(object):
     def save_analysis(self, query, body, headers, remote_address):
         identity = self._require_role(headers, remote_address, ("reviewer", "admin"))
         project_name, scan_id, records = analysis_endpoint.request(body)
+        # Do not trust a reviewer value supplied in JSON. The Git
+        # ``suggested_reviewer`` is separate metadata, and the saved DB
+        # reviewer is the authenticated operator who confirmed the analysis.
+        records = [dict(item, reviewer=identity) for item in records]
         with self._write_connection() as connection:
             result = self.runtime.analysis_service.save(
                 connection, project_name, scan_id, records,
-                reviewer=body.get("reviewer") or identity,
+                reviewer=identity,
+                enforce_current=True,
             )
         return 200, result
 

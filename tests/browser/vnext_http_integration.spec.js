@@ -132,7 +132,7 @@ test('canonical frontend talks to the real VNext HTTP server', async ({ page }) 
     });
     expect(savedLine.lines[0].analysis).toMatchObject({
       status: '可覆盖',
-      reviewer: 'http-reviewer',
+      reviewer: 'browser-reviewer',
     });
 
     const runtimeMetrics = await page.evaluate(async () => {

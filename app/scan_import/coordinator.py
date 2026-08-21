@@ -107,10 +107,8 @@ class ScanImportCoordinator(object):
                         verified=int(bool(snapshot.get("verified"))),
                         provenance=snapshot.get("provenance", ""),
                         repository_id=repository_id,
-                        commit_sha=(snapshot.get("commit_sha") or
-                                    snapshot.get("new_commit_sha")),
-                        identity_verified=int(bool(snapshot.get(
-                            "identity_verified", snapshot.get("verified")))),
+                        commit_sha=snapshot.get("commit_sha"),
+                        identity_verified=int(bool(snapshot.get("identity_verified", False))),
                         identity_provenance=snapshot.get("identity_provenance", ""),
                     )
                 if report:

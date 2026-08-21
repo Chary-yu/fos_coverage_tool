@@ -16,7 +16,7 @@ from app.db.repositories.analysis_domain_repository import (
 )
 from app.db.repositories.base import adapt_sql, execute, fetchall, fetchone
 from app.inheritance.cpp_parser import CppSourceAnalyzer
-from app.inheritance.dependencies import DependencyResolver
+from app.inheritance.dependencies import DependencyResolver, SourceAnalysisIndex
 from app.inheritance.git_snapshot import GitSnapshotProvider, GitTechnicalFailure
 from app.inheritance.line_map import GitLineMapEngine
 from app.inheritance.normalizer import normalize_cpp
@@ -40,9 +40,13 @@ class InheritanceEngine(object):
         self.parser = parser or CppSourceAnalyzer()
         self.dependencies = dependency_resolver or DependencyResolver()
         self.domain = domain_repository or AnalysisDomainRepository()
+        self._source_index_cache = {}
+        self._ancestry_cache = {}
+        self._metrics = {}
 
     def compare_line(self, old_line, new_line, old_analysis=None, new_analysis=None,
-                     old_line_number=None, new_line_number=None):
+                     old_line_number=None, new_line_number=None,
+                     old_index=None, new_index=None):
         old_analysis = old_analysis or {}
         new_analysis = new_analysis or {}
         old_line_number = int(old_line_number or old_analysis.get("line_number") or 0)
@@ -69,7 +73,13 @@ class InheritanceEngine(object):
             return self._result(False, "PP_CONTEXT_CHANGED")
         old_dep = dict(old_analysis, line_number=old_line_number)
         new_dep = dict(new_analysis, line_number=new_line_number)
-        dependency = self.dependencies.compare(old_dep, new_dep, old_line, new_line)
+        old_context = self._dependency_context(old_analysis, old_line_number)
+        new_context = self._dependency_context(new_analysis, new_line_number)
+        dependency = self.dependencies.compare(
+            old_dep, new_dep, old_line, new_line,
+            old_context=old_context, new_context=new_context,
+            old_index=old_index, new_index=new_index,
+        )
         if not dependency.ok:
             return self._result(False, dependency.reason_code,
                                 dependency_fingerprint=dependency.fingerprint)
@@ -89,6 +99,19 @@ class InheritanceEngine(object):
 
     def run(self, connection, candidate_scan_id, repository_paths=None,
             decision_run_id=None, algorithm_version=ALGORITHM_VERSION):
+        self._metrics = {
+            "parser_candidate_total": 0,
+            "parser_unresolved_total": 0,
+            "callee_unresolved_total": 0,
+            "macro_unresolved_total": 0,
+            "const_unresolved_total": 0,
+            "parser_cache_hit": 0,
+            "parser_cache_miss": 0,
+            "parser_unresolved_by_reason": {},
+            "callee_unresolved_by_reason": {},
+            "macro_unresolved_by_reason": {},
+            "const_unresolved_by_reason": {},
+        }
         candidate = fetchone(connection, "SELECT * FROM coverage_scans WHERE id=?",
                              (int(candidate_scan_id),))
         if not candidate:
@@ -105,7 +128,8 @@ class InheritanceEngine(object):
                 connection, candidate_scan_id, run_id, algorithm_version, "NO_PREDECESSOR"
             )
             return {"status": "PASSED", "decision_run_id": run_id,
-                    "decisions": decisions, "inherited": 0, "pending": len(decisions)}
+                    "decisions": decisions, "inherited": 0,
+                    "pending": len(decisions), "metrics": dict(self._metrics)}
         repository_paths = repository_paths or {}
         source_relations = fetchall(connection, """
             SELECT q.*, l.line_number AS source_line_number, l.line_text AS source_line_text,
@@ -127,6 +151,10 @@ class InheritanceEngine(object):
         """, (int(candidate_scan_id),))
         candidate_by_path = {
             (str(row.get("repository_name") or ""), str(row.get("file_path") or "")): row
+            for row in candidate_lines
+        }
+        candidate_by_file_line = {
+            (int(row.get("file_id") or 0), int(row.get("line_number") or 0)): row
             for row in candidate_lines
         }
         decisions = []
@@ -164,9 +192,9 @@ class InheritanceEngine(object):
                     reason, algorithm_version, mapping=mapping,
                 ))
                 continue
-            target_line = next((row for row in candidate_lines
-                                if row.get("id") == target_file.get("id") and
-                                int(row.get("line_number")) == int(new_line_number)), None)
+            target_line = candidate_by_file_line.get(
+                (int(target_file.get("id") or 0), int(new_line_number))
+            )
             if not target_line:
                 continue
             existing_decision = fetchone(connection, """
@@ -191,7 +219,36 @@ class InheritanceEngine(object):
                 old_line_text, new_line_text,
                 old_analysis, new_analysis,
                 relation.get("source_line_number"), new_line_number,
+                old_index=source_snapshot.get("old_index"),
+                new_index=source_snapshot.get("new_index"),
             )
+            self._metrics["parser_candidate_total"] += 1
+            if result.reason_code in (
+                    "FUNCTION_ID_UNRESOLVED", "PARSER_UNRELIABLE",
+                    "CALLEE_UNRESOLVED", "MACRO_CHANGED", "CONST_CHANGED"):
+                self._metrics["parser_unresolved_total"] += 1
+                by_reason = self._metrics["parser_unresolved_by_reason"]
+                by_reason[result.reason_code] = int(
+                    by_reason.get(result.reason_code) or 0
+                ) + 1
+            if result.reason_code == "CALLEE_UNRESOLVED":
+                self._metrics["callee_unresolved_total"] += 1
+                by_reason = self._metrics["callee_unresolved_by_reason"]
+                by_reason[result.reason_code] = int(
+                    by_reason.get(result.reason_code) or 0
+                ) + 1
+            if result.reason_code == "MACRO_CHANGED":
+                self._metrics["macro_unresolved_total"] += 1
+                by_reason = self._metrics["macro_unresolved_by_reason"]
+                by_reason[result.reason_code] = int(
+                    by_reason.get(result.reason_code) or 0
+                ) + 1
+            if result.reason_code == "CONST_CHANGED":
+                self._metrics["const_unresolved_total"] += 1
+                by_reason = self._metrics["const_unresolved_by_reason"]
+                by_reason[result.reason_code] = int(
+                    by_reason.get(result.reason_code) or 0
+                ) + 1
             result.mapping_fingerprint = mapping.fingerprint
             if result.ok and (not relation.get("analysis_block_id") or
                               not int(relation.get("block_identity_verified") or 0)):
@@ -247,7 +304,8 @@ class InheritanceEngine(object):
         return {"status": "PASSED", "decision_run_id": run_id,
                 "decisions": decisions,
                 "inherited": len([item for item in decisions if item.get("decision") == "INHERITED"]),
-                "pending": len([item for item in decisions if item.get("decision") != "INHERITED"])}
+                "pending": len([item for item in decisions if item.get("decision") != "INHERITED"]),
+                "metrics": dict(self._metrics)}
 
     def _ordinary_pending_decisions(self, connection, scan_id, run_id, version, reason):
         rows = fetchall(connection, """
@@ -278,26 +336,65 @@ class InheritanceEngine(object):
         """, (int(scan_id), str(repository_name or ""))) or {}
 
     def _snapshot_for_relation(self, relation, repo_path, old_snapshot, new_snapshot):
-        if repo_path and old_snapshot.get("commit_sha") and new_snapshot.get("commit_sha"):
+        old_commit = old_snapshot.get("commit_sha")
+        new_commit = new_snapshot.get("commit_sha")
+        if old_commit and new_commit and not (
+                int(old_snapshot.get("identity_verified") or 0) and
+                int(new_snapshot.get("identity_verified") or 0)):
+            return {"reason_code": "REPOSITORY_IDENTITY_UNVERIFIED"}
+        if not old_commit or not new_commit:
+            return {"reason_code": "REPOSITORY_IDENTITY_UNVERIFIED"}
+        if repo_path and old_commit and new_commit:
             try:
                 provider = GitSnapshotProvider(repo_path)
-                provider.ensure_commit(old_snapshot["commit_sha"])
-                provider.ensure_commit(new_snapshot["commit_sha"])
-                old_text = provider.read_file(old_snapshot["commit_sha"], relation["file_path"])
-                new_text = provider.read_file(new_snapshot["commit_sha"], relation["file_path"])
+                provider.ensure_commit(old_commit)
+                provider.ensure_commit(new_commit)
+                ancestry_key = (provider.repo_path, str(old_commit), str(new_commit))
+                if ancestry_key not in self._ancestry_cache:
+                    self._ancestry_cache[ancestry_key] = provider.is_ancestor(
+                        old_commit, new_commit
+                    )
+                if not self._ancestry_cache[ancestry_key]:
+                    return {"reason_code": "NON_ANCESTOR"}
+                old_text = provider.read_file(old_commit, relation["file_path"])
+                new_text = provider.read_file(new_commit, relation["file_path"])
                 mapping = self.line_mapper.map_git_file(
-                    repo_path, old_snapshot["commit_sha"], new_snapshot["commit_sha"],
+                    repo_path, old_commit, new_commit,
                     relation["file_path"],
                 )
-                return {"old_text": old_text, "new_text": new_text, "mapping": mapping}
+                old_index = self._source_index(provider, old_commit)
+                new_index = self._source_index(provider, new_commit)
+                return {"old_text": old_text, "new_text": new_text, "mapping": mapping,
+                        "old_index": old_index, "new_index": new_index}
             except GitTechnicalFailure as exc:
                 raise InheritanceTechnicalFailure(str(exc))
             except (OSError, ValueError) as exc:
                 raise InheritanceTechnicalFailure(str(exc))
-        # A fixture without Git identity can still exercise the pure line
-        # contract.  It is conservative and never invents source context.
-        text = relation.get("source_line_text") or ""
-        return {"old_text": text, "new_text": text}
+        # A production inheritance run cannot substitute a live/current text
+        # or a database line for an immutable Git snapshot.  Pure parser unit
+        # tests call compare_line directly; the durable run remains fail-closed.
+        return {"reason_code": "REPOSITORY_PATH_UNAVAILABLE"}
+
+    def _source_index(self, provider, commit):
+        key = (provider.repo_path, str(commit), self.parser.__class__.__name__)
+        if key in self._source_index_cache:
+            self._metrics["parser_cache_hit"] += 1
+            return self._source_index_cache[key]
+        self._metrics["parser_cache_miss"] += 1
+        analyses = {}
+        for path in provider.list_source_files(commit):
+            text = provider.read_file(commit, path)
+            analyses[path] = self.parser.analyze(text, path)
+        index = SourceAnalysisIndex(analyses)
+        self._source_index_cache[key] = index
+        return index
+
+    @staticmethod
+    def _dependency_context(analysis, line_number):
+        context = []
+        context.extend((analysis.get("controls") or {}).get(int(line_number), ()) or ())
+        context.extend((analysis.get("preprocessor") or {}).get(int(line_number), ()) or ())
+        return context
 
     @staticmethod
     def _ensure_group(connection, run_id, candidate_scan_id, source_scan_id,

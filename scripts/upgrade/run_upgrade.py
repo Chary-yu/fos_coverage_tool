@@ -18,6 +18,8 @@ import os
 import sys
 import time
 import json
+import hashlib
+import math
 import subprocess
 import logging
 import argparse
@@ -41,13 +43,138 @@ from scripts.upgrade.schema_preflight import (
 from scripts.diagnostics.path_mapping_audit import audit_path_mappings, audit_lcov_paths
 from scripts.diagnostics.security_scanner import scan_directory
 from scripts.diagnostics.sidecar_registry_audit import audit_sidecar_and_registry
-from scripts.diagnostics.perf_benchmark import run_performance_suite
 from scripts.maintenance.mysql_backup import perform_database_backup
 from scripts.upgrade.migrate_file_state import backfill_all_projects
 from scripts.upgrade.cutover_controller import CutoverController
 from app.upgrade.lifecycle import UpgradeLifecycle
 
 logger = logging.getLogger(__name__)
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_release_performance_artifact(path: str, payload: Dict[str, Any],
+                                           target_revision: str) -> List[str]:
+    """Validate immutable release A/B evidence before the cutover can finish.
+
+    The normal synthetic benchmark is intentionally not accepted here.  A
+    release artifact must be produced by two isolated exact-revision runs and
+    must retain the hashes of both source artifacts.
+    """
+    errors = []
+    if not isinstance(payload, dict):
+        return ["performance evidence is not a JSON object"]
+    if payload.get("status") != "PASSED":
+        errors.append("release performance A/B status is not PASSED")
+    if payload.get("evidence_class") != "release_performance_ab":
+        errors.append("performance evidence is not release_performance_ab")
+    if payload.get("comparison_type") != "release_revision_ab":
+        errors.append("performance evidence is not a release revision comparison")
+    if payload.get("candidate_commit") != target_revision:
+        errors.append("performance candidate_commit does not match target release")
+    if not payload.get("baseline_commit") or payload.get("baseline_commit") == target_revision:
+        errors.append("performance baseline_commit is missing or equals candidate")
+    if not payload.get("workload_id") or not payload.get("workload_hash"):
+        errors.append("performance workload identity is incomplete")
+    if not isinstance(payload.get("environment_identity"), dict) or not payload.get("environment_identity"):
+        errors.append("performance environment_identity is missing")
+    if payload.get("exit_code") != 0:
+        errors.append("PASSED performance evidence must have exit_code=0")
+    if payload.get("synthetic"):
+        errors.append("synthetic performance evidence cannot pass the release gate")
+
+    for field in ("baseline_ms", "candidate_ms"):
+        if not isinstance(payload.get(field), (int, float)) or not math.isfinite(float(payload.get(field))):
+            errors.append("performance {} is missing or non-finite".format(field))
+    for tier_name in ("Tier_A_1k", "Tier_B_10k", "Tier_C_50k", "Tier_D_100k"):
+        tier = payload.get(tier_name)
+        if not isinstance(tier, dict) or tier.get("status") != "PASSED":
+            errors.append("performance tier {} is not PASSED".format(tier_name))
+            continue
+        for field in ("baseline_ms", "candidate_ms"):
+            if not isinstance(tier.get(field), (int, float)) or not math.isfinite(float(tier.get(field))):
+                errors.append("performance {}.{} is missing or non-finite".format(tier_name, field))
+
+    virtual = payload.get("coverage_virtual_scroll_100k")
+    if not isinstance(virtual, dict) or virtual.get("status") != "PASSED":
+        errors.append("100k virtual-scroll release workload is not PASSED")
+    elif not isinstance(virtual.get("candidate_elapsed_ms"), (int, float)):
+        errors.append("100k virtual-scroll candidate elapsed time is missing")
+
+    source_artifacts = payload.get("source_artifacts")
+    source_payloads = {}
+    if not isinstance(source_artifacts, dict):
+        errors.append("source_artifacts are missing")
+    else:
+        for role in ("baseline", "candidate"):
+            source = source_artifacts.get(role)
+            source_path = source.get("path") if isinstance(source, dict) else ""
+            source_sha = source.get("sha256") if isinstance(source, dict) else ""
+            source_revision = source.get("revision") if isinstance(source, dict) else ""
+            if not source_path or not os.path.isabs(str(source_path)) or not os.path.isfile(str(source_path)):
+                errors.append("{} source performance artifact is missing".format(role))
+                continue
+            if not source_sha or _sha256_file(str(source_path)) != str(source_sha):
+                errors.append("{} source performance artifact SHA256 mismatch".format(role))
+            expected_revision = payload.get("baseline_commit") if role == "baseline" else payload.get("candidate_commit")
+            if source_revision != expected_revision:
+                errors.append("{} source performance artifact revision mismatch".format(role))
+            try:
+                with open(str(source_path), "r", encoding="utf-8") as source_stream:
+                    source_payload = json.load(source_stream)
+            except (OSError, ValueError, TypeError) as exc:
+                errors.append("{} source performance artifact is unreadable: {}".format(role, exc))
+                continue
+            source_payloads[role] = source_payload
+            if not isinstance(source_payload, dict) or source_payload.get("status") != "PASSED":
+                errors.append("{} source performance artifact is not PASSED".format(role))
+                continue
+            if source_payload.get("evidence_class") != "release_performance_revision" or \
+                    source_payload.get("comparison_type") != "single_revision":
+                errors.append("{} source performance artifact is not an independent revision run".format(role))
+            if source_payload.get("revision") != expected_revision:
+                errors.append("{} source performance payload revision mismatch".format(role))
+            if source_payload.get("workload_id") != payload.get("workload_id") or \
+                    source_payload.get("workload_hash") != payload.get("workload_hash"):
+                errors.append("{} source performance workload identity mismatch".format(role))
+            if source_payload.get("environment_identity") != payload.get("environment_identity"):
+                errors.append("{} source performance environment identity mismatch".format(role))
+
+    # Re-check the combined timings against the hashed source JSON. A modified
+    # summary must not be able to retain valid source hashes while changing the
+    # displayed measurements or PASS status.
+    for role, source_payload in source_payloads.items():
+        source_tiers = source_payload.get("tiers") or source_payload
+        for tier_name in ("Tier_A_1k", "Tier_B_10k", "Tier_C_50k", "Tier_D_100k"):
+            source_tier = source_tiers.get(tier_name) if isinstance(source_tiers, dict) else None
+            combined_tier = payload.get(tier_name) or {}
+            if not isinstance(source_tier, dict) or not isinstance(combined_tier, dict):
+                continue
+            measured = source_tier.get("measured_ms")
+            expected_field = "baseline_ms" if role == "baseline" else "candidate_ms"
+            observed = combined_tier.get(expected_field)
+            if not isinstance(measured, (int, float)) or not isinstance(observed, (int, float)) or \
+                    round(float(measured), 3) != round(float(observed), 3):
+                errors.append("{} source timing mismatch for {}".format(role, tier_name))
+        source_virtual = source_payload.get("coverage_virtual_scroll_100k") or {}
+        combined_virtual = payload.get("coverage_virtual_scroll_100k") or {}
+        expected_virtual_field = "baseline_elapsed_ms" if role == "baseline" else "candidate_elapsed_ms"
+        if isinstance(source_virtual, dict) and isinstance(combined_virtual, dict):
+            measured = source_virtual.get("elapsed_ms")
+            observed = combined_virtual.get(expected_virtual_field)
+            if not isinstance(measured, (int, float)) or not isinstance(observed, (int, float)) or \
+                    round(float(measured), 3) != round(float(observed), 3):
+                errors.append("{} source timing mismatch for 100k virtual-scroll".format(role))
+
+    if not path or not os.path.isfile(path):
+        errors.append("release performance artifact path is missing")
+    return errors
 
 
 def connect_live_database(db_config: Dict[str, Any]):
@@ -398,34 +525,59 @@ class UpgradeOrchestrator:
         })
         self.log("✔ Real browser suite passed." if real_browser.returncode == 0 else "⚠ Real browser evidence unavailable.")
 
-        # Step 7: Run Performance Benchmark Matrix
-        self.log("[Step 7/10] Running Performance Benchmark Matrix (Tiers A-D + Huge)...")
-        perf_artifact = os.path.join(os.path.dirname(self.manifest.manifest_path), "synthetic_dom_microbenchmark.json")
-        perf_cmd = ["npm", "run", "perf:synthetic-dom", "--", perf_artifact]
-        perf_process = subprocess.run(perf_cmd, cwd=self.repo_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if perf_process.returncode == 0 and os.path.isfile(perf_artifact):
-            with open(perf_artifact, "r", encoding="utf-8") as perf_stream:
-                perf_res = json.load(perf_stream)
-            perf_res["command"] = " ".join(perf_cmd)
-            perf_res["exit_code"] = perf_process.returncode
+        # Step 7: Consume immutable release A/B evidence.  The synthetic DOM
+        # benchmark remains a useful diagnostic, but it is not allowed to
+        # create a production performance claim inside the upgrade runner.
+        self.log("[Step 7/10] Validating exact-revision Performance A/B Evidence...")
+        configured_perf = upgrade_config.get("performance_evidence_path")
+        configured_perf = configured_perf or os.environ.get("COVERAGE_RELEASE_PERFORMANCE_AB")
+        perf_artifact = ""
+        if configured_perf:
+            perf_artifact = str(configured_perf)
+            if not os.path.isabs(perf_artifact):
+                perf_artifact = os.path.join(self.repo_root, perf_artifact)
+            perf_artifact = os.path.realpath(perf_artifact)
+        perf_cmd = "validate release_performance_ab artifact {}".format(perf_artifact or "<missing>")
+        perf_res = {}
+        perf_errors = []
+        if not perf_artifact or not os.path.isfile(perf_artifact):
+            perf_errors.append("upgrade.performance_evidence_path must point to a release A/B artifact")
         else:
-            # Keep the Python benchmark as diagnostics, explicitly classified
-            # synthetic so the final gate cannot mistake it for release proof.
-            perf_res = run_performance_suite()
-            perf_res["command"] = "python scripts/diagnostics/perf_benchmark.py"
-            perf_res["exit_code"] = perf_process.returncode
+            try:
+                with open(perf_artifact, "r", encoding="utf-8") as perf_stream:
+                    perf_res = json.load(perf_stream)
+            except (OSError, ValueError) as exc:
+                perf_errors.append("release performance artifact is unreadable: {}".format(exc))
+        if not perf_errors:
+            perf_errors.extend(_validate_release_performance_artifact(
+                perf_artifact, perf_res, identity.get("commit_sha")
+            ))
+        if perf_errors:
+            invalid_perf = dict(perf_res) if isinstance(perf_res, dict) else {}
+            invalid_perf.update({
+                "status": "FAILED",
+                "evidence_class": "release_performance_ab",
+                "revision": identity.get("commit_sha"),
+                "command": perf_cmd,
+                "exit_code": 1,
+                "artifact_path": perf_artifact,
+                "violations": perf_errors,
+            })
+            self.manifest.record("performance_benchmark", invalid_perf)
+            self.log("❌ Release performance A/B evidence rejected: {}".format("; ".join(perf_errors)))
+            return self._fail(lifecycle, "Release performance A/B evidence rejected")
+
         perf_res["revision"] = identity.get("commit_sha")
-        perf_res.setdefault("command", " ".join(perf_cmd))
-        perf_res.setdefault("exit_code", perf_process.returncode)
-        perf_res.setdefault("artifact_path", perf_artifact if os.path.isfile(perf_artifact) else "")
-        for tier_name, tier in perf_res.items():
+        perf_res["command"] = perf_cmd
+        perf_res["exit_code"] = 0
+        perf_res["artifact_path"] = perf_artifact
+        for tier_name in ("Tier_A_1k", "Tier_B_10k", "Tier_C_50k", "Tier_D_100k"):
+            tier = perf_res.get(tier_name)
             if isinstance(tier, dict):
-                if not tier.get("revision"):
-                    tier["revision"] = identity.get("commit_sha")
-                tier.setdefault("evidence_class", perf_res.get("evidence_class", "synthetic_benchmark"))
-                if tier_name != "_record_meta":
-                    tier.setdefault("command", " ".join(perf_cmd))
-                    tier.setdefault("exit_code", perf_process.returncode)
+                tier["revision"] = identity.get("commit_sha")
+                tier["evidence_class"] = "release_performance_ab"
+                tier["command"] = perf_cmd
+                tier["exit_code"] = 0
         self.manifest.record("performance_benchmark", perf_res)
         self.log(
             "  ✔ Tier A: baseline={}ms/candidate={}ms, Tier D (100k): baseline={}ms/candidate={}ms".format(

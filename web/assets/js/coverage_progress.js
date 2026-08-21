@@ -240,12 +240,13 @@
     const body = rows.length ? rows.map(row => `
       <tr><td>${asNumber(row.line_number)}</td><td class="code">${escapeHtml(row.line_text || '')}</td>
       <td>${escapeHtml(row.status || '')}</td><td>${escapeHtml(row.is_draft ? '草稿' : '')}</td>
-      <td>${escapeHtml(row.reviewer || row.suggested_reviewer || '')}</td>
+      <td>${escapeHtml(row.reviewer || '')}</td>
+      <td>${escapeHtml(row.suggested_reviewer || '')}</td>
       <td>${escapeHtml(row.coverage_method || '')}</td><td>${escapeHtml(row.uncovered_reason || '')}</td>
-      <td>${escapeHtml(row.updated_at || '')}</td></tr>`).join('') : '<tr><td colspan="8">暂无详细数据</td></tr>';
+      <td>${escapeHtml(row.updated_at || '')}</td></tr>`).join('') : '<tr><td colspan="9">暂无详细数据</td></tr>';
     document.getElementById('detailTable').innerHTML = `
-      <thead><tr><th>行号</th><th>代码行</th><th>填写状态</th><th>结论</th><th>责任人</th>
-      <th>覆盖方法</th><th>无法覆盖原因</th><th>更新时间</th></tr></thead><tbody>${body}</tbody>`;
+      <thead><tr><th>行号</th><th>代码行</th><th>填写状态</th><th>结论</th><th>确认 Reviewer</th>
+      <th>Suggested Reviewer</th><th>覆盖方法</th><th>无法覆盖原因</th><th>更新时间</th></tr></thead><tbody>${body}</tbody>`;
     currentDetailPage = asNumber(data.page) || 1;
     const totalPages = asNumber(data.total_pages);
     document.getElementById('detailStatus').innerHTML = `

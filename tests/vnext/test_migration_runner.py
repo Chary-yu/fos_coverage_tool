@@ -1,4 +1,5 @@
 import hashlib
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -10,7 +11,9 @@ from scripts.upgrade.migration_runner import (
     migrate_legacy,
     _split_sql,
 )
-from scripts.upgrade.schema_preflight import PROTECTED_TABLES, analyze_sql_script
+from scripts.upgrade.schema_preflight import (
+    PROTECTED_TABLES, analyze_sql_script, validate_ddl_file,
+)
 
 
 def legacy_connection():
@@ -64,6 +67,18 @@ def legacy_connection():
 
 
 class MigrationRunnerTest(unittest.TestCase):
+    def test_domain_constraint_ddl_is_additive_and_explicitly_restrictive(self):
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+        path = os.path.join(root, "scripts", "upgrade", "vnext_domain_constraints.sql")
+        safe, errors, warnings = validate_ddl_file(path)
+        self.assertTrue(safe, errors)
+        self.assertEqual(warnings, [])
+        with open(path, "r", encoding="utf-8") as stream:
+            ddl = stream.read().upper()
+        self.assertIn("FK_COVERAGE_REPOSITORIES_RESOURCE", ddl)
+        self.assertIn("FK_ANALYSIS_LINE_LINK_SOURCE_RELATION", ddl)
+        self.assertNotIn("ON DELETE CASCADE", ddl)
+
     def test_gate_a_and_domain_tables_are_protected_from_destructive_ddl(self):
         for table in (
             "coverage_schema_migrations", "coverage_analysis_records",

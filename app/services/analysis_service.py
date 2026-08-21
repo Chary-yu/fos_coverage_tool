@@ -35,7 +35,8 @@ class AnalysisService(object):
             raise KeyError("project not found")
         return row
 
-    def save(self, connection, project_name, scan_id, records, reviewer=""):
+    def save(self, connection, project_name, scan_id, records, reviewer="",
+             enforce_current=False):
         project = self._project(connection, project_name=project_name)
         scan = self.projects.get_scan(connection, int(scan_id))
         if not scan or int(scan.get("project_id")) != int(project["id"]):
@@ -45,10 +46,17 @@ class AnalysisService(object):
             # Analysis mutations never create or change the project CURRENT
             # pointer.  Publication owns that state transition exclusively.
             state = self.states.ensure(conn, project["id"])
+            if enforce_current and int(state.get("current_scan_id") or 0) != int(scan_id):
+                raise ValueError("MUTATION_REQUIRES_CURRENT_SCAN")
             if not records:
                 return {"saved": 0, "data_version": state.get("data_version", 0)}
             resolved = self._resolve_records(conn, int(scan_id), records, reviewer)
+            self._validate_concurrency(conn, int(scan_id), resolved)
             self._save_domain_records(conn, int(scan_id), resolved)
+            for line_id in sorted({int(item["line_id"]) for item in resolved}):
+                self.domain.close_active_rejection(
+                    conn, int(scan_id), line_id, "MANUAL_REANALYSIS"
+                )
             # The old table is a compatibility projection for old readers. It
             # is written only after the canonical Record/LineLink transaction
             # and is never read to decide current review state by new code.
@@ -56,6 +64,38 @@ class AnalysisService(object):
             saved = len(resolved)
             next_state = self.states.advance(conn, project["id"])
         return {"saved": saved, "data_version": next_state["data_version"]}
+
+    def _validate_concurrency(self, connection, scan_id, resolved):
+        """Validate the complete relation/content CAS bundle before writes."""
+        for item in resolved:
+            expected_relation = item.get("expected_relation_revision")
+            expected_record = item.get("expected_record_revision")
+            if expected_relation is None and expected_record is None:
+                continue
+            line_id = int(item["line_id"])
+            relation = self.domain.get_link(
+                connection, int(scan_id), line_id
+            )
+            # ``scan_id`` is attached by the resolver below; fall back to the
+            # operation's scan identity when validating direct callers.
+            if relation is None:
+                relation = fetchall(connection, """
+                    SELECT * FROM coverage_analysis_line_links
+                    WHERE scan_id=? AND line_id=? ORDER BY id DESC LIMIT 1
+                """, (int(scan_id), line_id))
+                relation = relation[0] if relation else None
+            if expected_relation is not None:
+                actual_relation = int((relation or {}).get("relation_revision") or 0)
+                if actual_relation != int(expected_relation):
+                    raise ValueError("STALE_RELATION_REVISION")
+            if expected_record is not None:
+                record_id = int(item.get("record_id") or
+                                item.get("analysis_record_id") or
+                                (relation or {}).get("analysis_record_id") or 0)
+                record = self.domain.get_record(connection, record_id) if record_id else None
+                if (not record or
+                        int(record.get("content_revision") or 0) != int(expected_record)):
+                    raise ValueError("STALE_CONTENT_REVISION")
 
     def _save_domain_records(self, connection, scan_id, resolved):
         """Persist content, exact human range and per-line relation together."""
@@ -109,6 +149,7 @@ class AnalysisService(object):
                 # One user operation cannot create a cross-file human block.
                 # Split into exact one-line blocks while retaining per-line
                 # content; this is safer than inventing a cross-file range.
+                links = []
                 for item in items:
                     line = line_rows[int(item["line_id"])]
                     block = self.domain.create_block(
@@ -117,13 +158,18 @@ class AnalysisService(object):
                         created_by=item.get("reviewer", ""), verified=True,
                         content_hash_value=content.get("content_hash"),
                     )
-                    self.domain.create_link(
-                        connection, scan_id, item["line_id"], content["id"],
-                        block_id=block["id"],
-                        review_state=self._review_state(item),
-                        relation_origin="MANUAL", reviewed_by=item.get("reviewer", ""),
-                        reviewed_at=item.get("reviewed_at"),
-                    )
+                    links.append({
+                        "scan_id": scan_id, "line_id": item["line_id"],
+                        "record_id": content["id"], "block_id": block["id"],
+                        "review_state": self._review_state(item),
+                        "relation_origin": "MANUAL",
+                        "reviewed_by": item.get("reviewer", ""),
+                        "reviewed_at": item.get("reviewed_at"),
+                        "expected_relation_revision": item.get(
+                            "expected_relation_revision"
+                        ),
+                    })
+                self.domain.create_links_many(connection, links)
                 continue
             file_id = next(iter(file_ids))
             block = self.domain.create_block(
@@ -131,13 +177,20 @@ class AnalysisService(object):
                 record_id=content["id"], created_by=first.get("reviewer", ""),
                 verified=True, content_hash_value=content.get("content_hash"),
             )
+            links = []
             for item in items:
-                self.domain.create_link(
-                    connection, scan_id, item["line_id"], content["id"],
-                    block_id=block["id"], review_state=self._review_state(item),
-                    relation_origin="MANUAL", reviewed_by=item.get("reviewer", ""),
-                    reviewed_at=item.get("reviewed_at"),
-                )
+                links.append({
+                    "scan_id": scan_id, "line_id": item["line_id"],
+                    "record_id": content["id"], "block_id": block["id"],
+                    "review_state": self._review_state(item),
+                    "relation_origin": "MANUAL",
+                    "reviewed_by": item.get("reviewer", ""),
+                    "reviewed_at": item.get("reviewed_at"),
+                    "expected_relation_revision": item.get(
+                        "expected_relation_revision"
+                    ),
+                })
+            self.domain.create_links_many(connection, links)
 
     @staticmethod
     def _review_state(item):

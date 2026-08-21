@@ -227,11 +227,39 @@ class EvidenceManifestV2:
                     errors.append("evidence[{}] missing {}".format(index, field))
             if record.get("candidate_revision") != candidate:
                 errors.append("evidence[{}] candidate revision mismatch".format(index))
+            if not isinstance(record.get("host_identity"), dict) or not record.get("host_identity"):
+                errors.append("evidence[{}] host identity is missing".format(index))
+            if not record.get("command_or_action"):
+                errors.append("evidence[{}] command/action is missing".format(index))
+            if record.get("status") not in (
+                    "PASSED", "INCOMPLETE", "BLOCKED", "FAILED", "PARTIAL",
+                    "UNAVAILABLE", "SKIPPED"):
+                errors.append("evidence[{}] status is not a known gate status".format(index))
             artifact_path = record.get("artifact_path") or ""
             if artifact_path and not record.get("artifact_sha256"):
                 errors.append("evidence[{}] artifact SHA256 missing".format(index))
+            if artifact_path:
+                if not os.path.isabs(artifact_path) or not os.path.isfile(artifact_path):
+                    errors.append("evidence[{}] artifact path is missing".format(index))
+                else:
+                    try:
+                        if _sha256_file(artifact_path) != str(record.get("artifact_sha256")):
+                            errors.append("evidence[{}] artifact SHA256 does not match".format(index))
+                    except OSError:
+                        errors.append("evidence[{}] artifact cannot be hashed".format(index))
             if record.get("status") == "PASSED" and record.get("exit_code") != 0:
                 errors.append("evidence[{}] PASSED without exit_code 0".format(index))
+            if record.get("status") == "PASSED" and record.get("synthetic"):
+                errors.append("evidence[{}] synthetic evidence cannot be PASSED".format(index))
+            release_identity = record.get("release_identity") or {}
+            if isinstance(release_identity, dict) and \
+                    release_identity.get("commit_sha") and \
+                    release_identity.get("commit_sha") != candidate:
+                errors.append("evidence[{}] release identity revision mismatch".format(index))
+            evidence_class = str(record.get("evidence_class") or "").lower()
+            if ("database" in evidence_class or "mariadb" in evidence_class or
+                    "mysql" in evidence_class) and not record.get("database_runtime_identity"):
+                errors.append("evidence[{}] database runtime identity is missing".format(index))
         if require_current_revision:
             current = ProductionEvidenceManifest(self.repo_root)._current_commit_sha()
             if current and current != candidate:
@@ -444,6 +472,26 @@ class ProductionEvidenceManifest:
                 or not pb.get("baseline_commit") or not pb.get("candidate_commit")
                 or not pb.get("workload_hash") or not pb.get("environment_identity")):
             unmet.append("Performance evidence is not an immutable release baseline/candidate A/B run")
+        if pb.get("candidate_commit") != revision:
+            unmet.append("Performance candidate commit does not match release identity")
+        if pb.get("baseline_commit") == pb.get("candidate_commit"):
+            unmet.append("Performance baseline and candidate commits must differ")
+        source_inputs = pb.get("source_inputs_sha256")
+        if not isinstance(source_inputs, list) or len(source_inputs) < 2 or \
+                any(not str(item or "") for item in source_inputs):
+            unmet.append("Performance source input hashes are missing")
+        source_artifacts = pb.get("source_artifacts") or {}
+        for role in ("baseline", "candidate"):
+            source = source_artifacts.get(role) if isinstance(source_artifacts, dict) else None
+            source_path = source.get("path") if isinstance(source, dict) else ""
+            source_sha = source.get("sha256") if isinstance(source, dict) else ""
+            expected_source_revision = pb.get("baseline_commit") if role == "baseline" else pb.get("candidate_commit")
+            if not source_path or not os.path.isabs(str(source_path)) or not os.path.isfile(str(source_path)):
+                unmet.append("Performance {} source artifact is missing".format(role))
+            elif not source_sha or _sha256_file(str(source_path)) != str(source_sha):
+                unmet.append("Performance {} source artifact SHA256 mismatch".format(role))
+            if not isinstance(source, dict) or source.get("revision") != expected_source_revision:
+                unmet.append("Performance {} source artifact revision mismatch".format(role))
         required_tiers = ["Tier_A_1k", "Tier_B_10k", "Tier_C_50k", "Tier_D_100k"]
         for tier in required_tiers:
             if tier not in pb or not isinstance(pb[tier], dict) or pb[tier].get("status") != "PASSED":

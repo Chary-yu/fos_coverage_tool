@@ -36,6 +36,7 @@
     "release_endpoint": "http://127.0.0.1:19528/api/coverage/release",
     "previous_release_endpoint": "http://127.0.0.1:19528/api/coverage/release",
     "rollback_evidence_path": ".artifacts/staging/rollback-evidence.json",
+    "performance_evidence_path": ".artifacts/staging/release-performance-ab.json",
     "path_mapping_source_paths": ["tests/fixtures/path_mapping"],
     "path_mapping_lcov_paths": ["tests/fixtures/path_mapping/coverage.info"],
     "commands": {

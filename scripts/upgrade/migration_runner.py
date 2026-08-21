@@ -87,7 +87,11 @@ CREATE TABLE IF NOT EXISTS coverage_file_state (
     scan_id INTEGER NOT NULL, file_id INTEGER NOT NULL, total_lines INTEGER NOT NULL DEFAULT 0,
     total_uncovered INTEGER NOT NULL DEFAULT 0, filled_total INTEGER NOT NULL DEFAULT 0,
     draft_total INTEGER NOT NULL DEFAULT 0, confirmed_total INTEGER NOT NULL DEFAULT 0,
-    pending_total INTEGER NOT NULL DEFAULT 0, data_version INTEGER NOT NULL DEFAULT 0,
+    pending_total INTEGER NOT NULL DEFAULT 0,
+    ordinary_pending_total INTEGER NOT NULL DEFAULT 0,
+    inherited_pending_total INTEGER NOT NULL DEFAULT 0,
+    manual_draft_pending_total INTEGER NOT NULL DEFAULT 0,
+    data_version INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL, PRIMARY KEY(scan_id, file_id)
 );
 CREATE TABLE IF NOT EXISTS coverage_background_jobs (
@@ -248,6 +252,11 @@ SQLITE_ADDITIVE_COLUMNS = {
         ("handler_version", "TEXT NOT NULL DEFAULT ''"),
         ("legacy_raw_percent", "REAL"),
         ("legacy_percent_unit", "TEXT NOT NULL DEFAULT ''"),
+    ],
+    "coverage_file_state": [
+        ("ordinary_pending_total", "INTEGER NOT NULL DEFAULT 0"),
+        ("inherited_pending_total", "INTEGER NOT NULL DEFAULT 0"),
+        ("manual_draft_pending_total", "INTEGER NOT NULL DEFAULT 0"),
     ],
 }
 
@@ -908,6 +917,11 @@ def apply_schema(connection, ddl_path, release_sha=""):
                 ("handler_version", "VARCHAR(64) NOT NULL DEFAULT ''"),
                 ("legacy_raw_percent", "DECIMAL(12,3) NULL"),
                 ("legacy_percent_unit", "VARCHAR(32) NOT NULL DEFAULT ''"),
+            ],
+            "coverage_file_state": [
+                ("ordinary_pending_total", "INT NOT NULL DEFAULT 0"),
+                ("inherited_pending_total", "INT NOT NULL DEFAULT 0"),
+                ("manual_draft_pending_total", "INT NOT NULL DEFAULT 0"),
             ],
         }
         for table_name, columns in additions.items():

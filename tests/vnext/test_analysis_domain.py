@@ -10,6 +10,7 @@ from app.db.repositories.analysis_domain_repository import INHERITED_PENDING
 from scripts.upgrade.domain_migration import apply_analysis_domain
 from scripts.upgrade.migration_runner import create_sqlite_schema
 from app.db.repositories import ProjectRepository, LineIndexRepository, ProjectStateRepository
+from app.services.progress_service import ProgressService
 
 
 class AnalysisDomainTest(unittest.TestCase):
@@ -88,8 +89,13 @@ class AnalysisDomainTest(unittest.TestCase):
             self.connection.execute(
                 "SELECT schema_version FROM coverage_schema_meta "
                 "WHERE schema_key='coverage_analysis_domain'"
-            ).fetchone()[0], 1
+            ).fetchone()[0], 2
         )
+        constraint_migration = self.connection.execute(
+            "SELECT state, to_version FROM coverage_schema_migrations "
+            "WHERE migration_id='coverage-analysis-domain-constraints-v1'"
+        ).fetchone()
+        self.assertEqual(tuple(constraint_migration), ("APPLIED", 2))
 
     def test_consistency_audit_detects_cross_scan_link(self):
         service = AnalysisDomainService()
@@ -148,6 +154,48 @@ class AnalysisDomainTest(unittest.TestCase):
             1,
         )
 
+    def test_manual_save_relation_revision_is_atomic_compare_and_set(self):
+        service = AnalysisService()
+        service.save(
+            self.connection, "domain", self.scan["id"],
+            [{"file_path_hash": "f" * 32, "line_number": 10,
+              "status": "可覆盖", "coverage_method": "unit"}],
+        )
+        line_id = self.connection.execute(
+            "SELECT id FROM coverage_lines WHERE line_number=10"
+        ).fetchone()[0]
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT relation_revision FROM coverage_analysis_line_links "
+                "WHERE line_id=?", (line_id,)
+            ).fetchone()[0],
+            1,
+        )
+        service.save(
+            self.connection, "domain", self.scan["id"],
+            [{"line_id": line_id, "expected_relation_revision": 1,
+              "status": "无法覆盖", "uncovered_reason": "changed"}],
+        )
+        current = self.connection.execute(
+            "SELECT relation_revision, review_state FROM coverage_analysis_line_links "
+            "WHERE line_id=?", (line_id,)
+        ).fetchone()
+        self.assertEqual(tuple(current), (2, "MANUAL_CONFIRMED"))
+        with self.assertRaises(ValueError) as raised:
+            service.save(
+                self.connection, "domain", self.scan["id"],
+                [{"line_id": line_id, "expected_relation_revision": 1,
+                  "status": "可覆盖", "coverage_method": "stale"}],
+            )
+        self.assertEqual(str(raised.exception), "STALE_RELATION_REVISION")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT relation_revision FROM coverage_analysis_line_links "
+                "WHERE line_id=?", (line_id,)
+            ).fetchone()[0],
+            2,
+        )
+
     def test_reject_and_undo_preserve_lineage_without_active_overlay(self):
         project_id = self.connection.execute(
             "SELECT project_id FROM coverage_scans WHERE id=?", (self.scan["id"],)
@@ -163,13 +211,24 @@ class AnalysisDomainTest(unittest.TestCase):
             self.connection, {"status": "可覆盖", "coverage_method": "unit"},
             origin="INHERITED",
         )
+        source_record = AnalysisDomainService().repository.create_record(
+            self.connection, {"status": "可覆盖"}, origin="MANUAL"
+        )
+        source_line_id = self.connection.execute(
+            "SELECT id FROM coverage_lines WHERE line_number=11"
+        ).fetchone()[0]
+        source_link = AnalysisDomainService().repository.create_link(
+            self.connection, self.scan["id"], source_line_id, source_record["id"],
+            review_state="MANUAL_CONFIRMED", relation_origin="MANUAL",
+        )
         line_id = self.connection.execute(
             "SELECT id FROM coverage_lines WHERE line_number=10"
         ).fetchone()[0]
         link = AnalysisDomainService().repository.create_link(
             self.connection, self.scan["id"], line_id, record["id"],
-            review_state=INHERITED_PENDING, relation_origin="INHERITED",
-            source_scan_id=self.scan["id"], source_line_id=line_id,
+            review_state=INHERITED_PENDING, relation_origin="INHERITANCE",
+            source_scan_id=self.scan["id"], source_line_id=source_line_id,
+            source_relation_id=source_link["id"],
         )
         self.connection.commit()
 
@@ -206,6 +265,178 @@ class AnalysisDomainTest(unittest.TestCase):
         )
         self.assertEqual(active_overlay[0]["review_state"], INHERITED_PENDING)
         self.assertEqual(active_overlay[0]["relation_is_active"], 1)
+
+    def test_manual_reanalysis_terminates_active_rejection_and_blocks_undo(self):
+        project_id = self.connection.execute(
+            "SELECT project_id FROM coverage_scans WHERE id=?", (self.scan["id"],)
+        ).fetchone()[0]
+        ProjectStateRepository().ensure(
+            self.connection, project_id, current_scan_id=self.scan["id"]
+        )
+        self.connection.execute(
+            "UPDATE coverage_project_state SET current_scan_id=? WHERE project_id=?",
+            (self.scan["id"], project_id),
+        )
+        domain = AnalysisDomainService().repository
+        record = domain.create_record(
+            self.connection, {"status": "未确认", "coverage_method": "unit"},
+            origin="INHERITED",
+        )
+        source_record = domain.create_record(
+            self.connection, {"status": "可覆盖"}, origin="MANUAL"
+        )
+        source_line_id = self.connection.execute(
+            "SELECT id FROM coverage_lines WHERE line_number=11"
+        ).fetchone()[0]
+        source_link = domain.create_link(
+            self.connection, self.scan["id"], source_line_id, source_record["id"],
+            review_state="MANUAL_CONFIRMED", relation_origin="MANUAL",
+        )
+        line_id = self.connection.execute(
+            "SELECT id FROM coverage_lines WHERE line_number=10"
+        ).fetchone()[0]
+        link = domain.create_link(
+            self.connection, self.scan["id"], line_id, record["id"],
+            review_state=INHERITED_PENDING, relation_origin="INHERITANCE",
+            source_scan_id=self.scan["id"], source_line_id=source_line_id,
+            source_relation_id=source_link["id"],
+        )
+        self.connection.commit()
+        rejection = InheritanceRejectionService().reject(
+            self.connection, project_id, self.scan["id"], line_id, "alice",
+            int(link["relation_revision"]),
+        )
+        self.connection.commit()
+        AnalysisService().save(
+            self.connection, "domain", self.scan["id"],
+            [{"line_id": line_id, "status": "可覆盖", "coverage_method": "manual",
+              "reviewer": "bob"}],
+            enforce_current=True,
+        )
+        self.connection.commit()
+        active_rejection = self.connection.execute(
+            "SELECT is_active, terminal_reason FROM coverage_inheritance_rejections "
+            "WHERE id=?", (rejection["id"],)
+        ).fetchone()
+        self.assertEqual(tuple(active_rejection), (0, "MANUAL_REANALYSIS"))
+        with self.assertRaises(ValueError) as raised:
+            InheritanceRejectionService().undo(
+                self.connection, project_id, self.scan["id"], line_id,
+                rejection["id"], 1, int(link["relation_revision"]) + 1,
+            )
+        self.assertEqual(str(raised.exception), "REJECTION_NOT_ACTIVE")
+
+    def test_progress_pending_partition_is_conserved(self):
+        project = self.projects.ensure_project(self.connection, "progress-domain")
+        scan = self.projects.create_scan(
+            self.connection, project["id"], "progress-scan", "import", "full",
+            status="building",
+        )
+        file_row = self.projects.ensure_file(
+            self.connection, scan["id"], "", "p" * 32, "src/progress.c", "progress.c"
+        )
+        self.lines.upsert_lines(self.connection, file_row["id"], [
+            {"line_number": number, "line_text": "return {};".format(number),
+             "coverage_state": "uncovered"}
+            for number in (1, 2, 3, 4)
+        ])
+        self.projects.seal_scan(self.connection, scan["id"])
+        from app.scan_import.publication import ScanPublicationService
+        state = ProjectStateRepository().ensure(
+            self.connection, project["id"], current_scan_id=None
+        )
+        ScanPublicationService(ProjectStateRepository()).publish_in_transaction(
+            self.connection, project["id"], scan["id"],
+            expected_current_scan_id=None,
+        )
+        service = AnalysisService()
+        service.save(
+            self.connection, "progress-domain", scan["id"],
+            [{"file_path_hash": "p" * 32, "line_number": 2,
+              "status": "未确认", "is_draft": True},
+             {"file_path_hash": "p" * 32, "line_number": 4,
+              "status": "可覆盖", "is_draft": False}],
+        )
+        domain = AnalysisDomainService().repository
+        source_scan = self.projects.create_scan(
+            self.connection, project["id"], "progress-source-scan", "import", "full",
+            status="building",
+        )
+        source_file = self.projects.ensure_file(
+            self.connection, source_scan["id"], "", "s" * 32,
+            "src/progress-source.c", "progress-source.c"
+        )
+        self.lines.upsert_lines(self.connection, source_file["id"], [
+            {"line_number": 3, "line_text": "return source;",
+             "coverage_state": "uncovered"}
+        ])
+        self.projects.seal_scan(self.connection, source_scan["id"])
+        inherited_record = domain.create_record(
+            self.connection, {"status": "未确认"}, origin="INHERITED"
+        )
+        source_record = domain.create_record(
+            self.connection, {"status": "可覆盖"}, origin="MANUAL"
+        )
+        source_line_id = self.connection.execute(
+            "SELECT id FROM coverage_lines WHERE file_id=? AND line_number=3",
+            (source_file["id"],),
+        ).fetchone()[0]
+        source_link = domain.create_link(
+            self.connection, source_scan["id"], source_line_id, source_record["id"],
+            review_state="MANUAL_CONFIRMED", relation_origin="MANUAL",
+        )
+        line_three = self.connection.execute(
+            "SELECT id FROM coverage_lines WHERE file_id=? AND line_number=3",
+            (file_row["id"],),
+        ).fetchone()[0]
+        domain.create_link(
+            self.connection, scan["id"], line_three, inherited_record["id"],
+            review_state=INHERITED_PENDING, relation_origin="INHERITANCE",
+            source_scan_id=source_scan["id"], source_line_id=source_line_id,
+            source_relation_id=source_link["id"],
+        )
+        self.connection.commit()
+        ProjectStateRepository().advance(self.connection, project["id"])
+        summary = ProgressService().rebuild(
+            self.connection, "progress-domain", scan["id"]
+        )
+        self.assertEqual(summary["pending_total"], 3)
+        self.assertEqual(summary["ordinary_pending_total"], 1)
+        self.assertEqual(summary["manual_draft_pending_total"], 1)
+        self.assertEqual(summary["inherited_pending_total"], 1)
+        self.assertEqual(summary["pending_conservation"]["status"], "PASSED")
+
+    def test_domain_write_rejects_cross_scan_line_and_block_identity(self):
+        project = self.projects.ensure_project(self.connection, "identity-domain")
+        other_scan = self.projects.create_scan(
+            self.connection, project["id"], "identity-scan", "import", "full",
+            status="building",
+        )
+        other_file = self.projects.ensure_file(
+            self.connection, other_scan["id"], "", "q" * 32, "src/q.c", "q.c"
+        )
+        self.lines.upsert_lines(self.connection, other_file["id"], [
+            {"line_number": 1, "line_text": "return 1;", "coverage_state": "uncovered"}
+        ])
+        record = AnalysisDomainService().repository.create_record(
+            self.connection, {"status": "未确认"}
+        )
+        with self.assertRaises(ValueError) as raised:
+            AnalysisDomainService().repository.create_link(
+                self.connection, self.scan["id"],
+                self.connection.execute(
+                    "SELECT id FROM coverage_lines WHERE file_id=?",
+                    (other_file["id"],),
+                ).fetchone()[0], record["id"],
+            )
+        self.assertEqual(str(raised.exception), "LINE_SCAN_IDENTITY_MISMATCH")
+        with self.assertRaises(ValueError) as raised:
+            AnalysisDomainService().repository.create_block(
+                self.connection, self.scan["id"], other_file["id"], 1, 1,
+            )
+        self.assertEqual(
+            str(raised.exception), "ANALYSIS_BLOCK_FILE_SCAN_IDENTITY_MISMATCH"
+        )
 
 
 if __name__ == "__main__":

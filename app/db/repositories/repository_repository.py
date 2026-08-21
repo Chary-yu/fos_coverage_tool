@@ -42,6 +42,8 @@ class RepositoryRepository(object):
             raise ValueError("repository_name is required")
         existing = self.get_by_name(connection, project_id, name)
         if existing:
+            if str(existing.get("lifecycle_state") or "ACTIVE").upper() == "RETIRED":
+                raise ValueError("REPOSITORY_RETIRED")
             return existing
         stamp = utc_sql()
         cursor = execute(connection, """
@@ -56,6 +58,33 @@ class RepositoryRepository(object):
         cursor.close()
         return self.get(connection, repository_id)
 
+    def add_alias(self, connection, project_id, repository_id, alias_name):
+        """Add an explicit compatibility alias without changing identity."""
+        alias = str(alias_name or "").strip()
+        repository = self.get(connection, repository_id)
+        if not alias or not repository or int(repository.get("project_id")) != int(project_id):
+            raise ValueError("repository alias identity is invalid")
+        canonical = self.get_by_name(connection, project_id, alias)
+        if canonical and int(canonical.get("id")) != int(repository_id):
+            raise ValueError("repository alias conflicts with another identity")
+        existing = fetchone(connection, """
+            SELECT * FROM coverage_repository_aliases
+            WHERE project_id=? AND alias_name=? AND retired_at IS NULL
+        """, (int(project_id), alias))
+        if existing:
+            if int(existing.get("repository_id")) != int(repository_id):
+                raise ValueError("repository alias conflicts with another identity")
+            return existing
+        cursor = execute(connection, """
+            INSERT INTO coverage_repository_aliases(
+                project_id, repository_id, alias_name, created_at
+            ) VALUES (?, ?, ?, ?)
+        """, (int(project_id), int(repository_id), alias, utc_sql()))
+        alias_id = insert_id(cursor)
+        cursor.close()
+        return fetchone(connection, "SELECT * FROM coverage_repository_aliases WHERE id=?",
+                        (alias_id,))
+
     def rename(self, connection, project_id, repository_id, new_name):
         new_name = str(new_name or "").strip()
         if not new_name:
@@ -63,13 +92,12 @@ class RepositoryRepository(object):
         current = self.get(connection, repository_id)
         if not current or int(current["project_id"]) != int(project_id):
             raise KeyError("repository not found")
+        if new_name == str(current.get("repository_name") or ""):
+            return current
+        if self.get_by_name(connection, project_id, new_name):
+            raise ValueError("repository name conflicts with an existing identity")
         stamp = utc_sql()
-        cursor = execute(connection, """
-            INSERT INTO coverage_repository_aliases(
-                project_id, repository_id, alias_name, created_at
-            ) VALUES (?, ?, ?, ?)
-        """, (int(project_id), int(repository_id), current["repository_name"], stamp))
-        cursor.close()
+        self.add_alias(connection, project_id, repository_id, current["repository_name"])
         cursor = execute(connection, """
             UPDATE coverage_repositories
             SET repository_name=?, updated_at=?
@@ -82,6 +110,12 @@ class RepositoryRepository(object):
         cursor = execute(connection, """
             UPDATE coverage_repositories SET lifecycle_state='RETIRED', updated_at=?
             WHERE id=?
+        """, (utc_sql(), int(repository_id)))
+        cursor.close()
+        cursor = execute(connection, """
+            UPDATE coverage_repository_aliases
+            SET retired_at=COALESCE(retired_at, ?)
+            WHERE repository_id=? AND retired_at IS NULL
         """, (utc_sql(), int(repository_id)))
         cursor.close()
         return self.get(connection, repository_id)

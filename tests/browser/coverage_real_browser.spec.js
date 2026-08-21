@@ -426,7 +426,7 @@ test('real Chromium virtualizes data and reuses cached viewport windows', async 
       const internals = window.__COVERAGE_ENHANCE_INTERNALS__;
       const region = internals.CodeRegionStore.get('region-1');
       const samples = [];
-      for (const target of [25000, 50000, 1]) {
+      for (const target of [25000, 50000, 75000, 100000, 1]) {
         const bounds = internals.CodeRegionController.virtualWindowBounds(region, target - 1);
         await internals.CodeRegionLoader.ensureVirtualWindow(
           internals.CodeRegionController.filePath, region, bounds.start, bounds.end

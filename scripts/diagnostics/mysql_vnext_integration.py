@@ -40,6 +40,7 @@ from app.code_detail.source_reader import (
 from app.db.manager import DatabaseManager
 from app.db.repositories.base import fetchone
 from scripts.upgrade.migration_runner import apply_schema
+from scripts.upgrade.domain_migration import apply_analysis_domain
 
 
 def _env(name, default=None):
@@ -143,6 +144,7 @@ def run(args):
                 os.path.join(_REPO_ROOT, "scripts/upgrade/vnext_schema.sql"),
                 release_sha="mysql-audit",
             )
+            apply_analysis_domain(schema_connection, release_sha="mysql-audit")
             schema_connection.commit()
             schema_row = fetchone(
                 schema_connection,
@@ -152,6 +154,14 @@ def run(args):
             )
             _assert(schema_row and int(schema_row["schema_version"]) == 1,
                     "VNext schema marker was not applied")
+            domain_row = fetchone(
+                schema_connection,
+                "SELECT schema_version, release_sha FROM coverage_schema_meta "
+                "WHERE schema_key = ?",
+                ("coverage_analysis_domain",),
+            )
+            _assert(domain_row and int(domain_row["schema_version"]) == 2,
+                    "Analysis Domain constraint marker was not applied")
             checks["schema_applied"] = True
         finally:
             schema_connection.close()

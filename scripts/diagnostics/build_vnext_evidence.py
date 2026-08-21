@@ -21,6 +21,7 @@ from scripts.diagnostics.active_runtime_audit import audit as audit_active_runti
 from scripts.diagnostics.configured_runtime_audit import audit as audit_configured_runtime
 from scripts.diagnostics.legacy_retirement_audit import audit as audit_legacy_retirement
 from scripts.upgrade.evidence_manifest import EvidenceManifestV2
+from app.inheritance.toolchain import parser_toolchain_preflight
 
 
 CAPABILITIES = [
@@ -121,6 +122,7 @@ def build(repo_root):
         # from the configuration evidence so it cannot be read as proof that
         # a service is running.
         "active_runtime": audit_active_runtime(repo_root),
+        "parser_toolchain": parser_toolchain_preflight(),
     }
 
 

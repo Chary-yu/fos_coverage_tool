@@ -234,6 +234,33 @@ class VNextApiExportSecurityTest(unittest.TestCase):
             3,
         )
 
+    def test_http_analysis_uses_authenticated_reviewer_not_client_value(self):
+        runtime = self._runtime({"mode": "disabled"})
+        scan = runtime.project_service.create_scan_and_ingest(
+            self.connection, "reviewer-auth", [{
+                "repository_name": "repo-a", "file_path": "src/a.c",
+                "file_path_hash": "r" * 32,
+                "lines": [{"line_number": 1, "coverage_state": "uncovered"}],
+            }], info_sha256="r" * 64,
+        )
+        line_id = self.connection.execute(
+            "SELECT id FROM coverage_lines WHERE line_number=1"
+        ).fetchone()[0]
+        status, _ = runtime.application().dispatch(
+            "POST", "/api/coverage/analysis", body={
+                "project_name": "reviewer-auth", "scan_id": scan["id"],
+                "reviewer": "client-spoof", "records": [{
+                    "line_id": line_id, "status": "可覆盖",
+                    "reviewer": "record-spoof", "coverage_method": "unit",
+                }],
+            },
+        )
+        self.assertEqual(status, 200)
+        row = self.connection.execute(
+            "SELECT reviewer FROM coverage_analyses WHERE line_id=?", (line_id,)
+        ).fetchone()
+        self.assertEqual(row[0], "anonymous")
+
     def test_sidecar_symlink_is_rejected(self):
         with tempfile.TemporaryDirectory(prefix="vnext-sidecar-") as root:
             outside = os.path.join(root, "outside")
@@ -258,6 +285,9 @@ class VNextApiExportSecurityTest(unittest.TestCase):
                 "lines": [{
                     "line_number": 10, "line_text": "return 0;",
                     "coverage_state": "uncovered",
+                }, {
+                    "line_number": 11, "line_text": "return 1;",
+                    "coverage_state": "uncovered",
                 }],
             }],
             info_sha256="i" * 64,
@@ -272,10 +302,21 @@ class VNextApiExportSecurityTest(unittest.TestCase):
             self.connection, {"status": "可覆盖", "coverage_method": "unit"},
             origin="INHERITED",
         )
+        source_record = runtime.analysis_domain_repository.create_record(
+            self.connection, {"status": "可覆盖"}, origin="MANUAL"
+        )
+        source_line_id = self.connection.execute(
+            "SELECT id FROM coverage_lines WHERE line_number=11"
+        ).fetchone()[0]
+        source_link = runtime.analysis_domain_repository.create_link(
+            self.connection, scan["id"], source_line_id, source_record["id"],
+            review_state="MANUAL_CONFIRMED", relation_origin="MANUAL",
+        )
         link = runtime.analysis_domain_repository.create_link(
             self.connection, scan["id"], line_id, record["id"],
-            review_state=INHERITED_PENDING, relation_origin="INHERITED",
-            source_scan_id=scan["id"], source_line_id=line_id,
+            review_state=INHERITED_PENDING, relation_origin="INHERITANCE",
+            source_scan_id=scan["id"], source_line_id=source_line_id,
+            source_relation_id=source_link["id"],
         )
         self.connection.commit()
 
@@ -314,6 +355,122 @@ class VNextApiExportSecurityTest(unittest.TestCase):
         )
         self.assertEqual(status, 409)
         self.assertEqual(payload["error"], "STALE_RELATION_REVISION")
+
+    def test_inheritance_cursor_is_bound_to_scan_version_and_filter(self):
+        runtime = self._runtime()
+        scan = runtime.project_service.create_scan_and_ingest(
+            self.connection, "cursor-project", [{
+                "repository_name": "repo-a", "file_path": "src/cursor.c",
+                "file_path_hash": "c" * 32,
+                "lines": [
+                    {"line_number": 10, "coverage_state": "uncovered"},
+                    {"line_number": 11, "coverage_state": "uncovered"},
+                ],
+            }], info_sha256="cursor-info",
+        )
+        line_ids = [row[0] for row in self.connection.execute(
+            "SELECT id FROM coverage_lines ORDER BY line_number"
+        ).fetchall()]
+        for index, line_id in enumerate(line_ids):
+            self.connection.execute("""
+                INSERT INTO coverage_inheritance_decisions(
+                    decision_run_id, candidate_scan_id, candidate_line_id,
+                    decision, reason_code, algorithm_version, evaluated_at
+                ) VALUES (?, ?, ?, 'NO_INHERIT', ?, 'test', CURRENT_TIMESTAMP)
+            """, ("cursor-run-{}".format(index), scan["id"], line_id,
+                  "REASON-{}".format(index)))
+        self.connection.commit()
+        app = runtime.application()
+        status, first = app.dispatch(
+            "GET", "/api/coverage/scans/{}/inheritance/decisions".format(scan["id"]),
+            query={"limit": 1},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(first["has_more"])
+        cursor = first["next_cursor"]
+        status, second = app.dispatch(
+            "GET", "/api/coverage/scans/{}/inheritance/decisions".format(scan["id"]),
+            query={"limit": 1, "cursor": cursor},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(second["items"]), 1)
+        status, payload = app.dispatch(
+            "GET", "/api/coverage/scans/{}/inheritance/decisions".format(scan["id"]),
+            query={"limit": 1, "cursor": cursor, "reason_code": "REASON-1"},
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"], "PAGINATION_CURSOR_STALE")
+        project_id = self.connection.execute(
+            "SELECT project_id FROM coverage_scans WHERE id=?", (scan["id"],)
+        ).fetchone()[0]
+        runtime.states.advance(self.connection, project_id)
+        self.connection.commit()
+        status, payload = app.dispatch(
+            "GET", "/api/coverage/scans/{}/inheritance/decisions".format(scan["id"]),
+            query={"limit": 1, "cursor": cursor},
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"], "PAGINATION_CURSOR_STALE")
+
+    def test_inheritance_pending_excludes_confirmed_and_rejected_relations(self):
+        runtime = self._runtime()
+        scan = runtime.project_service.create_scan_and_ingest(
+            self.connection, "pending-filter-project", [{
+                "repository_name": "repo-a", "file_path": "src/pending.c",
+                "file_path_hash": "p" * 32,
+                "lines": [
+                    {"line_number": 10, "coverage_state": "uncovered"},
+                    {"line_number": 11, "coverage_state": "uncovered"},
+                ],
+            }], info_sha256="pending-filter-info",
+        )
+        line_id = self.connection.execute(
+            "SELECT id FROM coverage_lines WHERE line_number=10"
+        ).fetchone()[0]
+        self.connection.execute("""
+            INSERT INTO coverage_inheritance_decisions(
+                decision_run_id, candidate_scan_id, candidate_line_id,
+                decision, reason_code, algorithm_version, evaluated_at
+            ) VALUES ('pending-filter-run', ?, ?, 'INHERITED', 'INHERITED', 'test', CURRENT_TIMESTAMP)
+        """, (scan["id"], line_id))
+        domain = runtime.analysis_domain_repository
+        source_record = domain.create_record(
+            self.connection, {"status": "可覆盖"}, origin="MANUAL"
+        )
+        source_line_id = self.connection.execute(
+            "SELECT id FROM coverage_lines WHERE line_number=11"
+        ).fetchone()[0]
+        source_link = domain.create_link(
+            self.connection, scan["id"], source_line_id, source_record["id"],
+            review_state="MANUAL_CONFIRMED", relation_origin="MANUAL",
+        )
+        record = domain.create_record(
+            self.connection, {"status": "未确认"}, origin="INHERITED"
+        )
+        link = domain.create_link(
+            self.connection, scan["id"], line_id, record["id"],
+            review_state=INHERITED_PENDING, relation_origin="INHERITANCE",
+            source_scan_id=scan["id"], source_line_id=source_line_id,
+            source_relation_id=source_link["id"],
+        )
+        self.connection.commit()
+        app = runtime.application()
+        status, payload = app.dispatch(
+            "GET", "/api/coverage/scans/{}/inheritance/pending".format(scan["id"]),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["items"]), 1)
+
+        self.connection.execute(
+            "UPDATE coverage_analysis_line_links SET review_state='MANUAL_CONFIRMED' "
+            "WHERE id=?", (link["id"],)
+        )
+        self.connection.commit()
+        status, payload = app.dispatch(
+            "GET", "/api/coverage/scans/{}/inheritance/pending".format(scan["id"]),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["items"], [])
 
 
 if __name__ == "__main__":

@@ -68,9 +68,12 @@ class CppSourceAnalyzer(object):
             return {"supported": False, "functions": [], "controls": {}, "preprocessor": {},
                     "macros": {}, "constants": {}, "calls": {}}
         lines = str(text or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        token_lines = [self.lexer.tokenize(line) for line in lines]
-        functions = self._functions(lines, token_lines, path)
-        controls = self._control_context(lines, token_lines)
+        token_lines = [tokens for _, tokens in self.lexer.tokenize_lines(text)]
+        lexer_uncertain = bool(getattr(self.lexer, "last_lines_uncertain", False))
+        functions = self._functions(lines, token_lines, path, lexer_uncertain)
+        controls = self._control_context(
+            lines, token_lines, getattr(self.lexer, "last_line_splices", set())
+        )
         preprocessor = self._preprocessor_context(lines)
         macros, constants = self._definitions(lines)
         calls = self._calls(token_lines)
@@ -78,6 +81,8 @@ class CppSourceAnalyzer(object):
             "supported": True, "functions": functions, "controls": controls,
             "preprocessor": preprocessor, "macros": macros, "constants": constants,
             "calls": calls, "lines": lines, "tokens": token_lines,
+            "path": path,
+            "uncertain": lexer_uncertain,
         }
 
     def function_for_line(self, analysis, line_number):
@@ -87,7 +92,7 @@ class CppSourceAnalyzer(object):
             return candidates[0]
         return None
 
-    def _functions(self, lines, token_lines, path):
+    def _functions(self, lines, token_lines, path, lexer_uncertain=False):
         functions = []
         brace_depth = 0
         brace_starts = {}
@@ -129,7 +134,8 @@ class CppSourceAnalyzer(object):
                                 body.extend(line_tokens)
                             functions.append(FunctionRange(
                                 identity, start, index, body_tokens=body,
-                                uncertain=self._looks_uncertain(" ".join(header)),
+                                uncertain=(lexer_uncertain or
+                                           self._looks_uncertain(" ".join(header))),
                             ))
                     brace_depth = max(0, brace_depth - 1)
                     closing_scope = brace_scope.pop(brace_depth + 1, None)
@@ -209,30 +215,96 @@ class CppSourceAnalyzer(object):
     def _looks_uncertain(prefix):
         return any(token in prefix for token in ("<", ">", "operator", "->*"))
 
-    def _control_context(self, lines, token_lines):
+    def _control_context(self, lines, token_lines, line_splices=None):
         context = {}
-        stack = []
-        for index, tokens in enumerate(token_lines, 1):
-            if tokens:
-                words = [token for token in tokens if token in self.CONTROL_WORDS]
-                if words:
-                    control = " ".join(tokens)
-                    stack.append(control)
-            context[index] = tuple(stack)
-            # Braces close the nearest control scope conservatively.  This is
-            # deliberately fail-closed for malformed/nested macro constructs.
-            closes = sum(1 for token in tokens if token == "}")
-            for _ in range(min(closes, len(stack))):
-                stack.pop()
+        active = []
+        brace_depth = 0
+        groups = []
+        index = 0
+        line_splices = set(line_splices or ())
+        while index < len(token_lines):
+            start = index + 1
+            end = start
+            tokens = list(token_lines[index])
+            while end in line_splices and end < len(token_lines):
+                tokens.extend(token_lines[end])
+                end += 1
+            groups.append((start, end, tuple(tokens)))
+            index = end
+        for start_line, end_line, tokens in groups:
+            line_context = [item[1] for item in active]
+            pending = []
+            token_index = 0
+            while token_index < len(tokens):
+                token = tokens[token_index]
+                if token in self.CONTROL_WORDS and self._control_start(tokens, token_index):
+                    descriptor, end = self._control_descriptor(tokens, token_index)
+                    if descriptor:
+                        # A control header and its opening brace frequently
+                        # share one physical line.  Record it for that line
+                        # immediately; assigning context only at line start
+                        # would make ``if (x) { return ...; }`` look ordinary.
+                        if descriptor not in line_context:
+                            line_context.append(descriptor)
+                        pending.append(descriptor)
+                    token_index = max(token_index + 1, end)
+                    continue
+                if token == "{":
+                    brace_depth += 1
+                    active.extend((brace_depth, descriptor) for descriptor in pending)
+                    pending = []
+                elif token == "}":
+                    active = [item for item in active if item[0] < brace_depth]
+                    brace_depth = max(0, brace_depth - 1)
+                token_index += 1
+            # A control header without a brace has no safely knowable extent.
+            # Keep it only for the current physical line; the following line
+            # remains ordinary pending instead of inheriting through a guessed
+            # statement boundary.
+            for physical_line in range(start_line, end_line + 1):
+                context[physical_line] = tuple(line_context)
         return context
+
+    @staticmethod
+    def _control_start(tokens, index):
+        if index == 0:
+            return True
+        return tokens[index - 1] in ("{", "}", ";", ":", "else", "do")
+
+    @staticmethod
+    def _control_descriptor(tokens, index):
+        token = tokens[index]
+        if token in ("else", "do"):
+            return token, index + 1
+        if token == "case":
+            end = index + 1
+            while end < len(tokens) and tokens[end] != ":":
+                end += 1
+            return " ".join(tokens[index:end + 1]), min(len(tokens), end + 1)
+        if index + 1 >= len(tokens) or tokens[index + 1] != "(":
+            return token, index + 1
+        depth = 0
+        end = index + 1
+        while end < len(tokens):
+            if tokens[end] == "(":
+                depth += 1
+            elif tokens[end] == ")":
+                depth -= 1
+                if depth == 0:
+                    end += 1
+                    break
+            end += 1
+        return " ".join(tokens[index:end]), end
 
     @staticmethod
     def _preprocessor_context(lines):
         stack = []
         context = {}
-        for index, line in enumerate(lines, 1):
+        logical_lines = CppLexer._logical_lines(lines)
+        for start_line, end_line, line in logical_lines:
+            for physical_line in range(start_line, end_line + 1):
+                context[physical_line] = tuple(stack)
             stripped = line.strip()
-            context[index] = tuple(stack)
             if not stripped.startswith("#"):
                 continue
             directive = stripped[1:].strip()
@@ -240,6 +312,7 @@ class CppSourceAnalyzer(object):
             if not match:
                 continue
             kind, expression = match.group(1), match.group(2).strip()
+            expression = " ".join(normalize_cpp(expression))
             if kind == "endif":
                 if stack:
                     stack.pop()
@@ -253,7 +326,7 @@ class CppSourceAnalyzer(object):
     def _definitions(self, lines):
         macros = {}
         constants = {}
-        for index, line in enumerate(lines, 1):
+        for index, _, line in CppLexer._logical_lines(lines):
             match = re.match(r"\s*#\s*define\s+([A-Za-z_]\w*)(.*)$", line)
             if match:
                 macros[match.group(1)] = (index, tuple(normalize_cpp(match.group(2))))

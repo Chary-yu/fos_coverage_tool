@@ -197,7 +197,10 @@ async function main() {
           evidence_class: 'synthetic_dom_microbenchmark', workload_id: result.workload_id,
           line_count: lineCount, baseline_ms: Number(baseline.toFixed(3)),
           candidate_ms: Number(candidate.toFixed(3)),
-          baseline_commit: null, candidate_commit: null
+          comparison_labels: {
+            baseline: 'per_node_append',
+            candidate: 'fragment_batch'
+          }
         };
       }
       result.line_count = 10000;
@@ -218,8 +221,6 @@ async function main() {
       result.status = 'FAILED';
     }
     result.comparison_type = 'synthetic_same_run';
-    result.baseline_commit = process.env.BASELINE_COMMIT || null;
-    result.candidate_commit = process.env.CANDIDATE_COMMIT || null;
     result.workload_hash = process.env.WORKLOAD_HASH || 'chromium-dom-batch-v1';
     result.environment_identity = {
       browser: result.browser || '',

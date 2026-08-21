@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fos-coverage-tool.invalid/contracts/evidence-manifest-v2.schema.json",
+  "title": "FOS Coverage Tool Evidence Manifest v2",
+  "type": "object",
+  "required": [
+    "evidence_schema_version",
+    "gate",
+    "candidate_revision",
+    "release_identity",
+    "database_runtime_identity",
+    "evidence",
+    "manifest_sha256"
+  ],
+  "properties": {
+    "evidence_schema_version": {"const": 2},
+    "gate": {"type": "string", "minLength": 1},
+    "candidate_revision": {"type": "string", "minLength": 1},
+    "release_identity": {"type": "object"},
+    "database_runtime_identity": {"type": "object"},
+    "evidence": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/evidenceRecord"}
+    },
+    "manifest_sha256": {"type": "string", "minLength": 64, "maxLength": 64}
+  },
+  "$defs": {
+    "evidenceRecord": {
+      "type": "object",
+      "required": [
+        "gate", "evidence_id", "evidence_class", "candidate_revision",
+        "host_identity", "command_or_action", "started_at", "finished_at",
+        "exit_code", "artifact_path", "artifact_sha256",
+        "source_inputs_sha256", "status", "synthetic"
+      ],
+      "properties": {
+        "gate": {"type": "string", "minLength": 1},
+        "evidence_id": {"type": "string", "minLength": 1},
+        "evidence_class": {"type": "string", "minLength": 1},
+        "candidate_revision": {"type": "string", "minLength": 1},
+        "host_identity": {"type": "object", "minProperties": 1},
+        "command_or_action": {},
+        "started_at": {"type": "string", "minLength": 1},
+        "finished_at": {"type": "string", "minLength": 1},
+        "exit_code": {"type": ["integer", "null"]},
+        "artifact_path": {"type": "string"},
+        "artifact_sha256": {"type": "string"},
+        "source_inputs_sha256": {"type": "array", "items": {"type": "string"}},
+        "status": {"enum": ["PASSED", "INCOMPLETE", "BLOCKED", "FAILED", "PARTIAL", "UNAVAILABLE", "SKIPPED"]},
+        "synthetic": {"type": "boolean"}
+      }
+    }
+  }
+}

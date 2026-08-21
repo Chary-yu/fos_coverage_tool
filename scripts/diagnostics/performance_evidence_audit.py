@@ -1,6 +1,7 @@
 """Validate browser performance evidence without fabricating server metrics."""
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -14,6 +15,14 @@ except ModuleNotFoundError:
 
 def _finite_number(value):
     return isinstance(value, (int, float)) and math.isfinite(float(value))
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def audit(path, allow_partial=False, require_cross_layer=False):
@@ -42,6 +51,32 @@ def audit(path, allow_partial=False, require_cross_layer=False):
             "violations": ["performance evidence is not valid JSON: {}".format(exc)],
             "missing_cross_layer_metrics": [],
         })
+
+    # A release A/B artifact has a stronger contract than the browser-only
+    # functional fixture: two independent exact-revision inputs, one workload
+    # identity, one comparable environment, and hashed source artifacts.
+    if evidence.get("evidence_class") == "release_performance_ab":
+        if evidence.get("comparison_type") != "release_revision_ab":
+            violations.append("release performance comparison type is not release_revision_ab")
+        if not evidence.get("baseline_commit") or not evidence.get("candidate_commit") or \
+                evidence.get("baseline_commit") == evidence.get("candidate_commit"):
+            violations.append("release performance baseline/candidate commit identity is invalid")
+        if not evidence.get("workload_hash") or not isinstance(evidence.get("environment_identity"), dict):
+            violations.append("release performance workload/environment identity is incomplete")
+        for tier_name in ("Tier_A_1k", "Tier_B_10k", "Tier_C_50k", "Tier_D_100k"):
+            tier = evidence.get(tier_name) or {}
+            if tier.get("status") != "PASSED" or not _finite_number(tier.get("baseline_ms")) or \
+                    not _finite_number(tier.get("candidate_ms")):
+                violations.append("release performance tier is incomplete: {}".format(tier_name))
+        source_artifacts = evidence.get("source_artifacts") or {}
+        for role in ("baseline", "candidate"):
+            source = source_artifacts.get(role) if isinstance(source_artifacts, dict) else None
+            source_path = source.get("path") if isinstance(source, dict) else ""
+            source_sha = source.get("sha256") if isinstance(source, dict) else ""
+            if not source_path or not os.path.isabs(str(source_path)) or not os.path.isfile(str(source_path)):
+                violations.append("release performance {} source artifact is missing".format(role))
+            elif not source_sha or _sha256(str(source_path)) != str(source_sha):
+                violations.append("release performance {} source artifact SHA256 mismatch".format(role))
 
     workload = evidence.get("coverage_virtual_scroll_100k") or {}
     required = (

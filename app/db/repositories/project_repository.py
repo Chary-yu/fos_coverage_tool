@@ -126,6 +126,10 @@ class ProjectRepository(object):
                                    identity_verified: int = 0,
                                    identity_provenance: str = ""):
         self._assert_scan_building(connection, scan_id)
+        if int(bool(identity_verified)) and not str(commit_sha or "").strip():
+            raise ValueError("verified scan identity requires commit_sha")
+        if int(bool(identity_verified)) and not str(identity_provenance or "").strip():
+            raise ValueError("verified scan identity requires identity_provenance")
         existing = fetchone(connection, """
             SELECT * FROM coverage_scan_repositories
             WHERE scan_id = ? AND repository_name = ?

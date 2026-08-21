@@ -15,7 +15,10 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from app.jobs.bounded_executor import BoundedJobExecutor, STATUS_COMPLETED, STATUS_CANCELLED
-from app.jobs.excel_streaming import export_project_coverage_streaming_zip
+from app.jobs.excel_streaming import (
+    build_directory_detail_workbook,
+    export_project_coverage_streaming_zip,
+)
 
 class TestPhase3JobsExport(unittest.TestCase):
 
@@ -90,6 +93,30 @@ class TestPhase3JobsExport(unittest.TestCase):
             self.assertIn("00_目录汇总.xlsx", names)
             self.assertIn("detail_src_core.xlsx", names)
             self.assertIn("detail_src_net.xlsx", names)
+
+    def test_excel_export_keeps_confirmed_and_suggested_reviewers_separate(self):
+        path = build_directory_detail_workbook(
+            "src/core",
+            iter([{
+                "file_path": "src/core/a.c", "line_number": 1,
+                "status": "可覆盖", "reviewer": "db-carol",
+                "suggested_reviewer": "git-alice", "coverage_method": "unit",
+                "uncovered_reason": "", "code_line": "return 0;",
+            }]),
+        )
+        try:
+            import openpyxl
+            workbook = openpyxl.load_workbook(path, read_only=True)
+            row = next(workbook.active.iter_rows(values_only=True))
+            self.assertEqual(row[3], "确认 Reviewer")
+            self.assertEqual(row[4], "Suggested Reviewer")
+            values = next(workbook.active.iter_rows(min_row=2, values_only=True))
+            self.assertEqual(values[3], "db-carol")
+            self.assertEqual(values[4], "git-alice")
+            workbook.close()
+        finally:
+            if os.path.isfile(path):
+                os.remove(path)
 
 if __name__ == "__main__":
     unittest.main()

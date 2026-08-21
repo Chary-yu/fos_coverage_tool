@@ -14,6 +14,7 @@ from app.inheritance.engine import InheritanceEngine
 from app.inject.service import ScanImportService
 from app.services.analysis_domain_service import AnalysisDomainService
 from app.services.project_service import ProjectService
+from app.scan_import.publication import ScanPublicationService
 from scripts.upgrade.migration_runner import create_sqlite_schema
 
 
@@ -108,6 +109,64 @@ class ScanImportLifecycleTest(unittest.TestCase):
         service.release(self.connection, "job-1", "owner-1")
         second = service.acquire(self.connection, [self.resource_id], "job-2", "owner-2")
         self.assertGreater(second[0]["fencing_token"], first[0]["fencing_token"])
+
+    def test_repository_master_rename_alias_and_retire_preserve_identity(self):
+        projects = ProjectRepository()
+        project = projects.ensure_project(self.connection, "repository-master")
+        repositories = RepositoryRepository()
+        original = repositories.ensure(
+            self.connection, project["id"], "repo-a", canonical_remote="origin-a"
+        )
+        renamed = repositories.rename(
+            self.connection, project["id"], original["id"], "repo-b"
+        )
+        self.assertEqual(renamed["id"], original["id"])
+        self.assertEqual(
+            repositories.get_by_name(self.connection, project["id"], "repo-a")["id"],
+            original["id"],
+        )
+        repositories.add_alias(self.connection, project["id"], original["id"], "legacy-a")
+        self.assertEqual(
+            repositories.get_by_name(self.connection, project["id"], "legacy-a")["id"],
+            original["id"],
+        )
+        other = repositories.ensure(self.connection, project["id"], "repo-c")
+        with self.assertRaises(ValueError):
+            repositories.add_alias(self.connection, project["id"], other["id"], "repo-a")
+        repositories.retire(self.connection, original["id"])
+        self.assertIsNone(
+            repositories.get_by_name(self.connection, project["id"], "legacy-a")
+        )
+        with self.assertRaises(ValueError) as raised:
+            repositories.ensure(self.connection, project["id"], "repo-b")
+        self.assertEqual(str(raised.exception), "REPOSITORY_RETIRED")
+
+    def test_publication_compare_and_swap_distinguishes_null_current(self):
+        projects = ProjectRepository()
+        project = projects.ensure_project(self.connection, "publication-cas")
+        states = ProjectStateRepository()
+        states.ensure(self.connection, project["id"], current_scan_id=None)
+        first = projects.create_scan(
+            self.connection, project["id"], "first", "coverage", "full",
+            info_sha256="hash-first",
+        )
+        second = projects.create_scan(
+            self.connection, project["id"], "second", "coverage", "full",
+            info_sha256="hash-second",
+        )
+        projects.seal_scan(self.connection, first["id"])
+        projects.seal_scan(self.connection, second["id"])
+        publication = ScanPublicationService()
+        publication.publish_in_transaction(
+            self.connection, project["id"], first["id"],
+            expected_current_scan_id=None,
+        )
+        with self.assertRaises(ValueError) as raised:
+            publication.publish_in_transaction(
+                self.connection, project["id"], second["id"],
+                expected_current_scan_id=None,
+            )
+        self.assertEqual(str(raised.exception), "CURRENT_POINTER_CHANGED")
 
     def test_execute_imports_staged_info_computes_inheritance_and_publishes(self):
         projects = ProjectRepository()

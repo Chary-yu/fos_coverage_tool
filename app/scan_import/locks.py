@@ -4,7 +4,7 @@ from __future__ import absolute_import
 
 from datetime import datetime, timedelta
 
-from app.db.repositories.base import adapt_sql, execute, fetchall, fetchone
+from app.db.repositories.base import adapt_sql, execute, fetchall, fetchone, is_sqlite
 from app.time_utils import utc_sql, utc_now_naive
 
 
@@ -49,10 +49,17 @@ class RepositoryResourceLockService(object):
         )
         try:
             for resource_id in sorted(set(int(item) for item in (resource_ids or []))):
-                lock = fetchone(connection, """
+                lock_sql = """
                     SELECT * FROM coverage_repository_resource_locks
                     WHERE physical_resource_id=?
-                """, (resource_id,))
+                """
+                if not is_sqlite(connection):
+                    # The read/expire/token decision must lock the physical
+                    # resource row on MariaDB.  Without this, two import
+                    # transactions can both observe an expired lease before
+                    # either writes its fencing token.
+                    lock_sql += " FOR UPDATE"
+                lock = fetchone(connection, lock_sql, (resource_id,))
                 if lock and not _expired(lock.get("expires_at")) and str(lock.get("job_id")) != str(job_id):
                     raise RepositoryBusyError(
                         "resource {} is owned by another active import".format(resource_id)

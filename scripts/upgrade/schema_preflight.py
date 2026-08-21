@@ -67,6 +67,12 @@ def analyze_sql_script(sql_text: str) -> Tuple[bool, List[str], List[str]]:
         if re.search(pat, clean_sql, re.IGNORECASE):
             errors.append(f"Forbidden destructive command pattern detected: {pat}")
 
+    if re.search(r"\bON\s+DELETE\s+CASCADE\b", clean_sql, re.IGNORECASE):
+        errors.append(
+            "ON DELETE CASCADE is forbidden for authoritative historical facts; "
+            "use explicit RESTRICT semantics"
+        )
+
     if re.search(r"\bADD\s+COLUMN\s+IF\s+NOT\s+EXISTS\b", clean_sql, re.IGNORECASE):
         errors.append(
             "MariaDB 5.5 does not provide reliable ADD COLUMN IF NOT EXISTS; "

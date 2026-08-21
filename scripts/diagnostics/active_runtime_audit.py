@@ -14,6 +14,10 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
+try:
+    from urllib.parse import urlparse
+except ImportError:  # pragma: no cover - Python 2 compatibility is not required at runtime
+    from urlparse import urlparse
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
@@ -91,17 +95,62 @@ def _bound_config(process, explicit_path=None):
         if item.startswith("--config="):
             selected = item.split("=", 1)[1]
             break
-    expected = os.path.realpath(explicit_path) if explicit_path else ""
-    observed = os.path.realpath(selected) if selected else ""
+    source = "process_environment" if environment.get("COVERAGE_CONFIG_PATH") else (
+        "process_cmdline" if selected else "implicit_default"
+    )
+    # A process started without --config is still bound to the repository's
+    # default configuration. Record that fact explicitly; otherwise an audit
+    # with no explicit --config would treat a live process as unbound merely
+    # because the default is implicit in the command line.
+    if not selected and process.get("available"):
+        repo_root = process.get("repo_root") or ""
+        default_path = os.path.join(repo_root, "coverage_config.json") if repo_root else ""
+        if default_path and os.path.isfile(default_path):
+            selected = default_path
+    repo_root = process.get("repo_root") or ""
+    expected_value = explicit_path
+    if expected_value and not os.path.isabs(str(expected_value)) and repo_root:
+        expected_value = os.path.join(repo_root, str(expected_value))
+    observed_value = selected
+    if observed_value and not os.path.isabs(str(observed_value)) and repo_root:
+        observed_value = os.path.join(repo_root, str(observed_value))
+    expected = os.path.realpath(expected_value) if expected_value else ""
+    observed = os.path.realpath(observed_value) if observed_value else ""
     return {
         "selected_path": selected,
         "selected_realpath": observed,
         "expected_realpath": expected,
         "matches_requested": bool(observed and (not expected or observed == expected)),
-        "source": "process_environment" if environment.get("COVERAGE_CONFIG_PATH") else (
-            "process_cmdline" if selected else "unobserved"
-        ),
+        "source": source if observed else "unobserved",
     }
+
+
+def _listening_ports(pid):
+    """Return TCP listening ports visible to a process on Linux.
+
+    HTTP health checks prove that a route exists, but do not prove that the
+    process selected the configured bind port. The procfs check adds that
+    identity evidence without opening sockets or changing runtime state. On a
+    non-Linux host it returns an empty set and the active audit remains
+    explicitly partial.
+    """
+    if not pid:
+        return []
+    ports = set()
+    for template in ("/proc/{}/net/tcp", "/proc/{}/net/tcp6"):
+        filename = template.format(int(pid))
+        try:
+            with open(filename, "r", encoding="ascii") as stream:
+                for line in stream.read().splitlines()[1:]:
+                    fields = line.split()
+                    if len(fields) < 4 or fields[3] != "0A":
+                        continue
+                    address = fields[1]
+                    port = address.rsplit(":", 1)[-1]
+                    ports.add(int(port, 16))
+        except (OSError, ValueError, IndexError):
+            continue
+    return sorted(ports)
 
 
 def _http_json(url, headers=None):
@@ -119,6 +168,10 @@ def _database_identity(config):
     result = {
         "configured_database": db.get("database", ""),
         "observed_database": None,
+        "observed_host": None,
+        "observed_port": None,
+        "schema_meta": [],
+        "schema_ready": False,
         "status": "NOT_PROBED",
     }
     try:
@@ -131,12 +184,26 @@ def _database_identity(config):
         )
         try:
             with connection.cursor() as cursor:
-                cursor.execute("SELECT DATABASE() AS database_name")
+                cursor.execute(
+                    "SELECT DATABASE() AS database_name, @@hostname AS hostname, "
+                    "@@port AS server_port"
+                )
                 row = cursor.fetchone() or {}
                 result["observed_database"] = row.get("database_name")
+                result["observed_host"] = row.get("hostname")
+                result["observed_port"] = row.get("server_port")
+                cursor.execute(
+                    "SELECT schema_key, schema_version FROM coverage_schema_meta"
+                )
+                result["schema_meta"] = [dict(item) for item in (cursor.fetchall() or [])]
+                result["schema_ready"] = any(
+                    str(item.get("schema_key") or "") == "coverage_vnext_core" and
+                    int(item.get("schema_version") or 0) >= 1
+                    for item in result["schema_meta"]
+                )
                 result["status"] = (
                     "PASSED" if result["observed_database"] == result["configured_database"]
-                    else "FAILED"
+                    and result["schema_ready"] else "FAILED"
                 )
         finally:
             connection.close()
@@ -149,9 +216,6 @@ def _database_identity(config):
 def audit(repo_root=ROOT, url=None, pid=None, pid_file=None, service=None, config_path=None,
           require_live=False, probe_database=False):
     configured = audit_configured(repo_root)
-    config = load_application_config(
-        config_path, base_dir=repo_root
-    ) if config_path else load_application_config(None, base_dir=repo_root)
     service_state = _service_state(service)
     resolved_pid = pid or _read_pid_file(pid_file)
     process = _read_proc(resolved_pid) if resolved_pid else {
@@ -162,7 +226,22 @@ def audit(repo_root=ROOT, url=None, pid=None, pid_file=None, service=None, confi
         if main_pid and main_pid != "0":
             process = _read_proc(int(main_pid))
             process["source"] = "systemd"
+    process["repo_root"] = os.path.abspath(repo_root)
     bound_config = _bound_config(process, config_path)
+    bound_config_path = bound_config.get("selected_path") or config_path or None
+    config_error = ""
+    try:
+        # Probe the configuration actually selected by the live process. This
+        # prevents an audit launched without --config from probing the checked
+        # in default DB while the process is serving the Candidate DB.
+        config = load_application_config(bound_config_path, base_dir=repo_root)
+    except (OSError, ValueError, RuntimeError) as exc:
+        config_error = str(exc)
+        config = load_application_config(None, base_dir=repo_root)
+    bound_config["config_load_error"] = config_error
+    bound_config["runtime_mode"] = config.get("runtime_mode")
+    bound_config["database"] = (config.get("mysql") or {}).get("database", "")
+    bound_config["server"] = config.get("server") or {}
 
     http = {}
     if url:
@@ -182,16 +261,31 @@ def audit(repo_root=ROOT, url=None, pid=None, pid_file=None, service=None, confi
     database = _database_identity(config) if probe_database else {
         "status": "NOT_PROBED",
         "configured_database": (config.get("mysql") or {}).get("database", ""),
+        "schema_ready": False,
     }
+    listening_ports = _listening_ports(process.get("pid")) if process.get("available") else []
+    configured_port = int((config.get("server") or {}).get("port") or 0)
+    try:
+        requested_url_port = urlparse(str(url)).port if url else None
+    except ValueError:
+        requested_url_port = None
     checks = {
         "process_or_service": bool(
             process.get("available") or service_state.get("available")
         ),
         "bound_configuration": bool(
-            process.get("available") and bound_config.get("matches_requested")
+            process.get("available") and bound_config.get("matches_requested") and
+            not bound_config.get("config_load_error") and
+            str(config.get("runtime_mode") or "").lower() == "vnext"
+        ),
+        "listening_port": bool(
+            process.get("available") and configured_port and
+            configured_port in listening_ports and
+            (requested_url_port is None or requested_url_port == configured_port)
         ),
         "release_identity": bool(release.get("commit_sha") and release.get("build_id")),
-        "database_identity": database.get("status") == "PASSED",
+        "database_identity": database.get("status") == "PASSED" and
+            bool(database.get("schema_ready")),
         "http_routes": bool(
             (http.get("health") or {}).get("status") == 200
             and (http.get("release") or {}).get("status") == 200
@@ -217,6 +311,8 @@ def audit(repo_root=ROOT, url=None, pid=None, pid_file=None, service=None, confi
         "http": http,
         "release": release,
         "database": database,
+        "listening_ports": listening_ports,
+        "config_load_error": config_error,
         "checks": checks,
         "missing_evidence": missing,
         "url": url or "",

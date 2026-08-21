@@ -32,12 +32,12 @@ class ProjectStateRepository(object):
 
     def advance(self, connection, project_id: int):
         current = self.ensure(connection, project_id)
-        next_version = int(current.get("data_version") or 0) + 1
         cursor = execute(connection, """
             UPDATE coverage_project_state
-            SET data_version = ?, file_state_version = 0, updated_at = CURRENT_TIMESTAMP
+            SET data_version = data_version + 1, file_state_version = 0,
+                updated_at = CURRENT_TIMESTAMP
             WHERE project_id = ?
-        """, (next_version, project_id))
+        """, (project_id,))
         cursor.close()
         return self.get(connection, project_id)
 
