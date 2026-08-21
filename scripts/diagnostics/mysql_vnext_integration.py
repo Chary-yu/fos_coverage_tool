@@ -11,6 +11,9 @@ from __future__ import print_function
 import argparse
 import json
 import os
+import platform
+import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -31,6 +34,8 @@ except ModuleNotFoundError:
 import pymysql
 
 from app.bootstrap import VNextRuntime, create_vnext_server
+from app.release_identity import generate_release_identity
+from app.time_utils import utc_iso
 from app.code_detail.code_region import FunctionRange
 from app.code_detail.sidecar_store import SidecarStore
 from app.code_detail.source_reader import (
@@ -55,6 +60,16 @@ from scripts.upgrade.legacy_fixture import (
 def _env(name, default=None):
     value = os.environ.get(name)
     return default if value in (None, "") else value
+
+
+def _revision():
+    try:
+        return subprocess.check_output(
+            ["git", "-C", _REPO_ROOT, "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        ).decode("ascii").strip()
+    except Exception:
+        return ""
 
 
 def _connect(host, port, user, password, database=None, autocommit=True):
@@ -194,14 +209,14 @@ def _run_legacy_migration_rehearsal(args):
         release_sha = "a" * 40
         schema_path = os.path.join(_REPO_ROOT, "scripts", "upgrade", "vnext_schema.sql")
         first_schema = apply_schema(target, schema_path, release_sha=release_sha)
-        second_schema = apply_schema(target, schema_path, release_sha=release_sha)
         first = migrate_legacy(source, target, release_sha=release_sha)
         domain = apply_analysis_domain(target, release_sha=release_sha)
-        domain_again = apply_analysis_domain(target, release_sha=release_sha)
         source.rollback()
         first_snapshot = capture_vnext_semantic_snapshot(target)
         second = migrate_legacy(source, target, release_sha=release_sha)
         second_snapshot = capture_vnext_semantic_snapshot(target)
+        domain_again = apply_analysis_domain(target, release_sha=release_sha)
+        second_schema = apply_schema(target, schema_path, release_sha=release_sha)
 
         counts = {}
         with target.cursor() as cursor:
@@ -268,6 +283,7 @@ def run(args):
     server_thread = None
     database = _database_name()
     checks = {}
+    started_at = utc_iso()
     root = tempfile.mkdtemp(prefix="vnext-mysql-audit-")
     report_root = os.path.join(root, "report")
     os.makedirs(report_root)
@@ -515,6 +531,21 @@ def run(args):
             "evidence_class": "real_mariadb_vnext_integration",
             "database_engine": "MariaDB",
             "database_version": _database_version(args),
+            "synthetic": True,
+            "synthetic_reason": "generated disposable input/report; real database runtime only",
+            "candidate_revision": _revision(),
+            "release_identity": generate_release_identity(repo_root=_REPO_ROOT),
+            "host_identity": {
+                "hostname": socket.gethostname(),
+                "platform": platform.platform(),
+            },
+            "command_or_action": (
+                "python scripts/diagnostics/mysql_vnext_integration.py "
+                "--create-disposable --migration-rehearsal"
+            ),
+            "started_at": started_at,
+            "finished_at": utc_iso(),
+            "exit_code": 0,
             "checks": checks,
             "database": database,
             "disposable": True,
@@ -605,10 +636,28 @@ def main(argv=None):
             "status": "FAILED",
             "evidence_class": "real_mariadb_vnext_integration",
             "database_engine": "MariaDB",
+            "synthetic": True,
+            "synthetic_reason": "generated disposable input/report; real database runtime only",
+            "candidate_revision": _revision(),
+            "release_identity": generate_release_identity(repo_root=_REPO_ROOT),
+            "host_identity": {
+                "hostname": socket.gethostname(),
+                "platform": platform.platform(),
+            },
+            "command_or_action": (
+                "python scripts/diagnostics/mysql_vnext_integration.py "
+                "--create-disposable --migration-rehearsal"
+            ),
+            "started_at": utc_iso(),
+            "finished_at": utc_iso(),
+            "exit_code": 1,
             "violations": ["{}: {}".format(type(exc).__name__, exc)],
             "disposable": True,
         })
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    # MariaDB returns DATETIME columns as ``datetime`` objects through
+    # PyMySQL.  Evidence must remain JSON-serializable without silently
+    # dropping those timestamp facts.
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     return 0 if result["status"] == "PASSED" else 1
 
 

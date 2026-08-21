@@ -2,6 +2,7 @@ import hashlib
 import os
 import sqlite3
 import tempfile
+from datetime import datetime
 import unittest
 
 from scripts.upgrade.migration_runner import (
@@ -9,6 +10,7 @@ from scripts.upgrade.migration_runner import (
     capture_vnext_snapshot,
     create_sqlite_schema,
     migrate_legacy,
+    semantic_hash,
     _split_sql,
 )
 from scripts.upgrade.schema_preflight import (
@@ -67,6 +69,30 @@ def legacy_connection():
 
 
 class MigrationRunnerTest(unittest.TestCase):
+    def test_semantic_hash_normalizes_mariadb_datetime_values(self):
+        self.assertEqual(
+            semantic_hash({
+                "legacy_provenance": [{
+                    "legacy_created_at": datetime(2026, 8, 21, 12, 34, 56),
+                }],
+            }),
+            semantic_hash({
+                "legacy_provenance": [{
+                    "legacy_created_at": "2026-08-21 12:34:56",
+                }],
+            }),
+        )
+
+    def test_legacy_timestamp_columns_keep_microsecond_precision(self):
+        root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+        path = os.path.join(root, "scripts", "upgrade", "vnext_schema.sql")
+        with open(path, "r", encoding="utf-8") as stream:
+            ddl = stream.read().lower()
+        self.assertIn("legacy_created_at datetime(6) null", ddl)
+        self.assertIn("legacy_updated_at datetime(6) null", ddl)
+        self.assertIn("legacy_source_created_at datetime(6) null", ddl)
+        self.assertIn("legacy_source_updated_at datetime(6) null", ddl)
+
     def test_domain_constraint_ddl_is_additive_and_explicitly_restrictive(self):
         root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
         path = os.path.join(root, "scripts", "upgrade", "vnext_domain_constraints.sql")

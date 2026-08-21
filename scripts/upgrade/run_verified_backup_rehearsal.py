@@ -80,7 +80,29 @@ def _sha256_text(path):
 
 def _mysql_config(config):
     value = config.get("mysql", config) if isinstance(config, dict) else {}
-    return dict(value or {})
+    result = dict(value or {})
+    # Keep credentials out of command lines while allowing a rehearsal host
+    # to bind the checked-in config contract to its local disposable server.
+    # These overrides are intentionally opt-in and are not used by normal
+    # Candidate startup.
+    overrides = {
+        "COVERAGE_REHEARSAL_MYSQL_HOST": "host",
+        "COVERAGE_REHEARSAL_MYSQL_PORT": "port",
+        "COVERAGE_REHEARSAL_MYSQL_USER": "user",
+        "COVERAGE_REHEARSAL_MYSQL_PASSWORD": "password",
+        "COVERAGE_REHEARSAL_MYSQL_DATABASE": "database",
+        "COVERAGE_REHEARSAL_MYSQL_RESTORE_HOST": "backup_restore_host",
+        "COVERAGE_REHEARSAL_MYSQL_RESTORE_PORT": "backup_restore_port",
+        "COVERAGE_REHEARSAL_MYSQL_RESTORE_USER": "backup_restore_user",
+        "COVERAGE_REHEARSAL_MYSQL_RESTORE_PASSWORD": "backup_restore_password",
+    }
+    for environment_name, key in overrides.items():
+        if environment_name in os.environ:
+            result[key] = os.environ.get(environment_name, "")
+    for key in ("port", "backup_restore_port"):
+        if key in result and result[key] not in (None, ""):
+            result[key] = int(result[key])
+    return result
 
 
 def _safe_database_name(value, label):
@@ -217,6 +239,27 @@ def _validate_dump(dump_path, expected_sha, repo_root, deployment_roots):
     return dump_path, actual, uncompressed
 
 
+def _semantic_diff(source, target, limit=8):
+    """Return bounded, machine-readable differences for a failed rehearsal."""
+    differences = []
+    for key in sorted(set(source or {}) | set(target or {})):
+        left = (source or {}).get(key)
+        right = (target or {}).get(key)
+        if left == right:
+            continue
+        item = {"field": key}
+        if isinstance(left, list) and isinstance(right, list):
+            item["source_count"] = len(left)
+            item["target_count"] = len(right)
+            item["source_head"] = left[:limit]
+            item["target_head"] = right[:limit]
+        else:
+            item["source"] = left
+            item["target"] = right
+        differences.append(item)
+    return differences[:limit]
+
+
 def _base_result(repo_root, revision, dump_path, dump_sha, output_path,
                  started_at, command):
     identity = generate_release_identity(repo_root=repo_root)
@@ -345,17 +388,17 @@ def run(args):
         source_semantic = capture_legacy_semantic_snapshot(source_connection)
         schema_path = os.path.join(repo_root, "scripts", "upgrade", "vnext_schema.sql")
         first_schema = apply_schema(target_connection, schema_path, release_sha=revision)
-        first_domain = apply_analysis_domain(target_connection, release_sha=revision)
         first_migration = migrate_legacy(
             source_connection, target_connection, release_sha=revision,
         )
+        first_domain = apply_analysis_domain(target_connection, release_sha=revision)
         target_semantic = capture_vnext_semantic_snapshot(target_connection)
         second_migration = migrate_legacy(
             source_connection, target_connection, release_sha=revision,
         )
         target_semantic_second = capture_vnext_semantic_snapshot(target_connection)
-        second_schema = apply_schema(target_connection, schema_path, release_sha=revision)
         second_domain = apply_analysis_domain(target_connection, release_sha=revision)
+        second_schema = apply_schema(target_connection, schema_path, release_sha=revision)
         semantic_match = bool(first_migration.get("authoritative_semantic_match"))
         idempotent = bool(second_migration.get("authoritative_semantic_match")) \
             and target_semantic == target_semantic_second
@@ -378,6 +421,9 @@ def run(args):
         result["source_semantic_hash"] = semantic_hash(source_semantic)
         result["target_semantic_hash"] = semantic_hash(target_semantic)
         result["target_semantic_hash_second"] = semantic_hash(target_semantic_second)
+        result["semantic_differences"] = _semantic_diff(
+            source_semantic, target_semantic,
+        )
         result["uncompressed_backup_bytes"] = uncompressed_size
         if not semantic_match:
             raise RuntimeError("restored Legacy -> VNext semantic hash mismatch")
@@ -430,7 +476,10 @@ def main(argv=None):
     if directory and not os.path.isdir(directory):
         os.makedirs(directory)
     with open(output, "w", encoding="utf-8") as stream:
-        json.dump(result, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        json.dump(
+            result, stream, ensure_ascii=False, indent=2, sort_keys=True,
+            default=str,
+        )
     if args.manifest_output:
         manifest_path = os.path.abspath(args.manifest_output)
         try:
@@ -474,8 +523,13 @@ def main(argv=None):
                 "evidence manifest generation failed: {}".format(exc)
             )
         with open(output, "w", encoding="utf-8") as stream:
-            json.dump(result, stream, ensure_ascii=False, indent=2, sort_keys=True)
-    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+            json.dump(
+                result, stream, ensure_ascii=False, indent=2, sort_keys=True,
+                default=str,
+            )
+    print(json.dumps(
+        result, ensure_ascii=False, indent=2, sort_keys=True, default=str,
+    ))
     return 0 if result.get("status") == "PASSED" else 1
 
 

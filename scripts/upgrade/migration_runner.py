@@ -7,6 +7,8 @@ import json
 import os
 import sqlite3
 import sys
+from datetime import date, datetime, time
+from decimal import Decimal
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
@@ -691,8 +693,26 @@ def capture_legacy_semantic_snapshot(connection, snapshot=None):
     return snapshot
 
 
+def _semantic_json_default(value):
+    """Normalize DB-API scalar values without losing semantic facts.
+
+    SQLite exposes historical timestamps as strings while PyMySQL exposes
+    DATETIME/DECIMAL values as Python objects.  Using the SQL textual form
+    keeps hashes comparable across both drivers and remains deterministic.
+    Unsupported objects fail closed instead of being silently stringified.
+    """
+    if isinstance(value, (datetime, date, time, Decimal)):
+        return str(value)
+    raise TypeError("Object of type {} is not JSON serializable".format(
+        type(value).__name__
+    ))
+
+
 def semantic_hash(snapshot):
-    payload = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(
+        snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        default=_semantic_json_default,
+    )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
@@ -971,6 +991,24 @@ def apply_schema(connection, ddl_path, release_sha=""):
     """
     cursor = connection.cursor()
     cursor.execute(adapt_sql(connection, ledger_ddl))
+    cursor.close()
+    connection.commit()
+    # ``coverage_schema_meta`` is part of the same additive core schema, but
+    # the migration ledger needs it before the full DDL loop so it can derive
+    # ``from_version`` on a genuinely empty MariaDB target.  SQLite creates
+    # this table in ``create_sqlite_schema``; MariaDB must bootstrap it here.
+    meta_ddl = """
+        CREATE TABLE IF NOT EXISTS coverage_schema_meta (
+            schema_key VARCHAR(64) NOT NULL,
+            schema_version INT NOT NULL,
+            applied_at DATETIME(6) NOT NULL,
+            release_sha CHAR(40) NOT NULL DEFAULT '',
+            migration_id VARCHAR(128) NOT NULL DEFAULT '',
+            PRIMARY KEY (schema_key)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """
+    cursor = connection.cursor()
+    cursor.execute(adapt_sql(connection, meta_ddl))
     cursor.close()
     connection.commit()
     existing_migration = fetchone(connection, """
@@ -1389,7 +1427,9 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None,
             job_repo.upsert(conn, {
                 "job_id": old_job["job_id"], "project_id": project["id"],
                 "kind": old_job["kind"], "state": state,
-                "progress": 0, "input_payload": json.dumps(old_job, sort_keys=True),
+                "progress": 0, "input_payload": json.dumps(
+                    old_job, sort_keys=True, default=_semantic_json_default,
+                ),
                 "error_message": old_job["error_message"] if state != "interrupted"
                 else "legacy active job requires manual migration decision",
                 "data_version": old_job["data_version"],
@@ -1420,7 +1460,8 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None,
                 "legacy_raw_is_draft": None,
                 "raw_payload_sha256": old_job.get("raw_payload_sha256", ""),
                 "raw_payload": json.dumps(
-                    old_job, ensure_ascii=False, sort_keys=True, default=str
+                    old_job, ensure_ascii=False, sort_keys=True,
+                    default=_semantic_json_default,
                 ),
             }])
 
@@ -1475,7 +1516,10 @@ def main(argv=None):
     if args.demo:
         source, target = _demo_connections()
         result = migrate_legacy(source, target, args.anomaly_path or None)
-        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        print(json.dumps(
+            result, ensure_ascii=False, indent=2, sort_keys=True,
+            default=_semantic_json_default,
+        ))
         return 0
     if args.source_config and args.target_config:
         import pymysql
@@ -1527,8 +1571,14 @@ def main(argv=None):
             }
             if args.anomaly_path:
                 with open(args.anomaly_path, "w", encoding="utf-8") as stream:
-                    json.dump(result, stream, ensure_ascii=False, indent=2, sort_keys=True)
-            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+                    json.dump(
+                        result, stream, ensure_ascii=False, indent=2, sort_keys=True,
+                        default=_semantic_json_default,
+                    )
+            print(json.dumps(
+                result, ensure_ascii=False, indent=2, sort_keys=True,
+                default=_semantic_json_default,
+            ))
             return 0 if result["status"] == "PASSED" else 1
         finally:
             source.close()
