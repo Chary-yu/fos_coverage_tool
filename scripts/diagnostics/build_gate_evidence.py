@@ -1,0 +1,490 @@
+"""Assemble truthful Gate A--F evidence bundles for one exact checkout.
+
+The builder fills repository-executable evidence and explicit missing-evidence
+records.  It is not a release certifier: generated SQLite/fixture evidence is
+marked synthetic and remains ``INCOMPLETE`` for production gates.
+"""
+
+from __future__ import print_function
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import sqlite3
+import subprocess
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from app.release_identity import generate_release_identity
+from app.time_utils import utc_iso
+from scripts.diagnostics.gate_matrix import build as build_gate_matrix
+from scripts.diagnostics.contract import with_contract
+from scripts.upgrade.domain_migration import apply_analysis_domain
+from scripts.upgrade.evidence_manifest import EvidenceManifestV2
+from scripts.upgrade.legacy_fixture import create_legacy_fixture_schema, seed_legacy_fixture
+from scripts.upgrade.migration_runner import (
+    capture_legacy_semantic_snapshot, capture_vnext_semantic_snapshot,
+    create_sqlite_schema, migrate_legacy, semantic_hash,
+    apply_schema,
+)
+
+
+GATE_FILES = {
+    "A": (
+        "source_schema.txt", "target_schema.txt", "migration_matrix.json",
+        "source_semantic.json", "target_semantic.json", "semantic_hashes.json",
+        "anomalies.json", "migration_run_1.json", "migration_run_2_idempotency.json",
+        "mariadb55_preflight.json", "targeted_tests.txt",
+    ),
+    "B": (
+        "schema_diff.json", "repository_identity_matrix.json", "backfill_before.json",
+        "backfill_after.json", "semantic_hashes.json", "orphan_checks.json",
+        "canonical_ownership_audit.json", "targeted_tests.txt",
+    ),
+    "C": (
+        "state_machine.json", "resource_locks.json", "fencing_tests.json",
+        "checkpoint_resume_tests.json", "current_pointer_tests.json",
+        "worktree_before_after.json", "publish_tests.json", "runtime_job_audit.json",
+        "targeted_tests.txt",
+    ),
+    "D": (
+        "rule_traceability.json", "reason_catalog.json", "fixture_manifest.json",
+        "decision_run_1.json", "decision_run_2.json", "determinism_diff.json",
+        "false_positive_report.json", "parser_toolchain.json", "dependency_report.json",
+        "targeted_tests.txt",
+    ),
+    "E": (
+        "api_contract.json", "http_acceptance.json", "browser_acceptance.json",
+        "asset_cache_parity.json", "parity_matrix.json", "performance_evidence.json",
+        "targeted_tests.txt",
+    ),
+    "F": (
+        "final_source_review.json", "final_security_review.json", "release_identity.json",
+        "database_runtime_identity.json", "candidate_layout.json",
+        "candidate_config_audit.json", "verified_backup.json", "pre_freeze_semantic.json",
+        "final_migration.json", "final_semantic_reconciliation.json",
+        "runtime_verification.json", "browser_smoke.json", "cutover_record.json",
+        "rollback_rehearsal.json", "acceptance_window_checks.json", "skill_drift_audit.json",
+    ),
+}
+
+TEST_GROUPS = {
+    "A": ["tests.vnext.test_migration_runner", "tests.vnext.test_legacy_migration_contract"],
+    "B": ["tests.vnext.test_analysis_domain", "tests.vnext.test_migration_runner"],
+    "C": ["tests.vnext.test_scan_import_lifecycle", "tests.vnext.test_jobs"],
+    "D": ["tests.vnext.test_inheritance_engine", "tests.vnext.test_parser_toolchain"],
+    "E": ["tests.vnext.test_api_export_security", "tests.vnext.test_registry_and_api_contract"],
+    "F": ["tests.release.test_upgrade_manifest", "tests.release.test_evidence_authenticity"],
+}
+
+
+def _revision(repo_root):
+    try:
+        return subprocess.check_output(
+            ["git", "-C", repo_root, "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        ).decode("ascii").strip()
+    except Exception:
+        return ""
+
+
+def _sha(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write(path, value, text=False):
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    if text:
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(str(value))
+    else:
+        with open(path, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True,
+                      default=str)
+
+
+def _read_text(path):
+    with open(path, "r", encoding="utf-8") as stream:
+        return stream.read()
+
+
+def _run_tests(repo_root, modules, enabled=True):
+    command = [sys.executable, "-m", "unittest"] + list(modules) + ["-v"]
+    if not enabled:
+        return {"status": "INCOMPLETE", "exit_code": None,
+                "command": command, "output": "test execution disabled"}
+    completed = subprocess.run(command, cwd=repo_root, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, check=False)
+    output = completed.stdout.decode("utf-8", errors="replace")
+    return {"status": "PASSED" if completed.returncode == 0 else "FAILED",
+            "exit_code": int(completed.returncode), "command": command,
+            "output": output}
+
+
+def _sqlite_migration():
+    source = sqlite3.connect(":memory:")
+    target = sqlite3.connect(":memory:")
+    source.row_factory = sqlite3.Row
+    target.row_factory = sqlite3.Row
+    try:
+        create_legacy_fixture_schema(source)
+        seed_legacy_fixture(source, project_name="bundle-a", line_count=32,
+                             analysis_count=20, job_count=1)
+        seed_legacy_fixture(source, project_name="bundle-b", line_count=16,
+                             analysis_count=8, job_count=0)
+        create_sqlite_schema(target)
+        apply_schema(
+            target,
+            os.path.join(ROOT, "scripts", "upgrade", "vnext_schema.sql"),
+            release_sha="bundle-fixture",
+        )
+        source_semantic = capture_legacy_semantic_snapshot(source)
+        first = migrate_legacy(source, target, release_sha="bundle-fixture")
+        domain = apply_analysis_domain(target, release_sha="bundle-fixture")
+        first_target = capture_vnext_semantic_snapshot(target)
+        second = migrate_legacy(source, target, release_sha="bundle-fixture")
+        second_target = capture_vnext_semantic_snapshot(target)
+        return {
+            "source_semantic": source_semantic,
+            "target_semantic": first_target,
+            "source_hash": semantic_hash(source_semantic),
+            "target_hash": semantic_hash(first_target),
+            "first": first,
+            "second": second,
+            "domain": domain,
+            "idempotent": first_target == second_target,
+            "synthetic": True,
+        }
+    finally:
+        source.close()
+        target.close()
+
+
+def _missing(name, reason):
+    return {"status": "INCOMPLETE", "evidence_class": name,
+            "synthetic": False, "violations": [reason]}
+
+
+def _external_json(env_name, reason):
+    path = os.environ.get(env_name, "")
+    if not path or not os.path.isfile(path):
+        return _missing("external_release_evidence", reason), []
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            return json.load(stream), [_sha(path)]
+    except (OSError, ValueError, TypeError) as exc:
+        return _missing("external_release_evidence", str(exc)), []
+
+
+def _gate_detail(repo_root, matrix, gate, sqlite_result=None, test_result=None):
+    gate_payload = matrix["gates"][gate]
+    detail = {
+        "gate": "GATE_{}".format(gate),
+        "candidate_revision": matrix.get("candidate_revision", ""),
+        "status": gate_payload.get("status", "INCOMPLETE"),
+        "executed": [item.get("name") for item in gate_payload.get("local_checks", [])],
+        "passed": [item.get("name") for item in gate_payload.get("local_checks", [])
+                   if item.get("status") == "PASSED"],
+        "failed": [item.get("name") for item in gate_payload.get("local_checks", [])
+                   if item.get("status") in ("FAILED", "BLOCKED")],
+        "skipped": [],
+        "missing_evidence": gate_payload.get("missing_evidence") or [],
+        "blocking_findings": [],
+        "artifacts": [],
+        "generated_at": utc_iso(),
+    }
+    if sqlite_result is not None:
+        detail["local_fixture"] = {
+            "status": "INCOMPLETE",
+            "synthetic": True,
+            "authoritative_semantic_match": bool(
+                sqlite_result["first"].get("authoritative_semantic_match")
+            ),
+            "idempotent": bool(sqlite_result.get("idempotent")),
+        }
+    if test_result is not None:
+        detail["targeted_tests"] = test_result
+        if test_result.get("status") == "FAILED":
+            detail["status"] = "FAILED"
+            detail["blocking_findings"].append("targeted test command failed")
+    return detail
+
+
+def build(repo_root, output_root, run_tests=True):
+    repo_root = os.path.abspath(repo_root)
+    output_root = os.path.abspath(output_root)
+    revision = _revision(repo_root)
+    identity = generate_release_identity(repo_root=repo_root)
+    matrix = build_gate_matrix(repo_root)
+    sqlite_result = _sqlite_migration()
+    all_gate_results = {}
+
+    fixture_source = os.path.join(repo_root, "tests", "fixtures",
+                                  "legacy_schema_mariadb55.sql")
+    vnext_schema = os.path.join(repo_root, "scripts", "upgrade", "vnext_schema.sql")
+    migration_matrix = {
+        "version": "legacy-migration-v2",
+        "source_tables": {
+            "coverage_analysis": "coverage_analyses + coverage_legacy_provenance",
+            "coverage_line_index": "coverage_files + coverage_lines + provenance",
+            "coverage_project_state": "coverage_projects + coverage_project_state",
+            "coverage_background_jobs": "coverage_background_jobs + provenance",
+        },
+        "active_job_policy": "queued/running/interrupted -> interrupted with anomaly",
+        "result_path_policy": "provenance-only until allowed-root revalidation",
+    }
+
+    for gate in "ABCDEF":
+        gate_dir = os.path.join(output_root, "gate-{}".format(gate.lower()))
+        if not os.path.isdir(gate_dir):
+            os.makedirs(gate_dir)
+        tests = _run_tests(repo_root, TEST_GROUPS[gate], enabled=run_tests)
+        _write(os.path.join(gate_dir, "targeted_tests.txt"),
+               json.dumps(tests, ensure_ascii=False, indent=2), text=True)
+        if gate == "A":
+            _write(os.path.join(gate_dir, "source_schema.txt"),
+                   _read_text(fixture_source), text=True)
+            _write(os.path.join(gate_dir, "target_schema.txt"),
+                   _read_text(vnext_schema), text=True)
+            _write(os.path.join(gate_dir, "migration_matrix.json"), migration_matrix)
+            _write(os.path.join(gate_dir, "source_semantic.json"),
+                   sqlite_result["source_semantic"])
+            _write(os.path.join(gate_dir, "target_semantic.json"),
+                   sqlite_result["target_semantic"])
+            _write(os.path.join(gate_dir, "semantic_hashes.json"), {
+                "source_semantic_hash": sqlite_result["source_hash"],
+                "target_semantic_hash": sqlite_result["target_hash"],
+                "authoritative_semantic_match": sqlite_result["first"].get(
+                    "authoritative_semantic_match", False
+                ),
+                "synthetic": True,
+            })
+            _write(os.path.join(gate_dir, "anomalies.json"),
+                   {"anomalies": sqlite_result["first"].get("anomalies", []),
+                    "synthetic": True})
+            _write(os.path.join(gate_dir, "migration_run_1.json"),
+                   sqlite_result["first"])
+            _write(os.path.join(gate_dir, "migration_run_2_idempotency.json"), {
+                "second_run": sqlite_result["second"],
+                "idempotent": sqlite_result["idempotent"],
+                "synthetic": True,
+            })
+            _write(os.path.join(gate_dir, "mariadb55_preflight.json"), _missing(
+                "mariadb55_preflight",
+                "static fixture/DDL is present; real MariaDB 5.5 runtime is not verified",
+            ))
+        elif gate == "B":
+            _write(os.path.join(gate_dir, "schema_diff.json"), {
+                "core_schema_sha256": _sha(vnext_schema),
+                "domain_schema_sha256": _sha(os.path.join(
+                    repo_root, "scripts", "upgrade", "vnext_domain_constraints.sql"
+                )),
+                "status": "PASSED",
+            })
+            _write(os.path.join(gate_dir, "repository_identity_matrix.json"), {
+                "logical_repository": "coverage_repositories.id",
+                "physical_resource": "coverage_repository_resources.resource_key",
+                "scan_snapshot": "coverage_scan_repositories",
+                "status": "PASSED",
+            })
+            _write(os.path.join(gate_dir, "backfill_before.json"), {
+                "status": "INCOMPLETE", "synthetic": True,
+                "source": "SQLite fixture before Analysis Domain backfill",
+            })
+            _write(os.path.join(gate_dir, "backfill_after.json"), {
+                "status": "INCOMPLETE", "synthetic": True,
+                "analysis_domain": sqlite_result["domain"],
+            })
+            _write(os.path.join(gate_dir, "semantic_hashes.json"), {
+                "source": sqlite_result["source_hash"],
+                "target": sqlite_result["target_hash"], "synthetic": True,
+            })
+            _write(os.path.join(gate_dir, "orphan_checks.json"),
+                   sqlite_result["domain"].get("consistency", _missing(
+                       "orphan_checks", "target DB backfill evidence is unavailable"
+                   )))
+            _write(os.path.join(gate_dir, "canonical_ownership_audit.json"),
+                   matrix["gates"]["B"]["local_checks"][0])
+        elif gate == "C":
+            for name, value in {
+                "state_machine.json": {"status": "PASSED", "states": [
+                    "CREATED", "STAGING", "IMPORTING", "SEALED", "PUBLISHED", "ABORTED"
+                ]},
+                "resource_locks.json": _missing("resource_lock_rehearsal", "live DB lock/fencing rehearsal is external"),
+                "fencing_tests.json": _missing("fencing_rehearsal", "live DB fencing evidence is external"),
+                "checkpoint_resume_tests.json": _missing("checkpoint_resume", "durable restart evidence is external"),
+                "current_pointer_tests.json": _missing("current_pointer", "final read-set evidence is external"),
+                "worktree_before_after.json": _missing("worktree_identity", "production worktree evidence is external"),
+                "publish_tests.json": matrix["gates"]["C"]["local_checks"][1],
+                "runtime_job_audit.json": _missing("runtime_job_audit", "production job recovery evidence is external"),
+            }.items():
+                _write(os.path.join(gate_dir, name), value)
+        elif gate == "D":
+            rules = matrix["gates"]["D"]["local_checks"][0]
+            parser = matrix["gates"]["D"]["local_checks"][1]
+            _write(os.path.join(gate_dir, "rule_traceability.json"), rules)
+            _write(os.path.join(gate_dir, "reason_catalog.json"), {
+                "status": "PASSED", "source": "contracts/inheritance_rules_v1.json",
+            })
+            _write(os.path.join(gate_dir, "fixture_manifest.json"), {
+                "status": "INCOMPLETE", "synthetic": True,
+                "reason": "generated corpus is auxiliary until target parser/toolchain is verified",
+            })
+            _write(os.path.join(gate_dir, "decision_run_1.json"), _missing(
+                "decision_run", "production deterministic corpus is external"))
+            _write(os.path.join(gate_dir, "decision_run_2.json"), _missing(
+                "decision_run", "production deterministic corpus is external"))
+            _write(os.path.join(gate_dir, "determinism_diff.json"), _missing(
+                "determinism_diff", "two independent production corpus runs are external"))
+            _write(os.path.join(gate_dir, "false_positive_report.json"), _missing(
+                "false_positive_report", "verified production corpus is external"))
+            _write(os.path.join(gate_dir, "parser_toolchain.json"), parser)
+            _write(os.path.join(gate_dir, "dependency_report.json"), _missing(
+                "dependency_report", "same-repository production dependency evidence is external"))
+        elif gate == "E":
+            _write(os.path.join(gate_dir, "api_contract.json"),
+                   matrix["gates"]["E"]["local_checks"][0])
+            browser, browser_inputs = _external_json(
+                "COVERAGE_GATE_E_BROWSER_EVIDENCE",
+                "real HTTP + Chromium evidence is not supplied",
+            )
+            performance, performance_inputs = _external_json(
+                "COVERAGE_GATE_E_PERF_EVIDENCE",
+                "cross-layer performance evidence is not supplied",
+            )
+            _write(os.path.join(gate_dir, "http_acceptance.json"), browser)
+            _write(os.path.join(gate_dir, "browser_acceptance.json"), browser)
+            _write(os.path.join(gate_dir, "asset_cache_parity.json"), _missing(
+                "asset_cache_parity", "exact release asset parity evidence is external"))
+            _write(os.path.join(gate_dir, "parity_matrix.json"), _missing(
+                "parity_matrix", "full VNext parity evidence is external"))
+            _write(os.path.join(gate_dir, "performance_evidence.json"), performance)
+        elif gate == "F":
+            _write(os.path.join(gate_dir, "final_source_review.json"), _missing(
+                "final_source_review", "exact-SHA production review is external"))
+            _write(os.path.join(gate_dir, "final_security_review.json"), _missing(
+                "final_security_review", "exact-SHA trust-boundary review is external"))
+            _write(os.path.join(gate_dir, "release_identity.json"), identity)
+            _write(os.path.join(gate_dir, "database_runtime_identity.json"), _missing(
+                "database_runtime_identity", "final target DB identity is external"))
+            _write(os.path.join(gate_dir, "candidate_layout.json"), _missing(
+                "candidate_layout", "fresh dual-environment inventory is external"))
+            _write(os.path.join(gate_dir, "candidate_config_audit.json"),
+                   matrix["gates"]["F"]["local_checks"][0])
+            for name, reason in {
+                "verified_backup.json": "verified production backup restore evidence is external",
+                "pre_freeze_semantic.json": "freeze stability evidence is external",
+                "final_migration.json": "final production migration evidence is external",
+                "final_semantic_reconciliation.json": "final target semantic reconciliation is external",
+                "runtime_verification.json": "traffic-closed runtime verification is external",
+                "browser_smoke.json": "traffic-closed browser smoke is external",
+                "cutover_record.json": "production cutover record is external",
+                "rollback_rehearsal.json": "exact before-release rollback evidence is external",
+                "acceptance_window_checks.json": "48-hour acceptance-window evidence is external",
+                "skill_drift_audit.json": "operator Skill Drift manifest is external",
+            }.items():
+                _write(os.path.join(gate_dir, name), _missing(name[:-5], reason))
+
+        detail = _gate_detail(repo_root, matrix, gate,
+                              sqlite_result if gate in ("A", "B") else None,
+                              tests)
+        detail["artifacts"] = list(GATE_FILES[gate]) + [
+            "evidence-manifest-v2.json", "gate_{}_result.json".format(gate.lower())
+        ]
+        result_path = os.path.join(gate_dir, "gate_{}_result.json".format(gate.lower()))
+        _write(result_path, detail)
+        manifest = EvidenceManifestV2(
+            repo_root, "gate-{}".format(gate.lower()),
+            candidate_revision=revision, release_identity=identity,
+            manifest_path=os.path.join(gate_dir, "evidence-manifest-v2.json"),
+        )
+        for name in GATE_FILES[gate]:
+            path = os.path.join(gate_dir, name)
+            if not os.path.isfile(path):
+                continue
+            synthetic = name in {
+                "source_semantic.json", "target_semantic.json", "semantic_hashes.json",
+                "anomalies.json", "migration_run_1.json", "migration_run_2_idempotency.json",
+                "backfill_before.json", "backfill_after.json", "fixture_manifest.json",
+            }
+            status = "PASSED" if name == "targeted_tests.txt" and tests["status"] == "PASSED" else "INCOMPLETE"
+            payload = None
+            try:
+                with open(path, "r", encoding="utf-8") as stream:
+                    payload = json.load(stream)
+                if isinstance(payload, dict) and payload.get("status") in (
+                        "FAILED", "BLOCKED", "INCOMPLETE", "PARTIAL", "UNAVAILABLE"):
+                    status = payload.get("status")
+            except (ValueError, OSError):
+                pass
+            if synthetic and status == "PASSED":
+                status = "INCOMPLETE"
+            manifest.record(
+                "{}-{}".format(gate.lower(), name.replace("/", "-").replace(".", "-")),
+                "synthetic_fixture" if synthetic else "repository_or_release_audit",
+                status, "build_gate_evidence.py", 0 if tests["status"] == "PASSED" else 1,
+                artifact_path=path, source_inputs_sha256=[], synthetic=synthetic,
+                observed_status=(payload or {}).get("status") if isinstance(payload, dict) else "",
+            )
+        all_gate_results[gate] = detail
+
+    matrix_path = os.path.join(output_root, "gate-matrix.json")
+    _write(matrix_path, matrix)
+    statuses = [str(item.get("status") or "INCOMPLETE")
+                for item in all_gate_results.values()]
+    overall_status = "FAILED" if any(
+        status in ("FAILED", "BLOCKED") for status in statuses
+    ) else ("INCOMPLETE" if any(status != "PASSED" for status in statuses)
+           else "PASSED")
+    return with_contract({
+        "status": overall_status,
+        "evidence_class": "gate_a_f_evidence_bundle",
+        "candidate_revision": revision,
+        "release_identity": identity,
+        "host_identity": {"hostname": platform.node(), "platform": platform.platform()},
+        "gates": all_gate_results,
+        "output_root": output_root,
+        "generated_at": utc_iso(),
+    })
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo-root", default=ROOT)
+    parser.add_argument("--output-root", default=".artifacts/gates")
+    parser.add_argument("--no-tests", action="store_true")
+    parser.add_argument(
+        "--allow-incomplete", action="store_true",
+        help="return success for an honest INCOMPLETE bundle, never for FAILED evidence",
+    )
+    parser.add_argument("--output")
+    args = parser.parse_args(argv)
+    output_root = args.output_root
+    if not os.path.isabs(output_root):
+        output_root = os.path.join(os.path.abspath(args.repo_root), output_root)
+    result = build(args.repo_root, output_root, run_tests=not args.no_tests)
+    encoded = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
+    if args.output:
+        output = args.output if os.path.isabs(args.output) else os.path.join(
+            os.path.abspath(args.repo_root), args.output
+        )
+        _write(output, result)
+    print(encoded)
+    return 0 if result["status"] == "PASSED" or (
+        result["status"] == "INCOMPLETE" and args.allow_incomplete
+    ) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

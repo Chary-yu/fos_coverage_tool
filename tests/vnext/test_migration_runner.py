@@ -137,6 +137,25 @@ class MigrationRunnerTest(unittest.TestCase):
         self.assertEqual(len(after["lines"]), len(before["lines"]))
         self.assertEqual(len(after["analyses"]), len(before["analyses"]))
 
+    def test_blank_analysis_path_uses_unique_line_identity(self):
+        source = legacy_connection()
+        self.addCleanup(source.close)
+        source.execute(
+            "UPDATE coverage_analysis SET file_path=? WHERE id=?",
+            ("", 1),
+        )
+        source.commit()
+        target = sqlite3.connect(":memory:")
+        self.addCleanup(target.close)
+        target.row_factory = sqlite3.Row
+        create_sqlite_schema(target)
+        result = migrate_legacy(source, target)
+        self.assertTrue(result["authoritative_semantic_match"])
+        self.assertEqual(
+            target.execute("SELECT file_path FROM coverage_files").fetchone()[0],
+            "src/migrated.c",
+        )
+
     def test_active_jobs_and_analysis_only_lines_are_explicitly_mapped(self):
         source = legacy_connection()
         self.addCleanup(source.close)

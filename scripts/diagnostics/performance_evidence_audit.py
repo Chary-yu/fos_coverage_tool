@@ -126,6 +126,8 @@ def audit(path, allow_partial=False, require_cross_layer=False):
         "status": status,
         "evidence_class": "performance_evidence_audit",
         "path": os.path.abspath(path),
+        "release_eligible": evidence.get("synthetic") is False and
+            evidence.get("release_eligible") is not False,
         "browser_status": browser_status,
         "gate": "cross_layer_performance" if require_cross_layer else "browser_functional",
         "browser_workload": workload.get("workload_id", ""),

@@ -617,7 +617,10 @@ class UpgradeOrchestrator:
         if known:
             first = known[0]
             queries.append((first, "exact"))
-            queries.append(("../" + first, "normalized"))
+            # LCOV/external path identities containing parent traversal are
+            # rejected by the canonical resolver rather than folded into a
+            # different path.
+            queries.append(("../" + first, "invalid_path"))
             queries.append((os.path.basename(first), "basename_only_rejected"))
             queries.append(("__missing__/not-present.c", "miss"))
         p_audit = audit_path_mappings(known, queries)

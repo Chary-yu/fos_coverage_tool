@@ -22,6 +22,22 @@ from app.code_detail.source_reader import SourceContext, SourceLineDTO, calc_sid
 from scripts.upgrade.migration_runner import create_sqlite_schema
 
 
+DEFAULT_FIXTURE_LINES = 120
+
+
+def _fixture_line_count():
+    raw = os.environ.get("COVERAGE_HTTP_FIXTURE_LINES", "")
+    if not raw:
+        return DEFAULT_FIXTURE_LINES
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError("COVERAGE_HTTP_FIXTURE_LINES must be an integer")
+    if value < 1 or value > 1000000:
+        raise ValueError("COVERAGE_HTTP_FIXTURE_LINES must be between 1 and 1000000")
+    return value
+
+
 def _connection_factory(db_path):
     def factory():
         connection = sqlite3.connect(db_path)
@@ -30,7 +46,8 @@ def _connection_factory(db_path):
     return factory
 
 
-def _fixture_lines():
+def _fixture_lines(line_count=None):
+    line_count = int(line_count or _fixture_line_count())
     return [
         {
             "line_number": line_number,
@@ -45,13 +62,15 @@ def _fixture_lines():
             "code_occurrence": 1,
             "suggested_reviewer": "git-alice" if line_number == 1 else "",
         }
-        for line_number in range(1, 121)
+        for line_number in range(1, line_count + 1)
     ]
 
 
-def _source_context():
+def _source_context(line_count=None):
+    line_count = int(line_count or _fixture_line_count())
+    with_panels = line_count <= DEFAULT_FIXTURE_LINES
     lines = []
-    for line_number in range(1, 121):
+    for line_number in range(1, line_count + 1):
         lines.append(SourceLineDTO(
             line_number,
             source="fixture_line_{}();".format(line_number),
@@ -62,16 +81,17 @@ def _source_context():
             block_end_line=line_number,
             block_type="single",
             suggested_reviewer="git-alice" if line_number == 1 else "",
-            is_block_entry=True,
+            is_block_entry=with_panels or line_number == 1,
         ))
     return SourceContext(
         "HttpFixture", "src/http_fixture.c", lines,
-        function_ranges=[FunctionRange(1, 120, "fixture")],
+        function_ranges=[FunctionRange(1, line_count, "fixture")],
         report_id="report_http_fixture",
     )
 
 
 def build_fixture():
+    line_count = _fixture_line_count()
     temporary = tempfile.TemporaryDirectory(prefix="vnext-http-browser-")
     root = temporary.name
     db_path = os.path.join(root, "fixture.db")
@@ -101,7 +121,7 @@ def build_fixture():
     factory = _connection_factory(db_path)
     seed_runtime = VNextRuntime(config, root, connection_factory=factory)
     try:
-        context = _source_context()
+        context = _source_context(line_count)
         file_path = "src/http_fixture.c"
         file_key = calc_sidecar_file_key(file_path, "repo-a")
         SidecarStore([report_root], chunk_size=2000).save_chunked_sidecar(
@@ -117,7 +137,7 @@ def build_fixture():
                     "file_path": file_path,
                     "file_path_hash": "",
                     "source_file_name": "http_fixture.c",
-                    "lines": _fixture_lines(),
+                    "lines": _fixture_lines(line_count),
                 }],
                 info_file_name="http_fixture.info",
                 info_sha256="a" * 64,

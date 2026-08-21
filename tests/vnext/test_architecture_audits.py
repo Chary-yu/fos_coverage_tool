@@ -92,6 +92,7 @@ class ArchitectureAuditTest(unittest.TestCase):
             partial = audit_performance(stream.name, allow_partial=True)
             strict = audit_performance(stream.name, require_cross_layer=True)
         self.assertEqual(partial["status"], "PARTIAL")
+        self.assertFalse(partial["release_eligible"])
         self.assertEqual(strict["status"], "FAILED")
         self.assertIn("peak_rss_bytes", strict["missing_cross_layer_metrics"])
         with tempfile.TemporaryDirectory() as directory:

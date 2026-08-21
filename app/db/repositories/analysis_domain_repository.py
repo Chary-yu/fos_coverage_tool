@@ -135,6 +135,81 @@ class AnalysisDomainRepository(object):
         cursor.close()
         return self.get_record(connection, record_id)
 
+    def create_records_many(self, connection, values, origin="MANUAL", now=None):
+        """Create content records with bounded executemany/readback batches."""
+        items = [dict(item or {}) for item in (values or [])]
+        if not items:
+            return []
+        stamp = now or utc_sql()
+        normalized = []
+        source_ids = []
+        for item in items:
+            source_id = item.get("legacy_source_analysis_id")
+            if source_id is None:
+                raise ValueError("bulk analysis record requires a legacy source id")
+            source_id = int(source_id)
+            content = {
+                "conclusion_status": item.get(
+                    "conclusion_status", item.get("status", "")
+                ) or "",
+                "coverage_method": item.get(
+                    "coverage_method", item.get("method", "")
+                ) or "",
+                "uncovered_reason": item.get(
+                    "uncovered_reason", item.get("reason", "")
+                ) or "",
+                "comment": item.get("comment", "") or "",
+            }
+            normalized.append((
+                content, source_id,
+                item.get("legacy_source_created_at"),
+                item.get("legacy_source_updated_at"),
+                item.get("legacy_raw_status", item.get("status")),
+                item.get("legacy_raw_is_draft", item.get("is_draft")),
+            ))
+            source_ids.append(source_id)
+        if len(set(source_ids)) != len(source_ids):
+            raise ValueError("duplicate legacy analysis source id in bulk insert")
+
+        def chunks(sequence, size=500):
+            for start in range(0, len(sequence), size):
+                yield sequence[start:start + size]
+
+        params = []
+        for content, source_id, created_at, updated_at, raw_status, raw_draft in normalized:
+            params.append((
+                content["conclusion_status"], content["coverage_method"],
+                content["uncovered_reason"], content["comment"],
+                content_hash(content), origin, source_id, created_at, updated_at,
+                raw_status, raw_draft, stamp, stamp,
+            ))
+        statement = """
+            INSERT INTO coverage_analysis_records(
+                conclusion_status, coverage_method, uncovered_reason, comment,
+                content_revision, content_hash, content_origin,
+                legacy_source_analysis_id, legacy_source_created_at,
+                legacy_source_updated_at, legacy_raw_status, legacy_raw_is_draft,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        for batch in chunks(params):
+            cursor = connection.cursor()
+            try:
+                cursor.executemany(adapt_sql(connection, statement), batch)
+            finally:
+                cursor.close()
+        rows = []
+        for batch in chunks(source_ids):
+            placeholders = ", ".join("?" for _ in batch)
+            rows.extend(fetchall(connection, """
+                SELECT * FROM coverage_analysis_records
+                WHERE legacy_source_analysis_id IN ({})
+            """.format(placeholders), batch))
+        by_source = {int(row["legacy_source_analysis_id"]): row for row in rows}
+        if len(by_source) != len(source_ids):
+            raise RuntimeError("bulk analysis record readback is incomplete")
+        return [by_source[source_id] for source_id in source_ids]
+
     def update_record(self, connection, record_id, values, expected_revision=None):
         current = self.get_record(connection, record_id)
         if not current:
@@ -529,26 +604,104 @@ class AnalysisDomainRepository(object):
             {where}
             ORDER BY a.id
         """.format(where=where), params)
-        created = 0
-        for row in rows:
-            if self.get_link(connection, row["scan_id"], row["physical_line_id"]):
+        if not rows:
+            return {"created": 0, "scanned": 0}
+
+        def chunks(sequence, size=500):
+            for start in range(0, len(sequence), size):
+                yield sequence[start:start + size]
+
+        line_ids = [int(row["physical_line_id"]) for row in rows]
+        existing_links = []
+        for batch in chunks(sorted(set(line_ids))):
+            placeholders = ", ".join("?" for _ in batch)
+            params = list(batch)
+            sql = """
+                SELECT scan_id, line_id, analysis_record_id
+                FROM coverage_analysis_line_links
+                WHERE line_id IN ({placeholders})
+            """.format(placeholders=placeholders)
+            if scan_id is not None:
+                sql += " AND scan_id=?"
+                params.append(int(scan_id))
+            existing_links.extend(fetchall(connection, sql, params))
+        existing_by_line = {
+            (int(row["scan_id"]), int(row["line_id"])): row
+            for row in existing_links
+        }
+        pending = [
+            row for row in rows
+            if (int(row["scan_id"]), int(row["physical_line_id"]))
+            not in existing_by_line
+        ]
+        if not pending:
+            return {"created": 0, "scanned": len(rows)}
+
+        source_ids = [int(row["id"]) for row in pending]
+        existing_records = []
+        for batch in chunks(sorted(set(source_ids))):
+            placeholders = ", ".join("?" for _ in batch)
+            existing_records.extend(fetchall(connection, """
+                SELECT * FROM coverage_analysis_records
+                WHERE legacy_source_analysis_id IN ({})
+            """.format(placeholders), batch))
+        records_by_source = {
+            int(row["legacy_source_analysis_id"]): row
+            for row in existing_records
+        }
+        new_record_values = []
+        for row in pending:
+            if int(row["id"]) in records_by_source:
                 continue
-            record = self.create_record(connection, {
-                "status": row.get("status"), "coverage_method": row.get("coverage_method"),
-                "uncovered_reason": row.get("uncovered_reason"), "comment": row.get("comment"),
+            new_record_values.append({
+                "status": row.get("status"),
+                "coverage_method": row.get("coverage_method"),
+                "uncovered_reason": row.get("uncovered_reason"),
+                "comment": row.get("comment"),
                 "legacy_source_analysis_id": row.get("id"),
                 "legacy_source_created_at": row.get("created_at"),
                 "legacy_source_updated_at": row.get("updated_at"),
                 "legacy_raw_status": row.get("status"),
                 "legacy_raw_is_draft": row.get("is_draft"),
-            }, origin="LEGACY_MIGRATED")
+            })
+        if new_record_values:
+            records_by_source.update({
+                int(row["legacy_source_analysis_id"]): row
+                for row in self.create_records_many(
+                    connection, new_record_values, origin="LEGACY_MIGRATED"
+                )
+            })
+
+        links = []
+        for row in pending:
+            record = records_by_source.get(int(row["id"]))
+            if not record:
+                raise RuntimeError("legacy analysis record readback is incomplete")
             state = MANUAL_DRAFT if int(row.get("is_draft") or 0) else (
-                MANUAL_CONFIRMED if row.get("status") in CONFIRMED_STATUSES else MANUAL_DRAFT
+                MANUAL_CONFIRMED if row.get("status") in CONFIRMED_STATUSES
+                else MANUAL_DRAFT
             )
-            self.create_link(connection, row["scan_id"], row["physical_line_id"],
-                             record["id"], review_state=state,
-                             relation_origin="LEGACY_MIGRATED",
-                             reviewed_by=row.get("reviewer") or "",
-                             reviewed_at=row.get("updated_at"))
-            created += 1
-        return {"created": created, "scanned": len(rows)}
+            links.append({
+                "scan_id": int(row["scan_id"]),
+                "line_id": int(row["physical_line_id"]),
+                "record_id": int(record["id"]),
+                "review_state": state,
+                "relation_origin": "LEGACY_MIGRATED",
+                "reviewed_by": row.get("reviewer") or "",
+                "reviewed_at": row.get("updated_at"),
+            })
+        # A link batch is intentionally scoped to one scan: the repository
+        # validates scan/file/line identity before doing its bulk write.  The
+        # legacy table can contain several scans, so partition here rather
+        # than weakening that fail-closed boundary.
+        links_by_scan = {}
+        for link in links:
+            links_by_scan.setdefault(int(link["scan_id"]), []).append(link)
+        created = 0
+        for scan_links in links_by_scan.values():
+            for batch in chunks(scan_links):
+                self.create_links_many(connection, batch)
+                created += len(batch)
+        return {"created": created, "scanned": len(rows),
+                "record_batch": len(new_record_values), "link_batch": created,
+                "scan_batches": len(links_by_scan)}

@@ -5,6 +5,12 @@ import base64
 import json
 import time
 import logging
+import sys
+
+try:
+    import resource
+except ImportError:  # pragma: no cover - unavailable on some platforms
+    resource = None
 
 from app.api.auth import MutationAuthorizer
 from app.api.router import Router
@@ -26,6 +32,20 @@ from app.time_utils import utc_sql
 
 
 logger = logging.getLogger(__name__)
+
+
+def _process_peak_rss_bytes():
+    """Return the process high-water RSS in bytes when the OS exposes it."""
+    if resource is None:
+        return 0
+    try:
+        value = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss or 0)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return 0
+    # Linux and most Unix implementations report KiB; macOS reports bytes.
+    if sys.platform == "darwin":
+        return max(0, value)
+    return max(0, value * 1024)
 
 
 class VNextApplication(object):
@@ -172,6 +192,9 @@ class VNextApplication(object):
             "runtime": "vnext",
             "code_detail": runtime.code_detail.metrics(),
             "jobs": runtime.job_service.metrics(),
+            "process": {
+                "peak_rss_bytes": _process_peak_rss_bytes(),
+            },
         }
         if runtime.database_manager is not None:
             payload["db_pool"] = runtime.database_manager.health()

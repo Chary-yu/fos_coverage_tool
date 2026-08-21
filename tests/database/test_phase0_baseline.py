@@ -18,7 +18,9 @@ from app.db.connection_pool import close_global_pool, get_global_pool
 from scripts.diagnostics.data_hash_gate import verify_data_integrity
 from scripts.maintenance.mysql_backup import perform_database_backup, compute_file_sha256
 from scripts.upgrade.schema_preflight import analyze_sql_script
-from scripts.diagnostics.path_mapping_audit import PathLookupIndex, audit_path_mappings
+from scripts.diagnostics.path_mapping_audit import (
+    PathLookupIndex, audit_path_mappings, normalize_path,
+)
 from scripts.diagnostics.security_scanner import scan_file
 from scripts.upgrade.evidence_manifest import ProductionEvidenceManifest
 
@@ -134,6 +136,15 @@ class TestPhase0Baseline(unittest.TestCase):
         p3, cls3 = idx.resolve("foo.c")
         self.assertIn(cls3, ["ambiguous_suffix", "basename_only_rejected"])
         self.assertIsNone(p3)
+
+        # External LCOV identities with parent traversal are invalid, not a
+        # normalized alias for a different source file.
+        with self.assertRaises(ValueError):
+            normalize_path("../src/module_a/foo.c")
+        self.assertEqual(
+            idx.resolve("../src/module_a/foo.c"),
+            (None, "invalid_path"),
+        )
 
     def test_connection_pool_isolated_by_database_identity(self):
         first = get_global_pool({"host": "db", "port": 3306,

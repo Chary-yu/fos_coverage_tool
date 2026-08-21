@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import uuid
 import urllib.request
 from urllib.parse import quote
@@ -40,7 +41,15 @@ from app.code_detail.source_reader import (
 from app.db.manager import DatabaseManager
 from app.db.repositories.base import fetchone
 from scripts.upgrade.migration_runner import apply_schema
+from scripts.upgrade.migration_runner import (
+    capture_vnext_semantic_snapshot,
+    migrate_legacy,
+    validate_migration_database_separation,
+)
 from scripts.upgrade.domain_migration import apply_analysis_domain
+from scripts.upgrade.legacy_fixture import (
+    create_legacy_fixture_schema, seed_legacy_fixture,
+)
 
 
 def _env(name, default=None):
@@ -110,6 +119,147 @@ def _assert(condition, message):
         raise AssertionError(message)
 
 
+def _create_database(connection, database):
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "CREATE DATABASE `{}` CHARACTER SET utf8mb4 "
+            "COLLATE utf8mb4_unicode_ci".format(database)
+        )
+
+
+def _drop_database(host, port, user, password, database):
+    connection = None
+    try:
+        connection = _connect(host, port, user, password)
+        with connection.cursor() as cursor:
+            cursor.execute("DROP DATABASE IF EXISTS `{}`".format(database))
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def _run_legacy_migration_rehearsal(args):
+    """Run a disposable real-MariaDB Legacy -> Empty VNext rehearsal.
+
+    The data is a generated fixture, so the result is explicitly marked
+    ``synthetic=true``.  It proves MariaDB SQL/transaction compatibility and
+    migration idempotency; it cannot satisfy Gate A's separate verified
+    production-backup requirement.
+    """
+    source_database = "coverage_legacy_audit_{}".format(uuid.uuid4().hex[:12])
+    target_database = "coverage_target_audit_{}".format(uuid.uuid4().hex[:12])
+    source = target = admin = None
+    started = time.time()
+    try:
+        admin = _connect(args.host, args.port, args.user, args.password)
+        _create_database(admin, source_database)
+        _create_database(admin, target_database)
+        admin.close()
+        admin = None
+
+        source_config = {
+            "host": args.host, "port": args.port, "user": args.user,
+            "password": args.password, "database": source_database,
+        }
+        target_config = dict(source_config, database=target_database)
+        source = _connect(
+            args.host, args.port, args.user, args.password,
+            database=source_database, autocommit=False,
+        )
+        target = _connect(
+            args.host, args.port, args.user, args.password,
+            database=target_database, autocommit=False,
+        )
+        separation = validate_migration_database_separation(
+            source_config, target_config,
+            source_connection=source, target_connection=target,
+        )
+        create_legacy_fixture_schema(source)
+        total_lines = max(2, int(args.migration_lines))
+        total_analyses = max(1, int(args.migration_analyses))
+        first_lines = total_lines // 2
+        second_lines = total_lines - first_lines
+        first_analyses = min(total_analyses, max(1, total_analyses // 2))
+        second_analyses = max(0, total_analyses - first_analyses)
+        seed_legacy_fixture(
+            source, project_name="fixture-a", line_count=first_lines,
+            analysis_count=first_analyses, job_count=int(args.migration_jobs),
+        )
+        seed_legacy_fixture(
+            source, project_name="fixture-b", line_count=second_lines,
+            analysis_count=second_analyses, job_count=0,
+        )
+        source.commit()
+
+        release_sha = "a" * 40
+        schema_path = os.path.join(_REPO_ROOT, "scripts", "upgrade", "vnext_schema.sql")
+        first_schema = apply_schema(target, schema_path, release_sha=release_sha)
+        second_schema = apply_schema(target, schema_path, release_sha=release_sha)
+        first = migrate_legacy(source, target, release_sha=release_sha)
+        domain = apply_analysis_domain(target, release_sha=release_sha)
+        domain_again = apply_analysis_domain(target, release_sha=release_sha)
+        source.rollback()
+        first_snapshot = capture_vnext_semantic_snapshot(target)
+        second = migrate_legacy(source, target, release_sha=release_sha)
+        second_snapshot = capture_vnext_semantic_snapshot(target)
+
+        counts = {}
+        with target.cursor() as cursor:
+            for table in (
+                    "coverage_projects", "coverage_scans", "coverage_files",
+                    "coverage_lines", "coverage_analyses",
+                    "coverage_legacy_provenance", "coverage_analysis_records",
+                    "coverage_analysis_line_links", "coverage_background_jobs"):
+                cursor.execute("SELECT COUNT(*) AS total FROM `{}`".format(table))
+                row = cursor.fetchone()
+                counts[table] = int(row.get("total") if isinstance(row, dict) else row[0])
+        _assert(first["authoritative_semantic_match"],
+                "first MariaDB migration semantic hash did not match")
+        _assert(second["authoritative_semantic_match"],
+                "second MariaDB migration semantic hash did not match")
+        _assert(first_snapshot == second_snapshot,
+                "MariaDB migration rerun changed semantic target facts")
+        _assert(counts["coverage_analysis_line_links"] == counts["coverage_analyses"],
+                "Analysis Domain backfill did not conserve analysis/link rows")
+        return with_contract({
+            "status": "PASSED",
+            "evidence_class": "real_mariadb_legacy_migration_rehearsal",
+            "database_engine": "MariaDB",
+            "database_version": _database_version(args),
+            "synthetic": True,
+            "synthetic_reason": "generated legacy fixture; not production backup evidence",
+            "source_database": source_database,
+            "target_database": target_database,
+            "database_runtime_identity": separation.get("runtime_fingerprint", {}),
+            "checks": {
+                "source_target_separation": separation,
+                "core_schema_first_apply": first_schema,
+                "core_schema_second_apply": second_schema,
+                "legacy_migration_first_run": first,
+                "analysis_domain_first_apply": domain,
+                "analysis_domain_second_apply": domain_again,
+                "semantic_snapshot_stable_on_rerun": True,
+                "target_counts": counts,
+            },
+            "workload": {
+                "projects": 2,
+                "lines": total_lines,
+                "analyses": total_analyses,
+                "jobs": int(args.migration_jobs),
+            },
+            "duration_ms": round((time.time() - started) * 1000, 2),
+        })
+    finally:
+        if source is not None:
+            source.close()
+        if target is not None:
+            target.close()
+        if admin is not None:
+            admin.close()
+        _drop_database(args.host, args.port, args.user, args.password, source_database)
+        _drop_database(args.host, args.port, args.user, args.password, target_database)
+
+
 def run(args):
     admin = None
     manager = None
@@ -124,6 +274,10 @@ def run(args):
     project_name = "MySQLAudit_{}".format(os.getpid())
 
     try:
+        migration_rehearsal = None
+        if args.migration_rehearsal:
+            migration_rehearsal = _run_legacy_migration_rehearsal(args)
+            checks["legacy_to_vnext_migration_rehearsal"] = migration_rehearsal
         admin = _connect(args.host, args.port, args.user, args.password)
         with admin.cursor() as cursor:
             cursor.execute(
@@ -436,6 +590,13 @@ def main(argv=None):
         "--create-disposable", action="store_true", required=True,
         help="required safety acknowledgement; only a generated temporary database is used",
     )
+    parser.add_argument(
+        "--migration-rehearsal", action="store_true",
+        help="also run a generated Legacy -> Empty VNext MariaDB rehearsal",
+    )
+    parser.add_argument("--migration-lines", type=int, default=90000)
+    parser.add_argument("--migration-analyses", type=int, default=51000)
+    parser.add_argument("--migration-jobs", type=int, default=1)
     args = parser.parse_args(argv)
     try:
         result = run(args)

@@ -52,6 +52,20 @@ def create_legacy_fixture_schema(connection, fixture_path=None):
     connection.commit()
 
 
+def _executemany_batched(connection, statement, rows, batch_size=1000):
+    """Keep fixture loading bounded on both SQLite and MariaDB."""
+    rows = list(rows or [])
+    for start in range(0, len(rows), int(batch_size)):
+        cursor = connection.cursor()
+        try:
+            cursor.executemany(
+                adapt_sql(connection, statement),
+                rows[start:start + int(batch_size)],
+            )
+        finally:
+            cursor.close()
+
+
 def seed_legacy_fixture(connection, project_name="fixture", line_count=2,
                         analysis_count=None, job_count=0):
     """Populate deterministic facts and return source counts.
@@ -61,36 +75,34 @@ def seed_legacy_fixture(connection, project_name="fixture", line_count=2,
     """
     analysis_count = line_count if analysis_count is None else int(analysis_count)
     stamp = utc_sql()
-    for line_number in range(1, int(line_count) + 1):
-        path = "src/fixture.c"
-        path_hash = hashlib.md5(path.encode("utf-8")).hexdigest()
-        cursor = connection.cursor()
-        cursor.execute(adapt_sql(connection, """
-            INSERT INTO coverage_line_index(
-                project_name, file_path, file_path_hash, source_file_name,
-                line_number, line_text, block_start_line, block_end_line,
-                block_type, function_name, function_hash, code_line_hash,
-                code_occurrence, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """), (project_name, path, path_hash, "fixture.c", line_number,
-                "line {};".format(line_number), line_number, line_number,
-                "single", "main", "fn", "line-{}".format(line_number), 1,
-                stamp, stamp))
-        cursor.close()
-    for line_number in range(1, int(analysis_count) + 1):
-        path = "src/fixture.c"
-        path_hash = hashlib.md5(path.encode("utf-8")).hexdigest()
-        cursor = connection.cursor()
-        cursor.execute(adapt_sql(connection, """
-            INSERT INTO coverage_analysis(
-                project_name, file_path, file_path_hash, source_file_name,
-                line_number, reviewer, status, is_draft, coverage_method,
-                uncovered_reason, comment, remark, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """), (project_name, path, path_hash, "fixture.c", line_number,
-                "reviewer", "可覆盖", 0, "unit", "", "comment", "remark",
-                stamp, stamp))
-        cursor.close()
+    path = "src/fixture.c"
+    path_hash = hashlib.md5(path.encode("utf-8")).hexdigest()
+    _executemany_batched(connection, """
+        INSERT INTO coverage_line_index(
+            project_name, file_path, file_path_hash, source_file_name,
+            line_number, line_text, block_start_line, block_end_line,
+            block_type, function_name, function_hash, code_line_hash,
+            code_occurrence, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [
+        (project_name, path, path_hash, "fixture.c", line_number,
+         "line {};".format(line_number), line_number, line_number,
+         "single", "main", "fn", "line-{}".format(line_number), 1,
+         stamp, stamp)
+        for line_number in range(1, int(line_count) + 1)
+    ])
+    _executemany_batched(connection, """
+        INSERT INTO coverage_analysis(
+            project_name, file_path, file_path_hash, source_file_name,
+            line_number, reviewer, status, is_draft, coverage_method,
+            uncovered_reason, comment, remark, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [
+        (project_name, path, path_hash, "fixture.c", line_number,
+         "reviewer", "可覆盖", 0, "unit", "", "comment", "remark",
+         stamp, stamp)
+        for line_number in range(1, int(analysis_count) + 1)
+    ])
     cursor = connection.cursor()
     cursor.execute(adapt_sql(connection, """
         INSERT INTO coverage_project_state(
@@ -99,20 +111,20 @@ def seed_legacy_fixture(connection, project_name="fixture", line_count=2,
         ) VALUES (?, ?, ?, ?, ?)
     """), (project_name, 7, 7, "legacy-key", stamp))
     cursor.close()
-    for index in range(int(job_count)):
-        cursor = connection.cursor()
-        cursor.execute(adapt_sql(connection, """
-            INSERT INTO coverage_background_jobs(
-                job_id, project_name, kind, state, percent, progress_unit,
-                stage, message, input_payload, result_path, filename, row_count,
-                data_version, heartbeat_at, finished_at, error_message,
-                created_at, started_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """), ("job-{}".format(index), project_name, "export", "completed",
-                100, "percent", "done", "ok", "{\"input\":true}",
-                "/legacy/result.zip", "result.zip", 2, 7, stamp, stamp, "",
-                stamp, stamp, stamp))
-        cursor.close()
+    _executemany_batched(connection, """
+        INSERT INTO coverage_background_jobs(
+            job_id, project_name, kind, state, percent, progress_unit,
+            stage, message, input_payload, result_path, filename, row_count,
+            data_version, heartbeat_at, finished_at, error_message,
+            created_at, started_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [
+        ("job-{}".format(index), project_name, "export", "completed",
+         100, "percent", "done", "ok", "{\"input\":true}",
+         "/legacy/result.zip", "result.zip", 2, 7, stamp, stamp, "",
+         stamp, stamp, stamp)
+        for index in range(int(job_count))
+    ])
     connection.commit()
     return {"projects": 1, "lines": int(line_count),
             "analyses": int(analysis_count), "jobs": int(job_count)}

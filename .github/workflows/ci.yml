@@ -115,6 +115,12 @@ jobs:
         run: >-
           python scripts/diagnostics/gate_matrix.py --allow-incomplete
           --output .artifacts/vnext/gate-matrix.json
+      - name: Assemble Gate A-F evidence bundle
+        run: >-
+          python scripts/diagnostics/build_gate_evidence.py
+          --allow-incomplete
+          --output-root .artifacts/vnext/gate-bundle
+          --output .artifacts/vnext/gate-bundle-summary.json
       - name: Upload VNext machine evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
@@ -181,7 +187,9 @@ jobs:
           mkdir -p .artifacts
           python scripts/diagnostics/mysql_vnext_integration.py \
             --create-disposable --host 127.0.0.1 --port 3306 \
-            --user root --password root | tee .artifacts/mariadb_vnext_integration.json
+            --user root --password root --migration-rehearsal \
+            --migration-lines 90000 --migration-analyses 51000 \
+            --migration-jobs 1 | tee .artifacts/mariadb_vnext_integration.json
       - name: Upload MariaDB integration evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
@@ -237,10 +245,16 @@ jobs:
       - run: npm ci
       - run: npx playwright install --with-deps chromium
       - name: Run required real-browser and canonical VNext HTTP suites
+        env:
+          COVERAGE_CROSS_LAYER_OUTPUT: .artifacts/cross_layer_performance_fixture.json
         run: mkdir -p .artifacts && npx playwright test tests/browser --reporter=json > .artifacts/browser_playwright.json
       - run: mkdir -p .artifacts && npm run perf:synthetic-dom -- .artifacts/synthetic_dom_microbenchmark.json
       - name: Validate browser performance evidence boundary
         run: python scripts/diagnostics/performance_evidence_audit.py .artifacts/synthetic_dom_microbenchmark.json --allow-partial
+      - name: Validate instrumented fixture metrics (not release evidence)
+        run: >-
+          python scripts/diagnostics/performance_evidence_audit.py
+          .artifacts/cross_layer_performance_fixture.json --require-cross-layer
       - name: Upload browser functional evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
@@ -249,6 +263,7 @@ jobs:
           path: |
             .artifacts/browser_playwright.json
             .artifacts/synthetic_dom_microbenchmark.json
+            .artifacts/cross_layer_performance_fixture.json
           if-no-files-found: error
 
   cross-layer-performance:
