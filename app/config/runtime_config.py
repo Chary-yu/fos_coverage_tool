@@ -40,7 +40,10 @@ def default_runtime_config(base_dir: str, project_name: str = "Gemini-NOS") -> D
             "password": "",
             "database": "coverage",
         },
-        "server": {"host": "0.0.0.0", "port": 9528},
+        # A no-config start must be loopback-only. Deployments that need a
+        # public bind must make that choice explicit in an environment config
+        # and put the service behind its operator/read-auth policy.
+        "server": {"host": "127.0.0.1", "port": 9528},
         "auth": {
             "mode": "reverse_proxy",
             "user_header": "X-Remote-User",

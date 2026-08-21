@@ -344,6 +344,21 @@ test('real Chromium virtualizes data and reuses cached viewport windows', async 
     await page.evaluate(() => window.scrollTo(0, 16000 * 24));
     await expect(page.locator('#L16000')).toBeVisible({ timeout: 30000 });
     expect(await page.locator('pre.source span[id^="L"]').count()).toBeLessThan(1500);
+    const residentSweep = await page.evaluate(async () => {
+      const internals = window.__COVERAGE_ENHANCE_INTERNALS__;
+      const region = internals.CodeRegionStore.get('region-1');
+      const samples = [];
+      for (const target of [25000, 50000, 1]) {
+        const bounds = internals.CodeRegionController.virtualWindowBounds(region, target - 1);
+        await internals.CodeRegionLoader.ensureVirtualWindow(
+          internals.CodeRegionController.filePath, region, bounds.start, bounds.end
+        );
+        internals.CodeRegionController.renderVirtualWindow(region, target - 1);
+        samples.push(region.loadedLineCount);
+      }
+      return { samples, peak: Math.max(...samples) };
+    });
+    expect(residentSweep.peak).toBeLessThanOrEqual(8000);
   } finally {
     await stopHarness(harness);
   }

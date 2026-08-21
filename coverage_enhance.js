@@ -45,6 +45,9 @@
     const VIRTUAL_SCROLL_THRESHOLD = 5000;
     const VIRTUAL_OVERSCAN_LINES = 300;
     const VIRTUAL_LINE_HEIGHT = 24;
+    // Resident data is bounded by physical network chunks, independently of
+    // the DOM render batch. Dirty/active review chunks are pinned below.
+    const MAX_VIRTUAL_CACHED_LINES = 8000;
     const PROGRESS_UPDATE_STORAGE_KEY = 'coverage-review-progress-updated';
 
     // 控制流分支关键字侦测正则 (边界隔离)
@@ -77,6 +80,7 @@
         networkLines: 0,
         virtualRenders: 0,
         virtualDomLines: 0,
+        virtualChunkEvictions: 0,
         maxDomLines: 0,
         layoutStart: 0,
         layoutMs: 0,
@@ -87,6 +91,7 @@
             this.networkLines = 0;
             this.virtualRenders = 0;
             this.virtualDomLines = 0;
+            this.virtualChunkEvictions = 0;
             this.maxDomLines = 0;
             this.layoutStart = 0;
             this.layoutMs = 0;
@@ -106,6 +111,7 @@
                 network_lines: this.networkLines,
                 virtual_renders: this.virtualRenders,
                 virtual_dom_lines: this.virtualDomLines,
+                virtual_chunk_evictions: this.virtualChunkEvictions,
                 max_dom_lines: this.maxDomLines,
                 layout_ms: this.layoutMs
             };
@@ -1007,7 +1013,10 @@
                     virtualLineHeight: VIRTUAL_LINE_HEIGHT,
                     virtualMeasuredHeights: new Map(),
                     virtualHeightBreaks: [],
-                    virtualRequest: null
+                    virtualRequest: null,
+                    virtualChunks: new Map(),
+                    virtualChunkClock: 0,
+                    virtualProtectedChunks: new Set()
                 };
                 this._regions.set(r.region_id, regState);
             });
@@ -1041,6 +1050,8 @@
                 r.loading = false;
                 r.lines = lines;
                 r.loadedLineCount = (lines || []).length;
+                r.virtualChunks = new Map();
+                r.virtualProtectedChunks = new Set();
                 r.error = null;
                 r.currentState = 'expanded-loaded';
                 (lines || []).forEach(registerReviewPanelMetadata);
@@ -1057,17 +1068,27 @@
             if (!Array.isArray(r.lines) || r.lines.length !== Number(totalLines || r.lineCount)) {
                 r.lines = new Array(Number(totalLines || r.lineCount));
             }
+            const physicalChunks = new Map();
             (lines || []).forEach(line => {
                 const index = Number(line.line_no) - Number(r.startLine);
-                if (index < 0 || index >= r.lines.length || !r.lines[index]) {
-                    if (index >= 0 && index < r.lines.length) r.lines[index] = line;
+                if (index < 0 || index >= r.lines.length) {
                     return;
                 }
+                const chunkIndex = Math.floor(index / NETWORK_CHUNK_LINES);
+                if (!physicalChunks.has(chunkIndex)) physicalChunks.set(chunkIndex, new Map());
+                physicalChunks.get(chunkIndex).set(index, line);
+                if (!r.lines[index]) r.loadedLineCount += 1;
                 r.lines[index] = line;
             });
-            r.loadedLineCount = r.lines.reduce(
-                (count, item) => count + (item ? 1 : 0), 0
-            );
+            physicalChunks.forEach((chunkLines, chunkIndex) => {
+                let chunk = r.virtualChunks.get(chunkIndex);
+                if (!chunk) {
+                    chunk = { lines: new Map(), access: 0 };
+                    r.virtualChunks.set(chunkIndex, chunk);
+                }
+                chunkLines.forEach((line, index) => chunk.lines.set(index, line));
+                chunk.access = ++r.virtualChunkClock;
+            });
             r.loaded = true;
             r.loading = false;
             r.error = null;
@@ -1121,13 +1142,70 @@
     // =========================================================================
     const RegionLineLRUCache = {
         _accessMap: new Map(),
+        _clock: 0,
         MAX_CACHED_LINES: 50000,
-        touch(regionId) { this._accessMap.set(regionId, Date.now()); },
+        MAX_VIRTUAL_CACHED_LINES: MAX_VIRTUAL_CACHED_LINES,
+        touch(regionId) { this._accessMap.set(regionId, ++this._clock); },
+        protectVirtualWindow(region, startIndex, endIndex) {
+            if (!region || !region.virtualized) return;
+            region.virtualProtectedChunks.clear();
+            const start = Math.max(0, Math.floor(Number(startIndex) || 0));
+            const end = Math.max(start, Math.ceil(Number(endIndex) || start));
+            const first = Math.floor(start / NETWORK_CHUNK_LINES);
+            const last = Math.max(first, Math.floor(Math.max(start, end - 1) / NETWORK_CHUNK_LINES));
+            for (let index = first; index <= last; index += 1) {
+                region.virtualProtectedChunks.add(index);
+            }
+        },
+        _hasPinnedReviewPanel(region, chunkIndex) {
+            const chunkStart = Number(region.startLine) + chunkIndex * NETWORK_CHUNK_LINES;
+            const chunkEnd = Math.min(
+                Number(region.endLine), chunkStart + NETWORK_CHUNK_LINES - 1
+            );
+            for (const [lineNumber, panel] of panelsMap.entries()) {
+                if (lineNumber < chunkStart || lineNumber > chunkEnd) continue;
+                const values = panel && panel.values;
+                if (dirtyPanelStartLines.has(Number(lineNumber)) ||
+                    (panel && panel.expanded) || (values && values.isDirty)) {
+                    return true;
+                }
+            }
+            return false;
+        },
+        evictVirtualChunks(region) {
+            if (!region || !region.virtualized || !region.virtualChunks) return;
+            let resident = 0;
+            const candidates = [];
+            region.virtualChunks.forEach((chunk, chunkIndex) => {
+                resident += chunk.lines.size;
+                if (!region.virtualProtectedChunks.has(chunkIndex) &&
+                    !this._hasPinnedReviewPanel(region, chunkIndex)) {
+                    candidates.push([chunkIndex, chunk]);
+                }
+            });
+            candidates.sort((left, right) => left[1].access - right[1].access);
+            for (const [chunkIndex, chunk] of candidates) {
+                if (resident <= this.MAX_VIRTUAL_CACHED_LINES) break;
+                chunk.lines.forEach((line, index) => {
+                    if (region.lines[index] === line) {
+                        region.lines[index] = undefined;
+                        region.loadedLineCount = Math.max(0, region.loadedLineCount - 1);
+                    }
+                });
+                region.virtualChunks.delete(chunkIndex);
+                PerformanceTelemetry.virtualChunkEvictions += 1;
+                resident -= chunk.lines.size;
+            }
+        },
         evictIfOverBudget() {
             const regions = CodeRegionStore.getAll();
             let totalLines = 0;
             const loadedCollapsed = [];
             regions.forEach(r => {
+                if (r.virtualized && r.currentState !== "collapsed-loaded" &&
+                    r.currentState !== "collapsed-unloaded") {
+                    this.evictVirtualChunks(r);
+                }
                 if (r.loaded && r.lines && r.loadedLineCount) {
                     totalLines += r.loadedLineCount;
                     if (r.currentState === "collapsed-loaded" || r.currentState === "collapsed-unloaded") {
@@ -1146,6 +1224,7 @@
                     if (r.linesEl) r.linesEl.innerHTML = "";
                 }
             }
+            return totalLines;
         }
     };
 
@@ -1231,6 +1310,7 @@
             if (!region || !region.virtualized) return;
             const start = Math.max(0, Math.floor(startIndex));
             const end = Math.min(Number(region.lineCount), Math.ceil(endIndex));
+            RegionLineLRUCache.protectVirtualWindow(region, start, end);
             let missingStart = -1;
             const missing = [];
             for (let index = start; index < end; index += 1) {
@@ -1244,11 +1324,19 @@
             if (missingStart >= 0) missing.push([missingStart, end]);
             if (!missing.length) return;
             const requests = [];
+            const physicalRequests = new Map();
             missing.forEach(([from, to]) => {
-                for (let cursor = from; cursor < to; cursor += NETWORK_CHUNK_LINES) {
-                    requests.push([cursor, Math.min(to, cursor + NETWORK_CHUNK_LINES)]);
+                const firstChunk = Math.floor(from / NETWORK_CHUNK_LINES);
+                const lastChunk = Math.floor(Math.max(from, to - 1) / NETWORK_CHUNK_LINES);
+                for (let chunk = firstChunk; chunk <= lastChunk; chunk += 1) {
+                    const physicalStart = chunk * NETWORK_CHUNK_LINES;
+                    physicalRequests.set(chunk, [
+                        physicalStart,
+                        Math.min(Number(region.lineCount), physicalStart + NETWORK_CHUNK_LINES)
+                    ]);
                 }
             });
+            physicalRequests.forEach(item => requests.push(item));
             const key = `${region.id}:${requests.map(item => item.join('-')).join(',')}`;
             if (this._inflightPromises.has(key)) {
                 return this._inflightPromises.get(key);
@@ -1277,6 +1365,10 @@
 
         async loadRegion(filePath, region, onChunkProgress) {
             if (region.loaded) {
+                if (region.virtualized) {
+                    const bounds = CodeRegionController.virtualWindowBounds(region);
+                    await this.ensureVirtualWindow(filePath, region, bounds.start, bounds.end);
+                }
                 return region.lines;
             }
 
@@ -1784,6 +1876,8 @@
             this.ensureVirtualScaffold(region);
             if (!region.virtualContent) return;
             const bounds = this.virtualWindowBounds(region, forcedStart);
+            RegionLineLRUCache.protectVirtualWindow(region, bounds.start, bounds.end);
+            RegionLineLRUCache.touch(region.id);
             const availableEnd = Math.min(bounds.end, (region.lines || []).length);
             const fragment = document.createDocumentFragment();
             const renderedIndexes = [];

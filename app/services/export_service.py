@@ -5,7 +5,8 @@ import os
 import re
 import tempfile
 import zipfile
-from datetime import datetime
+
+from app.time_utils import utc_iso
 
 
 class ExportService(object):
@@ -61,7 +62,7 @@ class ExportService(object):
             "scan": dict(scan),
             "report": dict(report or {}),
             "repositories": snapshots,
-            "generated_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "generated_at": utc_iso(),
             "release": self.release_identity,
         }
         target = self._safe_output_path(project_name, scan_id, output_path)

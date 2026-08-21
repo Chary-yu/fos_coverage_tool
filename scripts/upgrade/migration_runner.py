@@ -7,7 +7,6 @@ import json
 import os
 import sqlite3
 import sys
-from datetime import datetime
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
@@ -23,6 +22,7 @@ from app.db.repositories import (
 )
 from app.db.repositories.base import adapt_sql, fetchall, fetchone, is_sqlite
 from app.db.transaction import transaction
+from app.time_utils import utc_iso, utc_sql
 
 
 SQLITE_SCHEMA = """
@@ -105,7 +105,7 @@ CREATE TABLE IF NOT EXISTS coverage_incremental_results (
 
 
 def _now():
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    return utc_sql()
 
 
 def _table_exists(connection, table_name):
@@ -652,7 +652,7 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None, rele
             capture_vnext_semantic_snapshot(target_connection)
         ),
         "release_sha": release_sha or "",
-        "captured_at": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "captured_at": utc_iso(),
     }
     if anomaly_path:
         parent = os.path.dirname(os.path.abspath(anomaly_path))

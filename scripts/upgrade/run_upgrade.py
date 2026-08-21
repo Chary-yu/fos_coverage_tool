@@ -400,8 +400,8 @@ class UpgradeOrchestrator:
 
         # Step 7: Run Performance Benchmark Matrix
         self.log("[Step 7/10] Running Performance Benchmark Matrix (Tiers A-D + Huge)...")
-        perf_artifact = os.path.join(os.path.dirname(self.manifest.manifest_path), "browser_perf_ab.json")
-        perf_cmd = ["npm", "run", "perf:browser-ab", "--", perf_artifact]
+        perf_artifact = os.path.join(os.path.dirname(self.manifest.manifest_path), "synthetic_dom_microbenchmark.json")
+        perf_cmd = ["npm", "run", "perf:synthetic-dom", "--", perf_artifact]
         perf_process = subprocess.run(perf_cmd, cwd=self.repo_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if perf_process.returncode == 0 and os.path.isfile(perf_artifact):
             with open(perf_artifact, "r", encoding="utf-8") as perf_stream:

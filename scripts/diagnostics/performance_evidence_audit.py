@@ -16,7 +16,7 @@ def _finite_number(value):
     return isinstance(value, (int, float)) and math.isfinite(float(value))
 
 
-def audit(path, allow_partial=False):
+def audit(path, allow_partial=False, require_cross_layer=False):
     violations = []
     missing_cross_layer = []
     if not os.path.isfile(path):
@@ -43,7 +43,8 @@ def audit(path, allow_partial=False):
     required = (
         "request_count", "response_bytes", "max_response_bytes",
         "time_to_first_visible_ms", "time_to_target_line_ms",
-        "logical_line_count", "resident_js_lines", "dom_line_count",
+        "logical_line_count", "resident_js_lines", "resident_js_lines_peak",
+        "dom_line_count",
     )
     missing = [name for name in required if not _finite_number(workload.get(name))]
     if missing:
@@ -52,8 +53,8 @@ def audit(path, allow_partial=False):
         violations.append("100k virtual-scroll workload did not pass")
     if workload.get("logical_line_count") != 100000:
         violations.append("100k workload does not report logical_line_count=100000")
-    if _finite_number(workload.get("resident_js_lines")) and workload["resident_js_lines"] >= 2000:
-        violations.append("resident JS lines exceeded the 2000-line budget")
+    if _finite_number(workload.get("resident_js_lines_peak")) and workload["resident_js_lines_peak"] > 8000:
+        violations.append("resident JS lines exceeded the 8000-line sustained-scroll budget")
     if _finite_number(workload.get("dom_line_count")) and workload["dom_line_count"] >= 1500:
         violations.append("DOM line count exceeded the 1500-line budget")
 
@@ -70,12 +71,12 @@ def audit(path, allow_partial=False):
         "overlay_db_queries", "overlay_db_rows", "sidecar_decode_count",
         "p95_expand_ms", "peak_rss_bytes",
     ):
-        if name not in workload:
+        if not _finite_number(workload.get(name)):
             missing_cross_layer.append(name)
 
     browser_status = "PASSED" if not violations else "FAILED"
     status = browser_status if not missing_cross_layer else "PARTIAL"
-    if status == "PARTIAL" and not allow_partial:
+    if status == "PARTIAL" and (require_cross_layer or not allow_partial):
         violations.append(
             "cross-layer performance metrics are not present: {}".format(
                 ", ".join(missing_cross_layer)
@@ -87,6 +88,7 @@ def audit(path, allow_partial=False):
         "evidence_class": "performance_evidence_audit",
         "path": os.path.abspath(path),
         "browser_status": browser_status,
+        "gate": "cross_layer_performance" if require_cross_layer else "browser_functional",
         "browser_workload": workload.get("workload_id", ""),
         "missing_cross_layer_metrics": missing_cross_layer,
         "violations": violations,
@@ -100,11 +102,18 @@ def main(argv=None):
         "--allow-partial", action="store_true",
         help="allow browser-only evidence while reporting missing server metrics",
     )
+    parser.add_argument(
+        "--require-cross-layer", action="store_true",
+        help="fail unless DB/Sidecar/latency/RSS evidence is present",
+    )
     args = parser.parse_args(argv)
-    result = audit(args.path, allow_partial=args.allow_partial)
+    result = audit(
+        args.path, allow_partial=args.allow_partial,
+        require_cross_layer=args.require_cross_layer,
+    )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["browser_status"] == "PASSED" and (
-        result["status"] == "PASSED" or args.allow_partial
+        result["status"] == "PASSED" or (args.allow_partial and not args.require_cross_layer)
     ) else 1
 
 

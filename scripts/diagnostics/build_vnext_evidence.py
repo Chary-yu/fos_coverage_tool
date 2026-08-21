@@ -18,6 +18,8 @@ from scripts.diagnostics.runtime_participation_audit import audit as audit_parti
 from scripts.diagnostics.frontend_vnext_api_contract_audit import audit as audit_frontend_contract
 from scripts.diagnostics.scan_immutability_audit import audit as audit_scan_immutability
 from scripts.diagnostics.active_runtime_audit import audit as audit_active_runtime
+from scripts.diagnostics.configured_runtime_audit import audit as audit_configured_runtime
+from scripts.diagnostics.legacy_retirement_audit import audit as audit_legacy_retirement
 
 
 CAPABILITIES = [
@@ -110,8 +112,13 @@ def build(repo_root):
         "canonical_ownership": audit_canonical_ownership(repo_root),
         "runtime_participation": audit_participation(),
         "runtime_legacy_dependency": audit_legacy(repo_root),
+        "legacy_retirement": audit_legacy_retirement(repo_root),
         "frontend_vnext_api_contract": audit_frontend_contract(repo_root),
         "scan_immutability": audit_scan_immutability(),
+        "configured_runtime": audit_configured_runtime(repo_root),
+        # A checkout has no live process by definition; keep this separate
+        # from the configuration evidence so it cannot be read as proof that
+        # a service is running.
         "active_runtime": audit_active_runtime(repo_root),
     }
 

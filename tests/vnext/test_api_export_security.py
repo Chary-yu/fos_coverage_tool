@@ -26,12 +26,14 @@ class VNextApiExportSecurityTest(unittest.TestCase):
             runtime.close()
         self.connection.close()
 
-    def _runtime(self, auth=None):
+    def _runtime(self, auth=None, server=None):
         config = {
             "project_name": "fixture",
             "auth": auth or {"mode": "disabled"},
             "runtime_state": {"root": self.state_root},
         }
+        if server is not None:
+            config["server"] = server
         self.runtime = VNextRuntime(config, os.getcwd(), connection=self.connection)
         return self.runtime
 
@@ -79,6 +81,44 @@ class VNextApiExportSecurityTest(unittest.TestCase):
         status, payload = app.dispatch("GET", "/api/coverage/health")
         self.assertEqual(status, 200)
         self.assertEqual(payload["runtime"], "vnext")
+
+    def test_authenticated_operator_reads_survive_write_freeze(self):
+        runtime = self._runtime({
+            "mode": "reverse_proxy",
+            "trusted_proxy_addresses": ["10.0.0.5"],
+            "user_header": "X-Remote-User",
+        })
+        app = runtime.application()
+        marker = os.path.join(self.state_root, "upgrade-writes-frozen.json")
+        with open(marker, "w") as stream:
+            stream.write("{}")
+        headers = {"X-Remote-User": "operator"}
+        status, payload = app.dispatch(
+            "GET", "/api/coverage/routes", headers=headers,
+            remote_address="10.0.0.5",
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("routes", payload)
+        status, _ = app.dispatch(
+            "POST", "/api/coverage/projects", body={"project_name": "blocked"},
+            headers=headers, remote_address="10.0.0.5",
+        )
+        self.assertEqual(status, 503)
+
+    def test_non_loopback_bind_protects_data_reads(self):
+        runtime = self._runtime({
+            "mode": "reverse_proxy",
+            "trusted_proxy_addresses": ["10.0.0.5"],
+            "user_header": "X-Remote-User",
+        }, server={"host": "0.0.0.0", "port": 9528})
+        app = runtime.application()
+        status, _ = app.dispatch("GET", "/api/coverage/projects", remote_address="10.0.0.5")
+        self.assertEqual(status, 401)
+        status, _ = app.dispatch(
+            "GET", "/api/coverage/projects",
+            headers={"X-Remote-User": "operator"}, remote_address="10.0.0.5",
+        )
+        self.assertEqual(status, 200)
 
     def test_malformed_identity_and_batch_limits_fail_closed(self):
         app = self._runtime().application()

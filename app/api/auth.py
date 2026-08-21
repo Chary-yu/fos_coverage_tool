@@ -11,9 +11,13 @@ class MutationAuthorizer(object):
         self.config = config or {}
         self.auth = self.config.get("auth") or {}
 
-    def authorize(self, headers, remote_address):
-        if writes_are_frozen(self.repo_root, self.config):
-            return False, 503, "writes are frozen for upgrade"
+    def authenticate_operator(self, headers, remote_address):
+        """Authenticate an operator without applying the write freeze.
+
+        Read-only operational endpoints remain available during an upgrade so
+        operators can inspect jobs, metrics, routes, and exports while writes
+        are drained.
+        """
         # A caller that bypasses the canonical config loader must not
         # accidentally get an unauthenticated mutation surface.
         mode = str(self.auth.get("mode") or "reverse_proxy").lower()
@@ -31,3 +35,12 @@ class MutationAuthorizer(object):
         if not user:
             return False, 401, "authenticated user is required"
         return True, 200, user
+
+    def authorize_mutation(self, headers, remote_address):
+        if writes_are_frozen(self.repo_root, self.config):
+            return False, 503, "writes are frozen for upgrade"
+        return self.authenticate_operator(headers, remote_address)
+
+    def authorize(self, headers, remote_address):
+        """Backward-compatible alias for mutation authorization."""
+        return self.authorize_mutation(headers, remote_address)

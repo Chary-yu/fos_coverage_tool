@@ -1,15 +1,21 @@
-"""Map changed ownership boundaries to specialist regression suites."""
+"""Map changed ownership boundaries to specialist regression suites.
+
+The diff source is part of the evidence. A missing base/before revision is an
+error, not an empty change set, because an empty set would silently select the
+fallback suite and create false confidence.
+"""
 
 import argparse
 import fnmatch
 import json
 import os
 import subprocess
+import sys
 
 try:
-    from scripts.diagnostics.contract import CONTRACT_VERSION
+    from scripts.diagnostics.contract import CONTRACT_VERSION, with_contract
 except ModuleNotFoundError:
-    from contract import CONTRACT_VERSION
+    from contract import CONTRACT_VERSION, with_contract
 
 
 MAPPINGS = [
@@ -34,16 +40,50 @@ MAPPINGS = [
 ]
 
 
-def changed_files(repo_root, base=None):
-    command = ["git", "-C", repo_root, "diff", "--name-only"]
-    if base:
-        command.append("{}...HEAD".format(base))
-    else:
-        command.extend(["HEAD^", "HEAD"])
+class DiffResolutionError(RuntimeError):
+    pass
+
+
+def _usable_ref(value):
+    value = str(value or "").strip()
+    return value and value != "0" * 40
+
+
+def _git_revision(repo_root, ref):
     try:
-        output = subprocess.check_output(command, stderr=subprocess.DEVNULL)
-    except (OSError, subprocess.CalledProcessError):
-        return []
+        subprocess.check_output(
+            ["git", "-C", repo_root, "rev-parse", "--verify", ref],
+            stderr=subprocess.STDOUT,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise DiffResolutionError("git revision is unavailable: {}".format(ref)) from exc
+
+
+def _diff_spec(base=None, before=None, head=None):
+    head = head or "HEAD"
+    if _usable_ref(base):
+        return "{}...{}".format(base, head)
+    if _usable_ref(before):
+        return "{}..{}".format(before, head)
+    return "HEAD^..HEAD"
+
+
+def changed_files(repo_root, base=None, before=None, head=None):
+    """Return changed files or raise when the diff cannot be established."""
+    spec = _diff_spec(base=base, before=before, head=head)
+    _git_revision(repo_root, head or "HEAD")
+    if spec == "HEAD^..HEAD":
+        _git_revision(repo_root, "HEAD^")
+    else:
+        left = spec.split("...")[0] if "..." in spec else spec.split("..")[0]
+        _git_revision(repo_root, left)
+    try:
+        output = subprocess.check_output(
+            ["git", "-C", repo_root, "diff", "--name-only", spec],
+            stderr=subprocess.STDOUT,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise DiffResolutionError("unable to resolve changed files for {}".format(spec)) from exc
     return [item for item in output.decode("utf-8").splitlines() if item]
 
 
@@ -58,16 +98,65 @@ def select(files):
     return sorted(suites)
 
 
-def main():
+def _write_manifest(path, result):
+    if not path:
+        return
+    target = path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+    os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
+    with open(target, "w", encoding="utf-8") as stream:
+        json.dump(result, stream, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def _run_tests(repo_root, modules):
+    command = [sys.executable, "-m", "unittest"] + list(modules) + ["-v"]
+    return subprocess.call(command, cwd=repo_root)
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--base")
+    parser.add_argument("--before")
+    parser.add_argument("--head")
+    parser.add_argument("--manifest")
+    parser.add_argument("--run-tests", action="store_true")
     parser.add_argument("--repo-root", default=os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
-    args = parser.parse_args()
-    files = changed_files(args.repo_root, args.base)
-    result = {"contract_version": CONTRACT_VERSION,
-              "changed_files": files, "test_modules": select(files)}
+    args = parser.parse_args(argv)
+
+    base = args.base or os.environ.get("GITHUB_BASE_SHA") or os.environ.get("GITHUB_EVENT_BASE")
+    before = args.before or os.environ.get("GITHUB_EVENT_BEFORE")
+    head = args.head or os.environ.get("GITHUB_SHA") or "HEAD"
+    result = with_contract({
+        "evidence_class": "changed_test_selection",
+        "selection_status": "FAILED",
+        "repo_root": os.path.realpath(args.repo_root),
+        "base": base or "",
+        "before": before or "",
+        "head": head,
+        "changed_files": [],
+        "test_modules": [],
+    })
+    try:
+        files = changed_files(args.repo_root, base=base, before=before, head=head)
+        modules = select(files)
+        result.update({
+            "selection_status": "PASSED",
+            "diff_spec": _diff_spec(base=base, before=before, head=head),
+            "changed_files": files,
+            "test_modules": modules,
+        })
+        if args.run_tests:
+            exit_code = _run_tests(args.repo_root, modules)
+            result["selected_tests_exit_code"] = int(exit_code)
+            if exit_code != 0:
+                result["selection_status"] = "FAILED"
+    except DiffResolutionError as exc:
+        result["error"] = str(exc)
+        result["selection_status"] = "FAILED"
+
+    _write_manifest(args.manifest, result)
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0 if result["selection_status"] == "PASSED" else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

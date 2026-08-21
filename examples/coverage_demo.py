@@ -584,7 +584,7 @@ pre.source > span{{display:block;position:relative;white-space:pre}}.lineCov{{ba
 
 def main():
     parser = argparse.ArgumentParser(description="Launch a self-contained Coverage Tool browser demo")
-    parser.add_argument("--host", default="0.0.0.0", help="listen address (default: 0.0.0.0)")
+    parser.add_argument("--host", default="127.0.0.1", help="listen address (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8765, help="listen port (default: 8765)")
     parser.add_argument("--output", default=os.path.join(enhance_coverage.SCRIPT_DIR, ".coverage_demo"))
     args = parser.parse_args()

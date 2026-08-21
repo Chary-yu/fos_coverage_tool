@@ -11,16 +11,19 @@ Provides fast O(1) multi-level path resolution with repository namespace isolati
 from typing import Dict, Any, List, Tuple, Optional, Set
 
 def normalize_lcov_path(path: str) -> str:
-    """Normalize path separators and eliminate relative components."""
+    """Normalize a trusted LCOV path without accepting parent traversal.
+
+    LCOV paths are external metadata, not filesystem paths. Folding ``..``
+    would silently turn an invalid identity into a different valid identity,
+    so callers receive a fail-closed ``ValueError`` instead.
+    """
     clean = path.replace("\\", "/").strip().lstrip("/")
     parts = [p for p in clean.split("/") if p and p != "."]
     stack = []
     for p in parts:
         if p == "..":
-            if stack:
-                stack.pop()
-        else:
-            stack.append(p)
+            raise ValueError("LCOV path contains a parent traversal segment")
+        stack.append(p)
     return "/".join(stack)
 
 class LCOVPathLookupIndex:
@@ -39,7 +42,14 @@ class LCOVPathLookupIndex:
         basename_map: Dict[str, Set[str]] = {}
         
         for p in paths:
-            norm = normalize_lcov_path(p)
+            try:
+                norm = normalize_lcov_path(p)
+            except (AttributeError, TypeError, ValueError):
+                # Invalid external metadata is not allowed to poison the
+                # index or become a match through a normalized alias.
+                continue
+            if not norm:
+                continue
             exact_map[p] = p
             normalized_map.setdefault(norm, set()).add(p)
             
@@ -72,7 +82,12 @@ class LCOVPathLookupIndex:
             return repo_idx["exact"][query_path], "exact"
             
         # 2. Normalized
-        norm = normalize_lcov_path(query_path)
+        try:
+            norm = normalize_lcov_path(query_path)
+        except (AttributeError, TypeError, ValueError):
+            return None, "invalid_path"
+        if not norm:
+            return None, "invalid_path"
         if norm in repo_idx["normalized"]:
             candidates = repo_idx["normalized"][norm]
             if len(candidates) == 1:

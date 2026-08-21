@@ -14,14 +14,15 @@ import json
 import hashlib
 from typing import Dict, Any, Optional, Tuple, List
 
-try:
-    from datetime import datetime, timezone
-    def get_utc_iso():
-        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if hasattr(timezone, "utc") else datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-except ImportError:
-    from datetime import datetime
-    def get_utc_iso():
-        return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from app.time_utils import utc_iso
+
+
+def get_utc_iso():
+    return utc_iso()
 
 def hash_analysis_records(cursor, chunk_size: int = 10000) -> Tuple[int, str]:
     """Compute deterministic SHA256 over business fields of coverage_analysis."""

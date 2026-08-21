@@ -8,8 +8,9 @@ import sys
 import json
 import hashlib
 import subprocess
-from datetime import datetime, timezone
 from typing import Dict, Any, Optional
+
+from app.time_utils import utc_iso
 
 DEFAULT_VERSION = "v11.7 2026-08-19"
 DEFAULT_SCHEMA_VERSION = 2
@@ -73,15 +74,13 @@ def generate_release_identity(
     clean_ver = version.split()[0]
     build_id = f"{clean_ver}-{commit_sha[:8]}-{asset_hash[:8]}"
     
-    utc_now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if hasattr(timezone, "utc") else datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-    
     identity = {
         "version": version,
         "commit_sha": commit_sha,
         "build_id": build_id,
         "asset_hash": asset_hash,
         "schema_version": schema_version,
-        "built_at": utc_now
+        "built_at": utc_iso()
     }
     return identity
 

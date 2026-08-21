@@ -11,6 +11,7 @@ import coverage_check
 import enhance_coverage
 from app.code_detail.sidecar_store import SidecarStore
 from app.incremental.service import IncrementalService
+from app.incremental.path_index import LCOVPathLookupIndex, normalize_lcov_path
 from app.inject.parse_once import parse_gcov_source_once
 from code_region import build_code_regions
 from code_detail_service import CodeDetailService
@@ -227,6 +228,24 @@ filename src/a.c
         self.assertEqual(service.resolve_mapping_value("src/a.c", mapping)[0], [1])
         self.assertEqual(service.resolve_mapping_value("src/b.c", mapping)[0], [2])
         self.assertEqual(len(service._mapping_indexes), 1)
+
+    def test_lcov_parent_traversal_is_rejected_fail_closed(self):
+        with self.assertRaises(ValueError):
+            normalize_lcov_path("build/../src/a.c")
+        index = LCOVPathLookupIndex({"repo": ["/build/src/a.c"]})
+        self.assertEqual(
+            index.resolve_path("repo", "build/../src/a.c"),
+            (None, "invalid_path"),
+        )
+
+    def test_lcov_build_root_absolute_path_resolves_by_unique_suffix(self):
+        index = LCOVPathLookupIndex({
+            "repo": ["/home/git_for_coverage/repo/src/a.c"],
+        })
+        self.assertEqual(
+            index.resolve_path("repo", "src/a.c"),
+            ("/home/git_for_coverage/repo/src/a.c", "unique_suffix"),
+        )
 
     def test_multi_repository_same_relative_path_keeps_line_ownership_isolated(self):
         repo_a = os.path.join(self.temp_dir, "repo-a")

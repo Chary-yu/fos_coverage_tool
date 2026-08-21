@@ -65,6 +65,8 @@ class VNextApplication(object):
         body = body or {}
         headers = headers or {}
         try:
+            if method.upper() == "GET" and self._read_auth_required(path):
+                self._require_read(headers, remote_address)
             return self.router.dispatch(
                 method, path, query, body, headers, remote_address
             )
@@ -87,6 +89,21 @@ class VNextApplication(object):
             logger.exception("VNext application dispatch failed")
             return 500, {"error": "internal_error", "message": "internal server error"}
 
+    def _read_auth_required(self, path):
+        """Require operator auth for reads on an explicitly public bind."""
+        host = str((self.config.get("server") or {}).get("host") or "127.0.0.1").lower()
+        loopback_hosts = {"127.0.0.1", "localhost", "::1", "[::1]"}
+        if host in loopback_hosts:
+            return False
+        # Health and release are intentionally public for process probes; all
+        # data and operational reads on a non-loopback bind are protected.
+        return path not in ("/api/coverage/health", "/api/coverage/release")
+
+    def _require_read(self, headers, remote_address):
+        if str((self.config.get("auth") or {}).get("mode") or "reverse_proxy").lower() == "disabled":
+            raise PermissionError("401:non-loopback reads require operator authentication")
+        return self._require_operator(headers, remote_address)
+
     def _read_connection(self):
         return self.runtime.connection_context(read_only=True)
 
@@ -94,13 +111,16 @@ class VNextApplication(object):
         return self.runtime.connection_context(read_only=False)
 
     def _require_mutation(self, headers, remote_address):
-        allowed, status, identity = self.authorizer.authorize(headers, remote_address)
+        allowed, status, identity = self.authorizer.authorize_mutation(headers, remote_address)
         if not allowed:
             raise PermissionError("{}:{}".format(status, identity))
         return identity
 
     def _require_operator(self, headers, remote_address):
-        return self._require_mutation(headers, remote_address)
+        allowed, status, identity = self.authorizer.authenticate_operator(headers, remote_address)
+        if not allowed:
+            raise PermissionError("{}:{}".format(status, identity))
+        return identity
 
     def health(self, query, body, headers, remote_address):
         return 200, health_endpoint.payload(self)

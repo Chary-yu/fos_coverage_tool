@@ -1,8 +1,9 @@
 """Persistent background job identity/state repository."""
 
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from app.db.repositories.base import execute, fetchall, fetchone
+from app.time_utils import utc_now_naive, utc_sql
 
 
 class JobRepository(object):
@@ -41,7 +42,7 @@ class JobRepository(object):
             job.get("input_payload") or "{}", job.get("result_path") or "",
             job.get("error_message") or "", job.get("data_version"),
             job.get("heartbeat_at"), job.get("created_at") or _now(),
-            job.get("started_at"), job.get("finished_at"), _now(),
+            job.get("started_at"), job.get("finished_at"), utc_sql(),
             job.get("lease_owner") or "",
         )
         if existing:
@@ -65,7 +66,7 @@ class JobRepository(object):
         return self.get(connection, job["job_id"])
 
     def mark_stale(self, connection, timeout_seconds: float, now=None, lease_owner=None):
-        now_value = now or datetime.utcnow()
+        now_value = now or utc_now_naive()
         cutoff = now_value - timedelta(seconds=float(timeout_seconds))
         cutoff_text = cutoff.strftime("%Y-%m-%d %H:%M:%S")
         owner_clause = ""
@@ -87,4 +88,4 @@ class JobRepository(object):
 
 
 def _now():
-    return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    return utc_sql()

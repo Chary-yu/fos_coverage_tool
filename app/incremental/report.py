@@ -2,7 +2,8 @@
 
 import hashlib
 import json
-from datetime import datetime
+
+from app.time_utils import utc_iso
 
 
 class IncrementalReport(object):
@@ -15,7 +16,7 @@ class IncrementalReport(object):
         self.files = files or []
         self.scan_id = scan_id
         self.report_id = report_id
-        self.generated_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.generated_at = utc_iso()
 
     @property
     def source_signature(self):

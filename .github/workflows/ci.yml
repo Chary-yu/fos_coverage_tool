@@ -2,6 +2,11 @@ name: CI
 
 on:
   workflow_dispatch:
+    inputs:
+      cross_layer_evidence:
+        description: 'Path to an instrumented browser/server performance JSON'
+        required: false
+        type: string
   pull_request:
     paths:
       - '**.py'
@@ -46,6 +51,8 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
@@ -76,8 +83,8 @@ jobs:
         run: python scripts/diagnostics/runtime_legacy_dependency_audit.py
       - name: Verify frontend VNext API contract
         run: python scripts/diagnostics/frontend_vnext_api_contract_audit.py
-      - name: Verify active runtime configuration
-        run: python scripts/diagnostics/active_runtime_audit.py
+      - name: Verify configured runtime selection
+        run: mkdir -p .artifacts/vnext && python scripts/diagnostics/configured_runtime_audit.py > .artifacts/vnext/configured_runtime_audit.json
       - name: Verify Scan immutability barrier
         run: python scripts/diagnostics/scan_immutability_audit.py
       - name: Verify connection pool transaction and liveness contract
@@ -85,15 +92,32 @@ jobs:
       - name: Verify durable job lifecycle contract
         run: python scripts/diagnostics/job_lifecycle_audit.py
       - name: Verify changed-path specialist mapping
-        run: python scripts/diagnostics/changed_test_selection.py
+        env:
+          GITHUB_EVENT_BEFORE: ${{ github.event.before }}
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: >-
+          python scripts/diagnostics/changed_test_selection.py
+          --base "${GITHUB_BASE_SHA}" --before "${GITHUB_EVENT_BEFORE}"
+          --head "${GITHUB_SHA}" --run-tests
+          --manifest .artifacts/vnext/changed_test_selection.json
       - name: Build machine-readable VNext evidence matrix
         run: mkdir -p .artifacts/vnext && python scripts/diagnostics/build_vnext_evidence.py .artifacts/vnext/architecture_ownership_matrix.json
+      - name: Upload VNext machine evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: vnext-evidence-python-${{ matrix.python-version }}
+          path: .artifacts/vnext
+          if-no-files-found: error
 
   specialist-regression:
     name: Specialist regression suites
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
@@ -116,7 +140,7 @@ jobs:
     runs-on: ubuntu-latest
     services:
       mariadb:
-        image: mariadb:11.8
+        image: mariadb@sha256:24e76fcec8c003a0362d0dd53f4806e7e79458d7fdeaf47437760e19496f5a9c # 11.8
         env:
           MARIADB_ROOT_PASSWORD: root
           MARIADB_DATABASE: mysql
@@ -129,6 +153,8 @@ jobs:
           --health-retries=12
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
@@ -138,32 +164,49 @@ jobs:
           pip install -r requirements-py36.txt
           pip install pymysql
       - name: Run disposable real-MariaDB VNext integration
-        run: >-
-          python scripts/diagnostics/mysql_vnext_integration.py
-          --create-disposable --host 127.0.0.1 --port 3306
-          --user root --password root
+        run: |
+          set -o pipefail
+          mkdir -p .artifacts
+          python scripts/diagnostics/mysql_vnext_integration.py \
+            --create-disposable --host 127.0.0.1 --port 3306 \
+            --user root --password root | tee .artifacts/mariadb_vnext_integration.json
+      - name: Upload MariaDB integration evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: mariadb-vnext-integration-evidence
+          path: .artifacts/mariadb_vnext_integration.json
+          if-no-files-found: error
 
   py36-compat:
     name: Python 3.6 compatibility (changed runtime)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - name: Compile changed runtime modules
         run: |
           docker run --rm \
-            -v "$PWD:/workspace" -w /workspace python:3.6 \
+            -v "$PWD:/workspace" -w /workspace python@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc \
             bash -lc "find app scripts -type f -name '*.py' -print0 | xargs -0 python -m py_compile && python -m py_compile source_reader.py code_detail_service.py coverage_check.py enhance_coverage.py"
       - name: Run compatibility-focused tests
         run: |
           docker run --rm \
-            -v "$PWD:/workspace" -w /workspace python:3.6 \
-            python -m unittest tests.code_detail.test_phase2_core tests.incremental.test_phase5_inject_path -v
+            -v "$PWD:/workspace" -w /workspace python@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc \
+            python -m unittest \
+            tests.code_detail.test_phase2_core \
+            tests.incremental.test_phase5_inject_path \
+            tests.vnext.test_runtime_config \
+            tests.vnext.test_vnext_runtime -v
 
   mock-dom-regression:
     name: Mock DOM regression (not browser evidence)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
@@ -174,6 +217,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '20'
@@ -181,6 +226,33 @@ jobs:
       - run: npx playwright install --with-deps chromium
       - name: Run required real-browser and canonical VNext HTTP suites
         run: npx playwright test tests/browser
-      - run: mkdir -p .artifacts && npm run perf:browser-ab -- .artifacts/browser_perf_ab.json
+      - run: mkdir -p .artifacts && npm run perf:synthetic-dom -- .artifacts/synthetic_dom_microbenchmark.json
+        env:
+          BASELINE_COMMIT: ${{ github.event.before }}
+          CANDIDATE_COMMIT: ${{ github.sha }}
+          WORKLOAD_HASH: chromium-dom-batch-v1
       - name: Validate browser performance evidence boundary
-        run: python scripts/diagnostics/performance_evidence_audit.py .artifacts/browser_perf_ab.json --allow-partial
+        run: python scripts/diagnostics/performance_evidence_audit.py .artifacts/synthetic_dom_microbenchmark.json --allow-partial
+      - name: Upload browser functional evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: browser-functional-evidence
+          path: .artifacts/synthetic_dom_microbenchmark.json
+          if-no-files-found: error
+
+  cross-layer-performance:
+    name: Cross-layer performance gate (instrumented evidence)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.cross_layer_evidence != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Require cross-layer metrics
+        run: >-
+          python scripts/diagnostics/performance_evidence_audit.py
+          "${{ inputs.cross_layer_evidence }}" --require-cross-layer

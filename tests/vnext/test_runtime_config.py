@@ -32,6 +32,7 @@ class RuntimeConfigTest(unittest.TestCase):
         config = load_application_config(None, base_dir=os.getcwd())
         self.assertEqual(config["runtime_mode"], "vnext")
         self.assertEqual(config["schema_version"], 1)
+        self.assertEqual(config["server"]["host"], "127.0.0.1")
 
     def test_candidate_roots_are_resolved_relative_to_their_declared_base(self):
         with tempfile.TemporaryDirectory(prefix="vnext-config-") as root:

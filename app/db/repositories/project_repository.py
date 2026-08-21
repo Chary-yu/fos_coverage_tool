@@ -1,9 +1,9 @@
 """Project, immutable Scan, repository snapshot, report and file identity."""
 
-from datetime import datetime
 from typing import Any, Optional
 
 from app.db.repositories.base import adapt_sql, execute, fetchall, fetchone, insert_id, row_to_dict
+from app.time_utils import utc_sql
 
 
 MAX_IDENTITY_LOOKUP = 500
@@ -16,7 +16,7 @@ def _chunks(values, size):
 
 
 def _now(value=None):
-    return value or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    return value or utc_sql()
 
 
 class ProjectRepository(object):

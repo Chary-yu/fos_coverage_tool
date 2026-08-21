@@ -15,14 +15,15 @@ import platform
 import socket
 from typing import Dict, Any, List, Tuple, Optional
 
-try:
-    from datetime import datetime, timezone
-    def get_utc_iso():
-        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ") if hasattr(timezone, "utc") else datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-except ImportError:
-    from datetime import datetime
-    def get_utc_iso():
-        return datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from app.time_utils import utc_iso
+
+
+def get_utc_iso():
+    return utc_iso()
 
 MANIFEST_FILENAME = "production_evidence_manifest.json"
 _SUCCESS_STATUS = "UPGRADE_" + "SUCCESS"
@@ -272,10 +273,12 @@ class ProductionEvidenceManifest:
             
         # 8. Performance Benchmark
         pb = self.data.get("performance_benchmark", {})
-        if (pb.get("evidence_class") != "performance_ab" or not pb.get("workload_id")
+        if (pb.get("evidence_class") != "release_performance_ab" or not pb.get("workload_id")
                 or not isinstance(pb.get("baseline_ms"), (int, float))
-                or not isinstance(pb.get("candidate_ms"), (int, float))):
-            unmet.append("Performance evidence is not a baseline/candidate A/B run")
+                or not isinstance(pb.get("candidate_ms"), (int, float))
+                or not pb.get("baseline_commit") or not pb.get("candidate_commit")
+                or not pb.get("workload_hash") or not pb.get("environment_identity")):
+            unmet.append("Performance evidence is not an immutable release baseline/candidate A/B run")
         required_tiers = ["Tier_A_1k", "Tier_B_10k", "Tier_C_50k", "Tier_D_100k"]
         for tier in required_tiers:
             if tier not in pb or not isinstance(pb[tier], dict) or pb[tier].get("status") != "PASSED":

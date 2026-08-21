@@ -1,9 +1,9 @@
 """Persistence for immutable incremental report payloads bound to a Scan."""
 
 import json
-from datetime import datetime
 
 from app.db.repositories.base import execute, fetchone
+from app.time_utils import utc_sql
 
 
 class IncrementalRepository(object):
@@ -22,7 +22,7 @@ class IncrementalRepository(object):
             report.get("oldgit") or item.get("old_commit_sha") or "",
             report.get("newgit") or item.get("new_commit_sha") or "",
             payload,
-            datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            utc_sql(),
         )
         if existing:
             cursor = execute(connection, """
