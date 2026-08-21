@@ -236,7 +236,10 @@ test('instrumented real VNext HTTP fixture records 100k cross-layer workload', a
       const firstVisible = Boolean(document.querySelector('#L1'));
       const expandDurations = [firstVisibleAt - started];
       const sweep = [];
-      const targets = [25000, 50000, 75000, 100000, 1];
+      // Keep the initial line-1 window and visit six distinct physical
+      // Sidecar chunks. This must exercise expanded-region LRU eviction,
+      // rather than only proving that one stale window can be replaced.
+      const targets = [12500, 25000, 50000, 75000, 100000, 1];
       for (const target of targets) {
         const targetStarted = performance.now();
         const bounds = internals.CodeRegionController.virtualWindowBounds(region, target - 1);
@@ -330,6 +333,7 @@ test('instrumented real VNext HTTP fixture records 100k cross-layer workload', a
     expect(crossLayer.status).toBe('PASSED');
     expect(crossLayer.logical_line_count).toBe(100000);
     expect(crossLayer.resident_js_lines_peak).toBeLessThanOrEqual(8000);
+    expect(crossLayer.telemetry.virtual_chunk_evictions).toBeGreaterThan(0);
     expect(crossLayer.sweep.every(item => (
       item.resident_js_lines <= 8000 && item.dom_line_count < 1500
     ))).toBe(true);

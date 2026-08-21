@@ -194,6 +194,15 @@ python3 scripts/diagnostics/skill_drift_audit.py \
 python3 scripts/diagnostics/gate_matrix.py \
   --repo-root "$PWD" \
   --output /secure/evidence/gate-matrix.json
+python3 scripts/diagnostics/gate_task_status.py \
+  --repo-root "$PWD" \
+  --matrix /secure/evidence/gate-matrix.json \
+  --output /secure/evidence/gate-task-status.json
 ```
 
 只要任一外部 artifact 缺失、Gate 不匹配、commit 不匹配、runtime identity 不完整、exit code 非零或证据为 synthetic，命令就必须保持非零并输出 `INCOMPLETE`/`BLOCKED`。在真实外部证据产生前，不得将本地 Gate Matrix 的 `--allow-incomplete` 结果写成已发布或已验收。
+
+`gate_task_status.py` 会按 Appendix B 的 80 个固定任务逐条展开结果：只有任务所属
+Gate 和全部上游任务均为 `PASSED` 时，任务才会标记为 `PASSED`；缺失的真实
+Candidate/MariaDB/生产证据会在每个受影响任务的 `blockers` 中保留，不能被总 Gate
+状态折叠隐藏。

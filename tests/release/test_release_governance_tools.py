@@ -30,6 +30,8 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("real_browser_evidence.js", workflow)
         self.assertIn("--browser-evidence-output", workflow)
         self.assertIn("--evidence-output", workflow)
+        self.assertIn("gate_task_status.py", workflow)
+        self.assertIn("gate-task-status.json", workflow)
         self.assertIn("actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808", workflow)
         self.assertIn("fetch-depth: 0", workflow)
 

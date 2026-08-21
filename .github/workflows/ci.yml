@@ -125,6 +125,12 @@ jobs:
         run: >-
           python scripts/diagnostics/gate_matrix.py --allow-incomplete
           --output .artifacts/vnext/gate-matrix.json
+      - name: Build per-task Gate A-F status
+        run: >-
+          python scripts/diagnostics/gate_task_status.py
+          --matrix .artifacts/vnext/gate-matrix.json
+          --output .artifacts/vnext/gate-task-status.json
+          --allow-incomplete
       - name: Assemble Gate A-F evidence bundle
         run: >-
           python scripts/diagnostics/build_gate_evidence.py
