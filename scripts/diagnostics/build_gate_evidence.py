@@ -431,10 +431,24 @@ def build(repo_root, output_root, run_tests=True):
             report_dir = os.path.join(gate_dir, "playwright_report")
             _write(os.path.join(report_dir, "summary.json"), browser)
         elif gate == "F":
-            _write(os.path.join(gate_dir, "final_source_review.json"), _missing(
-                "final_source_review", "exact-SHA production review is external"))
-            _write(os.path.join(gate_dir, "final_security_review.json"), _missing(
-                "final_security_review", "exact-SHA trust-boundary review is external"))
+            local_checks = {
+                item.get("name"): item
+                for item in matrix["gates"]["F"].get("local_checks", [])
+            }
+            source_review = local_checks.get("final_source_review") or {}
+            security_review = local_checks.get("final_security_review") or {}
+            _write(
+                os.path.join(gate_dir, "final_source_review.json"),
+                source_review.get("summary") or _missing(
+                    "final_source_review", "exact-SHA source review is unavailable"
+                ),
+            )
+            _write(
+                os.path.join(gate_dir, "final_security_review.json"),
+                security_review.get("summary") or _missing(
+                    "final_security_review", "exact-SHA security review is unavailable"
+                ),
+            )
             _write(os.path.join(gate_dir, "release_identity.json"), identity)
             _write(os.path.join(gate_dir, "database_runtime_identity.json"), _missing(
                 "database_runtime_identity", "final target DB identity is external"))

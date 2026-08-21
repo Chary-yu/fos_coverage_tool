@@ -85,6 +85,17 @@ python3 scripts/upgrade/run_verified_backup_rehearsal.py \
 
 正式切换前重新生成 fresh inventory，至少覆盖 process/service、release identity、Current/Candidate roots、DB fingerprint、schema/table counts、jobs、磁盘公式、Nginx/auth boundary 和 backup location。再执行 freeze → final backup → Candidate rehearsal → traffic-closed verification → cutover → forced rollback rehearsal，并保留完整 before/target/rollback release identity。
 
+在 traffic-closed verification 前，先在最终 exact checkout 执行仓库内 source/security review：
+
+```bash
+python3 scripts/diagnostics/final_source_review.py \
+  --output /secure/evidence/gate-f/final_source_review.json
+python3 scripts/diagnostics/final_security_review.py \
+  --output /secure/evidence/gate-f/final_security_review.json
+```
+
+这两个结果只证明 exact SHA 的 source/canonical/runtime 与静态 trust-boundary 检查；它们不能替代后续的生产进程、Target DB、反向代理和 traffic-closed read-only 证据。
+
 Acceptance window 必须在窗口结束后运行：
 
 ```bash

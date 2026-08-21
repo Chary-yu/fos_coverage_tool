@@ -34,6 +34,8 @@ from scripts.diagnostics.scan_immutability_audit import audit as audit_scan
 from scripts.diagnostics.active_runtime_audit import audit as audit_active
 from scripts.diagnostics.configured_runtime_audit import audit as audit_configured
 from scripts.diagnostics.performance_evidence_audit import audit as audit_performance
+from scripts.diagnostics.final_security_review import audit as audit_final_security
+from scripts.diagnostics.final_source_review import audit as audit_final_source
 from scripts.upgrade.evidence_manifest import EvidenceManifestV2
 from scripts.upgrade.schema_preflight import validate_ddl_file
 
@@ -292,6 +294,8 @@ def build(repo_root):
             "local_checks": [
                 _local_check("configured_runtime", configured),
                 _local_check("active_runtime", active),
+                _local_check("final_source_review", audit_final_source(repo_root)),
+                _local_check("final_security_review", audit_final_security(repo_root)),
                 _local_check("legacy_retirement", legacy_retirement),
                 _local_check("parser_toolchain", parser),
             ],

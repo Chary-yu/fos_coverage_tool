@@ -4,7 +4,7 @@ import os
 import tempfile
 import unittest
 
-from scripts.diagnostics.gate_matrix import _external, _revision
+from scripts.diagnostics.gate_matrix import _external, _revision, build
 
 
 class GateMatrixEvidenceTest(unittest.TestCase):
@@ -152,5 +152,18 @@ class GateMatrixEvidenceTest(unittest.TestCase):
                     os.remove(target)
                 except OSError:
                     pass
+
+    def test_gate_f_includes_exact_source_and_security_reviews(self):
+        matrix = build(self.repo_root)
+        checks = {
+            item["name"]: item
+            for item in matrix["gates"]["F"]["local_checks"]
+        }
+        self.assertIn("final_source_review", checks)
+        self.assertIn("final_security_review", checks)
+        self.assertEqual(
+            checks["final_security_review"]["evidence_class"],
+            "exact_sha_security_review",
+        )
 if __name__ == "__main__":
     unittest.main()
