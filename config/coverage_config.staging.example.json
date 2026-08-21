@@ -34,7 +34,7 @@
   "upgrade": {
     "drain_timeout_sec": 30,
     "release_endpoint": "http://127.0.0.1:19528/api/coverage/release",
-    "previous_release_endpoint": "http://127.0.0.1:19528/api/coverage/release",
+    "previous_release_endpoint": "http://127.0.0.1:9528/api/coverage/release",
     "rollback_evidence_path": ".artifacts/staging/rollback-evidence.json",
     "performance_evidence_path": ".artifacts/staging/release-performance-ab.json",
     "path_mapping_source_paths": ["tests/fixtures/path_mapping"],
@@ -44,7 +44,7 @@
       "drain_jobs": ["python3", "scripts/upgrade/local_staging_control.py", "drain", "--config", "config/coverage_config.staging.example.json", "--pid-file", ".runtime-state-staging/api.pid"],
       "stop_api": ["python3", "scripts/upgrade/local_staging_control.py", "stop", "--config", "config/coverage_config.staging.example.json", "--pid-file", ".runtime-state-staging/api.pid"],
       "start_api": ["python3", "scripts/upgrade/local_staging_control.py", "start", "--config", "config/coverage_config.staging.example.json", "--pid-file", ".runtime-state-staging/api.pid", "--endpoint", "http://127.0.0.1:19528/api/coverage/release"],
-      "start_previous_api": ["python3", "scripts/upgrade/local_staging_control.py", "start", "--config", "config/coverage_config.staging.example.json", "--pid-file", ".runtime-state-staging/api.pid", "--endpoint", "http://127.0.0.1:19528/api/coverage/release"],
+      "start_previous_api": ["python3", "scripts/upgrade/local_staging_control.py", "start", "--config", "coverage_config.json", "--pid-file", ".runtime-state/api.pid", "--endpoint", "http://127.0.0.1:9528/api/coverage/release"],
       "open_traffic": ["python3", "scripts/upgrade/local_staging_control.py", "open", "--config", "config/coverage_config.staging.example.json", "--pid-file", ".runtime-state-staging/api.pid"]
     }
   }

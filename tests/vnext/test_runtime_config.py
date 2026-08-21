@@ -34,6 +34,20 @@ class RuntimeConfigTest(unittest.TestCase):
         self.assertEqual(config["schema_version"], 1)
         self.assertEqual(config["server"]["host"], "127.0.0.1")
 
+    def test_candidate_rollback_endpoint_and_start_command_are_distinct(self):
+        config = load_application_config(
+            os.path.join(os.getcwd(), "config/coverage_config.staging.example.json"),
+            base_dir=os.getcwd(),
+        )
+        upgrade = config["upgrade"]
+        self.assertNotEqual(
+            upgrade["release_endpoint"], upgrade["previous_release_endpoint"]
+        )
+        self.assertNotEqual(
+            upgrade["commands"]["start_api"],
+            upgrade["commands"]["start_previous_api"],
+        )
+
     def test_candidate_roots_are_resolved_relative_to_their_declared_base(self):
         with tempfile.TemporaryDirectory(prefix="vnext-config-") as root:
             path = os.path.join(root, "coverage.json")

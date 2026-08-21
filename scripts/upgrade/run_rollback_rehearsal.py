@@ -14,6 +14,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 from scripts.upgrade.cutover_controller import CutoverController
 from scripts.diagnostics.data_hash_gate import capture_database_snapshot, verify_data_integrity
+from app.upgrade.lifecycle import UpgradeLifecycle
 
 
 def sha256(path):
@@ -55,6 +56,20 @@ def release_identity_id(identity):
     return str(value)
 
 
+RELEASE_IDENTITY_FIELDS = (
+    "version", "commit_sha", "build_id", "asset_hash", "schema_version",
+)
+
+
+def release_identity_matches(observed, expected):
+    observed = observed or {}
+    expected = expected or {}
+    return bool(
+        all(observed.get(field) == expected.get(field)
+            for field in RELEASE_IDENTITY_FIELDS)
+    )
+
+
 def run(output, revision, config_path=None, before_release=None, target_release=None):
     config = {}
     if config_path:
@@ -90,13 +105,16 @@ def run(output, revision, config_path=None, before_release=None, target_release=
         before_db = after_db = None
         api_endpoint = None
         api_before = api_after = None
+        rollback_control = None
         if config_path:
             import pymysql
             api_endpoint = ((config.get("upgrade") or {}).get("release_endpoint"))
             if not api_endpoint:
                 raise RuntimeError("release_endpoint is required for rollback rehearsal")
+            if not ((config.get("upgrade") or {}).get("previous_release_endpoint")):
+                raise RuntimeError("previous_release_endpoint is required for rollback rehearsal")
             api_before = fetch_release_identity(api_endpoint)
-            if release_identity_id(api_before) != target_release_id:
+            if not release_identity_matches(api_before, target_release):
                 raise RuntimeError("release endpoint before identity is not the target release")
             db = config.get("mysql", config)
             db_connection = pymysql.connect(
@@ -117,6 +135,14 @@ def run(output, revision, config_path=None, before_release=None, target_release=
         changed = sha256(live) != before
         controller.rollback()
         restored = sha256(live) == before
+        if api_endpoint:
+            # A file restore alone is not a rollback rehearsal.  The
+            # configured lifecycle must stop the Candidate and start the
+            # independently identified previous release; its endpoint is
+            # checked again below.  Missing/failed commands stay fail-closed.
+            lifecycle = UpgradeLifecycle(ROOT, config, "staging", before_release)
+            lifecycle.api_started = True
+            rollback_control = lifecycle.abort()
         if db_connection is not None:
             after_db = capture_database_snapshot(db_connection, {"commit_sha": revision})
             db_unchanged, db_errors = verify_data_integrity(before_db, after_db)
@@ -125,9 +151,8 @@ def run(output, revision, config_path=None, before_release=None, target_release=
             db_unchanged, db_errors = True, []
         if api_endpoint:
             api_after = fetch_release_identity(api_endpoint)
-        api_identity_verified = bool(
-            api_after and release_identity_id(api_after) == before_release_id
-        )
+        api_identity_verified = bool(api_after and
+                                     release_identity_matches(api_after, before_release))
         rollback_release_id = release_identity_id(api_after) if api_after else ""
         rehearsal_ok = bool(
             changed and restored and db_unchanged and api_identity_verified
@@ -146,6 +171,7 @@ def run(output, revision, config_path=None, before_release=None, target_release=
             "api_identity_before": api_before or "not_checked",
             "api_identity_after": api_after or "not_checked",
             "api_identity_verified": api_identity_verified,
+            "rollback_control": rollback_control or "not_checked",
             "before_release_id": before_release_id,
             "target_release_id": target_release_id,
             "rollback_release_id": rollback_release_id,

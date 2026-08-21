@@ -29,6 +29,14 @@ def audit(repo_root=ROOT):
         violations.append("Candidate database is not coverage_candidate")
     if int((candidate.get("server") or {}).get("port") or 0) != 19528:
         violations.append("Candidate server port is not 19528")
+    upgrade = candidate.get("upgrade") or {}
+    if not upgrade.get("previous_release_endpoint"):
+        violations.append("Candidate previous_release_endpoint is missing")
+    elif upgrade.get("previous_release_endpoint") == upgrade.get("release_endpoint"):
+        violations.append("Candidate previous_release_endpoint must differ from release_endpoint")
+    commands = upgrade.get("commands") or {}
+    if commands.get("start_previous_api") == commands.get("start_api"):
+        violations.append("start_previous_api must not reuse the Candidate start command")
     return with_contract({
         "status": "PASSED" if not violations else "FAILED",
         "evidence_class": "configuration_audit",
@@ -38,6 +46,9 @@ def audit(repo_root=ROOT):
         "candidate_runtime_mode": candidate.get("runtime_mode"),
         "candidate_database": (candidate.get("mysql") or {}).get("database"),
         "candidate_port": (candidate.get("server") or {}).get("port"),
+        "candidate_release_endpoint": upgrade.get("release_endpoint", ""),
+        "candidate_previous_release_endpoint": upgrade.get("previous_release_endpoint", ""),
+        "rollback_command_distinct": commands.get("start_previous_api") != commands.get("start_api"),
         "violations": violations,
     })
 
