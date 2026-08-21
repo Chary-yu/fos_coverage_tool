@@ -1245,8 +1245,15 @@ def apply_schema(connection, ddl_path, release_sha=""):
     try:
         for statement in _split_sql(ddl):
             cursor = connection.cursor()
-            cursor.execute(adapt_sql(connection, statement))
-            cursor.close()
+            try:
+                cursor.execute(adapt_sql(connection, statement))
+            except Exception as exc:
+                compact = " ".join(str(statement).split())
+                raise RuntimeError(
+                    "DDL statement failed: {}".format(compact[:2000])
+                ) from exc
+            finally:
+                cursor.close()
         # Existing Candidate databases are upgraded through information_schema
         # checks rather than unsafe ADD COLUMN IF NOT EXISTS (unsupported by
         # MariaDB 5.5).  Fresh targets get the columns from the DDL above.
