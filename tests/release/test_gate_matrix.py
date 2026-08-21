@@ -20,7 +20,7 @@ class GateMatrixEvidenceTest(unittest.TestCase):
             )
             result = _external(
                 "test", "test evidence", "COVERAGE_GATE_TEST_EVIDENCE",
-                self.revision, self.repo_root,
+                self.revision, self.repo_root, "gate-a",
             )
             self.assertEqual(result["status"], "INCOMPLETE")
             self.assertTrue(result["violations"])
@@ -43,6 +43,7 @@ class GateMatrixEvidenceTest(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as stream:
                 json.dump({
                     "status": "PASSED",
+                    "gate": "gate-a",
                     "candidate_revision": self.revision,
                     "host_identity": {"hostname": "test"},
                     "evidence_class": "external_test",
@@ -58,7 +59,7 @@ class GateMatrixEvidenceTest(unittest.TestCase):
             os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = path
             result = _external(
                 "test", "test evidence", "COVERAGE_GATE_TEST_EVIDENCE",
-                self.revision, self.repo_root,
+                self.revision, self.repo_root, "gate-a",
             )
             self.assertEqual(result["status"], "PASSED")
             self.assertEqual(result["violations"], [])
@@ -84,6 +85,7 @@ class GateMatrixEvidenceTest(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as stream:
                 json.dump({
                     "status": "PASSED",
+                    "gate": "gate-a",
                     "candidate_revision": self.revision,
                     "host_identity": {"hostname": "test"},
                     "command_or_action": "test evidence",
@@ -92,7 +94,7 @@ class GateMatrixEvidenceTest(unittest.TestCase):
             os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = path
             result = _external(
                 "test", "test evidence", "COVERAGE_GATE_TEST_EVIDENCE",
-                self.revision, self.repo_root,
+                self.revision, self.repo_root, "gate-a",
             )
             self.assertEqual(result["status"], "INCOMPLETE")
             self.assertTrue(any("timestamps" in item for item in result["violations"]))
@@ -107,6 +109,48 @@ class GateMatrixEvidenceTest(unittest.TestCase):
             except OSError:
                 pass
 
-
+    def test_external_evidence_cannot_be_replayed_into_another_gate(self):
+        fd, path = tempfile.mkstemp(prefix="coverage-gate-wrong-gate-", suffix=".json")
+        os.close(fd)
+        artifact = path + ".payload"
+        old = os.environ.get("COVERAGE_GATE_TEST_EVIDENCE")
+        try:
+            with open(artifact, "w", encoding="utf-8") as stream:
+                stream.write("gate-a artifact\n")
+            with open(artifact, "rb") as stream:
+                artifact_sha = hashlib.sha256(stream.read()).hexdigest()
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "status": "PASSED",
+                    "gate": "gate-a",
+                    "candidate_revision": self.revision,
+                    "release_identity": {"commit_sha": self.revision},
+                    "host_identity": {"hostname": "test"},
+                    "evidence_class": "external_test",
+                    "command_or_action": "test evidence",
+                    "started_at": "2026-08-21T00:00:00Z",
+                    "finished_at": "2026-08-21T00:00:01Z",
+                    "exit_code": 0,
+                    "artifact_path": artifact,
+                    "artifact_sha256": artifact_sha,
+                    "synthetic": False,
+                }, stream)
+            os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = path
+            result = _external(
+                "test", "test evidence", "COVERAGE_GATE_TEST_EVIDENCE",
+                self.revision, self.repo_root, "gate-b",
+            )
+            self.assertEqual(result["status"], "INCOMPLETE")
+            self.assertTrue(any("gate" in item for item in result["violations"]))
+        finally:
+            if old is None:
+                os.environ.pop("COVERAGE_GATE_TEST_EVIDENCE", None)
+            else:
+                os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = old
+            for target in (path, artifact):
+                try:
+                    os.remove(target)
+                except OSError:
+                    pass
 if __name__ == "__main__":
     unittest.main()

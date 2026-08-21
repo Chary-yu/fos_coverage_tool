@@ -88,7 +88,7 @@ _KNOWN_STATUSES = {
 
 
 def _external(name, requirement, env_name=None, candidate_revision="",
-              repo_root=ROOT):
+              repo_root=ROOT, expected_gate=""):
     value = os.environ.get(env_name or "") if env_name else ""
     artifact_path = os.path.abspath(value) if value else ""
     artifact_exists = bool(artifact_path and os.path.isfile(artifact_path))
@@ -116,6 +116,8 @@ def _external(name, requirement, env_name=None, candidate_revision="",
             evidence_gate = str(evidence_payload.get("gate") or "")
             if not evidence_gate:
                 violations.append("Evidence Manifest v2 gate is missing")
+            elif expected_gate and evidence_gate != str(expected_gate):
+                violations.append("external evidence gate does not match the required gate")
             else:
                 manifest = EvidenceManifestV2(
                     repo_root, evidence_gate, manifest_path=artifact_path
@@ -149,6 +151,8 @@ def _external(name, requirement, env_name=None, candidate_revision="",
                 violations.append("external evidence command_or_action is missing")
             if not evidence_payload.get("evidence_class"):
                 violations.append("external evidence evidence_class is missing")
+            if expected_gate and evidence_payload.get("gate") != str(expected_gate):
+                violations.append("external evidence gate is missing or does not match the required gate")
             if not evidence_payload.get("started_at") or \
                     not evidence_payload.get("finished_at"):
                 violations.append("external evidence timestamps are missing")
@@ -236,8 +240,8 @@ def build(repo_root):
                 _local_check("contract_artifacts", contract_artifacts),
             ],
             "external_evidence": [
-                _external("verified_backup_restore", "verified production backup restored into an empty target", "COVERAGE_GATE_A_BACKUP_EVIDENCE", revision, repo_root),
-                _external("mariadb_55_rehearsal", "MariaDB 5.5 compatibility rehearsal", "COVERAGE_GATE_A_MARIADB_EVIDENCE", revision, repo_root),
+                _external("verified_backup_restore", "verified production backup restored into an empty target", "COVERAGE_GATE_A_BACKUP_EVIDENCE", revision, repo_root, "gate-a"),
+                _external("mariadb_55_rehearsal", "MariaDB 5.5 compatibility rehearsal", "COVERAGE_GATE_A_MARIADB_EVIDENCE", revision, repo_root, "gate-a"),
             ],
         },
         "B": {
@@ -251,7 +255,7 @@ def build(repo_root):
             ],
             "external_evidence": [_external(
                 "target_backfill_semantic_hash", "target DB backfill/orphan/semantic hash evidence",
-                "COVERAGE_GATE_B_DB_EVIDENCE", revision, repo_root,
+                "COVERAGE_GATE_B_DB_EVIDENCE", revision, repo_root, "gate-b",
             )],
         },
         "C": {
@@ -261,7 +265,7 @@ def build(repo_root):
             ],
             "external_evidence": [_external(
                 "durable_restart_rehearsal", "durable import restart/fencing/read-set rehearsal",
-                "COVERAGE_GATE_C_RESTART_EVIDENCE", revision, repo_root,
+                "COVERAGE_GATE_C_RESTART_EVIDENCE", revision, repo_root, "gate-c",
             )],
         },
         "D": {
@@ -271,7 +275,7 @@ def build(repo_root):
             ],
             "external_evidence": [_external(
                 "deterministic_corpus", "deterministic parser/callee/header corpus with zero false positives",
-                "COVERAGE_GATE_D_CORPUS_EVIDENCE", revision, repo_root,
+                "COVERAGE_GATE_D_CORPUS_EVIDENCE", revision, repo_root, "gate-d",
             )],
         },
         "E": {
@@ -280,8 +284,8 @@ def build(repo_root):
                 _local_check("performance_evidence", performance),
             ],
             "external_evidence": [
-                _external("real_browser_evidence", "real HTTP + Chromium parity evidence", "COVERAGE_GATE_E_BROWSER_EVIDENCE", revision, repo_root),
-                _external("cross_layer_performance", "DB/sidecar/query/RSS/p95 performance evidence", "COVERAGE_GATE_E_PERF_EVIDENCE", revision, repo_root),
+                _external("real_browser_evidence", "real HTTP + Chromium parity evidence", "COVERAGE_GATE_E_BROWSER_EVIDENCE", revision, repo_root, "gate-e"),
+                _external("cross_layer_performance", "DB/sidecar/query/RSS/p95 performance evidence", "COVERAGE_GATE_E_PERF_EVIDENCE", revision, repo_root, "gate-e"),
             ],
         },
         "F": {
@@ -292,9 +296,9 @@ def build(repo_root):
                 _local_check("parser_toolchain", parser),
             ],
             "external_evidence": [
-                _external("fresh_production_inventory", "fresh inventory/free-disk/dual-environment evidence", "COVERAGE_GATE_F_INVENTORY_EVIDENCE", revision, repo_root),
-                _external("backup_and_cutover", "verified backup/freeze/drain/cutover/rollback evidence", "COVERAGE_GATE_F_CUTOVER_EVIDENCE", revision, repo_root),
-                _external("acceptance_window", "48-hour acceptance and skill-drift audit evidence", "COVERAGE_GATE_F_ACCEPTANCE_EVIDENCE", revision, repo_root),
+                _external("fresh_production_inventory", "fresh inventory/free-disk/dual-environment evidence", "COVERAGE_GATE_F_INVENTORY_EVIDENCE", revision, repo_root, "gate-f"),
+                _external("backup_and_cutover", "verified backup/freeze/drain/cutover/rollback evidence", "COVERAGE_GATE_F_CUTOVER_EVIDENCE", revision, repo_root, "gate-f"),
+                _external("acceptance_window", "48-hour acceptance and skill-drift audit evidence", "COVERAGE_GATE_F_ACCEPTANCE_EVIDENCE", revision, repo_root, "gate-f"),
             ],
         },
     }

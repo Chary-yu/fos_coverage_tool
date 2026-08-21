@@ -14,6 +14,7 @@ from scripts.diagnostics.frontend_vnext_api_contract_audit import audit as audit
 from scripts.diagnostics.scan_immutability_audit import audit as audit_immutability
 from scripts.diagnostics.legacy_retirement_audit import audit as audit_legacy_retirement
 from scripts.diagnostics.contract_artifact_audit import audit as audit_contract_artifacts
+from scripts.diagnostics.task_manifest_audit import audit as audit_task_manifest
 from scripts.diagnostics.changed_test_selection import DiffResolutionError, changed_files, select
 from scripts.diagnostics.performance_evidence_audit import audit as audit_performance
 
@@ -110,6 +111,9 @@ class ArchitectureAuditTest(unittest.TestCase):
             self.assertEqual(result["browser_status"], "FAILED")
         self.assertEqual(audit_frontend(os.getcwd())["status"], "PASSED")
         self.assertEqual(audit_contract_artifacts(os.getcwd())["status"], "PASSED")
+        task_manifest = audit_task_manifest(os.getcwd())
+        self.assertEqual(task_manifest["status"], "PASSED")
+        self.assertEqual(task_manifest["expected_task_count"], 80)
         self.assertEqual(audit_immutability()["status"], "PASSED")
 
 

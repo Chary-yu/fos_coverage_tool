@@ -24,6 +24,7 @@ REQUIRED_FILES = (
     "docs/api_contract.json",
     "docs/contracts/evidence_manifest_v2.schema.json",
     "docs/release_identity_contract_v2.md",
+    "docs/gate_task_manifest.json",
     "schema/vnext_core/README.md",
     "schema/analysis_domain/README.md",
     "schema/inheritance_domain/README.md",
@@ -73,6 +74,7 @@ def audit(repo_root=ROOT):
     evidence_schema = _load(
         repo_root, "docs/contracts/evidence_manifest_v2.schema.json", violations
     )
+    task_manifest = _load(repo_root, "docs/gate_task_manifest.json", violations)
     if deterministic.get("algorithm_version") != "inheritance-v1":
         violations.append("deterministic inheritance algorithm version is not frozen")
     if deterministic.get("authoritative_rules_contract") != \
@@ -104,6 +106,17 @@ def audit(repo_root=ROOT):
     if evidence_schema.get("properties", {}).get("evidence_schema_version", {}).get(
             "const") != 2:
         violations.append("Evidence Manifest v2 schema is not version 2")
+    if task_manifest.get("schema_version") != 1 or not task_manifest.get("tasks"):
+        violations.append("Gate task manifest is missing or not version 1")
+    try:
+        from scripts.diagnostics.task_manifest_audit import audit as audit_tasks
+        task_result = audit_tasks(repo_root)
+        if task_result.get("status") != "PASSED":
+            violations.extend(task_result.get("violations") or [
+                "Gate task manifest audit failed"
+            ])
+    except (ImportError, OSError, ValueError) as exc:
+        violations.append("cannot run Gate task manifest audit: {}".format(exc))
     return with_contract({
         "status": "PASSED" if not violations else "FAILED",
         "evidence_class": "contract_artifact_audit",
