@@ -285,7 +285,11 @@ class VNextApiExportSecurityTest(unittest.TestCase):
         } for line_id, record_id, relation_revision in identities]
 
         trace = []
-        self.connection.set_trace_callback(trace.append)
+
+        def record_trace(statement):
+            trace.append(statement)
+
+        self.connection.set_trace_callback(record_trace)
         result = service.save(
             self.connection, "bulk-cas-analysis", scan["id"], records,
             reviewer="alice",
