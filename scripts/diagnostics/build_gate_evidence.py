@@ -544,10 +544,20 @@ def build(repo_root, output_root, run_tests=True):
             status, synthetic, observed_status = _manifest_artifact_attributes(
                 name, path, tests
             )
+            if status == "PASSED" or observed_status == "PASSED":
+                artifact_exit_code = 0
+            elif status in ("FAILED", "BLOCKED") or observed_status in (
+                    "FAILED", "BLOCKED"):
+                artifact_exit_code = 1
+            else:
+                # This artifact was not a successful executable result.  A
+                # null exit code is more truthful than borrowing the status
+                # of the optional Gate test group.
+                artifact_exit_code = None
             manifest.record(
                 "{}-{}".format(gate.lower(), name.replace("/", "-").replace(".", "-")),
                 "synthetic_fixture" if synthetic else "repository_or_release_audit",
-                status, "build_gate_evidence.py", 0 if tests["status"] == "PASSED" else 1,
+                status, "build_gate_evidence.py", artifact_exit_code,
                 artifact_path=path, source_inputs_sha256=[], synthetic=synthetic,
                 observed_status=observed_status,
             )

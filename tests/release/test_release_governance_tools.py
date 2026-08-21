@@ -12,6 +12,7 @@ from scripts.diagnostics.build_gate_evidence import (
 )
 from scripts.diagnostics.production_inventory import required_free_bytes
 from scripts.diagnostics.skill_drift_audit import REQUIRED_FIELDS, REQUIRED_SKILLS, audit as audit_skills
+from scripts.upgrade.evidence_manifest import EvidenceManifestV2
 
 
 class ReleaseGovernanceToolsTest(unittest.TestCase):
@@ -156,6 +157,12 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
                 self.assertTrue(os.path.isfile(os.path.join(
                     gate_dir, "evidence-manifest-v2.json"
                 )))
+                manifest = EvidenceManifestV2(
+                    os.getcwd(), "gate-{}".format(gate.lower()),
+                    manifest_path=os.path.join(gate_dir, "evidence-manifest-v2.json"),
+                )
+                valid, errors = manifest.validate()
+                self.assertTrue(valid, "invalid Gate {} manifest: {}".format(gate, errors))
 
     def test_manifest_artifact_attributes_preserve_status_and_synthetic_boundary(self):
         with tempfile.TemporaryDirectory() as directory:
