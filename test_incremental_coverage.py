@@ -281,10 +281,10 @@ class TestPython36Compatibility(unittest.TestCase):
 
     def test_threading_http_server_has_python36_fallback(self):
         project_dir = os.path.dirname(os.path.abspath(__file__))
-        with open(os.path.join(project_dir, "enhance_coverage.py"), "r", encoding="utf-8") as script_file:
+        with open(os.path.join(project_dir, "app", "api", "server.py"), "r", encoding="utf-8") as script_file:
             source = script_file.read()
-        self.assertIn("from socketserver import ThreadingMixIn", source)
-        self.assertIn("class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):", source)
+        self.assertIn("socketserver.ThreadingMixIn", source)
+        self.assertIn("class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):", source)
 
 
 class TestIncrementalReviewInjection(unittest.TestCase):
@@ -540,7 +540,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         self.assertIn("待填写 2 行", page_html)
         self.assertIn("多人提交同一文件", page_html)
         self.assertIn('data-project="developer_test"', page_html)
-        self.assertIn('data-file-key="src/main.c"', page_html)
+        self.assertIn('data-file-key="platform::src/main.c"', page_html)
         self.assertIn('class="js-task-unanalyzed"', page_html)
         self.assertIn('class="js-task-action"', page_html)
         self.assertIn('class="js-summary-review-files"', page_html)
@@ -829,7 +829,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
             with open(html_path, "r", encoding="utf-8") as f:
                 html_content = f.read()
             self.assertIn('<main data-project="FOS_V6R2">', html_content)
-            self.assertIn('data-file-key="/src/main.c"', html_content)
+            self.assertIn('data-file-key="repo_a::/src/main.c"', html_content)
             self.assertIn('class="js-unanalyzed-count"', html_content)
             self.assertIn('id="incremental-unanalyzed-total"', html_content)
             self.assertIn('data-sort-key="unanalyzed"', html_content)
@@ -920,7 +920,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         mock_mgr = unittest.mock.MagicMock()
         mock_mgr.is_available.return_value = True
 
-        counts_map = {"matched.c": 3}  # matched.c is present, missed.c is absent
+        counts_map = {"ssf::matched.c": 3}  # repository-qualified key is present; missed.c is absent
         with unittest.mock.patch.object(enhance_coverage, "db_module", object()), \
              unittest.mock.patch.object(enhance_coverage, "get_thread_db_manager", return_value=mock_mgr), \
              unittest.mock.patch.object(enhance_coverage, "get_incremental_unanalyzed_counts", return_value=(counts_map, 10)), \
@@ -928,7 +928,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
             unanalyzed_map = enhance_coverage.sync_incremental_unanalyzed_counts("WARN_PROJ", sample_result, config=mock_config)
             self.assertEqual(sample_result["summary"]["unanalyzed"], 4)  # 3 + 1
             printed_msgs = [call[0][0] for call in mock_print.call_args_list if call[0]]
-            self.assertTrue(any("[WARNING] Path miss for unanalyzed counts: 'missed.c'" in m for m in printed_msgs))
+            self.assertTrue(any("[WARNING] Path miss for unanalyzed counts: 'ssf::missed.c'" in m for m in printed_msgs))
             self.assertTrue(any("Matched 1 file(s), missed 1 file(s)" in m for m in printed_msgs))
 
     def test_frontend_js_refresh_error_sets_tooltip(self):

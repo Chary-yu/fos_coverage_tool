@@ -5168,10 +5168,10 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
         self.safe_write(data)
 
     def send_review_excel_by_dir_response(self, filename, project_name):
-        # Canonical bounded-memory exporter.  It fetches one directory at a
-        # time and writes a ZIP to a temporary file before HTTP transmission;
-        # the legacy direct ZipFile/socket implementation below is retained as
-        # unreachable compatibility code until the next cleanup release.
+        # Canonical bounded-memory exporter.  Fetch the detail rows once and
+        # partition them in memory by directory.  The streaming writer still
+        # emits one workbook at a time, but the database no longer sees one
+        # identical line-index query per directory.
         temp_fd, temp_path = tempfile.mkstemp(prefix="coverage-export-", suffix=".zip")
         os.close(temp_fd)
         try:
@@ -5184,14 +5184,23 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                     item["directory"] = directory
                     summaries.append(item)
 
+            raw_rows = db_manager.fetch_review_excel_rows(project_name, dir_path=None)
+            columns = (
+                "project_name", "source_file_name", "file_path", "line_number",
+                "line_text", "status", "coverage_method", "uncovered_reason", "reviewer"
+            )
+            rows_by_directory = {}
+            for row in raw_rows:
+                row_map = row if isinstance(row, dict) else dict(zip(columns, row))
+                directory = get_source_dir_name(row_map.get("file_path", ""))
+                rows_by_directory.setdefault(directory, []).append(row_map)
+
             def rows_for_directory(project, directory):
-                raw_rows = db_manager.fetch_review_excel_rows(project, directory)
-                columns = (
-                    "project_name", "source_file_name", "file_path", "line_number",
-                    "line_text", "status", "coverage_method", "uncovered_reason", "reviewer"
-                )
-                for row in raw_rows:
-                    yield row if isinstance(row, dict) else dict(zip(columns, row))
+                # ``project`` is part of the callback contract; the rows were
+                # already resolved for this project above.
+                del project
+                for row in rows_by_directory.get(directory, []):
+                    yield row
 
             export_project_coverage_streaming_zip(
                 project_name=project_name,

@@ -436,14 +436,15 @@ class TestIntegration(unittest.TestCase):
         self.assertIn('function saveReviewBlocksBatch', content)
         self.assertIn('暂存草稿', content)
         self.assertIn('确认提交', content)
-        self.assertIn("requestCoverageApi('/batch'", content)
+        self.assertIn("requestCoverageApi('/analysis'", content)
+        self.assertIn("requestCoverageApi('/code-lines/batch'", content)
         self.assertIn('function apiBaseCandidates', content)
         self.assertIn("progressLink.innerText = '查看进展 / 导出';", content)
-        self.assertIn('setStoredPanelValues(currentPanel, {', content)
+        self.assertIn('setStoredPanelValues(panel, {', content)
         self.assertIn("status: getStoredPanelValue(previous, 'status')", content)
         self.assertIn("batchInheritBtn.innerText = '批量继承';", content)
         self.assertIn('function findPreviousFilledPanelEntry', content)
-        self.assertIn('lineNum > sourceLineNum && lineNum <= startLineNum', content)
+        self.assertIn('lineNum > sourceLineNum && lineNum <= panel.lineNum', content)
         self.assertIn('setStoredPanelValues(targetPanel, inheritedValues);', content)
 
     @unittest.mock.patch('enhance_coverage.DatabaseManager')
@@ -773,11 +774,12 @@ class TestScalableProgress(unittest.TestCase):
     def test_progress_page_uses_background_jobs_and_paged_details(self):
         with open(enhance_coverage.PROGRESS_JS_SOURCE_PATH, "r", encoding="utf-8") as page_file:
             content = page_file.read()
-        self.assertIn("/progress/start?project=", content)
-        self.assertIn("/jobs/status?id=", content)
-        self.assertIn("/details?project=", content)
+        self.assertIn("/progress?", content)
+        self.assertIn("/jobs/", content)
+        self.assertIn("/progress/details?project=", content)
+        self.assertIn("/exports", content)
         self.assertIn("后台导出详细 CSV", content)
-        self.assertIn("未传输任何逐行明细", content)
+        self.assertIn("page_size=200", content)
         self.assertIn("showConnecting();", content)
         with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as html_file:
             html_content = html_file.read()
@@ -920,7 +922,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         duration = timer.mark("phase_test")
         self.assertGreaterEqual(duration, 0.0)
 
-        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "enhance_coverage.py")
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_impl.py")
         with open(py_path, "r", encoding="utf-8") as f:
             py_content = f.read()
 
@@ -934,7 +936,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("latest_mtime", sig)
         self.assertIn("total_size", sig)
 
-        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "enhance_coverage.py")
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_impl.py")
         with open(py_path, "r", encoding="utf-8") as f:
             py_content = f.read()
 
@@ -969,7 +971,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertTrue(mock_conn.close.called)
 
     def test_ios_ui_template_integrity(self):
-        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "enhance_coverage.py")
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_impl.py")
         with open(py_path, "r", encoding="utf-8") as f:
             py_content = f.read()
 
@@ -1008,7 +1010,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertEqual(enhance_coverage.get_project_data_version("test_persisted_project"), v2)
 
     def test_persistent_background_jobs_schema_and_methods(self):
-        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "enhance_coverage.py")
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_impl.py")
         with open(py_path, "r", encoding="utf-8") as f:
             py_content = f.read()
 
@@ -1133,7 +1135,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
             self.assertIsNone(res, "Expired job query from DB should return None and expire DB row")
 
     def test_cli_ops_paths_invalidate_data_version(self):
-        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "legacy_runtime.py")
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_impl.py")
         with open(py_path, "r", encoding="utf-8") as f:
             py_content = f.read()
 
@@ -1151,13 +1153,13 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("coverage_project_state", clear_content)
 
     def test_server_port_bind_order(self):
-        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "enhance_coverage.py")
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_impl.py")
         with open(py_path, "r", encoding="utf-8") as f:
             py_content = f.read()
 
-        server_def_pos = py_content.find("def run_server():")
+        server_def_pos = py_content.find("def run_server(")
         self.assertNotEqual(server_def_pos, -1)
-        bind_pos = py_content.find("ThreadingHTTPServer(server_address", server_def_pos)
+        bind_pos = py_content.find("create_server(server_address, CoverageHTTPRequestHandler)", server_def_pos)
         self.assertNotEqual(bind_pos, -1)
         recover_pos = py_content.find("recover_background_jobs()", bind_pos)
         self.assertGreater(recover_pos, bind_pos, "recover_background_jobs must execute AFTER socket bind in run_server")
