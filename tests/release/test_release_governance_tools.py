@@ -19,6 +19,20 @@ from scripts.upgrade.evidence_manifest import EvidenceManifestV2
 
 
 class ReleaseGovernanceToolsTest(unittest.TestCase):
+    def test_ci_has_manual_exact_sha_candidate_browser_lane(self):
+        with open(
+                os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
+                encoding="utf-8") as stream:
+            workflow = stream.read()
+        self.assertIn("real_browser_url:", workflow)
+        self.assertIn("real_browser_expected_revision:", workflow)
+        self.assertIn("real-browser-candidate:", workflow)
+        self.assertIn("real_browser_evidence.js", workflow)
+        self.assertIn("--browser-evidence-output", workflow)
+        self.assertIn("--evidence-output", workflow)
+        self.assertIn("actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808", workflow)
+        self.assertIn("fetch-depth: 0", workflow)
+
     def test_disk_formula_includes_twenty_percent_or_ten_gib_margin(self):
         result = required_free_bytes(100, 200, 300, 400, 500, 600)
         self.assertEqual(result["preceding_sum"], 2100)

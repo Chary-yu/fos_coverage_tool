@@ -105,6 +105,13 @@ header value 写入 artifact；但仍应通过环境变量或受控 secret 注�
 mutation；需要 mutation rehearsal 时应使用独立 Candidate 数据库和专门的 API
 回归脚本。
 
+同一采集器也接入 `.github/workflows/ci.yml` 的手动
+`real-browser-candidate` lane。触发 `workflow_dispatch` 时提供
+`real_browser_url`（可选提供 `real_browser_expected_revision`），并在仓库/环境
+Secret 中配置 `COVERAGE_BROWSER_USER`；job 会上传三个 exact-SHA JSON artifact。
+未提供 Candidate URL 时该 lane 不运行，普通 CI 仍只保留明确标记为 synthetic 的
+fixture/browser evidence。
+
 ## Gate F：切换、回滚和 48 小时窗口
 
 正式切换前重新生成 fresh inventory，至少覆盖 process/service、release identity、Current/Candidate roots、DB fingerprint、schema/table counts、jobs、磁盘公式、Nginx/auth boundary 和 backup location。再执行 freeze → final backup → Candidate rehearsal → traffic-closed verification → cutover → forced rollback rehearsal，并保留完整 before/target/rollback release identity。

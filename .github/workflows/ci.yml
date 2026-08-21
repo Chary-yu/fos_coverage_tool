@@ -7,6 +7,14 @@ on:
         description: 'Path to an instrumented browser/server performance JSON'
         required: false
         type: string
+      real_browser_url:
+        description: 'Exact Candidate HTML URL for real HTTP + Chromium Gate E evidence'
+        required: false
+        type: string
+      real_browser_expected_revision:
+        description: 'Exact 40-character Candidate commit SHA; defaults to the workflow SHA'
+        required: false
+        type: string
   pull_request:
     paths:
       - '**.py'
@@ -293,4 +301,47 @@ jobs:
         with:
           name: cross-layer-performance-evidence
           path: .artifacts/cross_layer_performance.json
+          if-no-files-found: error
+
+  real-browser-candidate:
+    name: Real Candidate browser evidence
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.real_browser_url != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+      - name: Install browser dependencies
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Collect exact-SHA Candidate browser and performance evidence
+        env:
+          REAL_BROWSER_URL: ${{ inputs.real_browser_url }}
+          REAL_BROWSER_EXPECTED_REVISION: ${{ inputs.real_browser_expected_revision || github.sha }}
+          COVERAGE_BROWSER_USER: ${{ secrets.COVERAGE_BROWSER_USER }}
+          COVERAGE_BROWSER_ROLE: ${{ secrets.COVERAGE_BROWSER_ROLE }}
+        run: |
+          set -o pipefail
+          mkdir -p .artifacts/real-browser-candidate
+          node scripts/diagnostics/real_browser_evidence.js \
+            --url "$REAL_BROWSER_URL" \
+            --expected-revision "$REAL_BROWSER_EXPECTED_REVISION" \
+            --header "X-Remote-User=$COVERAGE_BROWSER_USER" \
+            --header "X-Remote-Role=${COVERAGE_BROWSER_ROLE:-reviewer}" \
+            --output .artifacts/real-browser-candidate/workload.json \
+            --browser-evidence-output .artifacts/real-browser-candidate/browser-evidence.json \
+            --evidence-output .artifacts/real-browser-candidate/performance-evidence.json
+          python scripts/diagnostics/performance_evidence_audit.py \
+            .artifacts/real-browser-candidate/performance-evidence.json \
+            --require-cross-layer
+      - name: Upload exact-SHA Candidate browser evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: real-browser-candidate-evidence
+          path: .artifacts/real-browser-candidate
           if-no-files-found: error
