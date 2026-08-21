@@ -20,6 +20,7 @@ import re
 from typing import Dict, Any, Optional, Tuple
 
 from scripts.diagnostics.data_hash_gate import capture_database_snapshot
+from app.time_utils import utc_iso
 
 
 _DATABASE_IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
@@ -434,6 +435,13 @@ def perform_database_backup(
     if not verified_dump:
         return False, {}, verification_error or "backup verification failed"
 
+    source_environment = str(
+        config.get("backup_source_environment") or
+        os.environ.get("COVERAGE_BACKUP_SOURCE_ENVIRONMENT") or
+        os.environ.get("COVERAGE_ENV") or
+        ""
+    ).strip().lower()
+    operator = str(os.environ.get("COVERAGE_BACKUP_OPERATOR") or "").strip()
     manifest = {
         "status": "BACKUP_VERIFIED",
         "evidence_class": "mock" if use_mock or (allow_mock_in_test and not has_mysqldump) else "production_backup",
@@ -448,6 +456,15 @@ def perform_database_backup(
         "schema_sql_size": os.path.getsize(schema_sql) if os.path.isfile(schema_sql) else 0,
         "snapshot": snapshot,
         "verification": verification,
+        # Gate A's external rehearsal requires an explicit operator attestation
+        # in addition to the technical backup checks.  Empty values are kept in
+        # test/development manifests so they fail closed instead of being
+        # silently interpreted as production provenance.
+        "provenance": {
+            "source_environment": source_environment,
+            "operator": operator,
+            "attested_at": utc_iso() if operator else "",
+        },
     }
     if has_mysqldump:
         try:

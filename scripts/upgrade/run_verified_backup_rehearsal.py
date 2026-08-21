@@ -7,6 +7,8 @@ intentionally stricter than the generated-fixture MariaDB integration:
 * ``--create-disposable`` is required;
 * the dump must be outside the active deployment tree and have an explicit
   SHA256 (argument or sidecar file);
+* an independent backup provenance manifest is required and must identify a
+  verified, non-synthetic production backup whose dump SHA matches the input;
 * both databases must be absent before this command creates them;
 * only databases created by this command are eligible for cleanup; and
 * a successful result is never marked synthetic.
@@ -239,6 +241,83 @@ def _validate_dump(dump_path, expected_sha, repo_root, deployment_roots):
     return dump_path, actual, uncompressed
 
 
+def _load_backup_provenance_manifest(manifest_path, dump_path, dump_sha,
+                                     repo_root, deployment_roots):
+    """Load and fail closed on the operator-supplied backup provenance.
+
+    A successful restore only proves that *some* SQL stream can be migrated.
+    Gate A additionally needs evidence that the stream came from the verified
+    production backup workflow.  This contract deliberately requires the
+    manifest emitted by that workflow plus an explicit operator attestation;
+    a caller cannot turn a fixture dump into release evidence by passing an
+    SHA256 and setting ``synthetic`` to false in the rehearsal result.
+    """
+    if not manifest_path:
+        raise ValueError("--backup-manifest is required for Gate A evidence")
+    manifest_path = os.path.realpath(os.path.abspath(manifest_path))
+    if not os.path.isfile(manifest_path) or os.path.getsize(manifest_path) <= 0:
+        raise ValueError("backup provenance manifest is missing or empty")
+    roots = [repo_root] + [root for root in (deployment_roots or []) if root]
+    if any(_is_within(manifest_path, root) for root in roots):
+        raise ValueError(
+            "backup provenance manifest must be stored outside deployment roots"
+        )
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as stream:
+            manifest = json.load(stream)
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError("backup provenance manifest is not valid JSON: {}".format(exc))
+    if not isinstance(manifest, dict):
+        raise ValueError("backup provenance manifest must be a JSON object")
+
+    if manifest.get("status") != "BACKUP_VERIFIED":
+        raise ValueError("backup provenance status is not BACKUP_VERIFIED")
+    if manifest.get("evidence_class") != "production_backup":
+        raise ValueError("backup provenance is not classified as production_backup")
+    if manifest.get("synthetic") is not False:
+        raise ValueError("synthetic backup provenance cannot support Gate A")
+    if manifest.get("backup_root_external") is not True:
+        raise ValueError("backup provenance does not prove external backup storage")
+    if manifest.get("full_sql_gz_sha256") != str(dump_sha):
+        raise ValueError("backup provenance dump SHA256 does not match the input dump")
+    if type(manifest.get("full_sql_gz_size")) is not int or \
+            manifest.get("full_sql_gz_size") != os.path.getsize(dump_path):
+        raise ValueError("backup provenance dump size does not match the input dump")
+    if not manifest.get("database"):
+        raise ValueError("backup provenance source database is missing")
+
+    verification = manifest.get("verification")
+    if not isinstance(verification, dict):
+        raise ValueError("backup provenance verification details are missing")
+    if not isinstance(verification.get("table_inventory"), list) or \
+            not verification.get("table_inventory"):
+        raise ValueError("backup provenance has no verified table inventory")
+    if verification.get("restore_smoke") != "PASSED":
+        raise ValueError("backup provenance restore smoke was not PASSED")
+    if verification.get("restore_target_empty_before_restore") is not True:
+        raise ValueError("backup provenance restore target was not proven empty")
+    if not isinstance(verification.get("restore_database_runtime_identity"), dict) or \
+            not verification.get("restore_database_runtime_identity"):
+        raise ValueError("backup provenance restore runtime identity is missing")
+
+    snapshot = manifest.get("snapshot")
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("tables"), dict) or \
+            not snapshot.get("tables"):
+        raise ValueError("backup provenance source database snapshot is missing")
+
+    provenance = manifest.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ValueError("backup provenance operator attestation is missing")
+    if str(provenance.get("source_environment") or "").lower() != "production":
+        raise ValueError("backup provenance source_environment must be production")
+    if not str(provenance.get("operator") or "").strip():
+        raise ValueError("backup provenance operator attestation is missing")
+    if not str(provenance.get("attested_at") or "").strip():
+        raise ValueError("backup provenance attestation timestamp is missing")
+
+    return manifest_path, compute_file_sha256(manifest_path), manifest
+
+
 def _semantic_diff(source, target, limit=8):
     """Return bounded, machine-readable differences for a failed rehearsal."""
     differences = []
@@ -291,6 +370,10 @@ def run(args):
     revision = _revision(repo_root)
     started_at = utc_iso()
     dump_path = os.path.abspath(args.backup)
+    backup_manifest_arg = getattr(args, "backup_manifest", "")
+    backup_manifest_path = (
+        os.path.abspath(backup_manifest_arg) if backup_manifest_arg else ""
+    )
     expected_sha = ""
     try:
         expected_sha = _load_expected_sha(dump_path, args.backup_sha256)
@@ -299,7 +382,10 @@ def run(args):
         sha_error = str(exc)
     else:
         sha_error = ""
-    command = "python scripts/upgrade/run_verified_backup_rehearsal.py --create-disposable"
+    command = (
+        "python scripts/upgrade/run_verified_backup_rehearsal.py "
+        "--create-disposable --backup-manifest <verified-backup-manifest>"
+    )
     result = _base_result(
         repo_root, revision, dump_path, expected_sha,
         os.path.abspath(args.output), started_at, command,
@@ -323,10 +409,29 @@ def run(args):
         dump_path, dump_sha, uncompressed_size = _validate_dump(
             dump_path, expected_sha, repo_root, deployment_roots,
         )
+        (backup_manifest_path, backup_manifest_sha,
+         backup_provenance) = _load_backup_provenance_manifest(
+            backup_manifest_path, dump_path, dump_sha, repo_root,
+            deployment_roots,
+        )
         result["artifact_path"] = dump_path
         result["artifact_sha256"] = dump_sha
+        result["backup_provenance"] = {
+            "manifest_path": backup_manifest_path,
+            "manifest_sha256": backup_manifest_sha,
+            "source_environment": (
+                backup_provenance.get("provenance") or {}
+            ).get("source_environment", ""),
+            "operator": (backup_provenance.get("provenance") or {}).get(
+                "operator", ""
+            ),
+            "attested_at": (backup_provenance.get("provenance") or {}).get(
+                "attested_at", ""
+            ),
+        }
         result["source_inputs_sha256"] = [
             dump_sha,
+            backup_manifest_sha,
             _sha256_text(os.path.join(repo_root, "scripts", "upgrade", "vnext_schema.sql")),
         ]
         with open(os.path.abspath(args.config), "r", encoding="utf-8") as stream:
@@ -462,6 +567,10 @@ def main(argv=None):
     parser.add_argument("--config", required=True)
     parser.add_argument("--backup", required=True)
     parser.add_argument("--backup-sha256", default="")
+    parser.add_argument(
+        "--backup-manifest", required=True,
+        help="operator-supplied verified production backup-manifest.json",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--manifest-output", default="")
     parser.add_argument("--deployment-root", action="append", default=[])
@@ -507,6 +616,7 @@ def main(argv=None):
                 finished_at=result.get("finished_at") or "",
                 synthetic=False,
                 checks=result.get("checks") or {},
+                backup_provenance=result.get("backup_provenance") or {},
                 violations=result.get("violations") or [],
             )
             manifest_valid, manifest_errors = manifest.validate()

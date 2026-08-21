@@ -37,6 +37,9 @@ from scripts.diagnostics.performance_evidence_audit import audit as audit_perfor
 from scripts.diagnostics.final_security_review import audit as audit_final_security
 from scripts.diagnostics.final_source_review import audit as audit_final_source
 from scripts.upgrade.evidence_manifest import EvidenceManifestV2
+from scripts.upgrade.run_verified_backup_rehearsal import (
+    _load_backup_provenance_manifest,
+)
 from scripts.upgrade.schema_preflight import validate_ddl_file
 
 
@@ -87,6 +90,50 @@ _KNOWN_STATUSES = {
     "PASSED", "INCOMPLETE", "BLOCKED", "FAILED", "PARTIAL",
     "UNAVAILABLE", "SKIPPED",
 }
+
+
+def _backup_provenance_violations(payload, evidence_path, repo_root):
+    """Revalidate the independent production-backup manifest at Gate Matrix time."""
+    provenance = payload.get("backup_provenance")
+    if not isinstance(provenance, dict):
+        return ["verified backup evidence lacks backup_provenance manifest metadata"]
+    manifest_ref = str(provenance.get("manifest_path") or "")
+    if not manifest_ref:
+        return ["verified backup evidence lacks backup provenance manifest path"]
+    if not os.path.isabs(manifest_ref):
+        manifest_ref = os.path.join(os.path.dirname(os.path.abspath(evidence_path)), manifest_ref)
+    manifest_ref = os.path.abspath(manifest_ref)
+    if not os.path.isfile(manifest_ref):
+        return ["backup provenance manifest is missing: {}".format(manifest_ref)]
+    try:
+        manifest_sha = _sha256(manifest_ref)
+    except OSError:
+        return ["backup provenance manifest cannot be hashed"]
+    if manifest_sha != str(provenance.get("manifest_sha256") or ""):
+        return ["backup provenance manifest SHA256 does not match"]
+
+    artifact_ref = str(payload.get("artifact_path") or "")
+    if not artifact_ref:
+        return ["verified backup evidence lacks the dump artifact path"]
+    if not os.path.isabs(artifact_ref):
+        artifact_ref = os.path.join(os.path.dirname(os.path.abspath(evidence_path)), artifact_ref)
+    artifact_ref = os.path.abspath(artifact_ref)
+    artifact_sha = str(payload.get("artifact_sha256") or "")
+    if not os.path.isfile(artifact_ref):
+        return ["verified backup dump artifact is missing: {}".format(artifact_ref)]
+    try:
+        actual_artifact_sha = _sha256(artifact_ref)
+    except OSError:
+        return ["verified backup dump artifact cannot be hashed"]
+    if artifact_sha and actual_artifact_sha != artifact_sha:
+        return ["verified backup dump artifact SHA256 does not match"]
+    try:
+        _load_backup_provenance_manifest(
+            manifest_ref, artifact_ref, actual_artifact_sha, repo_root, [repo_root],
+        )
+    except (OSError, ValueError) as exc:
+        return ["backup provenance contract failed: {}".format(exc)]
+    return []
 
 
 def _external(name, requirement, env_name=None, candidate_revision="",
@@ -196,6 +243,18 @@ def _external(name, requirement, env_name=None, candidate_revision="",
                         violations.append("PASSED external evidence referenced artifact is missing")
                     elif _sha256(referenced) != artifact_sha:
                         violations.append("PASSED external evidence artifact SHA256 does not match")
+        if name == "verified_backup_restore" and observed_status == "PASSED":
+            if evidence_payload.get("evidence_schema_version") == 2:
+                records = evidence_payload.get("evidence") or []
+                for record in records:
+                    if isinstance(record, dict):
+                        violations.extend(_backup_provenance_violations(
+                            record, artifact_path, repo_root,
+                        ))
+            else:
+                violations.extend(_backup_provenance_violations(
+                    evidence_payload, artifact_path, repo_root,
+                ))
         observed_candidate = str(evidence_payload.get("candidate_revision") or "")
         if not observed_candidate or observed_candidate != str(candidate_revision or ""):
             violations.append("external evidence candidate revision mismatch")

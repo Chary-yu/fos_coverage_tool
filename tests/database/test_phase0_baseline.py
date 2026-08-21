@@ -102,6 +102,8 @@ class TestPhase0Baseline(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(backup_dir, "full.sql.gz.sha256")))
         self.assertEqual(manifest["status"], "BACKUP_VERIFIED")
         self.assertTrue(manifest["synthetic"])
+        self.assertIn("provenance", manifest)
+        self.assertEqual(manifest["provenance"]["operator"], "")
 
     def test_backup_root_must_not_be_inside_deployment_root(self):
         deployment_root = os.path.join(self.test_dir, "candidate")

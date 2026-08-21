@@ -1,5 +1,6 @@
 import json
 import hashlib
+import gzip
 import os
 import tempfile
 import unittest
@@ -153,6 +154,86 @@ class GateMatrixEvidenceTest(unittest.TestCase):
                     os.remove(target)
                 except OSError:
                     pass
+
+    def test_verified_backup_requires_independent_provenance_manifest(self):
+        old = os.environ.get("COVERAGE_GATE_TEST_EVIDENCE")
+        with tempfile.TemporaryDirectory() as directory:
+            dump = os.path.join(directory, "full.sql.gz")
+            with gzip.open(dump, "wb") as stream:
+                stream.write(b"CREATE TABLE coverage_example (id INT);\n")
+            with open(dump, "rb") as stream:
+                dump_sha = hashlib.sha256(stream.read()).hexdigest()
+            provenance_path = os.path.join(directory, "backup-manifest.json")
+            provenance = {
+                "status": "BACKUP_VERIFIED",
+                "evidence_class": "production_backup",
+                "synthetic": False,
+                "backup_root_external": True,
+                "database": "coverage",
+                "full_sql_gz_size": os.path.getsize(dump),
+                "full_sql_gz_sha256": dump_sha,
+                "snapshot": {"tables": {"coverage_analysis": {"count": 1}}},
+                "verification": {
+                    "table_inventory": ["coverage_example"],
+                    "restore_smoke": "PASSED",
+                    "restore_target_empty_before_restore": True,
+                    "restore_database_runtime_identity": {"version": "11.8"},
+                },
+                "provenance": {
+                    "source_environment": "production",
+                    "operator": "release-operator",
+                    "attested_at": "2026-08-21T00:00:00Z",
+                },
+            }
+            with open(provenance_path, "w", encoding="utf-8") as stream:
+                json.dump(provenance, stream)
+            with open(provenance_path, "rb") as stream:
+                provenance_sha = hashlib.sha256(stream.read()).hexdigest()
+
+            evidence_path = os.path.join(directory, "gate-a.json")
+            base = {
+                "status": "PASSED",
+                "gate": "gate-a",
+                "candidate_revision": self.revision,
+                "host_identity": {"hostname": "test"},
+                "evidence_class": "verified_production_backup_restore_rehearsal",
+                "command_or_action": "verified backup rehearsal",
+                "started_at": "2026-08-21T00:00:00Z",
+                "finished_at": "2026-08-21T00:00:01Z",
+                "exit_code": 0,
+                "artifact_path": dump,
+                "artifact_sha256": dump_sha,
+                "release_identity": {"commit_sha": self.revision},
+                "synthetic": False,
+            }
+            os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = evidence_path
+            with open(evidence_path, "w", encoding="utf-8") as stream:
+                json.dump(base, stream)
+            rejected = _external(
+                "verified_backup_restore", "verified production backup",
+                "COVERAGE_GATE_TEST_EVIDENCE", self.revision,
+                self.repo_root, "gate-a",
+            )
+            self.assertEqual(rejected["status"], "INCOMPLETE")
+            self.assertTrue(any("backup_provenance" in item for item in rejected["violations"]))
+
+            base["backup_provenance"] = {
+                "manifest_path": provenance_path,
+                "manifest_sha256": provenance_sha,
+            }
+            with open(evidence_path, "w", encoding="utf-8") as stream:
+                json.dump(base, stream)
+            accepted = _external(
+                "verified_backup_restore", "verified production backup",
+                "COVERAGE_GATE_TEST_EVIDENCE", self.revision,
+                self.repo_root, "gate-a",
+            )
+            self.assertEqual(accepted["status"], "PASSED")
+            self.assertEqual(accepted["violations"], [])
+        if old is None:
+            os.environ.pop("COVERAGE_GATE_TEST_EVIDENCE", None)
+        else:
+            os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = old
 
     def test_cross_layer_performance_requires_explicit_release_eligibility(self):
         fd, path = tempfile.mkstemp(prefix="coverage-gate-perf-", suffix=".json")

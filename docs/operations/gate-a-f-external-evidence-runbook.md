@@ -53,6 +53,7 @@ python3 scripts/upgrade/run_verified_backup_rehearsal.py \
   --config /secure/coverage-candidate-mysql.json \
   --backup /secure/backups/coverage-full.sql.gz \
   --backup-sha256 "$(awk '{print $1}' /secure/backups/coverage-full.sql.gz.sha256)" \
+  --backup-manifest /secure/backups/backup-manifest.json \
   --require-version-prefix 5.5 \
   --deployment-root /srv/fos-coverage/current \
   --deployment-root /srv/fos-coverage/candidate \
@@ -64,11 +65,44 @@ python3 scripts/upgrade/run_verified_backup_rehearsal.py \
 该命令会：
 
 1. 验证 dump 的 SHA256 和 gzip framing；
-2. 拒绝位于部署树内的 backup；
-3. 检查 source/target disposable 数据库在执行前不存在；
-4. 将 dump 恢复到 Legacy source，再迁移到独立 Empty VNext target；
-5. 检查 MariaDB runtime identity、semantic hash、重跑幂等和目标表清单；
-6. 只删除本次创建的两个数据库。
+2. 验证独立 `backup-manifest.json`：`production_backup`、`synthetic=false`、
+   外置 backup root、restore smoke、源库快照，以及 production/operator/时间戳
+   attestation；manifest 中的 dump SHA 和大小必须与输入一致；
+3. 拒绝位于部署树内的 backup 或 provenance manifest；
+4. 检查 source/target disposable 数据库在执行前不存在；
+5. 将 dump 恢复到 Legacy source，再迁移到独立 Empty VNext target；
+6. 检查 MariaDB runtime identity、semantic hash、重跑幂等和目标表清单；
+7. 只删除本次创建的两个数据库。
+
+`backup-manifest.json` 必须来自真实 backup workflow，并包含如下来源证明：
+
+生成生产 backup 时，应显式提供来源环境和操作者身份，例如：
+
+```bash
+export COVERAGE_BACKUP_SOURCE_ENVIRONMENT=production
+export COVERAGE_BACKUP_OPERATOR="$USER"
+```
+
+backup workflow 会把这两个值和 attestation 时间写入 manifest；未设置时保持空值，
+后续 rehearsal 会 fail closed。
+
+```json
+{
+  "status": "BACKUP_VERIFIED",
+  "evidence_class": "production_backup",
+  "synthetic": false,
+  "backup_root_external": true,
+  "provenance": {
+    "source_environment": "production",
+    "operator": "operator-id",
+    "attested_at": "2026-08-21T00:00:00Z"
+  }
+}
+```
+
+缺少 manifest、使用 mock/synthetic manifest、restore smoke 未通过或只提供
+手写 `status=PASSED` rehearsal JSON，都会保持 `INCOMPLETE`，不能填充
+`COVERAGE_GATE_A_BACKUP_EVIDENCE`。
 
 `scripts/diagnostics/mysql_vnext_integration.py --create-disposable --migration-rehearsal` 仍可用于 MariaDB SQL/事务/fixture 回归，但输出明确标记 `synthetic=true`，不能填充 `COVERAGE_GATE_A_BACKUP_EVIDENCE`。需要同时验证 Gate C durable import 时追加 `--scan-import-rehearsal`；该项会覆盖 busy zero-residue、staged artifact recovery、fencing CAS、CURRENT 原子发布和重复恢复幂等，但同样只属于本地 synthetic rehearsal。
 
