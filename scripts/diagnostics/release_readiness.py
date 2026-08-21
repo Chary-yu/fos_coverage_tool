@@ -186,6 +186,11 @@ def _dod_blockers(dod_status, candidate_revision):
             "type": "dod_status",
             "reason": "candidate_revision does not match Gate Matrix",
         })
+    if str(dod_status.get("current_revision") or "") != str(candidate_revision or ""):
+        blockers.append({
+            "type": "dod_status",
+            "reason": "current_revision does not match Gate Matrix",
+        })
     if dod_status.get("dod_count") != len(EXPECTED_DOD_IDS):
         blockers.append({
             "type": "dod_status",
@@ -214,6 +219,11 @@ def _dod_blockers(dod_status, candidate_revision):
             "type": "dod_status",
             "reason": "duplicate or unexpected DoD IDs",
             "dod_ids": unexpected,
+        })
+    if observed_ids != EXPECTED_DOD_IDS:
+        blockers.append({
+            "type": "dod_status",
+            "reason": "DoD IDs are not in canonical order",
         })
     if str(dod_status.get("status") or "INCOMPLETE").upper() != "PASSED":
         blockers.append({

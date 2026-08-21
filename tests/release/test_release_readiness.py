@@ -27,6 +27,7 @@ class ReleaseReadinessTest(unittest.TestCase):
                  "tasks": [{"task_id": task_id, "status": "PASSED"}
                            for task_id in EXPECTED_TASKS]}
         dod = {"status": "PASSED", "candidate_revision": self.revision,
+               "current_revision": self.revision,
                "dod_count": len(EXPECTED_DOD_IDS),
                "items": [{"dod_id": dod_id, "status": "PASSED"}
                          for dod_id in EXPECTED_DOD_IDS]}
