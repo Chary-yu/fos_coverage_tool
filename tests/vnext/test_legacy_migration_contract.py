@@ -36,6 +36,13 @@ class LegacyMigrationContractTest(unittest.TestCase):
         self.assertEqual(target.execute(
             "SELECT COUNT(*) FROM coverage_legacy_provenance"
         ).fetchone()[0], 9 + 11 + 1 + 2)
+        provenance_hashes = [
+            row[0] for row in target.execute(
+                "SELECT provenance_key_hash FROM coverage_legacy_provenance"
+            ).fetchall()
+        ]
+        self.assertTrue(all(len(value) == 64 for value in provenance_hashes))
+        self.assertEqual(len(provenance_hashes), len(set(provenance_hashes)))
         self.assertEqual(target.execute(
             "SELECT COUNT(*) FROM coverage_schema_migrations"
         ).fetchone()[0], 0)

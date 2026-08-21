@@ -612,21 +612,28 @@ Gate A VNext Core 仍使用 `coverage_analyses` 时：
 ```text
 coverage_legacy_provenance
   id BIGINT PK AUTO_INCREMENT
-  migration_id VARCHAR(64) NOT NULL
+  migration_id VARCHAR(128) NOT NULL
   target_entity_type VARCHAR(32) NOT NULL
   target_entity_id BIGINT NOT NULL
   source_table VARCHAR(64) NOT NULL
   source_identity VARCHAR(512) NOT NULL
-  legacy_created_at DATETIME NULL
-  legacy_updated_at DATETIME NULL
+  provenance_key_hash CHAR(64) NOT NULL
+  legacy_created_at DATETIME(6) NULL
+  legacy_updated_at DATETIME(6) NULL
   legacy_raw_status VARCHAR(64) NULL
   legacy_raw_is_draft TINYINT NULL
   raw_payload_sha256 CHAR(64) NOT NULL
   created_at DATETIME NOT NULL
-  UNIQUE(migration_id, target_entity_type, target_entity_id, source_table)
+  UNIQUE(provenance_key_hash)
+  KEY(source_table(31), source_identity(160))
 ```
 
-raw payload 本体不必复制敏感内容；`raw_payload_sha256` 用于证明映射输入未漂移。
+`provenance_key_hash` 是
+`SHA256(migration_id, target_entity_type, target_entity_id, source_table)` 的
+规范化身份指纹。它保留完整业务身份，同时避免 `utf8mb4` 在 MariaDB 5.5
+的 767-byte 索引上限；`source_table/source_identity` 查询继续做完整值过滤，
+前缀索引只负责候选定位。raw payload 本体不必复制敏感内容；
+`raw_payload_sha256` 用于证明映射输入未漂移。
 
 ### 验证
 

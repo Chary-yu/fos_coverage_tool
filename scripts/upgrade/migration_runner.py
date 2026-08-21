@@ -127,10 +127,11 @@ CREATE TABLE IF NOT EXISTS coverage_legacy_provenance (
     id INTEGER PRIMARY KEY AUTOINCREMENT, migration_id TEXT NOT NULL,
     target_entity_type TEXT NOT NULL, target_entity_id INTEGER NOT NULL,
     source_table TEXT NOT NULL, source_identity TEXT NOT NULL,
+    provenance_key_hash TEXT NOT NULL,
     legacy_created_at TEXT, legacy_updated_at TEXT,
     legacy_raw_status TEXT, legacy_raw_is_draft INTEGER,
     raw_payload_sha256 TEXT NOT NULL, raw_payload TEXT, created_at TEXT NOT NULL,
-    UNIQUE(migration_id, target_entity_type, target_entity_id, source_table)
+    UNIQUE(provenance_key_hash)
 );
 CREATE TABLE IF NOT EXISTS coverage_repositories (
     id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL,
@@ -289,6 +290,77 @@ def _column_exists(connection, table_name, column_name):
         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
     """, (table_name, column_name))
     return bool(row)
+
+
+def _index_exists(connection, table_name, index_name):
+    if is_sqlite(connection):
+        rows = connection.execute(
+            "PRAGMA index_list({})".format(table_name)
+        ).fetchall()
+        return any(str(row[1]) == index_name for row in rows)
+    row = fetchone(connection, """
+        SELECT INDEX_NAME FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = ?
+    """, (table_name, index_name))
+    return bool(row)
+
+
+def _legacy_provenance_key_hash(migration_id, entity_type,
+                                target_entity_id, source_table):
+    """Return a bounded identity key that remains indexable on MariaDB 5.5."""
+    payload = json.dumps([
+        str(migration_id or ""), str(entity_type or ""),
+        int(target_entity_id or 0), str(source_table or ""),
+    ], ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _ensure_legacy_provenance_key_hash(connection):
+    """Backfill the bounded key and install its MariaDB-safe unique index."""
+    table_name = "coverage_legacy_provenance"
+    if not _table_exists(connection, table_name) or not _column_exists(
+            connection, table_name, "provenance_key_hash"):
+        return
+    rows = fetchall(connection, """
+        SELECT id, migration_id, target_entity_type, target_entity_id,
+               source_table, provenance_key_hash
+        FROM coverage_legacy_provenance
+    """)
+    updates = []
+    for row in rows:
+        expected = _legacy_provenance_key_hash(
+            row.get("migration_id"), row.get("target_entity_type"),
+            row.get("target_entity_id"), row.get("source_table"),
+        )
+        if str(row.get("provenance_key_hash") or "") != expected:
+            updates.append((expected, int(row.get("id") or 0)))
+    if updates:
+        cursor = connection.cursor()
+        try:
+            cursor.executemany(adapt_sql(connection, """
+                UPDATE coverage_legacy_provenance
+                SET provenance_key_hash=? WHERE id=?
+            """), updates)
+        finally:
+            cursor.close()
+    index_name = "uq_legacy_provenance_hash"
+    if _index_exists(connection, table_name, index_name):
+        return
+    cursor = connection.cursor()
+    try:
+        if is_sqlite(connection):
+            cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} (provenance_key_hash)".format(
+                    index_name, table_name
+                )
+            )
+        else:
+            cursor.execute(adapt_sql(connection, """
+                ALTER TABLE coverage_legacy_provenance
+                ADD UNIQUE KEY uq_legacy_provenance_hash (provenance_key_hash)
+            """))
+    finally:
+        cursor.close()
 
 
 def _rows(connection, table_name):
@@ -720,9 +792,13 @@ def _upsert_legacy_provenance(connection, migration_id, entity_type,
                                target_entity_id, source_table, source_identity,
                                row, raw_payload=None):
     """Persist source timestamps/status/hash in the target DB idempotently."""
+    provenance_key_hash = _legacy_provenance_key_hash(
+        migration_id, entity_type, target_entity_id, source_table
+    )
     values = (
         migration_id, entity_type, int(target_entity_id or 0), source_table,
-        str(source_identity or ""), row.get("legacy_created_at"),
+        provenance_key_hash, str(source_identity or ""),
+        row.get("legacy_created_at"),
         row.get("legacy_updated_at"), row.get("status"),
         row.get("is_draft"), row.get("raw_payload_sha256") or "",
         raw_payload, _now(),
@@ -733,17 +809,17 @@ def _upsert_legacy_provenance(connection, migration_id, entity_type,
           AND source_table=?
     """, values[:4])
     if existing:
-        if str(existing.get("raw_payload_sha256") or "") != values[9]:
+        if str(existing.get("raw_payload_sha256") or "") != values[10]:
             raise ValueError("legacy provenance input changed on idempotent rerun")
         return int(existing.get("id") or 0)
     cursor = connection.cursor()
     cursor.execute(adapt_sql(connection, """
         INSERT INTO coverage_legacy_provenance(
             migration_id, target_entity_type, target_entity_id, source_table,
-            source_identity, legacy_created_at, legacy_updated_at,
+            provenance_key_hash, source_identity, legacy_created_at, legacy_updated_at,
             legacy_raw_status, legacy_raw_is_draft, raw_payload_sha256,
             raw_payload, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """), values)
     result = insert_id(cursor)
     cursor.close()
@@ -805,6 +881,9 @@ def _upsert_legacy_provenance_many(connection, migration_id, records):
             continue
         inserts.append((
             migration_id, key[0], key[1], key[2],
+            _legacy_provenance_key_hash(
+                migration_id, key[0], key[1], key[2]
+            ),
             str(item.get("source_identity") or ""),
             item.get("legacy_created_at"), item.get("legacy_updated_at"),
             item.get("legacy_raw_status"), item.get("legacy_raw_is_draft"),
@@ -816,10 +895,11 @@ def _upsert_legacy_provenance_many(connection, migration_id, records):
             cursor.executemany(adapt_sql(connection, """
                 INSERT INTO coverage_legacy_provenance(
                     migration_id, target_entity_type, target_entity_id,
-                    source_table, source_identity, legacy_created_at,
+                    source_table, provenance_key_hash, source_identity,
+                    legacy_created_at,
                     legacy_updated_at, legacy_raw_status, legacy_raw_is_draft,
                     raw_payload_sha256, raw_payload, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """), inserts)
         finally:
             cursor.close()
@@ -842,6 +922,13 @@ def create_sqlite_schema(connection):
                     )
                 )
     connection.executescript(SQLITE_DOMAIN_SCHEMA)
+    if not _column_exists(
+            connection, "coverage_legacy_provenance", "provenance_key_hash"):
+        connection.execute(
+            "ALTER TABLE coverage_legacy_provenance "
+            "ADD COLUMN provenance_key_hash TEXT NOT NULL DEFAULT ''"
+        )
+    _ensure_legacy_provenance_key_hash(connection)
     connection.commit()
 
 
@@ -1058,6 +1145,9 @@ def apply_schema(connection, ddl_path, release_sha=""):
             "coverage_schema_meta": [
                 ("migration_id", "VARCHAR(128) NOT NULL DEFAULT ''"),
             ],
+            "coverage_legacy_provenance": [
+                ("provenance_key_hash", "CHAR(64) NOT NULL DEFAULT ''"),
+            ],
             "coverage_scans": [
                 ("predecessor_scan_id", "BIGINT NULL"),
                 ("algorithm_version", "VARCHAR(64) NOT NULL DEFAULT ''"),
@@ -1091,6 +1181,7 @@ def apply_schema(connection, ddl_path, release_sha=""):
                     table_name, column_name, definition
                 )))
                 cursor.close()
+        _ensure_legacy_provenance_key_hash(connection)
         # Keep the historical key for old health checks while introducing the
         # stage-specific metadata required by Gate A.
         meta_rows = [

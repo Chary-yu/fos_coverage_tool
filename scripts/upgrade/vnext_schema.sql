@@ -235,6 +235,7 @@ CREATE TABLE IF NOT EXISTS coverage_legacy_provenance (
     target_entity_id BIGINT NOT NULL,
     source_table VARCHAR(64) NOT NULL,
     source_identity VARCHAR(512) NOT NULL,
+    provenance_key_hash CHAR(64) NOT NULL,
     legacy_created_at DATETIME(6) NULL,
     legacy_updated_at DATETIME(6) NULL,
     legacy_raw_status VARCHAR(64) NULL,
@@ -243,10 +244,8 @@ CREATE TABLE IF NOT EXISTS coverage_legacy_provenance (
     raw_payload LONGTEXT NULL,
     created_at DATETIME NOT NULL,
     PRIMARY KEY (id),
-    UNIQUE KEY uq_legacy_provenance (
-        migration_id, target_entity_type, target_entity_id, source_table
-    ),
-    KEY idx_legacy_provenance_source (source_table, source_identity)
+    UNIQUE KEY uq_legacy_provenance_hash (provenance_key_hash),
+    KEY idx_legacy_provenance_source (source_table(31), source_identity(160))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- Gate B: stable logical repositories and their physical Git resources.
