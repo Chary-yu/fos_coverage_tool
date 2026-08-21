@@ -81,6 +81,30 @@ python3 scripts/upgrade/run_verified_backup_rehearsal.py \
 
 浏览器功能证据必须来自真实 HTTP + Chromium，并保存 route/network/console/report artifact。性能证据必须另外保存 DB query/row 计数、Sidecar decode 计数、expand p95、峰值 RSS、100k virtual-scroll resident lines 和环境身份。只有浏览器功能绿而缺少跨层指标时，Gate E 仍是 `INCOMPLETE`；不得用 `--allow-partial` 结果作为 release performance PASS。
 
+仓库内的 `real_browser_evidence.js` 提供统一采集入口。它会先访问 Candidate 的
+`/api/coverage/release` 并 exact 比较 commit，再打开真实 HTML 页面执行 100k
+virtual-scroll sweep；release identity 不匹配、HTTP/Chromium 失败或跨层指标缺失
+都会 fail closed。浏览器功能和跨层性能使用不同的 evidence envelope：
+
+```bash
+npm ci  # 取证主机按既有方式准备 Python/Node 依赖
+node scripts/diagnostics/real_browser_evidence.js \
+  --url 'http://127.0.0.1:19528/<real-report-file>.gcov.html' \
+  --expected-revision "$(git rev-parse HEAD)" \
+  --header "X-Remote-User=$COVERAGE_BROWSER_USER" \
+  --header "X-Remote-Role=reviewer" \
+  --output /secure/evidence/gate-e/real-browser-workload.json \
+  --browser-evidence-output /secure/evidence/gate-e/browser-evidence.json \
+  --evidence-output /secure/evidence/gate-e/performance-evidence.json
+```
+
+将 `COVERAGE_GATE_E_BROWSER_EVIDENCE` 指向 `browser-evidence.json`，将
+`COVERAGE_GATE_E_PERF_EVIDENCE` 指向 `performance-evidence.json`。采集器不会把
+header value 写入 artifact；但仍应通过环境变量或受控 secret 注入凭据，不要把
+真实 token 直接提交到 shell history。该命令不执行分析保存、确认、导出或其他
+mutation；需要 mutation rehearsal 时应使用独立 Candidate 数据库和专门的 API
+回归脚本。
+
 ## Gate F：切换、回滚和 48 小时窗口
 
 正式切换前重新生成 fresh inventory，至少覆盖 process/service、release identity、Current/Candidate roots、DB fingerprint、schema/table counts、jobs、磁盘公式、Nginx/auth boundary 和 backup location。再执行 freeze → final backup → Candidate rehearsal → traffic-closed verification → cutover → forced rollback rehearsal，并保留完整 before/target/rollback release identity。

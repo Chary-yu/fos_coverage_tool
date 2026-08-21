@@ -330,6 +330,10 @@ test('instrumented real VNext HTTP fixture records 100k cross-layer workload', a
     expect(crossLayer.status).toBe('PASSED');
     expect(crossLayer.logical_line_count).toBe(100000);
     expect(crossLayer.resident_js_lines_peak).toBeLessThanOrEqual(8000);
+    expect(crossLayer.sweep.every(item => (
+      item.resident_js_lines <= 8000 && item.dom_line_count < 1500
+    ))).toBe(true);
+    expect(crossLayer.sweep[crossLayer.sweep.length - 1].target_line).toBe(1);
     expect(crossLayer.max_dom_lines).toBeLessThan(1500);
   } finally {
     await stopFixture(fixture);
