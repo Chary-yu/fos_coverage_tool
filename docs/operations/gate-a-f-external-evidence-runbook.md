@@ -198,6 +198,12 @@ python3 scripts/diagnostics/gate_task_status.py \
   --repo-root "$PWD" \
   --matrix /secure/evidence/gate-matrix.json \
   --output /secure/evidence/gate-task-status.json
+python3 scripts/diagnostics/release_readiness.py \
+  --repo-root "$PWD" \
+  --matrix /secure/evidence/gate-matrix.json \
+  --task-status /secure/evidence/gate-task-status.json \
+  --risk-register /secure/evidence/gate-f/release-risk-register.json \
+  --output /secure/evidence/release-readiness.json
 ```
 
 只要任一外部 artifact 缺失、Gate 不匹配、commit 不匹配、runtime identity 不完整、exit code 非零或证据为 synthetic，命令就必须保持非零并输出 `INCOMPLETE`/`BLOCKED`。在真实外部证据产生前，不得将本地 Gate Matrix 的 `--allow-incomplete` 结果写成已发布或已验收。
@@ -206,3 +212,9 @@ python3 scripts/diagnostics/gate_task_status.py \
 Gate 和全部上游任务均为 `PASSED` 时，任务才会标记为 `PASSED`；缺失的真实
 Candidate/MariaDB/生产证据会在每个受影响任务的 `blockers` 中保留，不能被总 Gate
 状态折叠隐藏。
+
+`release-risk-register.json` 必须显式绑定同一 `candidate_revision`，格式为
+`{"candidate_revision":"<sha>","risks":[]}` 或列出已批准的 P2/Info 风险。
+任何未关闭的 P0/P1、未批准的 P2/Info、缺失风险登记、Gate 缺证据或任务未完成都会
+输出 `NOT_READY`；只有全部 Gate/任务通过时才允许输出 `READY` 或
+`READY_WITH_ACCEPTED_RISK`。
