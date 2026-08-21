@@ -24,6 +24,7 @@ if ROOT not in sys.path:
 
 from app.release_identity import generate_release_identity
 from app.time_utils import utc_iso
+from scripts.upgrade.evidence_manifest import EvidenceManifestV2
 
 
 GIB = 1024 ** 3
@@ -625,6 +626,54 @@ def _release_identity_for_root(path):
     return {}
 
 
+def write_evidence_manifest(result, artifact_path, manifest_path, repo_root=ROOT):
+    """Bind one inventory artifact to Gate F Evidence Manifest v2.
+
+    The inventory remains the readable raw artifact.  The manifest is a
+    separate, hash-pinned wrapper so ``gate_matrix.py`` can consume the
+    result without accepting an unsigned ``status=PASSED`` JSON file.
+    """
+    artifact_path = os.path.abspath(str(artifact_path or ""))
+    manifest_path = os.path.abspath(str(manifest_path or ""))
+    if not artifact_path or not os.path.isfile(artifact_path):
+        raise ValueError("inventory artifact must exist before manifest creation")
+    if not manifest_path or artifact_path == manifest_path:
+        raise ValueError("manifest path must be distinct from the inventory artifact")
+    release_identity = result.get("release_identity") or {}
+    candidate_revision = str(release_identity.get("commit_sha") or "").strip()
+    if not candidate_revision:
+        raise ValueError("inventory release identity must contain commit_sha")
+    source_inputs = []
+    for observation in (result.get("configs") or {}).values():
+        if observation.get("sha256"):
+            source_inputs.append(observation["sha256"])
+    for item in (result.get("reverse_proxy") or {}).get("items") or []:
+        if item.get("sha256"):
+            source_inputs.append(item["sha256"])
+    manifest = EvidenceManifestV2(
+        repo_root, "gate-f", candidate_revision=candidate_revision,
+        release_identity=release_identity,
+        database_runtime_identity=result.get("database_runtime_identity") or {},
+        manifest_path=manifest_path,
+    )
+    manifest.record(
+        "gate-f-fresh-production-inventory", "fresh_production_inventory",
+        result.get("status") or "INCOMPLETE",
+        result.get("command_or_action") or
+        "python scripts/diagnostics/production_inventory.py",
+        int(result.get("exit_code", 1)), artifact_path=artifact_path,
+        source_inputs_sha256=source_inputs, candidate_revision=candidate_revision,
+        host_identity=result.get("host_identity") or {},
+        database_runtime_identity=result.get("database_runtime_identity") or {},
+        release_identity=release_identity,
+        started_at=result.get("started_at") or "",
+        finished_at=result.get("finished_at") or "",
+        synthetic=False, observed_status=result.get("status") or "INCOMPLETE",
+        completeness=result.get("completeness") or {},
+    )
+    return manifest_path
+
+
 def collect_inventory(args):
     started = utc_iso()
     current = _path_observation(args.current_root)
@@ -826,16 +875,37 @@ def main(argv=None):
         parser.add_argument("--{}".format(name.replace("_", "-")),
                             dest=name, type=int)
     parser.add_argument("--output")
+    parser.add_argument(
+        "--manifest-output",
+        help="optional Gate F Evidence Manifest v2 path; --output is the raw artifact",
+    )
     args = parser.parse_args(argv)
     result = collect_inventory(args)
     encoded = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
-    if args.output:
-        output = os.path.abspath(args.output)
+    output_path = args.output
+    if args.manifest_output and not output_path:
+        output_path = os.path.abspath(args.manifest_output) + ".inventory.json"
+    if output_path:
+        output = os.path.abspath(output_path)
         directory = os.path.dirname(output)
         if directory and not os.path.isdir(directory):
             os.makedirs(directory)
         with open(output, "w", encoding="utf-8") as stream:
             stream.write(encoded)
+        result["artifact_path"] = output
+    if args.manifest_output:
+        try:
+            manifest_path = write_evidence_manifest(
+                result, output_path, args.manifest_output, repo_root=ROOT
+            )
+            result["manifest_path"] = manifest_path
+        except (OSError, TypeError, ValueError) as exc:
+            result["status"] = "FAILED"
+            result["exit_code"] = 1
+            result.setdefault("violations", []).append(
+                "Evidence Manifest v2 creation failed: {}".format(exc)
+            )
+        encoded = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
     print(encoded)
     return 0 if result["status"] == "PASSED" else 1
 

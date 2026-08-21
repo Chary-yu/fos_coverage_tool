@@ -111,10 +111,11 @@ python3 scripts/diagnostics/production_inventory.py \
   --verified-backup-bytes <verified_backup_bytes> \
   --max-temp-worktree-bytes <max_temp_worktree_bytes> \
   --migration-temp-bytes <migration_temp_bytes> \
-  --output /secure/evidence/gate-f/fresh_inventory/summary.json
+  --output /secure/evidence/gate-f/fresh_inventory/summary.json \
+  --manifest-output /secure/evidence/gate-f/evidence-manifest-v2.json
 ```
 
-该工具会读取两个 DB 的 runtime fingerprint、schema/table counts、`data_version` 和 job state，并检查配置端口是否实际监听、服务 `MainPID` 是否能与进程命令行对应、backup 根是否在两个部署根之外，以及代理是否显式设置 Candidate 配置中的认证用户 header。它不会创建数据库、启动服务、修改配置或删除文件；`--output` 仅用于保存本次盘点结果。
+该工具会读取两个 DB 的 runtime fingerprint、schema/table counts、`data_version` 和 job state，并检查配置端口是否实际监听、服务 `MainPID` 是否能与进程命令行对应、backup 根是否在两个部署根之外，以及代理是否显式设置 Candidate 配置中的认证用户 header。它不会创建数据库、启动服务、修改配置或删除文件；`--output` 保存原始盘点结果，`--manifest-output` 生成可直接交给 `COVERAGE_GATE_F_INVENTORY_EVIDENCE` 的 Gate F Evidence Manifest v2。即使盘点不完整，manifest 也会保留 `INCOMPLETE`，不会伪造 PASS。
 
 在 traffic-closed verification 前，先在最终 exact checkout 执行仓库内 source/security review：
 

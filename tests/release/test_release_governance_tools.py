@@ -11,7 +11,9 @@ from scripts.diagnostics.build_gate_evidence import (
     GATE_DIRECTORIES, GATE_FILES, build as build_gate_evidence,
     _manifest_artifact_attributes,
 )
-from scripts.diagnostics.production_inventory import collect_inventory, required_free_bytes
+from scripts.diagnostics.production_inventory import (
+    collect_inventory, required_free_bytes, write_evidence_manifest,
+)
 from scripts.diagnostics.skill_drift_audit import REQUIRED_FIELDS, REQUIRED_SKILLS, audit as audit_skills
 from scripts.upgrade.evidence_manifest import EvidenceManifestV2
 
@@ -75,6 +77,32 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
             result = _proxy_observation([proxy])
             self.assertEqual(result["status"], "INCOMPLETE")
             self.assertFalse(result["signals"]["remote_user_header"])
+
+    def test_production_inventory_can_emit_gate_f_manifest_v2(self):
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = os.path.join(directory, "fresh-inventory.json")
+            manifest_path = os.path.join(directory, "evidence-manifest-v2.json")
+            with open(artifact, "w", encoding="utf-8") as stream:
+                json.dump({"status": "INCOMPLETE"}, stream)
+            from app.release_identity import generate_release_identity
+            result = {
+                "status": "INCOMPLETE", "exit_code": 1,
+                "release_identity": generate_release_identity(os.getcwd()),
+                "host_identity": {"hostname": "test"},
+                "started_at": "2026-08-21T00:00:00Z",
+                "finished_at": "2026-08-21T00:00:01Z",
+                "command_or_action": "production inventory test",
+                "database_runtime_identity": {},
+                "completeness": {"missing": ["current_db_identity"]},
+            }
+            write_evidence_manifest(result, artifact, manifest_path)
+            manifest = EvidenceManifestV2(
+                os.getcwd(), "gate-f", manifest_path=manifest_path
+            )
+            valid, errors = manifest.validate()
+            self.assertTrue(valid, errors)
+            self.assertEqual(manifest.data["evidence"][0]["status"], "INCOMPLETE")
+            self.assertFalse(manifest.data["evidence"][0]["synthetic"])
 
     def test_acceptance_window_fails_closed_without_exit_conditions(self):
         result = audit_window({
