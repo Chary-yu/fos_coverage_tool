@@ -52,11 +52,16 @@ class SidecarStore:
         self._metadata_cache: Dict[Tuple[str, str, str], Tuple[Tuple[int, int], Dict[str, Any]]] = {}
         self._legacy_cache: Dict[Tuple[str, str, str], Tuple[Tuple[int, int], Dict[str, Any]]] = {}
         self._decoded_chunk_cache = OrderedDict()
+        # A bounded chunk cache removes serial duplicate JSON decoding.  The
+        # in-flight map also coalesces concurrent cache misses so multiple
+        # HTTP workers do not parse the same physical chunk at once.
+        self._decoded_chunk_inflight = {}
         self._report_cache_dirs = {}
         self._metrics = {
             "metadata_reads": 0, "metadata_cache_hits": 0,
             "legacy_reads": 0, "legacy_cache_hits": 0,
             "chunk_reads": 0, "chunk_cache_hits": 0,
+            "chunk_inflight_waits": 0,
             "path_resolution_reads": 0,
         }
 
@@ -206,28 +211,57 @@ class SidecarStore:
         chunk_signature = self._stat_signature(chunk_path)
         effective_identity = "{}|{}".format(asset_identity, chunk_signature)
         cache_key = (str(report_id), str(file_path_hash), int(chunk_index), effective_identity)
+        while True:
+            with self._cache_lock:
+                cached = self._decoded_chunk_cache.get(cache_key)
+                if cached is not None:
+                    self._metrics["chunk_cache_hits"] += 1
+                    self._decoded_chunk_cache.move_to_end(cache_key)
+                    return cached
+                event = self._decoded_chunk_inflight.get(cache_key)
+                if event is None:
+                    event = threading.Event()
+                    self._decoded_chunk_inflight[cache_key] = event
+                    self._metrics["chunk_reads"] += 1
+                    owner = True
+                else:
+                    self._metrics["chunk_inflight_waits"] += 1
+                    owner = False
+            if owner:
+                break
+            # The owner either publishes the decoded list or clears the
+            # in-flight entry after an error.  Looping lets a waiter observe
+            # the cache, or become the next owner for a transient failure.
+            event.wait()
+
+        try:
+            if not os.path.isfile(chunk_path) or os.path.islink(chunk_path):
+                raise FileNotFoundError("sidecar chunk is missing")
+            with open(chunk_path, "r", encoding="utf-8") as stream:
+                decoded = json.load(stream)
+            if not isinstance(decoded, list):
+                raise ValueError("sidecar chunk must contain a JSON list")
+        except Exception:
+            with self._cache_lock:
+                current = self._decoded_chunk_inflight.pop(cache_key, None)
+                if current is not None:
+                    current.set()
+            raise
+
         with self._cache_lock:
             cached = self._decoded_chunk_cache.get(cache_key)
-            if cached is not None:
-                self._metrics["chunk_cache_hits"] += 1
+            if cached is None:
+                self._decoded_chunk_cache[cache_key] = decoded
                 self._decoded_chunk_cache.move_to_end(cache_key)
-                return cached
-            self._metrics["chunk_reads"] += 1
-        if not os.path.isfile(chunk_path) or os.path.islink(chunk_path):
-            raise FileNotFoundError("sidecar chunk is missing")
-        with open(chunk_path, "r", encoding="utf-8") as stream:
-            decoded = json.load(stream)
-        if not isinstance(decoded, list):
-            raise ValueError("sidecar chunk must contain a JSON list")
-        with self._cache_lock:
-            cached = self._decoded_chunk_cache.get(cache_key)
-            if cached is not None:
-                return cached
-            self._decoded_chunk_cache[cache_key] = decoded
-            self._decoded_chunk_cache.move_to_end(cache_key)
-            while len(self._decoded_chunk_cache) > self.max_cached_chunks:
-                self._decoded_chunk_cache.popitem(last=False)
-        return decoded
+                while len(self._decoded_chunk_cache) > self.max_cached_chunks:
+                    self._decoded_chunk_cache.popitem(last=False)
+                result = decoded
+            else:
+                result = cached
+            current = self._decoded_chunk_inflight.pop(cache_key, None)
+            if current is not None:
+                current.set()
+            return result
 
     def _find_report_cache_dirs(self, report_id: str) -> List[str]:
         if (not report_id or "\\" in str(report_id)

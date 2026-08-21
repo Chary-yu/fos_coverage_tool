@@ -253,6 +253,9 @@ class VNextCodeDetailService(object):
             "metadata_cache_hits": sum(int(item.get("metadata_cache_hits") or 0) for item in stores),
             "chunk_reads": sum(int(item.get("chunk_reads") or 0) for item in stores),
             "chunk_cache_hits": sum(int(item.get("chunk_cache_hits") or 0) for item in stores),
+            "chunk_inflight_waits": sum(
+                int(item.get("chunk_inflight_waits") or 0) for item in stores
+            ),
         }
         return {
             "identity_cache_entries": identity_count,
@@ -268,6 +271,7 @@ class VNextCodeDetailService(object):
             "sidecar_metadata_cache_hits": sidecar_metrics["metadata_cache_hits"],
             "sidecar_decode_count": sidecar_metrics["chunk_reads"],
             "sidecar_decode_cache_hits": sidecar_metrics["chunk_cache_hits"],
+            "sidecar_decode_inflight_waits": sidecar_metrics["chunk_inflight_waits"],
         }
 
     def layout(self, connection, scan_id, report_id, repository_name="", file_path=None):

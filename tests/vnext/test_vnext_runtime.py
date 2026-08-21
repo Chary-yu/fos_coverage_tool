@@ -3,6 +3,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 import urllib.request
 from contextlib import contextmanager
@@ -436,6 +437,65 @@ class VNextRuntimeTest(unittest.TestCase):
             self.assertEqual(stats["path_resolution_reads"], 1)
         self.assertEqual([[line["line_no"] for line in rows] for rows in first], [[1, 2], [3, 4]])
         self.assertEqual([[line["line_no"] for line in rows] for rows in second], [[1, 2], [3, 4]])
+
+    def test_sidecar_concurrent_chunk_miss_is_single_flight(self):
+        with tempfile.TemporaryDirectory(prefix="vnext-sidecar-single-flight-") as root:
+            store = SidecarStore([root], chunk_size=4)
+            context = SourceContext(
+                "single-flight", "src/single-flight.c", [
+                    SourceLineDTO(i, "line{}".format(i), coverage_state="covered")
+                    for i in range(1, 9)
+                ], report_id="report_single_flight",
+            )
+            key = calc_sidecar_file_key("src/single-flight.c")
+            store.save_chunked_sidecar(root, "report_single_flight", key, context)
+            store.load_metadata("report_single_flight", key)
+
+            chunk_started = threading.Event()
+            release_chunk = threading.Event()
+            chunk_loads = []
+            errors = []
+            results = []
+            original_load = json.load
+
+            def slow_chunk_load(stream, *args, **kwargs):
+                if os.path.basename(stream.name).startswith("lines-"):
+                    chunk_loads.append(stream.name)
+                    chunk_started.set()
+                    if len(chunk_loads) == 1:
+                        self.assertTrue(release_chunk.wait(5))
+                return original_load(stream, *args, **kwargs)
+
+            def worker():
+                try:
+                    results.append(store.load_lines_ranges(
+                        "report_single_flight", key, [(1, 2), (3, 4)]
+                    ))
+                except BaseException as exc:  # pragma: no cover - assertion aid
+                    errors.append(exc)
+
+            with mock.patch("app.code_detail.sidecar_store.json.load",
+                            side_effect=slow_chunk_load):
+                first = threading.Thread(target=worker)
+                second = threading.Thread(target=worker)
+                first.start()
+                self.assertTrue(chunk_started.wait(5))
+                second.start()
+                deadline = time.time() + 5
+                while (store.cache_stats()["chunk_inflight_waits"] < 1 and
+                       time.time() < deadline):
+                    time.sleep(0.01)
+                release_chunk.set()
+                first.join(5)
+                second.join(5)
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            self.assertEqual(len(chunk_loads), 1)
+            self.assertEqual(store.cache_stats()["chunk_reads"], 1)
+            self.assertGreaterEqual(store.cache_stats()["chunk_inflight_waits"], 1)
 
 
 if __name__ == "__main__":
