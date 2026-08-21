@@ -215,22 +215,33 @@ class VNextRuntime(object):
 
         def callback():
             with self.connection_context(read_only=False) as connection:
-                reclaimed = self.scan_import_recovery.reclaim(
-                    connection, job_id, self.scan_import_staging_root,
-                )
-                locks = reclaimed.get("locks") or []
-                fence = int(locks[0].get("fencing_token") if locks else 0)
+                fence = 0
                 try:
+                    reclaimed = self.scan_import_recovery.reclaim(
+                        connection, job_id, self.scan_import_staging_root,
+                    )
+                    locks = reclaimed.get("locks") or []
+                    fence = int(locks[0].get("fencing_token") if locks else 0)
                     return self.scan_import_coordinator.execute(
                         connection, job_id,
                         owner_token=reclaimed.get("owner_token") or "",
                         fencing_token=fence,
                     )
                 except Exception as exc:
-                    self.scan_import_recovery.record_failure(
-                        connection, job_id, "RESUME", exc.__class__.__name__,
-                        str(exc), fencing_token=fence,
-                    )
+                    current_job = self.jobs.get(connection, job_id)
+                    if str((current_job or {}).get("state") or "").lower() \
+                            not in ("failed", "completed"):
+                        try:
+                            self.scan_import_recovery.record_failure(
+                                connection, job_id, "RESUME", exc.__class__.__name__,
+                                str(exc), fencing_token=(fence or None),
+                            )
+                        except Exception:
+                            # Preserve the recovery error.  The job executor
+                            # still persists the terminal job state, while a
+                            # separate failure-ledger audit can report a
+                            # database/cleanup outage.
+                            pass
                     raise
 
         try:

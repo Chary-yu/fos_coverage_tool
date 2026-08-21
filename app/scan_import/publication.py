@@ -87,15 +87,33 @@ class ScanPublicationService(object):
     @staticmethod
     def _validate_read_set(connection, read_set):
         for item in read_set or []:
+            if not isinstance(item, dict):
+                raise ValueError("READ_SET_CHANGED")
             if item.get("relation_id") is not None:
                 row = fetchone(connection, """
                     SELECT relation_revision FROM coverage_analysis_line_links WHERE id=?
                 """, (int(item["relation_id"]),))
-                if not row or int(row.get("relation_revision") or 0) != int(item.get("relation_revision")):
+                if (item.get("relation_revision") is None or not row or
+                        int(row.get("relation_revision") or 0) !=
+                        int(item.get("relation_revision"))):
                     raise ValueError("READ_SET_CHANGED")
             if item.get("record_id") is not None:
                 row = fetchone(connection, """
                     SELECT content_revision FROM coverage_analysis_records WHERE id=?
                 """, (int(item["record_id"]),))
-                if not row or int(row.get("content_revision") or 0) != int(item.get("content_revision")):
+                if (item.get("content_revision") is None or not row or
+                        int(row.get("content_revision") or 0) !=
+                        int(item.get("content_revision"))):
+                    raise ValueError("READ_SET_CHANGED")
+            if item.get("rejection_id") is not None:
+                row = fetchone(connection, """
+                    SELECT rejection_revision, is_active
+                    FROM coverage_inheritance_rejections WHERE id=?
+                """, (int(item["rejection_id"]),))
+                if (not row or
+                        int(row.get("rejection_revision") or 0) !=
+                        int(item.get("rejection_revision") or 0) or
+                        (item.get("rejection_is_active") is not None and
+                         int(row.get("is_active") or 0) !=
+                         int(item.get("rejection_is_active") or 0))):
                     raise ValueError("READ_SET_CHANGED")

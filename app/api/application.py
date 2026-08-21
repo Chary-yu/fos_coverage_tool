@@ -718,11 +718,24 @@ class VNextApplication(object):
 
                 def import_callback():
                     with self._write_connection() as callback_connection:
-                        return self.runtime.scan_import_coordinator.execute(
-                            callback_connection, import_job_id,
-                            owner_token=import_owner,
-                            fencing_token=import_fence,
-                        )
+                        try:
+                            return self.runtime.scan_import_coordinator.execute(
+                                callback_connection, import_job_id,
+                                owner_token=import_owner,
+                                fencing_token=import_fence,
+                            )
+                        except Exception as exc:
+                            current_job = self.runtime.jobs.get(
+                                callback_connection, import_job_id
+                            )
+                            if str((current_job or {}).get("state") or "").lower() \
+                                    not in ("failed", "completed"):
+                                self.runtime.scan_import_recovery.record_failure(
+                                    callback_connection, import_job_id, "EXECUTE",
+                                    exc.__class__.__name__, str(exc),
+                                    fencing_token=import_fence,
+                                )
+                            raise
 
                 try:
                     queued_job = self.runtime.job_service.submit(
@@ -741,6 +754,7 @@ class VNextApplication(object):
                     self.runtime.scan_import_recovery.record_failure(
                         connection, import_job_id, "ENQUEUE", exc.__class__.__name__,
                         str(exc), fencing_token=import_fence,
+                        scan_status="ABORTED",
                     )
                     raise
                 # Internal lock ownership and filesystem paths are not API

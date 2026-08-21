@@ -160,6 +160,37 @@ class InheritanceEngineTest(unittest.TestCase):
         )
         self.assertEqual(result["reason_code"], "REPOSITORY_IDENTITY_UNVERIFIED")
 
+    def test_read_set_is_deterministic_and_deduplicated(self):
+        relations = [
+            {
+                "id": 9,
+                "relation_revision": 4,
+                "analysis_record_id": 21,
+                "source_content_revision": 7,
+            },
+            {
+                "id": 3,
+                "relation_revision": 2,
+                "analysis_record_id": 8,
+                "source_content_revision": 5,
+            },
+            {
+                "id": 9,
+                "relation_revision": 4,
+                "analysis_record_id": 21,
+                "source_content_revision": 7,
+            },
+        ]
+        self.assertEqual(
+            InheritanceEngine._read_set_for_relations(relations),
+            [
+                {"relation_id": 3, "relation_revision": 2},
+                {"relation_id": 9, "relation_revision": 4},
+                {"record_id": 8, "content_revision": 5},
+                {"record_id": 21, "content_revision": 7},
+            ],
+        )
+
     def test_rules_contract_contains_all_eighty_three_rules(self):
         result = audit_rules(os.getcwd())
         self.assertEqual(result["status"], "PASSED")

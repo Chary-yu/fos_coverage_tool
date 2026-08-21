@@ -238,12 +238,15 @@ class ScanImportCoordinator(object):
             scan_id = int(payload.get("scan_id") or checkpoint.get("scan_id"))
             project_id = int(payload.get("project_id") or 0)
             data_version = int(job.get("data_version") or 0)
+            checkpoint_payload = self._checkpoint_payload(checkpoint)
+            read_set = list(checkpoint_payload.get("read_set") or [])
             phase_payload = {
                 "scan_id": scan_id,
                 "artifact_id": artifact.get("artifact_id"),
                 "artifact_sha256": artifact.get("sha256"),
                 "file_count": len(files),
                 "line_count": sum(len(item.get("lines") or []) for item in files),
+                "read_set": read_set,
             }
             checkpoint = self._advance_to(
                 conn, checkpoint, job_id, fencing_token, "SCAN_CREATED",
@@ -275,7 +278,11 @@ class ScanImportCoordinator(object):
                 path_map = self._repository_path_map(
                     payload.get("repositories") or [], repository_paths
                 )
-                inheritance.run(conn, scan_id, repository_paths=path_map)
+                inheritance_result = inheritance.run(
+                    conn, scan_id, repository_paths=path_map
+                )
+                read_set = list(inheritance_result.get("read_set", read_set) or [])
+                phase_payload["read_set"] = read_set
             checkpoint = self._advance_to(
                 conn, checkpoint, job_id, fencing_token, "INHERITANCE_COMPUTED",
                 phase_payload,
@@ -305,6 +312,17 @@ class ScanImportCoordinator(object):
     @staticmethod
     def _phase_before(checkpoint, target):
         return PHASES.index(str(checkpoint.get("phase") or "LOCKED")) < PHASES.index(target)
+
+    @staticmethod
+    def _checkpoint_payload(checkpoint):
+        value = (checkpoint or {}).get("payload")
+        if isinstance(value, dict):
+            return dict(value)
+        try:
+            loaded = json.loads(value or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
 
     def _advance_to(self, connection, checkpoint, job_id, fencing_token, target,
                     payload=None):
@@ -372,13 +390,49 @@ class ScanImportCoordinator(object):
                 cursor.close()
                 raise ValueError("SCAN_NOT_IMPORTING")
             cursor.close()
+            seal_payload = self._checkpoint_payload(checkpoint)
+            seal_payload["scan_id"] = scan_id
             return self.checkpoints.advance(
                 conn, job_id, checkpoint["checkpoint_seq"], fencing_token,
-                "SEALED", payload={"scan_id": scan_id},
+                "SEALED", payload=seal_payload,
             )
 
     def publish(self, connection, job_id, expected_current_scan_id=None,
                 read_set=None):
+        try:
+            return self._publish_transaction(
+                connection, job_id,
+                expected_current_scan_id=expected_current_scan_id,
+                read_set=read_set,
+            )
+        except Exception as exc:
+            # A publish precondition failure must leave a terminal Candidate
+            # and release its physical lock.  The original transaction has
+            # already rolled back, so the recovery ledger can safely record
+            # the failure in a new transaction without risking a half-publish.
+            error_code = str(exc or "").split(":", 1)[0]
+            scan_status = "ABORTED" if error_code in {
+                "CURRENT_POINTER_CHANGED", "PREDECESSOR_MISMATCH",
+                "READ_SET_CHANGED", "IMPORT_NOT_SEALED",
+            } else "FAILED"
+            try:
+                from app.scan_import.recovery import ScanImportRecoveryService
+                ScanImportRecoveryService(
+                    coordinator=self, jobs=self.jobs, projects=self.projects,
+                    checkpoints=self.checkpoints, locks=self.locks,
+                ).record_failure(
+                    connection, job_id, "PUBLISH", type(exc).__name__, str(exc),
+                    scan_status=scan_status,
+                )
+            except Exception:
+                # Preserve the original publish error.  Recovery itself is
+                # observable through the job/lock audit and must not rewrite
+                # the exception that caused the failed publish.
+                pass
+            raise
+
+    def _publish_transaction(self, connection, job_id,
+                             expected_current_scan_id=None, read_set=None):
         with transaction(connection) as conn:
             job = self.jobs.get(conn, job_id)
             if not job:
@@ -394,6 +448,8 @@ class ScanImportCoordinator(object):
             if checkpoint.get("phase") != "SEALED":
                 raise ValueError("IMPORT_NOT_SEALED")
             locks = self._locks_for_job(conn, job_id)
+            checkpoint_payload = self._checkpoint_payload(checkpoint)
+            persisted_read_set = checkpoint_payload.get("read_set") or []
 
             def assert_fences():
                 for lock in locks:
@@ -407,7 +463,8 @@ class ScanImportCoordinator(object):
                 expected_current_scan_id=(payload.get("predecessor_scan_id")
                                            if expected_current_scan_id is None
                                            else expected_current_scan_id),
-                read_set=read_set, fence=assert_fences,
+                read_set=(read_set if read_set is not None else persisted_read_set),
+                fence=assert_fences,
             )
             self.checkpoints.advance(
                 conn, job_id, checkpoint["checkpoint_seq"],

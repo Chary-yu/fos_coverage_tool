@@ -108,7 +108,10 @@ class ScanImportRecoveryService(object):
             }
 
     def record_failure(self, connection, job_id, phase, error_class,
-                       message="", fencing_token=None):
+                       message="", fencing_token=None, scan_status="FAILED"):
+        scan_status = str(scan_status or "FAILED").upper()
+        if scan_status not in ("FAILED", "ABORTED"):
+            raise ValueError("invalid scan failure status")
         fingerprint = hashlib.sha256(
             "{}\n{}\n{}".format(phase, error_class, message).encode("utf-8")
         ).hexdigest()
@@ -139,10 +142,16 @@ class ScanImportRecoveryService(object):
             cursor.close()
             if scan_id:
                 cursor = execute(conn, """
-                    UPDATE coverage_scans SET status='FAILED'
+                    UPDATE coverage_scans SET status=?
                     WHERE id=? AND UPPER(status) IN
-                        ('IMPORTING', 'VALIDATING', 'BUILDING', 'CONSTRUCTING')
-                """, (int(scan_id),))
+                        ('IMPORTING', 'VALIDATING', 'BUILDING', 'CONSTRUCTING',
+                         'SEALED', 'READY')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM coverage_project_state ps
+                          WHERE ps.project_id=coverage_scans.project_id
+                            AND ps.current_scan_id=coverage_scans.id
+                      )
+                """, (scan_status, int(scan_id)))
                 cursor.close()
             for lock in self.coordinator._locks_for_job(conn, job_id):
                 self.locks.release(

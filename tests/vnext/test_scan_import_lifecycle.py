@@ -164,6 +164,137 @@ class ScanImportLifecycleTest(unittest.TestCase):
             recovery.validate(self.connection, result["job"]["job_id"])
         self.assertEqual(str(raised.exception), "UNSUPPORTED_SCAN_IMPORT_HANDLER")
 
+    def test_persisted_read_set_blocks_publish_and_releases_candidate(self):
+        projects = ProjectRepository()
+        states = ProjectStateRepository()
+        repositories = RepositoryRepository()
+        project_service = ProjectService(
+            projects, states, LineIndexRepository(), repository_repo=repositories
+        )
+        old = project_service.create_scan_and_ingest(
+            self.connection, "read-set", [{
+                "repository_name": "repo-a", "file_path": "src/a.c",
+                "file_path_hash": "r" * 32,
+                "lines": [{"line_number": 1, "coverage_state": "uncovered"}],
+            }], info_sha256="old-read-set",
+        )
+        line_id = self.connection.execute(
+            "SELECT id FROM coverage_lines WHERE file_id IN "
+            "(SELECT id FROM coverage_files WHERE scan_id=?)", (old["id"],)
+        ).fetchone()[0]
+        domain = AnalysisDomainRepository()
+        record = domain.create_record(
+            self.connection, {"status": "可覆盖", "coverage_method": "unit"}
+        )
+        relation = domain.create_link(
+            self.connection, old["id"], line_id, record["id"],
+            review_state="MANUAL_CONFIRMED",
+        )
+        self.connection.commit()
+        read_set = [{
+            "relation_id": relation["id"],
+            "relation_revision": relation["relation_revision"],
+            "record_id": record["id"],
+            "content_revision": record["content_revision"],
+        }]
+
+        coordinator = ScanImportCoordinator(
+            project_repository=projects, state_repository=states,
+            repository_repository=repositories,
+        )
+        result = coordinator.create(
+            self.connection, "read-set", self.info_path,
+            repository_resource_ids=[self.resource_id],
+            staging_root=os.path.join(self.temp.name, "read-set-stage"),
+        )
+        checkpoint = result["checkpoint"]
+        phases = (
+            "SCAN_CREATED", "INFO_STAGED", "COVERAGE_IMPORTED", "GIT_VERIFIED",
+            "SOURCE_PREPARED", "LINE_MAP_BUILT", "INHERITANCE_COMPUTED",
+            "STATS_REBUILT", "CONSISTENCY_VERIFIED",
+        )
+        for phase in phases:
+            checkpoint = coordinator.advance(
+                self.connection, result["job"]["job_id"],
+                checkpoint["checkpoint_seq"], result["locks"][0]["fencing_token"],
+                phase, payload={"read_set": read_set},
+            )
+        coordinator.seal(
+            self.connection, result["job"]["job_id"], result["owner_token"],
+            result["locks"][0]["fencing_token"],
+        )
+
+        domain.update_record(
+            self.connection, record["id"],
+            {"status": "无法覆盖", "coverage_method": "updated"},
+            expected_revision=record["content_revision"],
+        )
+        self.connection.commit()
+        with self.assertRaises(ValueError) as raised:
+            coordinator.publish(self.connection, result["job"]["job_id"])
+        self.assertEqual(str(raised.exception), "READ_SET_CHANGED")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT current_scan_id FROM coverage_project_state WHERE project_id=?",
+                (old["project_id"],),
+            ).fetchone()[0], old["id"]
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT status FROM coverage_scans WHERE id=?",
+                (result["scan"]["id"],),
+            ).fetchone()[0], "ABORTED"
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT state FROM coverage_background_jobs WHERE job_id=?",
+                (result["job"]["job_id"],),
+            ).fetchone()[0], "failed"
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM coverage_repository_resource_locks"
+            ).fetchone()[0], 0
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT phase, error_class FROM coverage_import_failures WHERE job_id=?",
+                (result["job"]["job_id"],),
+            ).fetchone()[0:2], ("PUBLISH", "ValueError")
+        )
+
+    def test_enqueue_failure_aborts_candidate_and_releases_lock(self):
+        coordinator = ScanImportCoordinator()
+        result = coordinator.create(
+            self.connection, "enqueue-failure", self.info_path,
+            repository_resource_ids=[self.resource_id],
+            staging_root=os.path.join(self.temp.name, "enqueue-stage"),
+        )
+        recovery = ScanImportRecoveryService(coordinator=coordinator)
+        recovery.record_failure(
+            self.connection, result["job"]["job_id"], "ENQUEUE",
+            "RuntimeError", "queue is full",
+            fencing_token=result["locks"][0]["fencing_token"],
+            scan_status="ABORTED",
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT status FROM coverage_scans WHERE id=?",
+                (result["scan"]["id"],),
+            ).fetchone()[0], "ABORTED"
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT state, error_message FROM coverage_background_jobs WHERE job_id=?",
+                (result["job"]["job_id"],),
+            ).fetchone()[0:2], ("failed", "queue is full")
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM coverage_repository_resource_locks"
+            ).fetchone()[0], 0
+        )
+
     def test_repository_master_rename_alias_and_retire_preserve_identity(self):
         projects = ProjectRepository()
         project = projects.ensure_project(self.connection, "repository-master")

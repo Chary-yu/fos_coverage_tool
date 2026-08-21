@@ -129,20 +129,23 @@ class InheritanceEngine(object):
             )
             return {"status": "PASSED", "decision_run_id": run_id,
                     "decisions": decisions, "inherited": 0,
-                    "pending": len(decisions), "metrics": dict(self._metrics)}
+                    "pending": len(decisions), "read_set": [],
+                    "metrics": dict(self._metrics)}
         repository_paths = repository_paths or {}
         source_relations = fetchall(connection, """
             SELECT q.*, l.line_number AS source_line_number, l.line_text AS source_line_text,
                    l.coverage_state AS source_coverage_state, f.file_path,
                    f.repository_name, f.file_path_hash, b.block_identity_verified,
-                   b.id AS source_block_id
+                   b.id AS source_block_id, r.content_revision AS source_content_revision
             FROM coverage_analysis_line_links q
             JOIN coverage_lines l ON l.id=q.line_id
             JOIN coverage_files f ON f.id=l.file_id
             LEFT JOIN coverage_analysis_blocks b ON b.id=q.analysis_block_id
+            LEFT JOIN coverage_analysis_records r ON r.id=q.analysis_record_id
             WHERE q.scan_id=? AND q.is_active=1
             ORDER BY f.repository_name, f.file_path, l.line_number
         """, (int(predecessor_id),))
+        read_set = self._read_set_for_relations(source_relations)
         candidate_lines = fetchall(connection, """
             SELECT l.*, f.file_path, f.repository_name, f.file_path_hash
             FROM coverage_lines l JOIN coverage_files f ON f.id=l.file_id
@@ -305,7 +308,38 @@ class InheritanceEngine(object):
                 "decisions": decisions,
                 "inherited": len([item for item in decisions if item.get("decision") == "INHERITED"]),
                 "pending": len([item for item in decisions if item.get("decision") != "INHERITED"]),
+                "read_set": read_set,
                 "metrics": dict(self._metrics)}
+
+    @staticmethod
+    def _read_set_for_relations(relations):
+        """Return the immutable predecessor facts consulted by inheritance.
+
+        The relation revision protects the line-level mapping/review fact and
+        the content revision protects the AnalysisRecord payload.  Keep the
+        set deterministic and de-duplicated because it is persisted in the
+        durable checkpoint and revalidated during the short publish CAS.
+        """
+        relations_by_id = {}
+        records_by_id = {}
+        for relation in relations or []:
+            relation_id = relation.get("id")
+            if relation_id is not None:
+                relations_by_id[int(relation_id)] = {
+                    "relation_id": int(relation_id),
+                    "relation_revision": int(relation.get("relation_revision") or 0),
+                }
+            record_id = relation.get("analysis_record_id")
+            if record_id is not None and relation.get("source_content_revision") is not None:
+                records_by_id[int(record_id)] = {
+                    "record_id": int(record_id),
+                    "content_revision": int(relation.get("source_content_revision") or 0),
+                }
+        return sorted(
+            list(relations_by_id.values()) + list(records_by_id.values()),
+            key=lambda item: (0 if "relation_id" in item else 1,
+                              int(item.get("relation_id", item.get("record_id", 0)))),
+        )
 
     def _ordinary_pending_decisions(self, connection, scan_id, run_id, version, reason):
         rows = fetchall(connection, """
