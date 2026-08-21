@@ -9,6 +9,13 @@ import os
 import re
 import sys
 
+# The tool is intentionally executable both as a module and as the documented
+# repository-root script.  Establish the repository import root before
+# loading the shared UTC/evidence helper.
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 from app.time_utils import utc_iso
 
 
@@ -85,18 +92,30 @@ def audit(payload, now=None):
                bool(item.get("no_inheritance")) for item in scans
                if isinstance(item, dict)):
         violations.append("at least one scan must exercise ordinary pending/no inheritance")
-    if int(payload.get("restart_recovery_passes") or 0) < 1:
+    restart_recovery_passes = _nonnegative_int(
+        payload.get("restart_recovery_passes"), "restart_recovery_passes", violations
+    )
+    large_file_checks = _nonnegative_int(
+        payload.get("large_file_checks"), "large_file_checks", violations
+    )
+    db_integrity_failures = _nonnegative_int(
+        payload.get("db_integrity_failures"), "db_integrity_failures", violations
+    )
+    semantic_hash_failures = _nonnegative_int(
+        payload.get("semantic_hash_failures"), "semantic_hash_failures", violations
+    )
+    if restart_recovery_passes < 1:
         violations.append("durable recovery after a normal restart is missing")
-    if int(payload.get("large_file_checks") or 0) < 1:
+    if large_file_checks < 1:
         violations.append("large-file Code Detail acceptance is missing")
     open_findings = payload.get("open_p0_p1") or []
     if open_findings:
         violations.append("P0/P1 findings remain open")
     if payload.get("technical_failure_trend") not in (None, "stable", "decreasing"):
         violations.append("critical error/technical_failure trend is not stable")
-    if int(payload.get("db_integrity_failures") or 0) != 0:
+    if db_integrity_failures != 0:
         violations.append("database authoritative integrity checks failed")
-    if int(payload.get("semantic_hash_failures") or 0) != 0:
+    if semantic_hash_failures != 0:
         violations.append("authoritative semantic checks failed")
     return {
         "status": "PASSED" if not violations else "INCOMPLETE",
@@ -112,14 +131,39 @@ def audit(payload, now=None):
     }
 
 
+def _nonnegative_int(value, field_name, violations):
+    """Parse a counter without allowing malformed evidence to crash the audit."""
+    if value in (None, ""):
+        return 0
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        violations.append("{} must be a non-negative integer".format(field_name))
+        return 0
+    if parsed < 0:
+        violations.append("{} must be a non-negative integer".format(field_name))
+        return 0
+    return parsed
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--output")
     args = parser.parse_args(argv)
-    with open(args.input, "r", encoding="utf-8") as stream:
-        payload = json.load(stream)
-    result = audit(payload)
+    try:
+        with open(args.input, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        result = audit(payload)
+    except (OSError, TypeError, ValueError) as exc:
+        # An evidence parser failure is itself an incomplete audit, not an
+        # unstructured traceback that can be mistaken for an infrastructure
+        # outage or silently omitted from the release bundle.
+        result = audit({})
+        result["violations"].insert(
+            0, "acceptance-window input could not be read: {}".format(exc)
+        )
+        result["exit_code"] = 1
     encoded = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
     if args.output:
         output = os.path.abspath(args.output)

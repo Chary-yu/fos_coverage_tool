@@ -29,6 +29,8 @@ MAPPINGS = [
      "tests.progress.test_phase4_progress tests.vnext.test_vnext_runtime"),
     ({"app/incremental/*", "app/inject/*", "coverage_check.py"},
      "tests.incremental.test_line_ownership_and_lcov_ranges tests.incremental.test_phase5_inject_path tests.vnext.test_incremental_canonical"),
+    ({"app/compat/*", "app/legacy_runtime.py", "app/incremental/legacy.py"},
+     "tests.vnext.test_legacy_telemetry tests.vnext.test_runtime_config tests.code_detail.test_phase2_core tests.incremental.test_phase5_inject_path"),
     ({"app/inheritance/*", "contracts/inheritance*", "tests/fixtures/inheritance_deterministic_corpus.json"},
      "tests.vnext.test_inheritance_engine tests.vnext.test_deterministic_inheritance_corpus tests.vnext.test_parser_toolchain tests.vnext.test_analysis_domain tests.vnext.test_scan_import_lifecycle"),
     ({"app/services/analysis_service.py", "app/services/project_service.py", "app/reports/*"},

@@ -52,6 +52,17 @@ class ArchitectureAuditTest(unittest.TestCase):
         self.assertTrue(retirement["retirement_checks"]["no_legacy_deployment"])
         self.assertFalse(retirement["retirement_checks"]["legacy_usage_zero_for_window"])
 
+    def test_legacy_retirement_rejects_failed_compatibility_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest = os.path.join(directory, "legacy-compatibility.json")
+            with open(manifest, "w", encoding="utf-8") as stream:
+                json.dump({"status": "FAILED", "candidate_revision": "abc"}, stream)
+            result = audit_legacy_retirement(
+                os.getcwd(), compatibility_manifest=manifest,
+            )
+        self.assertFalse(result["retirement_checks"]["compatibility_tests"])
+        self.assertIn("status=PASSED", result["compatibility_evidence"]["missing_keys"])
+
     def test_active_runtime_binding_uses_process_candidate_config(self):
         process = {
             "available": True,
@@ -84,6 +95,11 @@ class ArchitectureAuditTest(unittest.TestCase):
         self.assertIn("tests.vnext.test_deterministic_inheritance_corpus", inheritance)
         review = select(["app/services/inheritance_review_service.py"])
         self.assertIn("tests.vnext.test_api_export_security", review)
+
+    def test_changed_test_selection_covers_compatibility_telemetry(self):
+        selected = select(["app/compat/telemetry.py"])
+        self.assertIn("tests.vnext.test_legacy_telemetry", selected)
+        self.assertIn("tests.vnext.test_runtime_config", selected)
 
     def test_changed_test_selection_covers_backup_ownership(self):
         upgrade = select(["scripts/upgrade/run_verified_backup_rehearsal.py"])

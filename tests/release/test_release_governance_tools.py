@@ -1,4 +1,7 @@
 import os
+import json
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -50,6 +53,71 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
             _parse_time("2026-08-21T08:00:00+08:00"),
             _parse_time("2026-08-21T00:00:00Z"),
         )
+
+    def test_acceptance_window_rejects_malformed_counters_without_crashing(self):
+        result = audit_window({
+            "window_started_at": "2026-08-18T00:00:00Z",
+            "window_ends_at": "2026-08-20T00:00:00Z",
+            "now": "2026-08-21T00:00:00Z",
+            "restart_recovery_passes": "not-a-number",
+            "large_file_checks": -1,
+        })
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertTrue(any("restart_recovery_passes" in item for item in result["violations"]))
+        self.assertTrue(any("large_file_checks" in item for item in result["violations"]))
+
+    def test_acceptance_window_cli_is_executable_from_repository_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            input_path = os.path.join(root, "window.json")
+            with open(input_path, "w", encoding="utf-8") as stream:
+                json.dump({}, stream)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/diagnostics/acceptance_window_audit.py",
+                    "--input", input_path,
+                ],
+                cwd=os.getcwd(), stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, universal_newlines=True,
+            )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn('"status": "INCOMPLETE"', completed.stdout)
+        self.assertNotIn("ModuleNotFoundError", completed.stderr)
+
+    def test_acceptance_window_cli_reports_invalid_json_as_incomplete(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as stream:
+            stream.write("not-json")
+            stream.flush()
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/diagnostics/acceptance_window_audit.py",
+                    "--input", stream.name,
+                ],
+                cwd=os.getcwd(), stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, universal_newlines=True,
+            )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("input could not be read", completed.stdout)
+        self.assertEqual(completed.stderr, "")
+
+    def test_skill_drift_cli_is_executable_from_repository_root(self):
+        with tempfile.TemporaryDirectory() as root:
+            input_path = os.path.join(root, "skills.json")
+            with open(input_path, "w", encoding="utf-8") as stream:
+                json.dump({}, stream)
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/diagnostics/skill_drift_audit.py",
+                    "--input", input_path,
+                ],
+                cwd=os.getcwd(), stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, universal_newlines=True,
+            )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn('"status": "INCOMPLETE"', completed.stdout)
+        self.assertNotIn("ModuleNotFoundError", completed.stderr)
 
     def test_skill_drift_requires_every_owner_field(self):
         incomplete = audit_skills({"candidate_revision": "abc", "skills": {}})

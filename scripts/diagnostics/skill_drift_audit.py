@@ -12,6 +12,11 @@ import json
 import os
 import sys
 
+# Support the documented repository-root invocation as well as module import.
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 from scripts.diagnostics.contract import with_contract
 from app.time_utils import utc_iso
 
@@ -71,9 +76,16 @@ def main(argv=None):
     parser.add_argument("--candidate-revision", default="")
     parser.add_argument("--output")
     args = parser.parse_args(argv)
-    with open(args.input, "r", encoding="utf-8") as stream:
-        payload = json.load(stream)
-    result = audit(payload, args.candidate_revision)
+    try:
+        with open(args.input, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+        result = audit(payload, args.candidate_revision)
+    except (OSError, TypeError, ValueError) as exc:
+        result = audit({}, args.candidate_revision)
+        result["violations"].insert(
+            0, "skill-drift input could not be read: {}".format(exc)
+        )
+        result["exit_code"] = 1
     encoded = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
     if args.output:
         output = os.path.abspath(args.output)

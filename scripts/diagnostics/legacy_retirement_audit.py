@@ -103,14 +103,19 @@ def _runtime_mode_checks(repo_root):
     }
 
 
-def _manifest_check(path, required_keys):
+def _manifest_check(path, required_keys, expected_values=None):
     values = _load_json(path)
+    expected_values = dict(expected_values or {})
+    missing_keys = [key for key in required_keys if not values or not values.get(key)]
+    for key, expected in expected_values.items():
+        if not values or values.get(key) != expected:
+            missing_keys.append("{}={}".format(key, expected))
     return {
         "configured": bool(path),
         "path": os.path.abspath(path) if path else "",
         "available": values is not None,
-        "passed": bool(values is not None and all(values.get(key) for key in required_keys)),
-        "missing_keys": [key for key in required_keys if not values or not values.get(key)],
+        "passed": bool(values is not None and not missing_keys),
+        "missing_keys": missing_keys,
     }
 
 
@@ -129,7 +134,10 @@ def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None)
     )
     telemetry = _usage_telemetry()
     runtime_modes = _runtime_mode_checks(repo_root)
-    compatibility = _manifest_check(compatibility_manifest, ("status", "candidate_revision"))
+    compatibility = _manifest_check(
+        compatibility_manifest, ("status", "candidate_revision"),
+        expected_values={"status": "PASSED"},
+    )
     release = _manifest_check(retirement_manifest, ("removal_commit", "rollback_plan"))
     checks = {
         "no_legacy_deployment": runtime_modes["passed"],
