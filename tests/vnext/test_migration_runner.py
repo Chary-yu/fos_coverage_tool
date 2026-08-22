@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 from datetime import datetime
 import unittest
+from unittest import mock
 
 from scripts.upgrade.migration_runner import (
     capture_legacy_snapshot,
@@ -15,6 +16,7 @@ from scripts.upgrade.migration_runner import (
     semantic_hash,
     _stream_legacy_semantic_hash,
     _stream_vnext_semantic_hash,
+    _legacy_file_contexts,
     _migration_checkpoint_done,
     _migration_checkpoint_key_hash,
     _upsert_migration_checkpoint,
@@ -241,19 +243,16 @@ class MigrationRunnerTest(unittest.TestCase):
         )
         source.commit()
         expected = semantic_hash(capture_legacy_semantic_snapshot(source))
-        statements = []
-        source.set_trace_callback(statements.append)
-        descriptor = _stream_legacy_semantic_hash(
-            source, ["project-a"], {"project-a": 7},
-        )
+        with mock.patch(
+                "scripts.upgrade.migration_runner._legacy_file_contexts",
+                wraps=_legacy_file_contexts) as context_reader:
+            descriptor = _stream_legacy_semantic_hash(
+                source, ["project-a"], {"project-a": 7},
+            )
         self.assertEqual(descriptor["semantic_hash"], expected)
-        line_context_reads = [
-            sql for sql in statements
-            if "select * from coverage_line_index" in sql.lower()
-        ]
         self.assertEqual(
-            len(line_context_reads), 2,
-            "one legacy line-context read per physical file is expected",
+            context_reader.call_count, 2,
+            "one legacy file context read per physical file is expected",
         )
 
     def test_blank_analysis_path_uses_unique_line_identity(self):
