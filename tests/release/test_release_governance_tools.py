@@ -39,6 +39,24 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808", workflow)
         self.assertIn("fetch-depth: 0", workflow)
 
+    def test_perf_benchmark_help_is_side_effect_free(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "benchmark.json")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/diagnostics/perf_benchmark.py",
+                    "--help",
+                    "--output",
+                    output,
+                ],
+                cwd=os.getcwd(), stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, universal_newlines=True,
+            )
+            self.assertEqual(completed.returncode, 0)
+            self.assertIn("--output", completed.stdout)
+            self.assertFalse(os.path.exists(output))
+
     def test_disk_formula_includes_twenty_percent_or_ten_gib_margin(self):
         result = required_free_bytes(100, 200, 300, 400, 500, 600)
         self.assertEqual(result["preceding_sum"], 2100)

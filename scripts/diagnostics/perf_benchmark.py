@@ -13,6 +13,7 @@ Measures:
 - Memory RSS footprint
 """
 
+import argparse
 import os
 import sys
 import time
@@ -141,12 +142,30 @@ def run_performance_suite() -> Dict[str, Any]:
         
     return results
 
-if __name__ == "__main__":
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the dependency-free synthetic sidecar/layout benchmark. "
+            "The result is not release performance evidence."
+        )
+    )
+    parser.add_argument(
+        "--output",
+        default=os.path.join(_REPO_ROOT, "benchmarks", "perf_baseline.json"),
+        help="JSON output path (default: benchmarks/perf_baseline.json)",
+    )
+    args = parser.parse_args(argv)
+
     print("=== Running Performance Benchmark Suite (Items 24) ===")
-    res = run_performance_suite()
-    out_file = os.path.join(_REPO_ROOT, "benchmarks", "perf_baseline.json")
+    result = run_performance_suite()
+    out_file = os.path.abspath(args.output)
     os.makedirs(os.path.dirname(out_file), exist_ok=True)
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(res, f, indent=2)
+    with open(out_file, "w", encoding="utf-8") as stream:
+        json.dump(result, stream, indent=2)
     print(f"Benchmark results recorded to {out_file}:")
-    print(json.dumps(res, indent=2))
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

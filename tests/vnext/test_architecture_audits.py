@@ -266,6 +266,8 @@ class ArchitectureAuditTest(unittest.TestCase):
         selected = select(["scripts/diagnostics/dod_status.py"])
         self.assertIn("tests.release.test_dod_status", selected)
         self.assertIn("tests.release.test_release_readiness", selected)
+        benchmark = select(["scripts/diagnostics/perf_benchmark.py"])
+        self.assertIn("tests.release.test_release_governance_tools", benchmark)
         selected_manifest = select(["docs/gate_dod_manifest.json"])
         self.assertIn("tests.release.test_dod_status", selected_manifest)
 
@@ -303,6 +305,30 @@ class ArchitectureAuditTest(unittest.TestCase):
         self.assertEqual(task_manifest["status"], "PASSED")
         self.assertEqual(task_manifest["expected_task_count"], 80)
         self.assertEqual(audit_immutability()["status"], "PASSED")
+
+    def test_frontend_contract_rejects_legacy_progress_envelope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            progress_path = os.path.join(
+                directory, "web", "assets", "js", "coverage_progress.js"
+            )
+            detail_path = os.path.join(
+                directory, "web", "assets", "js", "coverage_enhance.js"
+            )
+            os.makedirs(os.path.dirname(progress_path))
+            for source, target in (
+                ("web/assets/js/coverage_progress.js", progress_path),
+                ("web/assets/js/coverage_enhance.js", detail_path),
+            ):
+                with open(source, "r", encoding="utf-8") as stream:
+                    contents = stream.read()
+                with open(target, "w", encoding="utf-8") as stream:
+                    stream.write(contents)
+            with open(progress_path, "a", encoding="utf-8") as stream:
+                stream.write("\nconst legacyEnvelope = payload.data;\n")
+
+            result = audit_frontend(directory)
+            self.assertEqual(result["status"], "FAILED")
+            self.assertTrue(any("payload.data" in item for item in result["violations"]))
 
     def test_cross_layer_release_gate_rejects_synthetic_metrics(self):
         payload = {
