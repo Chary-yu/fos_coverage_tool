@@ -67,6 +67,7 @@ class VNextApplication(object):
         self.router.add("GET", r"^/api/coverage/projects$", self.projects)
         self.router.add("GET", r"^/api/coverage/projects/([^/]+)/scans$", self.scans)
         self.router.add("GET", r"^/api/coverage/scans/([^/]+)/inheritance/pending$", self.inheritance_pending)
+        self.router.add("GET", r"^/api/coverage/scans/([^/]+)/inheritance/relation$", self.inheritance_relation)
         self.router.add("GET", r"^/api/coverage/scans/([^/]+)/inheritance/decisions$", self.inheritance_decisions)
         self.router.add("POST", r"^/api/coverage/scans/([^/]+)/inheritance/confirm$", self.inheritance_confirm)
         self.router.add("POST", r"^/api/coverage/scans/([^/]+)/inheritance/edit-confirm$", self.inheritance_edit_confirm)
@@ -417,6 +418,62 @@ class VNextApplication(object):
                 rows[-1]["decision_id"] if has_more and rows else None,
                 scan_id, data_version, filter_key,
             ), "has_more": has_more,
+        }
+
+    def inheritance_relation(self, scan_id, query, body, headers, remote_address):
+        """Return exactly one active inheritance relation for one target line.
+
+        This endpoint is intentionally not a convenience wrapper around the
+        paged pending list.  The target identity is fully scoped by Scan,
+        repository, path, and either immutable line/relation id.
+        """
+        repository_name = str(query.get("repository_name") or "").strip()
+        file_path = str(query.get("file_path") or query.get("file") or "").strip()
+        line_id = query.get("line_id")
+        relation_id = query.get("relation_id")
+        line_number = query.get("line_number")
+        if not file_path or (line_id is None and relation_id is None and line_number is None):
+            raise ValueError("repository_name, file_path and line_id/relation_id/line_number are required")
+        with self._read_connection() as connection:
+            _, project = self._inheritance_scan(connection, int(scan_id))
+            state = self.runtime.states.get(connection, int(project["id"])) or {}
+            data_version = int(state.get("data_version") or 0)
+            clauses = [
+                "d.candidate_scan_id=?", "d.decision='INHERITED'",
+                "q.is_active=1", "f.repository_name=?", "f.file_path=?",
+            ]
+            params = [int(scan_id), repository_name, file_path]
+            if line_id is not None:
+                clauses.append("l.id=?")
+                params.append(int(line_id))
+            elif relation_id is not None:
+                clauses.append("q.id=?")
+                params.append(int(relation_id))
+            else:
+                clauses.append("l.line_number=?")
+                params.append(int(line_number))
+            rows = fetchall(connection, """
+                SELECT d.id AS decision_id, d.candidate_line_id, d.reason_code,
+                       d.algorithm_version, d.evaluated_at, l.line_number,
+                       f.file_path, f.repository_name, q.id AS relation_id,
+                       q.review_state, q.relation_revision, q.analysis_record_id,
+                       r.conclusion_status, r.coverage_method, r.uncovered_reason,
+                       r.comment, q.reviewed_by
+                FROM coverage_inheritance_decisions d
+                JOIN coverage_lines l ON l.id=d.candidate_line_id
+                JOIN coverage_files f ON f.id=l.file_id
+                JOIN coverage_analysis_line_links q
+                  ON q.scan_id=d.candidate_scan_id AND q.line_id=d.candidate_line_id
+                 AND q.is_active=1
+                LEFT JOIN coverage_analysis_records r ON r.id=q.analysis_record_id
+                WHERE {where}
+                ORDER BY d.id DESC LIMIT 2
+            """.format(where=" AND ".join(clauses)), params)
+        if len(rows) > 1:
+            raise ValueError("inheritance relation is ambiguous")
+        return 200, {
+            "scan_id": int(scan_id), "data_version": data_version,
+            "item": rows[0] if rows else None,
         }
 
     def inheritance_decisions(self, scan_id, query, body, headers, remote_address):

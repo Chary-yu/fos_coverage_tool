@@ -63,6 +63,66 @@ class VNextRuntimeTest(unittest.TestCase):
         self.assertIn("resources", payload["jobs"])
         self.assertIn("code_detail", payload)
 
+    def test_exact_inheritance_relation_query_is_scoped_to_target_line(self):
+        status, body = self.application.dispatch(
+            "POST", "/api/coverage/projects", body={"project_name": "fixture"}
+        )
+        self.assertEqual(status, 201)
+        status, body = self.application.dispatch(
+            "POST", "/api/coverage/scans",
+            body={
+                "project_name": "fixture", "info_sha256": "e" * 64,
+                "report": {"report_id": "report_relation"},
+                "repositories": [{
+                    "repository_name": "repo-relation", "repository_path": "/tmp/relation",
+                    "branch_name": "main", "old_commit_sha": "1" * 40,
+                    "new_commit_sha": "2" * 40, "verified": True,
+                }],
+            },
+        )
+        self.assertEqual(status, 201)
+        scan_id = body["scan"]["id"]
+        self.runtime.project_service.ingest_files(
+            self.connection, scan_id, [{
+                "repository_name": "repo-relation", "file_path": "src/relation.c",
+                "file_path_hash": "r" * 32,
+                "lines": [{"line_number": 601, "line_text": "return 0;",
+                            "coverage_state": "uncovered"}],
+            }]
+        )
+        line_id = self.connection.execute(
+            "SELECT l.id FROM coverage_lines l JOIN coverage_files f ON f.id=l.file_id "
+            "WHERE f.scan_id=? AND l.line_number=601",
+            (scan_id,),
+        ).fetchone()[0]
+        domain = self.runtime.analysis_domain_repository
+        record = domain.create_record(
+            self.connection, {"status": "可覆盖", "coverage_method": "unit"},
+            origin="INHERITED",
+        )
+        link = domain.create_link(
+            self.connection, scan_id, line_id, record["id"],
+            review_state="INHERITED_PENDING", relation_origin="INHERITANCE",
+        )
+        self.connection.execute("""
+            INSERT INTO coverage_inheritance_decisions(
+                decision_run_id, candidate_scan_id, candidate_line_id,
+                decision, reason_code, algorithm_version, evaluated_at
+            ) VALUES (?, ?, ?, 'INHERITED', 'TEST', 'test-v1', CURRENT_TIMESTAMP)
+        """, ("r" * 64, scan_id, line_id))
+        self.connection.commit()
+
+        status, payload = self.application.dispatch(
+            "GET", "/api/coverage/scans/{}/inheritance/relation".format(scan_id),
+            query={
+                "repository_name": "repo-relation", "file_path": "src/relation.c",
+                "line_number": "601",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["item"]["candidate_line_id"], line_id)
+        self.assertEqual(payload["item"]["relation_id"], link["id"])
+
     def test_scan_analysis_freshness_and_report_identity(self):
         status, body = self.application.dispatch(
             "POST", "/api/coverage/projects", body={"project_name": "fixture"}
@@ -508,6 +568,71 @@ class VNextRuntimeTest(unittest.TestCase):
             self.assertEqual(len(chunk_loads), 1)
             self.assertEqual(store.cache_stats()["chunk_reads"], 1)
             self.assertGreaterEqual(store.cache_stats()["chunk_inflight_waits"], 1)
+
+    def test_code_detail_overlay_singleflight_and_byte_budget(self):
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def slow_overlay(*args, **kwargs):
+            calls.append(1)
+            started.set()
+            self.assertTrue(release.wait(5))
+            return [{"line_number": 1, "status": "可覆盖"}]
+
+        with mock.patch.object(self.runtime.analyses, "get_by_file",
+                               side_effect=slow_overlay):
+            results = []
+            errors = []
+
+            def worker():
+                try:
+                    results.append(self.runtime.code_detail._overlay(
+                        None, 991, data_version=7, report_id="report-singleflight"
+                    ))
+                except BaseException as exc:  # pragma: no cover - assertion aid
+                    errors.append(exc)
+
+            first = threading.Thread(target=worker)
+            second = threading.Thread(target=worker)
+            first.start()
+            self.assertTrue(started.wait(5))
+            second.start()
+            deadline = time.time() + 5
+            while (self.runtime.code_detail.metrics()["overlay_singleflight_shared"] < 1 and
+                   time.time() < deadline):
+                time.sleep(0.01)
+            release.set()
+            first.join(5)
+            second.join(5)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(results), 2)
+        metrics = self.runtime.code_detail.metrics()
+        self.assertLessEqual(metrics["cache_bytes"], metrics["max_cache_bytes"])
+        self.assertGreaterEqual(metrics["overlay_singleflight_shared"], 1)
+
+    def test_sidecar_oversize_entry_bypasses_cache_without_breaking_reads(self):
+        with tempfile.TemporaryDirectory(prefix="vnext-sidecar-byte-budget-") as root:
+            store = SidecarStore(
+                [root], chunk_size=4, max_cache_bytes=128, max_entry_bytes=32,
+            )
+            context = SourceContext(
+                "budget", "src/budget.c", [
+                    SourceLineDTO(i, "line-{}-payload".format(i), coverage_state="covered")
+                    for i in range(1, 9)
+                ], report_id="report_budget",
+            )
+            key = calc_sidecar_file_key("src/budget.c")
+            store.save_chunked_sidecar(root, "report_budget", key, context)
+            self.assertIsNotNone(store.load_metadata("report_budget", key))
+            self.assertIsNotNone(store.load_lines_range("report_budget", key, 1, 2))
+            stats = store.cache_stats()
+            self.assertLessEqual(stats["cache_bytes"], stats["max_cache_bytes"])
+            self.assertGreater(stats["cache_oversize_bypass"], 0)
 
 
 if __name__ == "__main__":

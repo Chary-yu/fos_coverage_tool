@@ -42,6 +42,10 @@
     const NETWORK_CHUNK_LINES = 2000;
     const RENDER_BATCH_LINES = 250;
     const MAX_CHUNK_CONCURRENCY = 3;
+    const MAX_CODE_DETAIL_BATCH_RANGES = 1000;
+    const MAX_CODE_DETAIL_BATCH_LOGICAL_LINES = 20000;
+    const MAX_INITIAL_BATCH_CONCURRENCY = 3;
+    const MAX_INITIAL_BATCH_RETRIES = 2;
     const VIRTUAL_SCROLL_THRESHOLD = 5000;
     const VIRTUAL_OVERSCAN_LINES = 300;
     const VIRTUAL_LINE_HEIGHT = 24;
@@ -1300,11 +1304,94 @@
     // =========================================================================
     const CodeRegionLoader = {
         _inflightPromises: new Map(), // regionId or 'batch' -> Promise
+        _initialBatchControllers: new Set(),
+        _initialBatchToken: 0,
+
+        cancelInitialBatch() {
+            this._initialBatchToken += 1;
+            this._initialBatchControllers.forEach(controller => {
+                try { controller.abort(); } catch (error) { /* already cancelled */ }
+            });
+            this._initialBatchControllers.clear();
+        },
+
+        _initialBatchGroups(regions) {
+            const groups = [];
+            let current = [];
+            let logicalLines = 0;
+            regions.forEach(region => {
+                const span = Number(region.lineCount ||
+                    (Number(region.endLine) - Number(region.startLine) + 1));
+                if (current.length && (
+                    current.length >= MAX_CODE_DETAIL_BATCH_RANGES ||
+                    logicalLines + span > MAX_CODE_DETAIL_BATCH_LOGICAL_LINES
+                )) {
+                    groups.push(current);
+                    current = [];
+                    logicalLines = 0;
+                }
+                current.push(region);
+                logicalLines += span;
+            });
+            if (current.length) groups.push(current);
+            return groups;
+        },
+
+        async _requestInitialBatch(filePath, regions, token, generations) {
+            const ranges = regions.map(region => ({
+                start_line: region.startLine, end_line: region.endLine
+            }));
+            let lastError = null;
+            for (let attempt = 0; attempt <= MAX_INITIAL_BATCH_RETRIES; attempt += 1) {
+                if (token !== this._initialBatchToken) return null;
+                const controller = typeof AbortController === 'function'
+                    ? new AbortController() : null;
+                if (controller) this._initialBatchControllers.add(controller);
+                try {
+                    const options = {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' }
+                    };
+                    if (controller) options.signal = controller.signal;
+                    return await requestCoverageApi('/code-lines/batch', {
+                        ...options,
+                        body: JSON.stringify({
+                            scan_id: currentScanId,
+                            file_path: filePath,
+                            repository_name: currentRepositoryName,
+                            report_id: currentReportId,
+                            ranges
+                        })
+                    });
+                } catch (error) {
+                    lastError = error;
+                    if (token !== this._initialBatchToken ||
+                        regions.some(region => region.loadGeneration !== generations.get(region.id))) {
+                        return null;
+                    }
+                    if (attempt < MAX_INITIAL_BATCH_RETRIES) {
+                        await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
+                    }
+                } finally {
+                    if (controller) this._initialBatchControllers.delete(controller);
+                }
+            }
+            // A failed batch is returned as a per-batch failure.  The caller
+            // may explicitly retry that region through the bounded GET path;
+            // no other batch is discarded and no local data is fabricated.
+            return { __batch_error__: lastError || new Error('batch request failed') };
+        },
 
         async loadInitialBatch(filePath, expandedRegions) {
             if (!expandedRegions || expandedRegions.length === 0) {
                 return [];
             }
+
+            this.cancelInitialBatch();
+            const token = this._initialBatchToken;
+            const generations = new Map(expandedRegions.map(region => [
+                region.id, region.loadGeneration || 0
+            ]));
 
             expandedRegions.forEach(r => CodeRegionStore.setLoading(r.id, '正在加载…'));
 
@@ -1313,49 +1400,52 @@
             );
             if (!batchRegions.length) return expandedRegions;
 
-            const data = await requestCoverageApi('/code-lines/batch', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    scan_id: currentScanId,
-                    file_path: filePath,
-                    repository_name: currentRepositoryName,
-                    report_id: currentReportId,
-                    ranges: batchRegions.map(region => ({
-                        start_line: region.startLine, end_line: region.endLine
-                    }))
-                })
-            });
+            const groups = this._initialBatchGroups(batchRegions);
+            const responses = new Array(groups.length);
+            let nextGroup = 0;
+            const worker = async () => {
+                while (nextGroup < groups.length) {
+                    const index = nextGroup++;
+                    responses[index] = await this._requestInitialBatch(
+                        filePath, groups[index], token, generations
+                    );
+                }
+            };
+            await Promise.all(Array.from(
+                { length: Math.min(MAX_INITIAL_BATCH_CONCURRENCY, groups.length) }, worker
+            ));
+            if (token !== this._initialBatchToken) return expandedRegions;
 
-            // The VNext endpoint names the collection ``ranges``; older
-            // compatibility transports used ``batches``.  Accept both after
-            // requestCoverageApi has normalized the outer success envelope.
-            const responseRanges = data && Array.isArray(data.ranges)
-                ? data.ranges
-                : (data && Array.isArray(data.batches) ? data.batches : null);
-            if (responseRanges) {
+            responses.forEach((data, groupIndex) => {
+                const group = groups[groupIndex];
+                if (!data || data.__batch_error__) {
+                    group.forEach(region => {
+                        if (region.loadGeneration === generations.get(region.id)) {
+                            CodeRegionStore.setCollapsed(region.id);
+                        }
+                    });
+                    return;
+                }
+                // The VNext endpoint names the collection ``batches``; accept
+                // the shared ``ranges`` spelling used by newer transports.
+                const responseRanges = Array.isArray(data.ranges)
+                    ? data.ranges
+                    : (Array.isArray(data.batches) ? data.batches : null);
                 const rangeMap = new Map();
-                responseRanges.forEach((r, index) => {
-                    const fallback = batchRegions[index];
-                    const start = r.start_line !== undefined ? r.start_line : fallback.startLine;
-                    const end = r.end_line !== undefined ? r.end_line : fallback.endLine;
-                    rangeMap.set(`${start}-${end}`, responseLines(r));
+                (responseRanges || []).forEach((range, index) => {
+                    const fallback = group[index];
+                    if (!fallback) return;
+                    const start = range.start_line !== undefined ? range.start_line : fallback.startLine;
+                    const end = range.end_line !== undefined ? range.end_line : fallback.endLine;
+                    rangeMap.set(`${start}-${end}`, responseLines(range));
                 });
-                batchRegions.forEach(reg => {
-                    const key = `${reg.startLine}-${reg.endLine}`;
-                    if (rangeMap.has(key)) {
-                        CodeRegionStore.setLoaded(reg.id, rangeMap.get(key));
-                    } else {
-                        CodeRegionStore.setCollapsed(reg.id);
-                    }
+                group.forEach(region => {
+                    if (region.loadGeneration !== generations.get(region.id)) return;
+                    const key = `${region.startLine}-${region.endLine}`;
+                    if (rangeMap.has(key)) CodeRegionStore.setLoaded(region.id, rangeMap.get(key));
+                    else CodeRegionStore.setCollapsed(region.id);
                 });
-            } else {
-                batchRegions.forEach(reg => {
-                    if (!reg.loaded) {
-                        CodeRegionStore.setCollapsed(reg.id);
-                    }
-                });
-            }
+            });
             return expandedRegions;
         },
 
@@ -1684,15 +1774,15 @@
             inheritBtn.className = 'coverage-inherit-btn';
             inheritBtn.type = 'button';
             inheritBtn.innerText = '继承';
-            inheritBtn.title = '继承上一条已填写的分析结果';
+            inheritBtn.title = '仅确认服务器提供的精确自动继承关系';
             inheritBtn.setAttribute('data-panel-action', 'inherit');
 
             const batchInheritBtn = document.createElement('button');
             batchInheritBtn.className = 'coverage-inherit-btn batch';
             batchInheritBtn.type = 'button';
-            batchInheritBtn.innerText = '批量继承';
-            batchInheritBtn.title = '从上方最近已填写控件继承到它之后至当前控件的整段内容';
-            batchInheritBtn.setAttribute('data-panel-action', 'batch-inherit');
+            batchInheritBtn.innerText = '手工复制上一条';
+            batchInheritBtn.title = '明确创建 MANUAL 草稿：从上方最近已填写控件复制到当前区域';
+            batchInheritBtn.setAttribute('data-panel-action', 'manual-copy');
 
             const rejectBtn = document.createElement('button');
             rejectBtn.className = 'coverage-inherit-btn reject coverage-inherit-reject-btn';
@@ -2094,7 +2184,7 @@
             else if (action === 'previous') navigateReviewPanel(panel.lineNum, -1);
             else if (action === 'next') navigateReviewPanel(panel.lineNum, 1);
             else if (action === 'inherit') this.inheritPanel(panel);
-            else if (action === 'batch-inherit') this.batchInheritPanel(panel);
+            else if (action === 'batch-inherit' || action === 'manual-copy') this.batchInheritPanel(panel);
             else if (action === 'reject-inheritance') this.rejectServerInheritance(panel);
             else if (action === 'undo-rejection') this.undoServerInheritance(panel);
         },
@@ -2190,23 +2280,16 @@
 
         async findServerInheritanceCandidate(panel) {
             if (!panel || !currentScanId || !this.filePath) return null;
-            const query = new URLSearchParams({ limit: '500' });
-            try {
-                const payload = await requestCoverageApi(
-                    `/scans/${encodeURIComponent(currentScanId)}/inheritance/pending?${query.toString()}`,
-                    { method: 'GET' }
-                );
-                const items = payload && Array.isArray(payload.items) ? payload.items : [];
-                return items.find(item =>
-                    Number(item.line_number) === Number(panel.lineNum) &&
-                    String(item.file_path || '') === String(this.filePath || '') &&
-                    String(item.repository_name || '') === String(currentRepositoryName || '')
-                ) || null;
-            } catch (error) {
-                // Older injected pages may not expose the inheritance API;
-                // retain the local draft-copy behavior in that case.
-                return null;
-            }
+            const query = new URLSearchParams({
+                repository_name: currentRepositoryName || '',
+                file_path: this.filePath,
+                line_number: String(panel.lineNum)
+            });
+            const payload = await requestCoverageApi(
+                `/scans/${encodeURIComponent(currentScanId)}/inheritance/relation?${query.toString()}`,
+                { method: 'GET' }
+            );
+            return payload && payload.item ? payload.item : null;
         },
 
         async confirmServerInheritance(panel, candidate) {
@@ -2340,7 +2423,15 @@
         },
 
         async inheritPanel(panel) {
-            const serverCandidate = await this.findServerInheritanceCandidate(panel);
+            let serverCandidate = null;
+            try {
+                serverCandidate = await this.findServerInheritanceCandidate(panel);
+            } catch (error) {
+                if (typeof alert === 'function') {
+                    alert(`无法读取服务器继承关系；当前面板未改变。${error.message ? `\n${error.message}` : ''}`);
+                }
+                return;
+            }
             if (serverCandidate) {
                 try {
                     if (await this.confirmServerInheritance(panel, serverCandidate)) {
@@ -2354,23 +2445,9 @@
                     return;
                 }
             }
-            const previous = findPreviousFilledPanel(panel.lineNum);
-            if (!previous) {
-                if (typeof alert === 'function') alert('没有找到上一条已填写的分析结果。');
-                return;
+            if (typeof alert === 'function') {
+                alert('当前行没有服务器提供的自动继承关系。请使用“手工复制上一条”创建明确的 MANUAL 草稿。');
             }
-            setStoredPanelValues(panel, {
-                status: getStoredPanelValue(previous, 'status') || '未确认',
-                reviewerInput: getStoredPanelValue(previous, 'reviewerInput'),
-                methodInput: getStoredPanelValue(previous, 'methodInput'),
-                reasonInput: getStoredPanelValue(previous, 'reasonInput'),
-                isDirty: true
-            });
-            if (panel.saveBtn) {
-                panel.saveBtn.innerText = 'Save';
-                panel.saveBtn.className = 'coverage-analysis-btn';
-            }
-            markPanelDirty(panel.lineNum);
         },
 
         batchInheritPanel(panel) {
@@ -2386,6 +2463,7 @@
                 reviewerInput: getStoredPanelValue(sourcePanel, 'reviewerInput'),
                 methodInput: getStoredPanelValue(sourcePanel, 'methodInput'),
                 reasonInput: getStoredPanelValue(sourcePanel, 'reasonInput'),
+                isDraft: true,
                 isDirty: true
             };
             const targetEntries = panelLineNumbers
@@ -2700,6 +2778,7 @@
             if (!region || !region.domContainer) return;
             if (region.loading && !force) return; // Prevent manual collapse during chunk stream loading
 
+            CodeRegionLoader.cancelInitialBatch();
             region.loadGeneration = (region.loadGeneration || 0) + 1;
 
             // Free DOM memory while preserving DraftStore edits

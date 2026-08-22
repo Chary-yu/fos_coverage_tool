@@ -6,6 +6,7 @@
     "scan_create": "POST /api/coverage/scans",
     "job_detail": "GET /api/coverage/jobs/{job_id}",
     "inheritance_pending": "GET /api/coverage/scans/{scan_id}/inheritance/pending",
+    "inheritance_relation": "GET /api/coverage/scans/{scan_id}/inheritance/relation",
     "inheritance_decisions": "GET /api/coverage/scans/{scan_id}/inheritance/decisions",
     "inheritance_confirm": "POST /api/coverage/scans/{scan_id}/inheritance/confirm",
     "inheritance_edit_confirm": "POST /api/coverage/scans/{scan_id}/inheritance/edit-confirm",
@@ -31,6 +32,12 @@
     "line_id_or_line_number",
     "expected_relation_revision"
   ],
+  "inheritance_relation_query": {
+    "required": ["scan_id", "repository_name", "file_path"],
+    "one_of": ["line_id", "relation_id", "line_number"],
+    "response": ["scan_id", "data_version", "item"],
+    "global_pending_list_fallback": false
+  },
   "mutation_rules": {
     "current_scan_only": true,
     "authenticated_operator_is_reviewer": true,

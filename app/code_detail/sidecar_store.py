@@ -26,6 +26,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from .source_reader import SourceContext, SourceLineDTO, calc_sidecar_file_key
+from .cache_budget import ByteBudget
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,15 @@ MAX_TOTAL_RANGE_SPAN = 20000
 MAX_RANGE_CHUNKS = 256
 MAX_SIDECAR_LINES = 1000000
 
+
+def _estimate_cache_bytes(value):
+    try:
+        return max(1, len(json.dumps(
+            value, ensure_ascii=False, sort_keys=True, default=repr,
+        ).encode("utf-8")))
+    except Exception:
+        return max(1, len(repr(value).encode("utf-8", "replace")))
+
 class SidecarStore:
     def __init__(
         self,
@@ -43,15 +53,27 @@ class SidecarStore:
         chunk_size: int = DEFAULT_CHUNK_SIZE,
         asset_identity: str = "",
         max_cached_chunks: int = 128,
+        max_cache_bytes: int = 32 * 1024 * 1024,
+        max_entry_bytes: int = 4 * 1024 * 1024,
+        max_metadata_entries: int = 128,
+        max_legacy_entries: int = 32,
+        process_budget: Optional[ByteBudget] = None,
     ):
         self.search_dirs = [os.path.abspath(d) for d in (search_dirs or []) if os.path.isdir(d)]
         self.chunk_size = chunk_size
         self.asset_identity = str(asset_identity or "")
         self.max_cached_chunks = max(1, int(max_cached_chunks))
+        self.max_cache_bytes = max(0, int(max_cache_bytes))
+        self.max_entry_bytes = max(0, int(max_entry_bytes))
+        self.max_metadata_entries = max(1, int(max_metadata_entries))
+        self.max_legacy_entries = max(1, int(max_legacy_entries))
+        self._process_cache_budget = process_budget or ByteBudget(self.max_cache_bytes)
         self._cache_lock = threading.RLock()
-        self._metadata_cache: Dict[Tuple[str, str, str], Tuple[Tuple[int, int], Dict[str, Any]]] = {}
-        self._legacy_cache: Dict[Tuple[str, str, str], Tuple[Tuple[int, int], Dict[str, Any]]] = {}
+        self._metadata_cache = OrderedDict()
+        self._legacy_cache = OrderedDict()
         self._decoded_chunk_cache = OrderedDict()
+        self._cache_bytes = 0
+        self._cache_type_bytes = {"metadata": 0, "legacy": 0, "chunk": 0}
         # A bounded chunk cache removes serial duplicate JSON decoding.  The
         # in-flight map also coalesces concurrent cache misses so multiple
         # HTTP workers do not parse the same physical chunk at once.
@@ -63,6 +85,10 @@ class SidecarStore:
             "chunk_reads": 0, "chunk_cache_hits": 0,
             "chunk_inflight_waits": 0,
             "path_resolution_reads": 0,
+            "metadata_cache_misses": 0,
+            "legacy_cache_misses": 0,
+            "cache_evictions": 0,
+            "cache_oversize_bypass": 0,
         }
 
     def add_search_dir(self, directory: str):
@@ -85,8 +111,90 @@ class SidecarStore:
                 "legacy_entries": len(self._legacy_cache),
                 "decoded_chunk_entries": len(self._decoded_chunk_cache),
                 "report_directory_entries": len(self._report_cache_dirs),
+                "cache_bytes": int(self._cache_bytes),
+                "max_cache_bytes": int(self.max_cache_bytes),
+                "max_entry_bytes": int(self.max_entry_bytes),
+                "metadata_cache_bytes": int(self._cache_type_bytes["metadata"]),
+                "legacy_cache_bytes": int(self._cache_type_bytes["legacy"]),
+                "decoded_chunk_cache_bytes": int(self._cache_type_bytes["chunk"]),
+                "process_cache_bytes": self._process_cache_budget.current_bytes(),
             })
         return result
+
+    def _cache_remove_locked(self, cache, key, cache_name):
+        entry = cache.pop(key, None)
+        if entry is None:
+            return None
+        if cache_name == "chunk":
+            value, size = entry
+        else:
+            _, value, size = entry
+        self._cache_bytes = max(0, self._cache_bytes - int(size))
+        self._cache_type_bytes[cache_name] = max(
+            0, self._cache_type_bytes[cache_name] - int(size)
+        )
+        self._process_cache_budget.release(size)
+        return value
+
+    def _evict_oldest_locked(self, preferred=None):
+        caches = (preferred or [], [self._metadata_cache, "metadata"],
+                  [self._legacy_cache, "legacy"],
+                  [self._decoded_chunk_cache, "chunk"])
+        for item in caches:
+            if not item or len(item) != 2:
+                continue
+            cache, cache_name = item
+            if cache:
+                key = next(iter(cache))
+                self._cache_remove_locked(cache, key, cache_name)
+                self._metrics["cache_evictions"] += 1
+                return True
+        return False
+
+    def _cache_put_locked(self, cache, key, value, signature, cache_name,
+                          max_entries=None):
+        size = _estimate_cache_bytes(value)
+        type_limit = self.max_cache_bytes
+        if cache_name == "metadata":
+            type_limit = self.max_cache_bytes
+        elif cache_name == "legacy":
+            type_limit = self.max_cache_bytes
+        elif cache_name == "chunk":
+            type_limit = self.max_cache_bytes
+        if (type_limit <= 0 or self.max_entry_bytes <= 0 or
+                size > type_limit or size > self.max_entry_bytes):
+            self._metrics["cache_oversize_bypass"] += 1
+            return False
+        self._cache_remove_locked(cache, key, cache_name)
+        while cache and ((max_entries and len(cache) >= max_entries) or
+                         self._cache_type_bytes[cache_name] + size > type_limit):
+            self._evict_oldest_locked([[cache, cache_name]])
+        while self._cache_bytes + size > self.max_cache_bytes:
+            if not self._evict_oldest_locked():
+                break
+        if (self._cache_bytes + size > self.max_cache_bytes or
+                not self._process_cache_budget.try_acquire(size)):
+            self._metrics["cache_oversize_bypass"] += 1
+            return False
+        if cache_name == "chunk":
+            cache[key] = (value, size)
+        else:
+            cache[key] = (signature, value, size)
+        cache.move_to_end(key)
+        self._cache_bytes += size
+        self._cache_type_bytes[cache_name] += size
+        return True
+
+    def clear_caches(self):
+        """Drop rebuildable payloads and release the shared process budget."""
+        with self._cache_lock:
+            for cache, cache_name in (
+                    (self._metadata_cache, "metadata"),
+                    (self._legacy_cache, "legacy"),
+                    (self._decoded_chunk_cache, "chunk")):
+                while cache:
+                    self._cache_remove_locked(cache, next(iter(cache)), cache_name)
+            self._report_cache_dirs.clear()
 
     @staticmethod
     def _stat_signature(path: str) -> Optional[Tuple[int, int]]:
@@ -132,7 +240,9 @@ class SidecarStore:
             cached = self._metadata_cache.get(cache_key)
             if cached and cached[0] == signature:
                 self._metrics["metadata_cache_hits"] += 1
+                self._metadata_cache.move_to_end(cache_key)
                 return cached[1]
+            self._metrics["metadata_cache_misses"] += 1
             self._metrics["metadata_reads"] += 1
         try:
             with open(meta_path, "r", encoding="utf-8") as stream:
@@ -146,12 +256,15 @@ class SidecarStore:
                 cached = self._metadata_cache.get(cache_key)
                 if cached and cached[0] == signature:
                     return cached[1]
-                self._metadata_cache[cache_key] = (signature, meta)
+                self._cache_put_locked(
+                    self._metadata_cache, cache_key, meta, signature, "metadata",
+                    self.max_metadata_entries,
+                )
             return meta
         except Exception as exc:
             logger.warning("[SidecarStore] Error reading chunk meta %s: %s", meta_path, exc)
             with self._cache_lock:
-                self._metadata_cache.pop(cache_key, None)
+                self._cache_remove_locked(self._metadata_cache, cache_key, "metadata")
             return None
 
     def _load_legacy_payload(
@@ -169,7 +282,9 @@ class SidecarStore:
             cached = self._legacy_cache.get(cache_key)
             if cached and cached[0] == signature:
                 self._metrics["legacy_cache_hits"] += 1
+                self._legacy_cache.move_to_end(cache_key)
                 return cached[1]
+            self._metrics["legacy_cache_misses"] += 1
             self._metrics["legacy_reads"] += 1
         try:
             with open(legacy_path, "r", encoding="utf-8") as stream:
@@ -192,12 +307,15 @@ class SidecarStore:
                 cached = self._legacy_cache.get(cache_key)
                 if cached and cached[0] == signature:
                     return cached[1]
-                self._legacy_cache[cache_key] = (signature, payload)
+                self._cache_put_locked(
+                    self._legacy_cache, cache_key, payload, signature, "legacy",
+                    self.max_legacy_entries,
+                )
             return payload
         except Exception as exc:
             logger.warning("[SidecarStore] Error reading legacy sidecar %s: %s", legacy_path, exc)
             with self._cache_lock:
-                self._legacy_cache.pop(cache_key, None)
+                self._cache_remove_locked(self._legacy_cache, cache_key, "legacy")
             return None
 
     def _load_decoded_chunk(
@@ -217,7 +335,7 @@ class SidecarStore:
                 if cached is not None:
                     self._metrics["chunk_cache_hits"] += 1
                     self._decoded_chunk_cache.move_to_end(cache_key)
-                    return cached
+                    return cached[0]
                 event = self._decoded_chunk_inflight.get(cache_key)
                 if event is None:
                     event = threading.Event()
@@ -251,13 +369,14 @@ class SidecarStore:
         with self._cache_lock:
             cached = self._decoded_chunk_cache.get(cache_key)
             if cached is None:
-                self._decoded_chunk_cache[cache_key] = decoded
-                self._decoded_chunk_cache.move_to_end(cache_key)
-                while len(self._decoded_chunk_cache) > self.max_cached_chunks:
-                    self._decoded_chunk_cache.popitem(last=False)
-                result = decoded
+                self._cache_put_locked(
+                    self._decoded_chunk_cache, cache_key, decoded, None, "chunk",
+                    self.max_cached_chunks,
+                )
+                cached = self._decoded_chunk_cache.get(cache_key)
+                result = cached[0] if cached is not None else decoded
             else:
-                result = cached
+                result = cached[0]
             current = self._decoded_chunk_inflight.pop(cache_key, None)
             if current is not None:
                 current.set()
