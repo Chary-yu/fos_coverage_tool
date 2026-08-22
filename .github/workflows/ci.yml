@@ -332,6 +332,8 @@ jobs:
             bash -lc "find app scripts -type f -name '*.py' -print0 | xargs -0 python -m py_compile && python -m py_compile source_reader.py code_detail_service.py coverage_check.py enhance_coverage.py"
       - name: Run compatibility-focused tests
         run: |
+          mkdir -p .artifacts
+          set -o pipefail
           docker run --rm \
             -v "$PWD:/workspace" -w /workspace python@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc \
             python -m unittest \
@@ -342,7 +344,14 @@ jobs:
             tests.vnext.test_jobs \
             tests.vnext.test_migration_runner \
             tests.vnext.test_runtime_config \
-            tests.vnext.test_vnext_runtime -v
+            tests.vnext.test_vnext_runtime -v 2>&1 | tee .artifacts/py36-compat.log
+      - name: Upload Python 3.6 compatibility log
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: py36-compatibility-log
+          path: .artifacts/py36-compat.log
+          if-no-files-found: error
 
   mock-dom-regression:
     name: Mock DOM regression (not browser evidence)
