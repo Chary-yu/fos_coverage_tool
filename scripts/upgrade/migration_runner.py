@@ -323,6 +323,42 @@ def _index_exists(connection, table_name, index_name):
     return bool(row)
 
 
+RUNTIME_INDEXES = (
+    ("coverage_background_jobs", "idx_vnext_jobs_active_identity",
+     "project_id, scan_id, kind, data_version, state, created_at, job_id"),
+    ("coverage_background_jobs", "idx_vnext_jobs_recovery",
+     "state, heartbeat_at, created_at, job_id"),
+    ("coverage_background_jobs", "idx_vnext_jobs_created_cursor",
+     "created_at, job_id"),
+    ("coverage_file_state", "idx_vnext_file_state_pending",
+     "scan_id, pending_total, file_id"),
+    ("coverage_analysis_line_links", "idx_vnext_links_scan_active_line",
+     "scan_id, is_active, line_id"),
+)
+
+
+def _ensure_runtime_indexes(connection):
+    """Install bounded hot-path indexes using MariaDB-5.5-safe additive DDL."""
+    for table_name, index_name, columns in RUNTIME_INDEXES:
+        if not _table_exists(connection, table_name) or _index_exists(
+                connection, table_name, index_name):
+            continue
+        cursor = connection.cursor()
+        try:
+            if is_sqlite(connection):
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS {} ON {} ({})".format(
+                        index_name, table_name, columns
+                    )
+                )
+            else:
+                cursor.execute(adapt_sql(connection, """
+                    ALTER TABLE {table} ADD INDEX {index} ({columns})
+                """.format(table=table_name, index=index_name, columns=columns)))
+        finally:
+            cursor.close()
+
+
 def _legacy_provenance_key_hash(migration_id, entity_type,
                                 target_entity_id, source_table):
     """Return a bounded identity key that remains indexable on MariaDB 5.5."""
@@ -1215,6 +1251,7 @@ def create_sqlite_schema(connection):
             _ensure_incremental_result_key_hash,
             _ensure_import_failure_key_hash):
         ensure_key_hash(connection)
+    _ensure_runtime_indexes(connection)
     connection.commit()
 
 
@@ -1312,6 +1349,8 @@ def apply_schema(connection, ddl_path, release_sha=""):
             str(existing_before_preflight.get("state") or "").upper() == "APPLIED"):
         if str(existing_before_preflight.get("ddl_sha256") or "") != ddl_sha256:
             raise ValueError("schema migration checksum changed after APPLIED state")
+        _ensure_runtime_indexes(connection)
+        connection.commit()
         return {"status": "PASSED", "migration_id": migration_id,
                 "idempotent": True, "ddl_sha256": ddl_sha256,
                 "target_preflight": preflight}
@@ -1558,6 +1597,7 @@ def apply_schema(connection, ddl_path, release_sha=""):
         _ensure_legacy_provenance_key_hash(connection)
         _ensure_incremental_result_key_hash(connection)
         _ensure_import_failure_key_hash(connection)
+        _ensure_runtime_indexes(connection)
         # Keep the historical key for old health checks while introducing the
         # stage-specific metadata required by Gate A.
         meta_rows = [
@@ -1808,7 +1848,8 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None,
                 file_row = files[(context["repository_name"], context["file_path_hash"])]
                 line_rows = line_repo.upsert_lines(
                     conn, file_row["id"],
-                    [context["lines"][number] for number in sorted(context["lines"])]
+                    [context["lines"][number] for number in sorted(context["lines"])],
+                    return_rows=True,
                 )
                 by_number = {int(row["line_number"]): row for row in line_rows}
                 for number, row in by_number.items():

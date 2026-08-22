@@ -40,12 +40,23 @@ class ScanImportRecoveryService(object):
             self.stager = ImmutableArtifactStager(path)
         return self.stager
 
-    def list_recoverable(self, connection):
+    def list_recoverable(self, connection, limit=200, cursor=None):
+        params = []
+        cursor_sql = ""
+        if cursor:
+            cursor_sql = " AND (created_at > ? OR (created_at = ? AND job_id > ?))"
+            params.extend((
+                str(cursor.get("created_at") or ""),
+                str(cursor.get("created_at") or ""),
+                str(cursor.get("job_id") or ""),
+            ))
+        params.append(min(200, max(1, int(limit or 200))))
         return fetchall(connection, """
             SELECT * FROM coverage_background_jobs
             WHERE kind='scan_import' AND state IN ('queued', 'running', 'interrupted')
-            ORDER BY created_at, job_id
-        """)
+            {cursor_sql}
+            ORDER BY created_at, job_id LIMIT ?
+        """.format(cursor_sql=cursor_sql), params)
 
     def validate(self, connection, job_id):
         job = self.jobs.get(connection, job_id)

@@ -180,6 +180,7 @@ CREATE TABLE IF NOT EXISTS coverage_file_state (
     data_version BIGINT NOT NULL DEFAULT 0,
     updated_at DATETIME NOT NULL,
     PRIMARY KEY (scan_id, file_id),
+    KEY idx_vnext_file_state_pending (scan_id, pending_total, file_id),
     CONSTRAINT fk_file_state_scan FOREIGN KEY (scan_id)
         REFERENCES coverage_scans(id),
     CONSTRAINT fk_file_state_file FOREIGN KEY (file_id)
@@ -210,6 +211,11 @@ CREATE TABLE IF NOT EXISTS coverage_background_jobs (
     KEY idx_vnext_jobs_project (project_id),
     KEY idx_vnext_jobs_scan (scan_id),
     KEY idx_vnext_jobs_state (state),
+    KEY idx_vnext_jobs_active_identity (
+        project_id, scan_id, kind, data_version, state, created_at, job_id
+    ),
+    KEY idx_vnext_jobs_recovery (state, heartbeat_at, created_at, job_id),
+    KEY idx_vnext_jobs_created_cursor (created_at, job_id),
     CONSTRAINT fk_vnext_jobs_project FOREIGN KEY (project_id)
         REFERENCES coverage_projects(id),
     CONSTRAINT fk_vnext_jobs_scan FOREIGN KEY (scan_id)
@@ -393,6 +399,7 @@ CREATE TABLE IF NOT EXISTS coverage_analysis_line_links (
     UNIQUE KEY uq_analysis_line_link_line (scan_id, line_id),
     KEY idx_analysis_line_link_record (analysis_record_id),
     KEY idx_analysis_line_link_state (scan_id, review_state, is_active),
+    KEY idx_vnext_links_scan_active_line (scan_id, is_active, line_id),
     CONSTRAINT fk_analysis_line_link_scan FOREIGN KEY (scan_id)
         REFERENCES coverage_scans(id),
     CONSTRAINT fk_analysis_line_link_line FOREIGN KEY (line_id)

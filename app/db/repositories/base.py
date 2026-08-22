@@ -82,6 +82,22 @@ def fetchall(connection, sql: str, params: Iterable[Any] = ()):
         cursor.close()
 
 
+def iter_rows(connection, sql: str, params: Iterable[Any] = (), batch_size=500):
+    """Yield DB rows in bounded batches without materializing a result set."""
+    cursor = execute(connection, sql, params)
+    columns = _description(cursor)
+    size = max(1, int(batch_size or 500))
+    try:
+        while True:
+            rows = cursor.fetchmany(size)
+            if not rows:
+                break
+            for row in rows:
+                yield row_to_dict(cursor, row) if not isinstance(row, dict) else dict(row)
+    finally:
+        cursor.close()
+
+
 def insert_id(cursor, fallback: int = 0) -> int:
     value = getattr(cursor, "lastrowid", None)
     try:

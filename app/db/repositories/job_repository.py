@@ -124,7 +124,8 @@ class JobRepository(object):
         return count
 
     def list_recoverable(self, connection, timeout_seconds: float, now=None,
-                         lease_owner=None, exclude_kinds=None):
+                         lease_owner=None, exclude_kinds=None, limit=200,
+                         cursor=None):
         """List queued or fenced/stale jobs before a recovery claim.
 
         A recovery worker must inspect the durable input before changing state;
@@ -154,10 +155,19 @@ class JobRepository(object):
                 ", ".join("?" for _ in values)
             ))
             params.extend(str(value) for value in values)
+        if cursor:
+            clauses.append("(created_at > ? OR (created_at = ? AND job_id > ?))")
+            params.extend((
+                str(cursor.get("created_at") or ""),
+                str(cursor.get("created_at") or ""),
+                str(cursor.get("job_id") or ""),
+            ))
+        page_limit = min(200, max(1, int(limit or 200)))
+        params.append(page_limit)
         return fetchall(connection, """
             SELECT * FROM coverage_background_jobs
             WHERE {}
-            ORDER BY created_at, job_id
+            ORDER BY created_at, job_id LIMIT ?
         """.format(" AND ".join(clauses)), params)
 
     def claim_for_recovery(self, connection, job_id, lease_owner, now=None,

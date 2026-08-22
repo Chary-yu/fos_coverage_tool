@@ -101,7 +101,8 @@ class InheritanceEngine(object):
         )
 
     def run(self, connection, candidate_scan_id, repository_paths=None,
-            decision_run_id=None, algorithm_version=ALGORITHM_VERSION):
+            decision_run_id=None, algorithm_version=ALGORITHM_VERSION,
+            collect_decisions=False, batch_size=500):
         self._metrics = {
             "parser_candidate_total": 0,
             "parser_unresolved_total": 0,
@@ -141,194 +142,161 @@ class InheritanceEngine(object):
             "predecessor_scan_id": predecessor_id,
             "algorithm_version": algorithm_version,
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
-        if not predecessor_id:
-            decisions = self._ordinary_pending_decisions(
-                connection, candidate_scan_id, run_id, algorithm_version, "NO_PREDECESSOR"
-            )
-            return {"status": "PASSED", "decision_run_id": run_id,
-                    "decisions": decisions, "inherited": 0,
-                    "pending": len(decisions), "read_set": [],
-                    "metrics": dict(self._metrics)}
+        decisions = [] if collect_decisions else None
         repository_paths = repository_paths or {}
-        source_relations = fetchall(connection, """
-            SELECT q.*, l.line_number AS source_line_number, l.line_text AS source_line_text,
-                   l.coverage_state AS source_coverage_state, f.file_path,
-                   f.repository_name, f.file_path_hash, b.block_identity_verified,
-                   b.id AS source_block_id, r.content_revision AS source_content_revision
-            FROM coverage_analysis_line_links q
-            JOIN coverage_lines l ON l.id=q.line_id
-            JOIN coverage_files f ON f.id=l.file_id
-            LEFT JOIN coverage_analysis_blocks b ON b.id=q.analysis_block_id
-            LEFT JOIN coverage_analysis_records r ON r.id=q.analysis_record_id
-            WHERE q.scan_id=? AND q.is_active=1
-            ORDER BY f.repository_name, f.file_path, l.line_number
-        """, (int(predecessor_id),))
-        read_set = self._read_set_for_relations(source_relations)
-        candidate_lines = fetchall(connection, """
-            SELECT l.*, f.file_path, f.repository_name, f.file_path_hash
-            FROM coverage_lines l JOIN coverage_files f ON f.id=l.file_id
-            WHERE f.scan_id=?
-            ORDER BY f.repository_name, f.file_path, l.line_number
-        """, (int(candidate_scan_id),))
-        # A path identifies a Candidate file, not a Candidate line. Keeping a
-        # line row here used to overwrite the entry once per physical line;
-        # the later lookup then used that line id as if it were file_id.
-        candidate_file_id_by_path = {}
-        ambiguous_file_paths = set()
-        for row in candidate_lines:
-            key = (str(row.get("repository_name") or ""),
-                   str(row.get("file_path") or ""))
-            file_id = int(row.get("file_id") or 0)
-            previous = candidate_file_id_by_path.get(key)
-            if previous is None:
-                candidate_file_id_by_path[key] = file_id
-            elif int(previous) != file_id:
-                ambiguous_file_paths.add(key)
-        candidate_by_file_line = {
-            (int(row.get("file_id") or 0), int(row.get("line_number") or 0)): row
-            for row in candidate_lines
-        }
-        decisions = []
-        decided_line_ids = set()
-        file_contexts = {}
-        for relation in source_relations:
-            self._metrics["relation_total"] += 1
-            key = (str(relation.get("repository_name") or ""),
-                   str(relation.get("file_path") or ""))
-            repository_status = repository_resolution.get(key[0])
+        read_set_by_relation = {}
+        read_set_by_record = {}
+
+        def persist(candidate_line, relation, reason, result=None, mapping=None):
+            decision = self._write_decision(
+                connection, run_id, candidate_scan_id, candidate_line, relation,
+                reason, algorithm_version, result=result, mapping=mapping,
+            )
+            if decisions is not None:
+                decisions.append(decision)
+            return decision
+
+        if not predecessor_id:
+            for candidate_line in self._iter_candidate_lines(
+                    connection, candidate_scan_id, batch_size=batch_size):
+                if self._is_review_candidate(candidate_line):
+                    persist(candidate_line, None, "NO_PREDECESSOR")
+            summary = self._decision_summary(connection, run_id)
+            return self._run_result(
+                run_id, decisions, summary, [], self._metrics,
+            )
+
+        # Read the source side a file work-unit at a time.  Relation pages and
+        # candidate line pages are bounded; no full scan is retained in Python.
+        for source_file in self._iter_relation_files(
+                connection, predecessor_id, batch_size=batch_size):
+            repository_name = str(source_file.get("repository_name") or "")
+            repository_status = repository_resolution.get(repository_name)
             if repository_resolution_available and (
                     not repository_status or
                     str(repository_status.get("reason_code") or "NO_PREDECESSOR") != "READY"):
-                # Repository eligibility is decided before Git ancestry. In
-                # particular, an ancestor commit on another branch must never
-                # reach _snapshot_for_relation(). The final candidate-line
-                # pass persists the repository-level reason for every pending
-                # line so the rejection remains explainable.
                 continue
-            target_file_id = candidate_file_id_by_path.get(key)
-            if not target_file_id or key in ambiguous_file_paths:
+            key = (repository_name, str(source_file.get("file_path") or ""))
+            target_file = self._candidate_file(
+                connection, candidate_scan_id, repository_name, key[1]
+            )
+            if not target_file:
                 continue
-            source_snapshot = file_contexts.get(key)
-            if source_snapshot is None:
-                repo_path = repository_paths.get(key[0])
-                candidate_snapshot = self._repository_snapshot(
-                    connection, candidate_scan_id, key[0]
+            target_lines = {
+                int(row.get("line_number") or 0): row
+                for row in self._iter_file_lines(
+                    connection, int(target_file["id"]), batch_size=batch_size
                 )
-                predecessor_snapshot = self._repository_snapshot(
-                    connection, predecessor_id, key[0]
+            }
+            first_relation = None
+            source_snapshot = None
+            for relation in self._iter_source_relations(
+                    connection, predecessor_id, int(source_file["file_id"]),
+                    batch_size=batch_size):
+                self._metrics["relation_total"] += 1
+                self._add_read_set(
+                    relation, read_set_by_relation, read_set_by_record
                 )
-                source_snapshot = self._snapshot_for_relation(
-                    relation, repo_path, predecessor_snapshot, candidate_snapshot
-                )
-                self._metrics["file_work_units"] += 1
-                if not source_snapshot.get("reason_code"):
-                    old_lines = source_snapshot["old_text"].splitlines()
-                    new_lines = source_snapshot["new_text"].splitlines()
-                    source_snapshot["old_analysis"] = self.parser.analyze(
-                        source_snapshot["old_text"], relation.get("file_path") or ""
+                if first_relation is None:
+                    first_relation = relation
+                    repo_path = repository_paths.get(repository_name)
+                    candidate_snapshot = self._repository_snapshot(
+                        connection, candidate_scan_id, repository_name
                     )
-                    source_snapshot["new_analysis"] = self.parser.analyze(
-                        source_snapshot["new_text"], relation.get("file_path") or ""
+                    predecessor_snapshot = self._repository_snapshot(
+                        connection, predecessor_id, repository_name
                     )
-                    source_snapshot["old_lines"] = old_lines
-                    source_snapshot["new_lines"] = new_lines
-                    self._metrics["parser_file_total"] += 2
-                file_contexts[key] = source_snapshot
-            if source_snapshot.get("reason_code"):
-                decisions.append(self._write_decision(
-                    connection, run_id, candidate_scan_id, None, relation,
-                    source_snapshot["reason_code"], algorithm_version,
-                ))
-                continue
-            mapping = source_snapshot.get("mapping") or self.line_mapper.map_text(
-                source_snapshot["old_text"], source_snapshot["new_text"]
-            )
-            if not source_snapshot.get("mapping"):
-                self._metrics["mapping_total"] += 1
-            new_line_number = mapping.get(int(relation["source_line_number"]))
-            if new_line_number is None:
-                reason = "LINE_DELETED" if int(relation["source_line_number"]) in mapping.deleted else "LINE_AMBIGUOUS"
-                decisions.append(self._write_decision(
-                    connection, run_id, candidate_scan_id, None, relation,
-                    reason, algorithm_version, mapping=mapping,
-                ))
-                continue
-            target_line = candidate_by_file_line.get(
-                (int(target_file_id), int(new_line_number))
-            )
-            if not target_line:
-                continue
-            self._metrics["decision_read_total"] += 1
-            existing_decision = fetchone(connection, """
-                SELECT * FROM coverage_inheritance_decisions
-                WHERE decision_run_id=? AND candidate_line_id=?
-            """, (run_id, int(target_line["id"])))
-            old_analysis = source_snapshot["old_analysis"]
-            new_analysis = source_snapshot["new_analysis"]
-            old_lines = source_snapshot["old_lines"]
-            new_lines = source_snapshot["new_lines"]
-            old_line_text = (old_lines[int(relation["source_line_number"]) - 1]
-                             if 0 < int(relation["source_line_number"]) <= len(old_lines)
-                             else relation.get("source_line_text") or "")
-            new_line_text = (new_lines[int(new_line_number) - 1]
-                             if 0 < int(new_line_number) <= len(new_lines)
-                             else target_line.get("line_text") or "")
-            result = self.compare_line(
-                old_line_text, new_line_text,
-                old_analysis, new_analysis,
-                relation.get("source_line_number"), new_line_number,
-                old_index=source_snapshot.get("old_index"),
-                new_index=source_snapshot.get("new_index"),
-            )
-            self._metrics["parser_candidate_total"] += 1
-            if result.reason_code in (
-                    "FUNCTION_ID_UNRESOLVED", "PARSER_UNRELIABLE",
-                    "CALLEE_UNRESOLVED", "MACRO_CHANGED", "CONST_CHANGED"):
-                self._metrics["parser_unresolved_total"] += 1
-                by_reason = self._metrics["parser_unresolved_by_reason"]
-                by_reason[result.reason_code] = int(
-                    by_reason.get(result.reason_code) or 0
-                ) + 1
-            if result.reason_code == "CALLEE_UNRESOLVED":
-                self._metrics["callee_unresolved_total"] += 1
-                by_reason = self._metrics["callee_unresolved_by_reason"]
-                by_reason[result.reason_code] = int(
-                    by_reason.get(result.reason_code) or 0
-                ) + 1
-            if result.reason_code == "MACRO_CHANGED":
-                self._metrics["macro_unresolved_total"] += 1
-                by_reason = self._metrics["macro_unresolved_by_reason"]
-                by_reason[result.reason_code] = int(
-                    by_reason.get(result.reason_code) or 0
-                ) + 1
-            if result.reason_code == "CONST_CHANGED":
-                self._metrics["const_unresolved_total"] += 1
-                by_reason = self._metrics["const_unresolved_by_reason"]
-                by_reason[result.reason_code] = int(
-                    by_reason.get(result.reason_code) or 0
-                ) + 1
-            result.mapping_fingerprint = mapping.fingerprint
-            if result.ok and (not relation.get("analysis_block_id") or
-                              not int(relation.get("block_identity_verified") or 0)):
-                result = self._result(False, "BLOCK_AMBIGUOUS",
-                                      line_mapping_fingerprint=mapping.fingerprint)
-            decision = self._write_decision(
-                connection, run_id, candidate_scan_id, target_line, relation,
-                result.reason_code, algorithm_version, result=result,
-                mapping=mapping,
-            )
-            decisions.append(decision)
-            decided_line_ids.add(int(target_line["id"]))
-            if result.ok:
+                    source_snapshot = self._snapshot_for_relation(
+                        relation, repo_path, predecessor_snapshot,
+                        candidate_snapshot,
+                    )
+                    self._metrics["file_work_units"] += 1
+                    if not source_snapshot.get("reason_code"):
+                        source_snapshot["old_lines"] = source_snapshot["old_text"].splitlines()
+                        source_snapshot["new_lines"] = source_snapshot["new_text"].splitlines()
+                        source_snapshot["old_analysis"] = self.parser.analyze(
+                            source_snapshot["old_text"], key[1]
+                        )
+                        source_snapshot["new_analysis"] = self.parser.analyze(
+                            source_snapshot["new_text"], key[1]
+                        )
+                        self._metrics["parser_file_total"] += 2
+                if source_snapshot.get("reason_code"):
+                    persist(None, relation, source_snapshot["reason_code"])
+                    continue
+                mapping = source_snapshot.get("mapping")
+                if mapping is None:
+                    mapping = self.line_mapper.map_text(
+                        source_snapshot["old_text"], source_snapshot["new_text"]
+                    )
+                    self._metrics["mapping_total"] += 1
+                new_line_number = mapping.get(int(relation["source_line_number"]))
+                if new_line_number is None:
+                    reason = (
+                        "LINE_DELETED"
+                        if int(relation["source_line_number"]) in mapping.deleted
+                        else "LINE_AMBIGUOUS"
+                    )
+                    persist(None, relation, reason, mapping=mapping)
+                    continue
+                target_line = target_lines.get(int(new_line_number))
+                if not target_line:
+                    persist(None, relation, "NO_TARGET_LINE", mapping=mapping)
+                    continue
+                self._metrics["decision_read_total"] += 1
+                existing_decision = fetchone(connection, """
+                    SELECT * FROM coverage_inheritance_decisions
+                    WHERE decision_run_id=? AND candidate_line_id=?
+                """, (run_id, int(target_line["id"])))
+                old_lines = source_snapshot["old_lines"]
+                new_lines = source_snapshot["new_lines"]
+                old_line_number = int(relation["source_line_number"])
+                new_line_number = int(new_line_number)
+                old_line_text = (
+                    old_lines[old_line_number - 1]
+                    if 0 < old_line_number <= len(old_lines)
+                    else relation.get("source_line_text") or ""
+                )
+                new_line_text = (
+                    new_lines[new_line_number - 1]
+                    if 0 < new_line_number <= len(new_lines)
+                    else target_line.get("line_text") or ""
+                )
+                result = self.compare_line(
+                    old_line_text, new_line_text,
+                    source_snapshot["old_analysis"], source_snapshot["new_analysis"],
+                    old_line_number, new_line_number,
+                    old_index=source_snapshot.get("old_index"),
+                    new_index=source_snapshot.get("new_index"),
+                )
+                self._record_parser_result(result)
+                result.mapping_fingerprint = mapping.fingerprint
+                if result.ok and (not relation.get("analysis_block_id") or
+                                  not int(relation.get("block_identity_verified") or 0)):
+                    result = self._result(
+                        False, "BLOCK_AMBIGUOUS",
+                        line_mapping_fingerprint=mapping.fingerprint,
+                    )
+                persist(
+                    target_line, relation, result.reason_code,
+                    result=result, mapping=mapping,
+                )
+                if not result.ok:
+                    continue
                 if (existing_decision and
                         str(existing_decision.get("decision") or "") == "INHERITED" and
                         self._active_link_for_line(
                             connection, candidate_scan_id, target_line["id"]
                         )):
                     continue
-                record = self.domain.get_record(connection, relation["analysis_record_id"])
-                state = (CARRIED_COVERED if str(target_line.get("coverage_state") or "").lower()
-                         in ("covered", "1") else INHERITED_PENDING)
+                record = self.domain.get_record(
+                    connection, relation["analysis_record_id"]
+                )
+                state = (
+                    CARRIED_COVERED
+                    if str(target_line.get("coverage_state") or "").lower()
+                    in ("covered", "1") else INHERITED_PENDING
+                )
                 clone = self.domain.create_record(connection, {
                     "conclusion_status": record.get("conclusion_status", ""),
                     "coverage_method": record.get("coverage_method", ""),
@@ -347,33 +315,191 @@ class InheritanceEngine(object):
                     source_line_id=relation["line_id"],
                     source_relation_id=relation["id"],
                 )
-        # A predecessor relation is not a license to silently omit a new or
-        # renamed candidate line.  Every uncovered candidate receives an
-        # ordinary, explainable no-inherit decision when no source relation
-        # reached it; covered lines are outside the review-candidate set.
-        for candidate_line in candidate_lines:
-            line_id = int(candidate_line.get("id") or 0)
-            if line_id in decided_line_ids or not self._is_review_candidate(candidate_line):
+
+        # A source relation is not a license to omit a new candidate line.
+        # The anti-join makes retries idempotent without a resident line-id set.
+        for candidate_line in self._iter_candidate_lines(
+                connection, candidate_scan_id, run_id=run_id,
+                batch_size=batch_size):
+            if not self._is_review_candidate(candidate_line):
                 continue
-            candidate_key = (str(candidate_line.get("repository_name") or ""),
-                             str(candidate_line.get("file_path") or ""))
-            repository_status = repository_resolution.get(candidate_key[0])
+            repository_name = str(candidate_line.get("repository_name") or "")
             reason = "NO_SOURCE_RELATION"
             if repository_resolution_available:
-                repository_reason = str((repository_status or {}).get("reason_code") or
-                                        "NO_PREDECESSOR")
+                repository_reason = str(
+                    (repository_resolution.get(repository_name) or {}).get(
+                        "reason_code"
+                    ) or "NO_PREDECESSOR"
+                )
                 if repository_reason != "READY":
                     reason = repository_reason
-            decisions.append(self._write_decision(
-                connection, run_id, candidate_scan_id, candidate_line, None,
-                reason, algorithm_version,
-            ))
-        return {"status": "PASSED", "decision_run_id": run_id,
-                "decisions": decisions,
-                "inherited": len([item for item in decisions if item.get("decision") == "INHERITED"]),
-                "pending": len([item for item in decisions if item.get("decision") != "INHERITED"]),
-                "read_set": read_set,
-                "metrics": dict(self._metrics)}
+            persist(candidate_line, None, reason)
+        read_set = self._read_set_from_maps(read_set_by_relation, read_set_by_record)
+        summary = self._decision_summary(connection, run_id)
+        return self._run_result(
+            run_id, decisions, summary, read_set, self._metrics,
+        )
+
+    @staticmethod
+    def _run_result(run_id, decisions, summary, read_set, metrics):
+        return {
+            "status": "PASSED", "decision_run_id": run_id,
+            "decisions": decisions if decisions is not None else [],
+            "decision_count": int(summary.get("total") or 0),
+            "inherited": int(summary.get("inherited") or 0),
+            "pending": int(summary.get("pending") or 0),
+            "read_set": read_set,
+            "metrics": dict(metrics),
+        }
+
+    @staticmethod
+    def _add_read_set(relation, relations, records):
+        relation_id = relation.get("id")
+        if relation_id is not None:
+            relations[int(relation_id)] = {
+                "relation_id": int(relation_id),
+                "relation_revision": int(relation.get("relation_revision") or 0),
+            }
+        record_id = relation.get("analysis_record_id")
+        if record_id is not None and relation.get("source_content_revision") is not None:
+            records[int(record_id)] = {
+                "record_id": int(record_id),
+                "content_revision": int(relation.get("source_content_revision") or 0),
+            }
+
+    @staticmethod
+    def _read_set_from_maps(relations, records):
+        return sorted(
+            list(relations.values()) + list(records.values()),
+            key=lambda item: (
+                0 if "relation_id" in item else 1,
+                int(item.get("relation_id", item.get("record_id", 0))),
+            ),
+        )
+
+    def _record_parser_result(self, result):
+        self._metrics["parser_candidate_total"] += 1
+        reason = result.reason_code
+        if reason in (
+                "FUNCTION_ID_UNRESOLVED", "PARSER_UNRELIABLE",
+                "CALLEE_UNRESOLVED", "MACRO_CHANGED", "CONST_CHANGED"):
+            self._metrics["parser_unresolved_total"] += 1
+            values = self._metrics["parser_unresolved_by_reason"]
+            values[reason] = int(values.get(reason) or 0) + 1
+        counter = {
+            "CALLEE_UNRESOLVED": "callee_unresolved_total",
+            "MACRO_CHANGED": "macro_unresolved_total",
+            "CONST_CHANGED": "const_unresolved_total",
+        }.get(reason)
+        if counter:
+            self._metrics[counter] += 1
+            values = self._metrics[counter.replace("_total", "_by_reason")]
+            values[reason] = int(values.get(reason) or 0) + 1
+
+    def _decision_summary(self, connection, run_id):
+        row = fetchone(connection, """
+            SELECT COUNT(*) AS total,
+                   COALESCE(SUM(CASE WHEN decision='INHERITED' THEN 1 ELSE 0 END), 0)
+                       AS inherited
+            FROM coverage_inheritance_decisions WHERE decision_run_id=?
+        """, (run_id,)) or {}
+        total = int(row.get("total") or 0)
+        inherited = int(row.get("inherited") or 0)
+        return {"total": total, "inherited": inherited, "pending": total - inherited}
+
+    def _iter_relation_files(self, connection, scan_id, batch_size=500):
+        last_id = 0
+        while True:
+            rows = fetchall(connection, """
+                SELECT f.id AS file_id, f.file_path, f.repository_name,
+                       f.file_path_hash
+                FROM coverage_files f
+                WHERE f.scan_id=? AND f.id>? AND EXISTS (
+                    SELECT 1 FROM coverage_lines l
+                    JOIN coverage_analysis_line_links q ON q.line_id=l.id
+                    WHERE l.file_id=f.id AND q.scan_id=? AND q.is_active=1
+                )
+                ORDER BY f.id LIMIT ?
+            """, (int(scan_id), int(last_id), int(scan_id),
+                   int(max(1, batch_size))))
+            if not rows:
+                break
+            for row in rows:
+                yield row
+            last_id = int(rows[-1].get("file_id") or 0)
+
+    def _iter_source_relations(self, connection, scan_id, file_id, batch_size=500):
+        last_id = 0
+        while True:
+            rows = fetchall(connection, """
+                SELECT q.*, l.file_id AS source_file_id,
+                       l.line_number AS source_line_number,
+                       l.line_text AS source_line_text,
+                       l.coverage_state AS source_coverage_state,
+                       f.file_path, f.repository_name, f.file_path_hash,
+                       b.block_identity_verified, b.id AS source_block_id,
+                       r.content_revision AS source_content_revision
+                FROM coverage_analysis_line_links q
+                JOIN coverage_lines l ON l.id=q.line_id
+                JOIN coverage_files f ON f.id=l.file_id
+                LEFT JOIN coverage_analysis_blocks b ON b.id=q.analysis_block_id
+                LEFT JOIN coverage_analysis_records r ON r.id=q.analysis_record_id
+                WHERE q.scan_id=? AND q.is_active=1 AND l.file_id=? AND q.id>?
+                ORDER BY q.id LIMIT ?
+            """, (int(scan_id), int(file_id), int(last_id), int(max(1, batch_size))))
+            if not rows:
+                break
+            for row in rows:
+                yield row
+            last_id = int(rows[-1].get("id") or 0)
+
+    def _candidate_file(self, connection, scan_id, repository_name, file_path):
+        return fetchone(connection, """
+            SELECT * FROM coverage_files
+            WHERE scan_id=? AND repository_name=? AND file_path=?
+            ORDER BY id LIMIT 1
+        """, (int(scan_id), str(repository_name or ""), str(file_path or "")))
+
+    def _iter_file_lines(self, connection, file_id, batch_size=500):
+        last_id = 0
+        while True:
+            rows = fetchall(connection, """
+                SELECT l.* FROM coverage_lines l
+                WHERE l.file_id=? AND l.id>? ORDER BY l.id LIMIT ?
+            """, (int(file_id), int(last_id), int(max(1, batch_size))))
+            if not rows:
+                break
+            for row in rows:
+                yield row
+            last_id = int(rows[-1].get("id") or 0)
+
+    def _iter_candidate_lines(self, connection, scan_id, run_id=None,
+                              batch_size=500):
+        last_id = 0
+        while True:
+            decision_join = ""
+            decision_filter = ""
+            params = []
+            if run_id:
+                decision_join = """
+                    LEFT JOIN coverage_inheritance_decisions d
+                      ON d.candidate_line_id=l.id AND d.decision_run_id=?
+                """
+                params.append(str(run_id))
+                decision_filter = " AND d.id IS NULL"
+            params.extend((int(scan_id), int(last_id), int(max(1, batch_size))))
+            rows = fetchall(connection, """
+                SELECT l.*, f.file_path, f.repository_name, f.file_path_hash
+                FROM coverage_lines l JOIN coverage_files f ON f.id=l.file_id
+                {decision_join}
+                WHERE f.scan_id=? AND l.id>? {decision_filter}
+                ORDER BY l.id LIMIT ?
+            """.format(decision_join=decision_join, decision_filter=decision_filter), params)
+            if not rows:
+                break
+            for row in rows:
+                yield row
+            last_id = int(rows[-1].get("id") or 0)
 
     @staticmethod
     def _read_set_for_relations(relations):
@@ -466,10 +592,13 @@ class InheritanceEngine(object):
                     return {"reason_code": "NON_ANCESTOR"}
                 old_text = provider.read_file(old_commit, relation["file_path"])
                 new_text = provider.read_file(new_commit, relation["file_path"])
-                mapping = self.line_mapper.map_git_file(
-                    repo_path, old_commit, new_commit,
-                    relation["file_path"],
-                )
+                map_git_text = getattr(self.line_mapper, "map_git_text", None)
+                mapping = (map_git_text(
+                    repo_path, old_commit, new_commit, relation["file_path"],
+                    old_text, new_text,
+                ) if map_git_text else self.line_mapper.map_git_file(
+                    repo_path, old_commit, new_commit, relation["file_path"],
+                ))
                 old_index = self._source_index(provider, old_commit)
                 new_index = self._source_index(provider, new_commit)
                 return {"old_text": old_text, "new_text": new_text, "mapping": mapping,

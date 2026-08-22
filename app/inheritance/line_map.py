@@ -82,6 +82,14 @@ class GitLineMapEngine(object):
             raise ValueError("Git line-map path is not repository-relative")
         old_text = self._show(repo_path, old_commit, relative_path, timeout)
         new_text = self._show(repo_path, new_commit, relative_path, timeout)
+        return self.map_git_text(
+            repo_path, old_commit, new_commit, relative_path,
+            old_text, new_text, timeout=timeout,
+        )
+
+    def map_git_text(self, repo_path, old_commit, new_commit, relative_path,
+                     old_text, new_text, timeout=30):
+        """Map already-read Git snapshots using one diff invocation."""
         # Verify the primary Git evidence even when the pure mapper is used to
         # produce the physical mapping.  Rename detection and external diff
         # drivers are explicitly disabled.

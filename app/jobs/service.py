@@ -210,59 +210,72 @@ class VNextBackgroundJobService(object):
     def recover(self, heartbeat_timeout=None, exclude_kinds=None):
         connection = self.connection_factory()
         try:
-            with transaction(connection) as conn:
-                timeout = (self.heartbeat_timeout if heartbeat_timeout is None
-                           else heartbeat_timeout)
-                list_recoverable = getattr(self.repository, "list_recoverable", None)
-                claim = getattr(self.repository, "claim_for_recovery", None)
-                if not list_recoverable or not claim:
+            timeout = (self.heartbeat_timeout if heartbeat_timeout is None
+                       else heartbeat_timeout)
+            list_recoverable = getattr(self.repository, "list_recoverable", None)
+            claim = getattr(self.repository, "claim_for_recovery", None)
+            if not list_recoverable or not claim:
+                with transaction(connection) as conn:
                     return self.repository.mark_stale(
                         conn, timeout, lease_owner=self.lease_owner,
                         exclude_kinds=exclude_kinds,
                     )
-                candidates = list_recoverable(
-                    conn, timeout, lease_owner=self.lease_owner,
-                    exclude_kinds=exclude_kinds,
-                )
+            recovered_count = 0
+            cursor = None
+            while True:
                 claimed = []
-                interrupted = 0
-                for candidate in candidates:
-                    factory = self.recovery_handlers.get(
-                        str(candidate.get("kind") or "")
+                with transaction(connection) as conn:
+                    candidates = list_recoverable(
+                        conn, timeout, lease_owner=self.lease_owner,
+                        exclude_kinds=exclude_kinds, limit=200, cursor=cursor,
                     )
-                    if not factory:
-                        mark_interrupted = getattr(self.repository, "mark_interrupted", None)
-                        interrupted += (mark_interrupted(conn, candidate["job_id"])
-                                        if mark_interrupted else 0)
-                        continue
-                    recovered = claim(
-                        conn, candidate["job_id"], self.lease_owner,
-                        expected_state=candidate.get("state"),
-                        expected_lease_owner=candidate.get("lease_owner"),
-                        expected_heartbeat_at=candidate.get("heartbeat_at"),
-                    )
-                    if recovered:
-                        claimed.append((recovered, factory))
-            recovered_count = interrupted
-            for job, factory in claimed:
-                try:
-                    callback = factory(job)
-                    self._enqueue(job, callback)
-                    recovered_count += 1
-                except Exception as error:
-                    failure_connection = self.connection_factory()
+                    if not candidates:
+                        break
+                    last = candidates[-1]
+                    cursor = {
+                        "created_at": str(last.get("created_at") or ""),
+                        "job_id": str(last.get("job_id") or ""),
+                    }
+                    for candidate in candidates:
+                        factory = self.recovery_handlers.get(
+                            str(candidate.get("kind") or "")
+                        )
+                        if not factory:
+                            mark_interrupted = getattr(
+                                self.repository, "mark_interrupted", None
+                            )
+                            recovered_count += (
+                                mark_interrupted(conn, candidate["job_id"])
+                                if mark_interrupted else 0
+                            )
+                            continue
+                        recovered = claim(
+                            conn, candidate["job_id"], self.lease_owner,
+                            expected_state=candidate.get("state"),
+                            expected_lease_owner=candidate.get("lease_owner"),
+                            expected_heartbeat_at=candidate.get("heartbeat_at"),
+                        )
+                        if recovered:
+                            claimed.append((recovered, factory))
+                for job, factory in claimed:
                     try:
-                        with transaction(failure_connection) as conn:
-                            failed = dict(job)
-                            failed.update({
-                                "state": "failed", "error_message": str(error),
-                                "finished_at": _now(), "heartbeat_at": _now(),
-                            })
-                            self.repository.upsert(conn, failed)
-                    finally:
-                        close = getattr(failure_connection, "close", None)
-                        if close:
-                            close()
+                        callback = factory(job)
+                        self._enqueue(job, callback)
+                        recovered_count += 1
+                    except Exception as error:
+                        failure_connection = self.connection_factory()
+                        try:
+                            with transaction(failure_connection) as conn:
+                                failed = dict(job)
+                                failed.update({
+                                    "state": "failed", "error_message": str(error),
+                                    "finished_at": _now(), "heartbeat_at": _now(),
+                                })
+                                self.repository.upsert(conn, failed)
+                        finally:
+                            close = getattr(failure_connection, "close", None)
+                            if close:
+                                close()
             return recovered_count
         finally:
             close = getattr(connection, "close", None)

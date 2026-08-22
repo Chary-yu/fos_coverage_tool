@@ -149,18 +149,24 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
         source = self._functions if kind == "functions" else (
             self._macros if kind == "macros" else self._constants
         )
-        if str(name) in source:
-            # A second definition may still be hidden. Continue loading until
-            # all paths are visited or the byte budget makes the result
-            # explicitly unresolved.
-            pass
+        symbol = str(name)
         for path in self._lazy_paths:
-            if path not in self.analyses:
-                if not self._load_path(path) and self.budget_exhausted:
+            values = source.get(symbol, ())
+            if len(values) > 1:
+                break
+            if path not in self.analyses and not self._load_path(path):
+                if self.budget_exhausted:
                     break
+            source = self._functions if kind == "functions" else (
+                self._macros if kind == "macros" else self._constants
+            )
+            if len(source.get(symbol, ())) > 1:
+                break
 
     def functions(self, name, local_analysis=None):
         self._ensure_symbol("functions", name)
+        if self.budget_exhausted:
+            return []
         values = list(self._functions.get(str(name), ()))
         if values or local_analysis is None:
             return values
@@ -169,6 +175,8 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
 
     def definitions(self, kind, name, local_analysis=None):
         self._ensure_symbol(kind, name)
+        if self.budget_exhausted:
+            return []
         source = self._macros if kind == "macros" else self._constants
         values = list(source.get(str(name), ()))
         if values or local_analysis is None:
