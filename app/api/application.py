@@ -76,6 +76,7 @@ class VNextApplication(object):
         self.router.add("POST", r"^/api/coverage/scans/([^/]+)/inheritance/undo$", self.inheritance_undo)
         self.router.add("GET", r"^/api/coverage/progress$", self.progress)
         self.router.add("GET", r"^/api/coverage/progress/details$", self.progress_details)
+        self.router.add("GET", r"^/api/coverage/progress/files$", self.progress_files)
         self.router.add("GET", r"^/api/coverage/progress/pending$", self.progress_pending)
         self.router.add("GET", r"^/api/coverage/incremental/unanalyzed$", self.unanalyzed)
         self.router.add("POST", r"^/api/coverage/incremental$", self.incremental)
@@ -656,6 +657,47 @@ class VNextApplication(object):
             "page": page, "page_size": page_size, "total": total,
             "total_pages": (total + page_size - 1) // page_size if total else 0,
             "rows": rows,
+        }
+
+    def progress_files(self, query, body, headers, remote_address):
+        """Return a bounded keyset page of file aggregates for Progress UI."""
+        project_name = progress_endpoint.project_name(
+            query, self.config.get("project_name") or ""
+        )
+        page_size = min(200, max(1, int(query.get("page_size") or 100)))
+        scan_id = query.get("scan_id")
+        with self._read_connection() as connection:
+            project = self.runtime.projects.get_project_by_name(connection, project_name)
+            if not project:
+                raise KeyError("project not found")
+            state = self.runtime.states.get(connection, int(project["id"])) or {}
+            effective_scan_id = int(scan_id) if scan_id else int(
+                state.get("current_scan_id") or 0
+            )
+            if not effective_scan_id:
+                return 200, {
+                    "project_name": project_name, "scan_id": None,
+                    "files": [], "page_size": page_size,
+                    "has_more": False, "next_cursor": None,
+                }
+            data_version = int(state.get("data_version") or 0)
+            cursor_id = self._decode_cursor(
+                query.get("cursor"), effective_scan_id, data_version, "progress_files"
+            )
+            page = self.runtime.progress_service.files_page(
+                connection, project_name, effective_scan_id,
+                page_size=page_size,
+                cursor={"file_id": cursor_id} if cursor_id is not None else None,
+            )
+        next_cursor = page.get("next_cursor")
+        next_id = (next_cursor or {}).get("file_id") if next_cursor else None
+        return 200, {
+            "project_name": project_name, "scan_id": effective_scan_id,
+            "data_version": data_version, "files": page.get("rows") or [],
+            "page_size": page_size, "has_more": bool(page.get("has_more")),
+            "next_cursor": self._encode_cursor(
+                next_id, effective_scan_id, data_version, "progress_files"
+            ) if next_id is not None else None,
         }
 
     def progress_pending(self, query, body, headers, remote_address):

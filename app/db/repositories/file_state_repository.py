@@ -288,8 +288,14 @@ class FileStateRepository(object):
             "pending_line_references": [],
         }
 
-    def pending_file_page(self, connection, scan_id: int, limit=200, cursor=None):
-        """Return bounded file-level pending aggregates without line materialization."""
+    def file_page(self, connection, scan_id: int, limit=200, cursor=None,
+                  pending_only=False):
+        """Return a bounded file window without materializing physical lines.
+
+        ``pending_only`` keeps the historical developer-task query narrow;
+        progress pages can request all file aggregates through the same
+        keyset/capability-aware path.
+        """
         page_limit = min(500, max(1, int(limit or 200)))
         after_id = int((cursor or {}).get("file_id") or 0)
         coverage = fetchone(connection, """
@@ -305,6 +311,9 @@ class FileStateRepository(object):
             int(coverage.get("files") or 0) == int(coverage.get("states") or 0)
         )
         if use_derived:
+            derived_filter = "f.scan_id=? AND f.id>?"
+            if pending_only:
+                derived_filter += " AND fs.pending_total > 0"
             rows = fetchall(connection, """
                 SELECT f.id AS file_id, f.repository_name, f.file_path,
                        fs.total_lines, fs.total_uncovered, fs.filled_total,
@@ -314,13 +323,17 @@ class FileStateRepository(object):
                 FROM coverage_files f
                 JOIN coverage_file_state fs
                   ON fs.scan_id=f.scan_id AND fs.file_id=f.id
-                WHERE f.scan_id=? AND fs.pending_total > 0 AND f.id > ?
+                WHERE {where}
                 ORDER BY f.id
                 LIMIT ?
-            """, (int(scan_id), after_id, page_limit + 1))
+            """.format(where=derived_filter),
+                (int(scan_id), after_id, page_limit + 1))
         else:
             uncovered = self._UNCOVERED_SQL
             confirmed = self._CONFIRMED_SQL
+            grouped_filter = "grouped.file_id > ?"
+            if pending_only:
+                grouped_filter = "grouped.pending_total > 0 AND " + grouped_filter
             rows = fetchall(connection, """
                 SELECT * FROM (
                     SELECT f.id AS file_id, f.repository_name, f.file_path,
@@ -352,7 +365,7 @@ class FileStateRepository(object):
                     WHERE f.scan_id=?
                     GROUP BY f.id, f.repository_name, f.file_path
                 ) grouped
-                WHERE grouped.pending_total > 0 AND grouped.file_id > ?
+                WHERE {where}
                 ORDER BY grouped.file_id
                 LIMIT ?
             """.format(
@@ -360,6 +373,7 @@ class FileStateRepository(object):
                 confirmed=confirmed, ordinary=self._ORDINARY_PENDING_SQL,
                 inherited=self._INHERITED_PENDING_SQL,
                 manual=self._MANUAL_DRAFT_PENDING_SQL,
+                where=grouped_filter,
             ), (int(scan_id), after_id, page_limit + 1))
         has_more = len(rows) > page_limit
         rows = rows[:page_limit]
@@ -376,13 +390,19 @@ class FileStateRepository(object):
             item["pending_line_numbers"] = (
                 self.pending_line_numbers_for_file(
                     connection, int(scan_id), item["file_id"], limit=200
-                ) if item["unanalyzed"] <= 200 else []
+                ) if pending_only and item["unanalyzed"] <= 200 else []
             )
             result.append(item)
         next_cursor = (
             {"file_id": result[-1]["file_id"]} if has_more and result else None
         )
         return {"rows": result, "has_more": has_more, "next_cursor": next_cursor}
+
+    def pending_file_page(self, connection, scan_id: int, limit=200, cursor=None):
+        """Compatibility wrapper for the bounded pending-file API."""
+        return self.file_page(
+            connection, scan_id, limit=limit, cursor=cursor, pending_only=True
+        )
 
     def pending_line_numbers_for_file(self, connection, scan_id, file_id, limit=200):
         uncovered = self._UNCOVERED_SQL

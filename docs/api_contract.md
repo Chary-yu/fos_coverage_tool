@@ -10,5 +10,7 @@ Progress Details is a canonical top-level pagination envelope. Its response
 fields are page, page_size, total, total_pages, and rows; clients must
 consume these fields directly and must not unwrap a legacy data member. The
 pending-file homepage endpoint is likewise bounded and may return has_more
-and next_cursor; physical line detail is loaded only through the explicit
-file detail route.
+and next_cursor. `GET /api/coverage/progress/files` is the canonical bounded
+keyset window for the Progress file table; it returns only the current window
+and binds its cursor to scan/data-version/filter. Physical line detail is
+loaded only through the explicit file detail route.

@@ -213,6 +213,70 @@ class VNextRuntimeTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(report[0], scan_id)
 
+    def test_progress_files_uses_bounded_keyset_windows(self):
+        status, body = self.application.dispatch(
+            "POST", "/api/coverage/projects", body={"project_name": "progress-files"}
+        )
+        self.assertEqual(status, 201)
+        status, body = self.application.dispatch(
+            "POST", "/api/coverage/scans",
+            body={
+                "project_name": "progress-files",
+                "info_sha256": "p" * 64,
+                "report": {"report_id": "report-progress-files"},
+                "repositories": [{
+                    "repository_name": "repo-progress",
+                    "repository_path": "/candidate/repo-progress",
+                    "branch_name": "main",
+                    "old_commit_sha": "1" * 40,
+                    "new_commit_sha": "2" * 40,
+                    "verified": True,
+                }],
+            },
+        )
+        self.assertEqual(status, 201)
+        scan_id = body["scan"]["id"]
+        self.runtime.project_service.ingest_files(
+            self.connection, scan_id, [
+                {
+                    "repository_name": "repo-progress",
+                    "file_path": "src/a.c",
+                    "file_path_hash": "a" * 32,
+                    "lines": [{"line_number": 1, "line_text": "a();",
+                               "coverage_state": "uncovered"}],
+                },
+                {
+                    "repository_name": "repo-progress",
+                    "file_path": "src/b.c",
+                    "file_path_hash": "b" * 32,
+                    "lines": [{"line_number": 1, "line_text": "b();",
+                               "coverage_state": "uncovered"}],
+                },
+            ],
+        )
+
+        status, first = self.application.dispatch(
+            "GET", "/api/coverage/progress/files",
+            query={"project": "progress-files", "page_size": "1"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(first["scan_id"], scan_id)
+        self.assertEqual(len(first["files"]), 1)
+        self.assertTrue(first["has_more"])
+        self.assertTrue(first["next_cursor"])
+        self.assertEqual(first["files"][0]["pending_line_numbers"], [])
+
+        status, second = self.application.dispatch(
+            "GET", "/api/coverage/progress/files",
+            query={
+                "project": "progress-files", "page_size": "1",
+                "cursor": first["next_cursor"],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(second["has_more"])
+        self.assertEqual([row["file_path"] for row in second["files"]], ["src/b.c"])
+
     def test_serializer_handles_cross_layer_values(self):
         value = to_jsonable({
             "amount": Decimal("1.50"),

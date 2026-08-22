@@ -107,11 +107,23 @@ class ProgressService(object):
         state = self.states.get(connection, project["id"]) or {}
         scan_id = scan_id or state.get("current_scan_id")
         if not scan_id:
-            return []
+            return {"rows": [], "has_more": False, "next_cursor": None}
         page = self.file_states.pending_file_page(
             connection, int(scan_id), limit=page_size, cursor=cursor
         )
         return page
+
+    def files_page(self, connection, project_name, scan_id=None,
+                   page_size=200, cursor=None):
+        project = self._project(connection, project_name)
+        state = self.states.get(connection, project["id"]) or {}
+        scan_id = scan_id or state.get("current_scan_id")
+        if not scan_id:
+            return {"rows": [], "has_more": False, "next_cursor": None}
+        return self.file_states.file_page(
+            connection, int(scan_id), limit=page_size, cursor=cursor,
+            pending_only=False,
+        )
 
     def pending_page(self, connection, project_name, scan_id=None,
                      page=1, page_size=100):

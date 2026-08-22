@@ -30,6 +30,9 @@
   let resolvedApiBase = '';
   let activeLoadToken = 0;
   let currentFileRows = [];
+  let currentTeamRows = [];
+  let pendingFileCursor = null;
+  let pendingFileHasMore = false;
   let currentDetailFile = '';
   let currentDetailPage = 1;
   let currentScanId = params.get('scan_id') || '';
@@ -99,7 +102,38 @@
       <tbody>${tableRows(rows, pathKey)}</tbody>`;
   }
 
+  function moduleRowsHtml(row, teamIdx) {
+    const modules = Array.isArray(row && row.modules_detail) ? row.modules_detail : [];
+    const teamQuery = encodeURIComponent(row && row.team || '');
+    const isIncremental = reviewScope === 'incremental';
+    return modules.map(mod => {
+      const modQuery = encodeURIComponent(mod.module || '');
+      const subModLinkHtml = isIncremental
+        ? `<a href="incremental_coverage.html?module=${modQuery}&team=${teamQuery}" class="progress-link" title="点击查看 [${escapeHtml(mod.module || '')}] 文件审查明细">└─ ${escapeHtml(mod.module || '')}</a>`
+        : `└─ ${escapeHtml(mod.module || '')}`;
+      return `
+        <tr class="module-subrow team-subrow-${teamIdx}" style="background-color: #f8fafc;">
+          <td style="padding-left: 28px; font-weight: 600; color: #334155;">${subModLinkHtml}</td>
+          <td class="muted">-</td>
+          <td class="path muted">${escapeHtml(mod.module || '')}</td>
+          <td>${asNumber(mod.file_total)}</td>
+          <td>${asNumber(mod.total_uncovered)}</td>
+          <td>${asNumber(mod.filled_total)}</td>
+          <td>${asNumber(mod.unfilled_total)}</td>
+          <td>${asNumber(mod.confirmed_total)}</td>
+          <td>${asNumber(mod.coverable_total)}</td>
+          <td>${asNumber(mod.uncoverable_total)}</td>
+          <td>${asNumber(mod.redundant_total)}</td>
+          <td>${fmtRate(mod.fill_rate)} ${bar(mod.fill_rate)}</td>
+          <td>${fmtRate(mod.confirmed_rate)} ${bar(mod.confirmed_rate)}</td>
+          <td>${escapeHtml(mod.last_updated || '')}</td>
+        </tr>`;
+    }).join('');
+  }
+
   function renderTeamTable(rows) {
+    currentTeamRows = Array.isArray(rows) ? rows : [];
+    rows = currentTeamRows;
     if (!rows || rows.length === 0) {
       document.getElementById('teamTable').innerHTML = `
         <thead><tr><th>小组</th><th>组长</th><th>模块</th><th>文件数</th><th>未覆盖</th>
@@ -165,30 +199,6 @@
         </tr>`;
       htmlParts.push(parentTr);
 
-      modules.forEach(mod => {
-        const modQuery = encodeURIComponent(mod.module || '');
-        const subModLinkHtml = isIncremental
-          ? `<a href="incremental_coverage.html?module=${modQuery}&team=${teamQuery}" class="progress-link" title="点击查看 [${escapeHtml(mod.module || '')}] 文件审查明细">└─ ${escapeHtml(mod.module || '')}</a>`
-          : `└─ ${escapeHtml(mod.module || '')}`;
-        const subTr = `
-          <tr class="module-subrow team-subrow-${teamIdx}" style="display:none; background-color: #f8fafc;">
-            <td style="padding-left: 28px; font-weight: 600; color: #334155;">${subModLinkHtml}</td>
-            <td class="muted">-</td>
-            <td class="path muted">${escapeHtml(mod.module || '')}</td>
-            <td>${asNumber(mod.file_total)}</td>
-            <td>${asNumber(mod.total_uncovered)}</td>
-            <td>${asNumber(mod.filled_total)}</td>
-            <td>${asNumber(mod.unfilled_total)}</td>
-            <td>${asNumber(mod.confirmed_total)}</td>
-            <td>${asNumber(mod.coverable_total)}</td>
-            <td>${asNumber(mod.uncoverable_total)}</td>
-            <td>${asNumber(mod.redundant_total)}</td>
-            <td>${fmtRate(mod.fill_rate)} ${bar(mod.fill_rate)}</td>
-            <td>${fmtRate(mod.confirmed_rate)} ${bar(mod.confirmed_rate)}</td>
-            <td>${escapeHtml(mod.last_updated || '')}</td>
-          </tr>`;
-        htmlParts.push(subTr);
-      });
     });
 
     document.getElementById('teamTable').innerHTML = `
@@ -201,18 +211,37 @@
       btn.addEventListener('click', function(e) {
         e.preventDefault();
         const idx = this.getAttribute('data-team-index');
-        const subrows = document.querySelectorAll(`.team-subrow-${idx}`);
         const isCollapsed = this.textContent.trim() === '▶';
         this.textContent = isCollapsed ? '▼' : '▶';
-        subrows.forEach(r => {
-          r.style.display = isCollapsed ? 'table-row' : 'none';
-        });
+        const existing = document.querySelectorAll(`.team-subrow-${idx}`);
+        if (isCollapsed && existing.length === 0) {
+          const parent = this.closest('tr');
+          if (parent) parent.insertAdjacentHTML(
+            'afterend', moduleRowsHtml(currentTeamRows[Number(idx)] || {}, Number(idx))
+          );
+        } else {
+          existing.forEach(r => { r.remove(); });
+        }
       });
     });
   }
 
-  function renderFileTable(rows) {
-    currentFileRows = Array.isArray(rows) ? rows : [];
+  function updateFilePager() {
+    const pager = document.getElementById('filePager');
+    const button = document.getElementById('loadMoreFilesBtn');
+    const status = document.getElementById('filePagerStatus');
+    if (!pager || !button || !status) return;
+    pager.hidden = !currentFileRows.length && !pendingFileHasMore;
+    button.hidden = !pendingFileHasMore;
+    button.disabled = false;
+    status.innerText = currentFileRows.length
+      ? `当前窗口 ${currentFileRows.length} 个文件${pendingFileHasMore ? '，还有更多' : ''}`
+      : '当前窗口暂无文件';
+  }
+
+  function renderFileTable(rows, append) {
+    const nextRows = Array.isArray(rows) ? rows : [];
+    currentFileRows = append ? currentFileRows.concat(nextRows) : nextRows;
     const body = currentFileRows.length === 0
       ? '<tr><td colspan="14" style="text-align:center; padding: 24px; color:#8e8e93;">✨ 暂无文件覆盖率数据</td></tr>'
       : currentFileRows.map((row, index) => {
@@ -233,6 +262,7 @@
       <thead><tr><th>文件路径</th><th>模块</th><th>小组</th><th>组长</th><th>匹配状态</th>
       <th>未覆盖</th><th>已填</th><th>未填</th><th>已确认</th><th>可覆盖</th>
       <th>无法覆盖</th><th>冗余</th><th>填写率</th><th>确认率</th></tr></thead><tbody>${body}</tbody>`;
+    updateFilePager();
   }
 
   function renderDetailTable(data) {
@@ -357,12 +387,30 @@
     renderOwnershipStatus(data.ownership || { available: false, warning: 'VNext 汇总不提供旧版目录归属表。' });
     renderTeamTable(data.teams || []);
     renderTable('dirTable', data.dirs || [], 'dir_path');
-    renderFileTable(data.files || []);
+    if (Array.isArray(data.files)) renderFileTable(data.files, false);
     if (projectRows.length === 0) {
       statusEl.innerHTML = `<span class="warning">未找到项目“${escapeHtml(project)}”的审查行索引。请在数据库可连接时重新执行 incremental 或 inject。</span>`;
     } else {
       statusEl.innerText = `已加载 ${asNumber(data.file_count || meta.indexed_file_total)} 个文件的填写摘要；项目：${project}，接口：${apiBase}`;
     }
+  }
+
+  async function loadFilePage(apiBase, project, append, token) {
+    const query = new URLSearchParams({
+      project, scope: reviewScope, page_size: '100',
+    });
+    if (currentScanId) query.set('scan_id', currentScanId);
+    if (append && pendingFileCursor) query.set('cursor', pendingFileCursor);
+    const payload = await fetchJsonWithTimeout(
+      `${apiBase}/progress/files?${query.toString()}`, 10000
+    );
+    if (token != null && token !== activeLoadToken) {
+      throw new Error('已取消过期的文件窗口加载');
+    }
+    pendingFileCursor = payload.next_cursor || null;
+    pendingFileHasMore = Boolean(payload.has_more && pendingFileCursor);
+    renderFileTable(payload.files || [], Boolean(append));
+    return payload;
   }
 
   async function loadProgress() {
@@ -400,15 +448,13 @@
           if (!currentScanId && payload && payload.scan_id) {
             currentScanId = String(payload.scan_id);
           }
-          const pendingPayload = await fetchJsonWithTimeout(
-            `${apiBase}/incremental/unanalyzed?${query.toString()}&page_size=200`, 10000
-          );
-          payload.files = Array.isArray(pendingPayload.files) ? pendingPayload.files : [];
-          payload.pending_files_has_more = Boolean(pendingPayload.has_more);
           window.clearInterval(connectingTimer);
           resolvedApiBase = apiBase;
           updateLinks(project, apiBase);
+          pendingFileCursor = null;
+          pendingFileHasMore = false;
           renderProgressData(project, apiBase, payload || {});
+          await loadFilePage(apiBase, project, false, token);
           const url = new URL(window.location.href);
           url.searchParams.set('project', project);
           if (currentScanId) url.searchParams.set('scan_id', currentScanId);
@@ -525,6 +571,22 @@
   }
 
   document.getElementById('loadBtn').addEventListener('click', loadProgress);
+  const loadMoreFilesBtn = document.getElementById('loadMoreFilesBtn');
+  if (loadMoreFilesBtn) {
+    loadMoreFilesBtn.addEventListener('click', async () => {
+      if (!resolvedApiBase || !pendingFileHasMore) return;
+      loadMoreFilesBtn.disabled = true;
+      try {
+        await loadFilePage(
+          resolvedApiBase, projectInput.value.trim(), true, activeLoadToken
+        );
+      } catch (error) {
+        statusEl.innerHTML = `<span class="error">文件窗口加载失败：${escapeHtml(error.message)}</span>`;
+      } finally {
+        loadMoreFilesBtn.disabled = false;
+      }
+    });
+  }
   detailExportBtn.addEventListener('click', exportFullDetails);
   const expandAllBtn = document.getElementById('expandAllTeamModulesBtn');
   const collapseAllBtn = document.getElementById('collapseAllTeamModulesBtn');
