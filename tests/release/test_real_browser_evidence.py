@@ -73,6 +73,36 @@ class TestRealBrowserEvidence(unittest.TestCase):
             self.assertEqual(evidence["artifact_sha256"], report_sha)
             self.assertEqual(browser["artifact_sha256"], report_sha)
 
+    def test_local_fixture_mode_is_explicitly_synthetic_and_not_release_eligible(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report_path = os.path.join(directory, "workload.json")
+            evidence_path = os.path.join(directory, "performance.json")
+            result = subprocess.run(
+                [
+                    "node", self.script,
+                    "--url", "http://127.0.0.1:1/not-running.gcov.html",
+                    "--expected-revision", "a" * 40,
+                    "--allow-local-fixture",
+                    "--output", report_path,
+                    "--evidence-output", evidence_path,
+                    "--timeout-ms", "3000",
+                ],
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            with open(report_path, "r", encoding="utf-8") as stream:
+                report = json.load(stream)
+            with open(evidence_path, "r", encoding="utf-8") as stream:
+                evidence = json.load(stream)
+            self.assertTrue(report["synthetic"])
+            self.assertFalse(report["release_eligible"])
+            self.assertEqual(report["evidence_class"], "real_http_chromium_fixture")
+            self.assertTrue(evidence["synthetic"])
+            self.assertFalse(evidence["release_eligible"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,6 +12,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const crypto = require('crypto');
+const net = require('net');
 const { chromium } = require('@playwright/test');
 
 const WORKLOAD_ID = 'vnext-real-http-virtual-scroll-100k-v1';
@@ -28,10 +29,13 @@ function usage() {
     '    [--evidence-output <gate-e-performance-json>]',
     '    [--browser-evidence-output <gate-e-browser-json>]',
     '    [--header <name=value>] ...',
+    '    [--allow-local-fixture]',
     '    [--timeout-ms <milliseconds>]',
     '',
-    'The target must be a real HTTP Candidate page. Headers are accepted for',
-    'a trusted reverse proxy, but header values are never written to evidence.'
+    'The target must be a real HTTP Candidate page. Loopback targets are',
+    'rejected unless --allow-local-fixture is supplied; that mode always',
+    'produces synthetic, non-release evidence. Headers are accepted for a',
+    'trusted reverse proxy, but header values are never written to evidence.'
   ].join('\n');
 }
 
@@ -41,10 +45,15 @@ function parseArgs(argv) {
     '--url', '--expected-revision', '--output', '--evidence-output',
     '--browser-evidence-output', '--header', '--timeout-ms'
   ]);
+  const booleanArgs = new Set(['--allow-local-fixture']);
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === '--help' || arg === '-h') {
       args.help = true;
+      continue;
+    }
+    if (booleanArgs.has(arg)) {
+      args.allow_local_fixture = true;
       continue;
     }
     if (!valueArgs.has(arg)) throw new Error(`unknown argument: ${arg}`);
@@ -95,6 +104,24 @@ function safeUrl(raw) {
     return `${value.origin}${value.pathname}`;
   } catch (_) {
     return '<invalid-url>';
+  }
+}
+
+function isLoopbackHost(hostname) {
+  const normalized = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (normalized === 'localhost' || normalized === '::1' ||
+      normalized === '0:0:0:0:0:0:0:1') return true;
+  if (net.isIP(normalized) !== 4) return false;
+  const octets = normalized.split('.').map(value => Number(value));
+  return octets.length === 4 && octets[0] === 127;
+}
+
+function isLocalFixture(args) {
+  if (!args || args.allow_local_fixture !== true) return false;
+  try {
+    return isLoopbackHost(new URL(args.url).hostname);
+  } catch (_) {
+    return false;
   }
 }
 
@@ -244,12 +271,13 @@ async function runWorkload(page, lineCount) {
 
 function buildFailure(args, startedAt, message, details = {}) {
   const finishedAt = now();
+  const localFixture = isLocalFixture(args);
   return {
     schema_version: 1,
     status: 'INCOMPLETE',
-    evidence_class: 'real_http_chromium_performance',
+    evidence_class: localFixture ? 'real_http_chromium_fixture' : 'real_http_chromium_performance',
     gate: 'gate-e',
-    synthetic: false,
+    synthetic: localFixture,
     release_eligible: false,
     candidate_revision: args.expected_revision || '',
     release_identity: {},
@@ -282,11 +310,12 @@ function buildEnvelope(report, reportPath, args) {
 function browserEvidenceReport(report) {
   const browserStatus = report.browser_status === 'PASSED' ? 'PASSED' : report.status;
   const workload = report.coverage_virtual_scroll_100k || {};
+  const localFixture = report.synthetic === true;
   return {
     ...report,
     status: browserStatus,
-    evidence_class: 'real_http_chromium_browser',
-    release_eligible: browserStatus === 'PASSED',
+    evidence_class: localFixture ? 'real_http_chromium_fixture' : 'real_http_chromium_browser',
+    release_eligible: !localFixture && browserStatus === 'PASSED',
     exit_code: browserStatus === 'PASSED' ? 0 : 1,
     coverage_virtual_scroll_100k: {
       ...workload,
@@ -307,6 +336,14 @@ async function collect(args, startedAt) {
   let report;
 
   try {
+    const target = new URL(args.url);
+    const localFixture = isLocalFixture(args);
+    if (isLoopbackHost(target.hostname) && !localFixture) {
+      throw new Error(
+        'loopback Candidate URL is not release evidence; use --allow-local-fixture '
+        + 'for synthetic local validation'
+      );
+    }
     browser = await chromium.launch({ headless: true });
     const context = await browser.newContext({
       viewport: { width: 1280, height: 800 },
@@ -389,10 +426,10 @@ async function collect(args, startedAt) {
       ...workload,
       workload_status: workload.status,
       status: browserStatus && crossLayerReady ? 'PASSED' : 'FAILED',
-      evidence_class: 'real_http_chromium_performance',
-      synthetic: false,
-      release_eligible: browserStatus && crossLayerReady,
-      comparison_type: 'single_live_candidate',
+      evidence_class: localFixture ? 'real_http_chromium_fixture' : 'real_http_chromium_performance',
+      synthetic: localFixture,
+      release_eligible: !localFixture && browserStatus && crossLayerReady,
+      comparison_type: localFixture ? 'single_disposable_fixture' : 'single_live_candidate',
       candidate_revision: args.expected_revision,
       environment_identity: {
         browser: await page.evaluate(() => navigator.userAgent),
@@ -417,10 +454,10 @@ async function collect(args, startedAt) {
     report = {
       schema_version: 1,
       status: browserStatus && crossLayerReady ? 'PASSED' : 'FAILED',
-      evidence_class: 'real_http_chromium_performance',
+      evidence_class: localFixture ? 'real_http_chromium_fixture' : 'real_http_chromium_performance',
       gate: 'gate-e',
-      synthetic: false,
-      release_eligible: browserStatus && crossLayerReady,
+      synthetic: localFixture,
+      release_eligible: !localFixture && browserStatus && crossLayerReady,
       candidate_revision: args.expected_revision,
       release_identity: releaseIdentity,
       host_identity: hostIdentity(),
