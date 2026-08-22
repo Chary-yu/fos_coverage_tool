@@ -401,9 +401,10 @@
             currentScanId = String(payload.scan_id);
           }
           const pendingPayload = await fetchJsonWithTimeout(
-            `${apiBase}/incremental/unanalyzed?${query.toString()}`, 10000
+            `${apiBase}/incremental/unanalyzed?${query.toString()}&page_size=200`, 10000
           );
           payload.files = Array.isArray(pendingPayload.files) ? pendingPayload.files : [];
+          payload.pending_files_has_more = Boolean(pendingPayload.has_more);
           window.clearInterval(connectingTimer);
           resolvedApiBase = apiBase;
           updateLinks(project, apiBase);
@@ -444,7 +445,7 @@
       const payload = await fetchJsonWithTimeout(
         `${apiBase}/progress/details?project=${encodeURIComponent(project)}&scan_id=${encodeURIComponent(currentScanId)}&repository_name=${encodeURIComponent(currentRepositoryName)}&file=${encodeURIComponent(filePath)}&page=${Math.max(1, page || 1)}&page_size=200`, 15000
       );
-      renderDetailTable(payload.data || {});
+      renderDetailTable(payload || {});
       section.scrollIntoView({ behavior: 'smooth', block: 'start' });
     } catch (error) {
       document.getElementById('detailStatus').innerHTML = `<span class="error">详细数据加载失败：${escapeHtml(error.message)}</span>`;
