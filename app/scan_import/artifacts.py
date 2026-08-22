@@ -66,14 +66,8 @@ class ImmutableArtifactStager(object):
 
     def verify_staged(self, connection, artifact_id, expected_sha256=""):
         """Verify the staged file without touching the user's original path."""
-        artifact = fetchone(connection, """
-            SELECT * FROM coverage_import_artifacts WHERE artifact_id=?
-        """, (str(artifact_id),))
-        if not artifact:
-            raise KeyError("staged artifact not found")
+        artifact = self.get_descriptor(connection, artifact_id)
         staged_path = os.path.realpath(str(artifact.get("staged_path") or ""))
-        if not os.path.isfile(staged_path):
-            raise FileNotFoundError(staged_path)
         digest = hashlib.sha256()
         size = 0
         with open(staged_path, "rb") as stream:
@@ -84,6 +78,18 @@ class ImmutableArtifactStager(object):
         expected = str(expected_sha256 or artifact.get("sha256") or "").lower()
         if observed.lower() != expected or int(artifact.get("size_bytes") or 0) != size:
             raise ValueError("STAGED_ARTIFACT_CHANGED")
+        return artifact
+
+    def get_descriptor(self, connection, artifact_id):
+        """Return the durable descriptor without rereading the staged bytes."""
+        artifact = fetchone(connection, """
+            SELECT * FROM coverage_import_artifacts WHERE artifact_id=?
+        """, (str(artifact_id),))
+        if not artifact:
+            raise KeyError("staged artifact not found")
+        staged_path = os.path.realpath(str(artifact.get("staged_path") or ""))
+        if not os.path.isfile(staged_path):
+            raise FileNotFoundError(staged_path)
         if not int(artifact.get("immutable") or 0):
             raise ValueError("STAGED_ARTIFACT_NOT_IMMUTABLE")
         return artifact

@@ -68,17 +68,25 @@ class ScanImportService(object):
             raise FileNotFoundError(info_path)
         return info_path
 
-    def parse_info_file(self, info_path, repositories=None):
+    def parse_info_file(self, info_path, repositories=None, expected_sha256="",
+                        verify=False):
         """Parse a trusted staged artifact into immutable physical line facts."""
         info_path = os.path.realpath(str(info_path or ""))
         if not os.path.isfile(info_path):
             raise FileNotFoundError(info_path)
-        digest = hashlib.sha256()
-        with open(info_path, "rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
+        digest = None
+        if verify:
+            digest = hashlib.sha256()
+            with open(info_path, "rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            observed = digest.hexdigest()
+            expected = str(expected_sha256 or "").strip().lower()
+            if expected and observed.lower() != expected:
+                raise ValueError("STAGED_ARTIFACT_CHANGED")
         parsed = load_info(info_path)
-        return digest.hexdigest(), parsed, self.build_files(parsed, repositories or [])
+        return (digest.hexdigest() if digest is not None else
+                str(expected_sha256 or "")), parsed, self.build_files(parsed, repositories or [])
 
     def build_files(self, parsed, repositories=None):
         files = []

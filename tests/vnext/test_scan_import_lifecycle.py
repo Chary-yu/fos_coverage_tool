@@ -403,6 +403,76 @@ class ScanImportLifecycleTest(unittest.TestCase):
             self.connection, result["job"]["job_id"]
         )["phase"], "PUBLISHED")
 
+    def test_restart_resumes_after_durable_coverage_checkpoint(self):
+        projects = ProjectRepository()
+        states = ProjectStateRepository()
+        repositories = RepositoryRepository()
+        project_service = ProjectService(
+            projects, states, LineIndexRepository(), repository_repo=repositories
+        )
+        domain_repository = AnalysisDomainRepository()
+        dependencies = dict(
+            project_repository=projects, state_repository=states,
+            repository_repository=repositories, project_service=project_service,
+            import_service=ScanImportService(project_service),
+            inheritance_engine=InheritanceEngine(domain_repository=domain_repository),
+            file_state_repository=FileStateRepository(),
+            analysis_domain_service=AnalysisDomainService(domain_repository),
+        )
+
+        class StopAfterCoverageCoordinator(ScanImportCoordinator):
+            def __init__(self, *args, **kwargs):
+                self._stopped = False
+                super().__init__(*args, **kwargs)
+
+            def _run_phase_operation(self, connection, job_id, owner_token,
+                                     fencing_token, target, payload=None,
+                                     operation=None):
+                result = super()._run_phase_operation(
+                    connection, job_id, owner_token, fencing_token, target,
+                    payload=payload, operation=operation,
+                )
+                if target == "COVERAGE_IMPORTED" and not self._stopped:
+                    self._stopped = True
+                    raise RuntimeError("simulated process stop")
+                return result
+
+        first = StopAfterCoverageCoordinator(**dependencies)
+        result = first.create(
+            self.connection, "restartable", self.info_path,
+            repository_resource_ids=[self.resource_id],
+            staging_root=os.path.join(self.temp.name, "restart-stage"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "simulated process stop"):
+            first.execute(
+                self.connection, result["job"]["job_id"],
+                owner_token=result["owner_token"],
+                fencing_token=result["locks"][0]["fencing_token"],
+            )
+        self.assertEqual(
+            first.checkpoints.get(self.connection, result["job"]["job_id"])["phase"],
+            "COVERAGE_IMPORTED",
+        )
+        self.assertIsNone(self.connection.execute(
+            "SELECT current_scan_id FROM coverage_project_state"
+        ).fetchone()[0])
+
+        restarted = ScanImportCoordinator(**dependencies)
+        state = restarted.execute(
+            self.connection, result["job"]["job_id"],
+            owner_token=result["owner_token"],
+            fencing_token=result["locks"][0]["fencing_token"],
+        )
+        self.assertEqual(state["current_scan_id"], result["scan"]["id"])
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM coverage_lines l JOIN coverage_files f "
+            "ON f.id=l.file_id WHERE f.scan_id=?", (result["scan"]["id"],)
+        ).fetchone()[0], 1)
+        self.assertEqual(
+            restarted.checkpoints.get(self.connection, result["job"]["job_id"])["phase"],
+            "PUBLISHED",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

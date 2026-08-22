@@ -42,6 +42,7 @@ class ScanImportCoordinator(object):
         self.file_states = file_state_repository or FileStateRepository()
         self.analysis_domain_service = analysis_domain_service
         self.project_service = project_service
+        self._execution_contexts = {}
 
     def _stager(self, root):
         if self.stager is None:
@@ -164,14 +165,123 @@ class ScanImportCoordinator(object):
                 raise
 
     def execute(self, connection, job_id, owner_token=None, fencing_token=None,
-                repository_paths=None):
+                repository_paths=None, verify_artifact=False):
         """Run a durable import from its immutable staged artifact.
 
-        The source file, Git objects and JSON parsing are verified before the
-        mutation transaction.  Every database phase and its checkpoint then
-        commit together, so a restart can safely resume at the last durable
-        phase without publishing a partially-built Candidate.
+        Each construction phase owns a short transaction and a durable CAS
+        checkpoint.  A process restart therefore re-enters at the last
+        committed phase instead of replaying one large STAGED transaction.
+        Normal execution consumes the immutable artifact descriptor without a
+        second hash pass; recovery explicitly requests one verification pass.
         """
+        context = self._load_execution_context(
+            connection, job_id, owner_token, fencing_token,
+            verify_artifact=verify_artifact,
+        )
+        payload = context["payload"]
+        owner_token = context["owner_token"]
+        fencing_token = context["fencing_token"]
+        scan_id = context["scan_id"]
+        checkpoint = context["checkpoint"]
+        artifact = context["artifact"]
+
+        if checkpoint.get("phase") in ("PUBLISHED", "DONE"):
+            return self.states.get(connection, int(payload.get("project_id") or 0))
+        if checkpoint.get("phase") == "SEALED":
+            return self.publish(connection, job_id)
+
+        phase_payload = self._checkpoint_payload(checkpoint)
+        phase_payload.update({
+            "scan_id": scan_id,
+            "artifact_id": artifact.get("artifact_id"),
+            "artifact_sha256": artifact.get("sha256"),
+        })
+        files = None
+        if self._phase_before(checkpoint, "COVERAGE_IMPORTED"):
+            if self.import_service is None:
+                raise RuntimeError("IMPORT_SERVICE_NOT_CONFIGURED")
+            _, _, files = self.import_service.parse_info_file(
+                artifact["staged_path"], payload.get("repositories") or [],
+                expected_sha256=artifact.get("sha256"), verify=verify_artifact,
+            )
+            phase_payload.update({
+                "file_count": len(files),
+                "line_count": sum(len(item.get("lines") or []) for item in files),
+            })
+
+        self._advance_phase(connection, job_id, owner_token, fencing_token,
+                            "SCAN_CREATED", phase_payload)
+        self._advance_phase(connection, job_id, owner_token, fencing_token,
+                            "INFO_STAGED", phase_payload)
+        if files is not None:
+            project_service = self._project_service()
+            self._run_phase_operation(
+                connection, job_id, owner_token, fencing_token,
+                "COVERAGE_IMPORTED", phase_payload,
+                lambda conn: project_service._ingest_files(conn, scan_id, files),
+            )
+
+        if self._phase_before(self._checkpoint(connection, job_id), "GIT_VERIFIED"):
+            self._verify_git_snapshots(
+                context["snapshots"], payload.get("repositories") or [],
+                repository_paths=repository_paths,
+            )
+            self._advance_phase(connection, job_id, owner_token, fencing_token,
+                                "GIT_VERIFIED", phase_payload)
+        self._advance_phase(connection, job_id, owner_token, fencing_token,
+                            "SOURCE_PREPARED", phase_payload)
+        self._advance_phase(connection, job_id, owner_token, fencing_token,
+                            "LINE_MAP_BUILT", phase_payload)
+
+        inheritance = self._inheritance_engine()
+        checkpoint = self._checkpoint(connection, job_id)
+        if self._phase_before(checkpoint, "INHERITANCE_COMPUTED"):
+            path_map = self._repository_path_map(
+                payload.get("repositories") or [], repository_paths
+            )
+            def compute_inheritance(conn):
+                result = inheritance.run(conn, scan_id, repository_paths=path_map)
+                phase_payload["read_set"] = list(
+                    result.get("read_set", phase_payload.get("read_set") or []) or []
+                )
+            self._run_phase_operation(
+                connection, job_id, owner_token, fencing_token,
+                "INHERITANCE_COMPUTED", phase_payload, compute_inheritance,
+            )
+
+        checkpoint = self._checkpoint(connection, job_id)
+        if self._phase_before(checkpoint, "STATS_REBUILT"):
+            job = self.jobs.get(connection, job_id)
+            data_version = int(job.get("data_version") or 0)
+            self._run_phase_operation(
+                connection, job_id, owner_token, fencing_token,
+                "STATS_REBUILT", phase_payload,
+                lambda conn: self.file_states.rebuild_scan(
+                    conn, scan_id, data_version=data_version, file_rows=None
+                ),
+            )
+
+        checkpoint = self._checkpoint(connection, job_id)
+        if self._phase_before(checkpoint, "CONSISTENCY_VERIFIED"):
+            def verify_consistency(conn):
+                audit = (self.analysis_domain_service.audit_consistency(
+                    conn, scan_id=scan_id
+                ) if self.analysis_domain_service else {"status": "PASSED"})
+                if audit.get("status") != "PASSED":
+                    raise ValueError("ANALYSIS_DOMAIN_INCONSISTENT")
+                phase_payload["consistency"] = "PASSED"
+            self._run_phase_operation(
+                connection, job_id, owner_token, fencing_token,
+                "CONSISTENCY_VERIFIED", phase_payload, verify_consistency,
+            )
+
+        self.seal(connection, job_id, owner_token, fencing_token)
+        result = self.publish(connection, job_id)
+        self._execution_contexts.pop(str(job_id), None)
+        return result
+
+    def _load_execution_context(self, connection, job_id, owner_token,
+                                fencing_token, verify_artifact=False):
         with transaction(connection) as conn:
             job = self.jobs.get(conn, job_id)
             if not job or str(job.get("kind") or "") != "scan_import":
@@ -186,128 +296,74 @@ class ScanImportCoordinator(object):
                              int(checkpoint.get("fencing_token") or 0))
             self._assert_all_fences(conn, job_id, owner_token, fencing_token,
                                     checkpoint=checkpoint)
-            artifact = self._stager(
+            stager = self._stager(
                 payload.get("staging_root") or os.path.dirname(
                     str(payload.get("info_path") or ".")
                 )
-            ).verify_staged(
+            )
+            artifact = (stager.verify_staged(
                 conn, payload.get("artifact_id"),
                 expected_sha256=payload.get("artifact_sha256"),
-            )
+            ) if verify_artifact else stager.get_descriptor(
+                conn, payload.get("artifact_id")
+            ))
             scan_id = int(payload.get("scan_id") or checkpoint.get("scan_id"))
             snapshots = self.projects.list_repository_snapshots(conn, scan_id)
-            terminal_phase = str(checkpoint.get("phase") or "LOCKED")
+            return {
+                "job": job, "payload": payload, "checkpoint": checkpoint,
+                "artifact": artifact, "snapshots": snapshots,
+                "scan_id": scan_id, "owner_token": owner_token,
+                "fencing_token": fencing_token,
+            }
 
-        if terminal_phase in ("PUBLISHED", "DONE"):
-            return self.states.get(connection, int(payload.get("project_id") or 0))
-        if terminal_phase == "SEALED":
-            return self.publish(connection, job_id)
+    def _checkpoint(self, connection, job_id):
+        checkpoint = self.checkpoints.get(connection, job_id)
+        if not checkpoint:
+            raise KeyError("import checkpoint not found")
+        return checkpoint
 
-        if self.import_service is None:
-            raise RuntimeError("IMPORT_SERVICE_NOT_CONFIGURED")
-        digest, parsed, files = self.import_service.parse_info_file(
-            artifact["staged_path"], payload.get("repositories") or []
+    def _advance_phase(self, connection, job_id, owner_token, fencing_token,
+                       target, payload=None):
+        return self._run_phase_operation(
+            connection, job_id, owner_token, fencing_token, target, payload,
+            operation=None,
         )
-        if str(digest).lower() != str(artifact.get("sha256") or "").lower():
-            raise ValueError("STAGED_ARTIFACT_CHANGED")
-        self._verify_git_snapshots(snapshots, payload.get("repositories") or {},
-                                   repository_paths=repository_paths)
 
-        project_service = self.project_service
-        if project_service is None:
+    def _run_phase_operation(self, connection, job_id, owner_token, fencing_token,
+                             target, payload=None, operation=None):
+        with transaction(connection) as conn:
+            checkpoint = self._checkpoint(conn, job_id)
+            if not self._phase_before(checkpoint, target):
+                return checkpoint
+            current_index = PHASES.index(str(checkpoint.get("phase") or "LOCKED"))
+            if current_index + 1 != PHASES.index(target):
+                raise ValueError("IMPORT_PHASE_SKIP")
+            self._assert_all_fences(conn, job_id, owner_token, fencing_token,
+                                    checkpoint=checkpoint)
+            if operation is not None:
+                operation(conn)
+            return self.checkpoints.advance(
+                conn, job_id, checkpoint["checkpoint_seq"], fencing_token,
+                target, payload=payload,
+            )
+
+    def _project_service(self):
+        if self.project_service is None:
             from app.services.project_service import ProjectService
-            project_service = ProjectService(
+            self.project_service = ProjectService(
                 self.projects, self.states, repository_repo=self.repositories
             )
-        inheritance = self.inheritance
-        if inheritance is None:
+        return self.project_service
+
+    def _inheritance_engine(self):
+        if self.inheritance is None:
             from app.inheritance.engine import InheritanceEngine
-            inheritance = InheritanceEngine(
+            self.inheritance = InheritanceEngine(
                 domain_repository=getattr(
                     self.analysis_domain_service, "repository", None
                 )
             )
-        with transaction(connection) as conn:
-            job = self.jobs.get(conn, job_id)
-            payload = json.loads(job.get("input_payload") or "{}")
-            checkpoint = self.checkpoints.get(conn, job_id)
-            locks = self._locks_for_job(conn, job_id)
-            owner_token = owner_token or (locks[0].get("owner_token") if locks else "")
-            self._assert_all_fences(conn, job_id, owner_token, fencing_token,
-                                    checkpoint=checkpoint)
-            scan_id = int(payload.get("scan_id") or checkpoint.get("scan_id"))
-            project_id = int(payload.get("project_id") or 0)
-            data_version = int(job.get("data_version") or 0)
-            checkpoint_payload = self._checkpoint_payload(checkpoint)
-            read_set = list(checkpoint_payload.get("read_set") or [])
-            phase_payload = {
-                "scan_id": scan_id,
-                "artifact_id": artifact.get("artifact_id"),
-                "artifact_sha256": artifact.get("sha256"),
-                "file_count": len(files),
-                "line_count": sum(len(item.get("lines") or []) for item in files),
-                "read_set": read_set,
-            }
-            checkpoint = self._advance_to(
-                conn, checkpoint, job_id, fencing_token, "SCAN_CREATED",
-                phase_payload,
-            )
-            checkpoint = self._advance_to(
-                conn, checkpoint, job_id, fencing_token, "INFO_STAGED",
-                phase_payload,
-            )
-            if self._phase_before(checkpoint, "COVERAGE_IMPORTED"):
-                project_service._ingest_files(conn, scan_id, files)
-            checkpoint = self._advance_to(
-                conn, checkpoint, job_id, fencing_token, "COVERAGE_IMPORTED",
-                phase_payload,
-            )
-            checkpoint = self._advance_to(
-                conn, checkpoint, job_id, fencing_token, "GIT_VERIFIED",
-                phase_payload,
-            )
-            checkpoint = self._advance_to(
-                conn, checkpoint, job_id, fencing_token, "SOURCE_PREPARED",
-                phase_payload,
-            )
-            checkpoint = self._advance_to(
-                conn, checkpoint, job_id, fencing_token, "LINE_MAP_BUILT",
-                phase_payload,
-            )
-            if self._phase_before(checkpoint, "INHERITANCE_COMPUTED"):
-                path_map = self._repository_path_map(
-                    payload.get("repositories") or [], repository_paths
-                )
-                inheritance_result = inheritance.run(
-                    conn, scan_id, repository_paths=path_map
-                )
-                read_set = list(inheritance_result.get("read_set", read_set) or [])
-                phase_payload["read_set"] = read_set
-            checkpoint = self._advance_to(
-                conn, checkpoint, job_id, fencing_token, "INHERITANCE_COMPUTED",
-                phase_payload,
-            )
-            if self._phase_before(checkpoint, "STATS_REBUILT"):
-                self.file_states.rebuild_scan(
-                    conn, scan_id, data_version=data_version, file_rows=files
-                )
-            checkpoint = self._advance_to(
-                conn, checkpoint, job_id, fencing_token, "STATS_REBUILT",
-                phase_payload,
-            )
-            if self._phase_before(checkpoint, "CONSISTENCY_VERIFIED"):
-                audit = (self.analysis_domain_service.audit_consistency(
-                    conn, scan_id=scan_id
-                ) if self.analysis_domain_service else {"status": "PASSED"})
-                if audit.get("status") != "PASSED":
-                    raise ValueError("ANALYSIS_DOMAIN_INCONSISTENT")
-            self._advance_to(
-                conn, checkpoint, job_id, fencing_token, "CONSISTENCY_VERIFIED",
-                dict(phase_payload, consistency="PASSED"),
-            )
-
-        self.seal(connection, job_id, owner_token, fencing_token)
-        return self.publish(connection, job_id)
+        return self.inheritance
 
     @staticmethod
     def _phase_before(checkpoint, target):

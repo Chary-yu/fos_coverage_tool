@@ -306,7 +306,7 @@ class VNextRuntime(object):
                     return self.scan_import_coordinator.execute(
                         connection, job_id,
                         owner_token=reclaimed.get("owner_token") or "",
-                        fencing_token=fence,
+                        fencing_token=fence, verify_artifact=True,
                     )
                 except Exception as exc:
                     current_job = self.jobs.get(connection, job_id)
