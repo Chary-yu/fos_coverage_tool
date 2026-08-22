@@ -122,7 +122,12 @@ CREATE TABLE IF NOT EXISTS coverage_schema_migrations (
     from_version INTEGER NOT NULL DEFAULT 0, to_version INTEGER NOT NULL,
     ddl_sha256 TEXT NOT NULL, state TEXT NOT NULL,
     started_at TEXT NOT NULL, finished_at TEXT, release_sha TEXT NOT NULL DEFAULT '',
-    error_class TEXT NOT NULL DEFAULT ''
+    error_class TEXT NOT NULL DEFAULT '',
+    target_database TEXT NOT NULL DEFAULT '',
+    target_runtime_fingerprint TEXT NOT NULL DEFAULT '',
+    target_table_inventory_hash TEXT NOT NULL DEFAULT '',
+    target_emptiness_result TEXT NOT NULL DEFAULT '',
+    target_preflight_at TEXT
 );
 CREATE TABLE IF NOT EXISTS coverage_legacy_provenance (
     id INTEGER PRIMARY KEY AUTOINCREMENT, migration_id TEXT NOT NULL,
@@ -242,6 +247,13 @@ CREATE TABLE IF NOT EXISTS coverage_import_failures (
 SQLITE_ADDITIVE_COLUMNS = {
     "coverage_schema_meta": [
         ("migration_id", "TEXT NOT NULL DEFAULT ''"),
+    ],
+    "coverage_schema_migrations": [
+        ("target_database", "TEXT NOT NULL DEFAULT ''"),
+        ("target_runtime_fingerprint", "TEXT NOT NULL DEFAULT ''"),
+        ("target_table_inventory_hash", "TEXT NOT NULL DEFAULT ''"),
+        ("target_emptiness_result", "TEXT NOT NULL DEFAULT ''"),
+        ("target_preflight_at", "TEXT"),
     ],
     "coverage_incremental_results": [
         ("incremental_key_hash", "TEXT NOT NULL DEFAULT ''"),
@@ -510,6 +522,168 @@ def _nullable_int(value):
         return None
 
 
+# These are the only objects that may exist before the first VNext business
+# DDL.  The list is intentionally explicit: a prefix/suffix rule would allow
+# a legacy table or an operator-created staging table to slip through the
+# Empty Target gate.
+TARGET_BOOTSTRAP_TABLES = frozenset((
+    "coverage_schema_meta", "coverage_schema_migrations",
+))
+VNEXT_BUSINESS_TABLES = frozenset((
+    "coverage_projects", "coverage_scans", "coverage_scan_repositories",
+    "coverage_reports", "coverage_files", "coverage_lines",
+    "coverage_analyses", "coverage_project_state", "coverage_file_state",
+    "coverage_background_jobs", "coverage_incremental_results",
+    "coverage_legacy_provenance", "coverage_repositories",
+    "coverage_repository_aliases", "coverage_repository_resources",
+    "coverage_analysis_records", "coverage_analysis_blocks",
+    "coverage_inheritance_groups", "coverage_analysis_line_links",
+    "coverage_inheritance_decisions", "coverage_inheritance_rejections",
+    "coverage_repository_resource_locks", "coverage_import_artifacts",
+    "coverage_import_checkpoints", "coverage_import_failures",
+))
+
+
+def _database_table_names(connection):
+    """Return user tables without executing arbitrary table-name SQL."""
+    if is_sqlite(connection):
+        rows = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        ).fetchall()
+        return sorted(str(row[0]) for row in rows)
+    rows = fetchall(connection, """
+        SELECT TABLE_NAME FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE() ORDER BY TABLE_NAME
+    """)
+    return sorted(str(row.get("TABLE_NAME") or row.get("table_name") or "")
+                  for row in rows if row.get("TABLE_NAME") or row.get("table_name"))
+
+
+def _safe_table_count(connection, table_name):
+    if not table_name or not table_name.replace("_", "").isalnum():
+        raise ValueError("unsafe target table name")
+    return int((fetchone(connection, "SELECT COUNT(*) AS total FROM {}".format(
+        table_name)) or {}).get("total") or 0)
+
+
+def _target_fingerprint(connection):
+    try:
+        value = fingerprint_connection(connection)
+    except Exception:
+        value = {}
+    return value if isinstance(value, dict) else {}
+
+
+def assert_empty_vnext_target(connection, migration_id="coverage-vnext-core-v2",
+                              allow_initialized_schema=False):
+    """Fail closed unless the target is empty or a resumable empty schema.
+
+    This function is deliberately independent from ``apply_schema`` so direct
+    runners and rehearsal tools can call the same gate.  It performs no
+    business DDL/DML.  A schema whose business tables already contain rows is
+    never accepted, even when its migration ledger claims to be incomplete.
+    """
+    tables = _database_table_names(connection)
+    unknown = sorted(set(tables) - TARGET_BOOTSTRAP_TABLES - VNEXT_BUSINESS_TABLES)
+    if unknown:
+        raise RuntimeError(
+            "MIGRATION_TARGET_NOT_EMPTY:unknown_tables=" + ",".join(unknown)
+        )
+    counts = {table: _safe_table_count(connection, table) for table in tables}
+    business_counts = {
+        table: counts.get(table, 0) for table in VNEXT_BUSINESS_TABLES
+        if table in counts
+    }
+    nonempty_business = sorted(
+        table for table, count in business_counts.items() if int(count) > 0
+    )
+    if nonempty_business:
+        raise RuntimeError(
+            "MIGRATION_TARGET_NOT_EMPTY:business_rows=" +
+            ",".join(nonempty_business)
+        )
+
+    ledger = None
+    if "coverage_schema_migrations" in tables:
+        ledger = fetchone(connection, """
+            SELECT * FROM coverage_schema_migrations
+            WHERE migration_id=? ORDER BY started_at DESC LIMIT 1
+        """, (str(migration_id),))
+    business_schema_present = bool(set(tables) & VNEXT_BUSINESS_TABLES)
+    if business_schema_present and not allow_initialized_schema:
+        raise RuntimeError(
+            "MIGRATION_TARGET_NOT_EMPTY:business_schema_present"
+        )
+    if business_schema_present and allow_initialized_schema and not ledger:
+        raise RuntimeError(
+            "MIGRATION_TARGET_NOT_EMPTY:business_schema_untracked"
+        )
+
+    runtime = _target_fingerprint(connection)
+    inventory_payload = {
+        "tables": tables, "counts": counts,
+        "migration_id": str(migration_id),
+    }
+    inventory_hash = hashlib.sha256(json.dumps(
+        inventory_payload, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), default=_semantic_json_default,
+    ).encode("utf-8")).hexdigest()
+    result = "EMPTY" if not tables else (
+        "BOOTSTRAP_ONLY" if not business_schema_present else "RESUMABLE_EMPTY_SCHEMA"
+    )
+    return {
+        "status": "PASSED", "result": result, "migration_id": str(migration_id),
+        "tables": tables, "counts": counts,
+        "unknown_tables": unknown,
+        "runtime_fingerprint": runtime,
+        "database": str(runtime.get("database") or ""),
+        "table_inventory_hash": inventory_hash,
+        "ledger_state": str((ledger or {}).get("state") or ""),
+    }
+
+
+def _record_target_preflight(connection, migration_id, preflight, state="PREFLIGHTED",
+                             ddl_sha256="", release_sha=""):
+    """Persist the exact preflight evidence in the bootstrap ledger."""
+    if not _table_exists(connection, "coverage_schema_migrations"):
+        raise RuntimeError("migration ledger must exist before preflight evidence")
+    now = _now()
+    runtime = preflight.get("runtime_fingerprint") or {}
+    runtime_key = str(runtime.get("runtime_key") or "")
+    database = str(preflight.get("database") or runtime.get("database") or "")
+    fields = (str(migration_id), "coverage_vnext_core", ddl_sha256 or "", state,
+              now, release_sha or "", database, runtime_key,
+              str(preflight.get("table_inventory_hash") or ""),
+              str(preflight.get("result") or ""), now)
+    existing = fetchone(connection, """
+        SELECT migration_id FROM coverage_schema_migrations WHERE migration_id=?
+    """, (str(migration_id),))
+    cursor = connection.cursor()
+    try:
+        if existing:
+            cursor.execute(adapt_sql(connection, """
+                UPDATE coverage_schema_migrations
+                SET schema_key=?, ddl_sha256=?, state=?, started_at=?,
+                    release_sha=?, target_database=?, target_runtime_fingerprint=?,
+                    target_table_inventory_hash=?, target_emptiness_result=?,
+                    target_preflight_at=?
+                WHERE migration_id=?
+            """), (fields[1], fields[2], fields[3], fields[4], fields[5],
+                    fields[6], fields[7], fields[8], fields[9], fields[10],
+                    fields[0]))
+        else:
+            cursor.execute(adapt_sql(connection, """
+                INSERT INTO coverage_schema_migrations(
+                    migration_id, schema_key, from_version, to_version,
+                    ddl_sha256, state, started_at, release_sha,
+                    target_database, target_runtime_fingerprint,
+                    target_table_inventory_hash, target_emptiness_result,
+                    target_preflight_at
+                ) VALUES (?, ?, 0, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """), fields)
+    finally:
+        cursor.close()
 def capture_legacy_snapshot(connection):
     """Normalize legacy facts without changing their source semantics."""
     analysis = []
@@ -1007,6 +1181,9 @@ def _upsert_legacy_provenance_many(connection, migration_id, records):
 
 def create_sqlite_schema(connection):
     connection.executescript(SQLITE_SCHEMA)
+    # Domain tables include the migration ledger.  Create them before applying
+    # additive columns so the helper also works for a brand-new SQLite target.
+    connection.executescript(SQLITE_DOMAIN_SCHEMA)
     for table_name, columns in SQLITE_ADDITIVE_COLUMNS.items():
         existing = {
             str(row[1]) for row in connection.execute(
@@ -1020,7 +1197,6 @@ def create_sqlite_schema(connection):
                         table_name, column_name, definition
                     )
                 )
-    connection.executescript(SQLITE_DOMAIN_SCHEMA)
     if not _column_exists(
             connection, "coverage_legacy_provenance", "provenance_key_hash"):
         connection.execute(
@@ -1119,7 +1295,55 @@ def apply_schema(connection, ddl_path, release_sha=""):
     ddl_sha256 = hashlib.sha256(ddl.encode("utf-8")).hexdigest()
     migration_id = "coverage-vnext-core-v2"
 
+    existing_before_preflight = None
+    if _table_exists(connection, "coverage_schema_migrations"):
+        existing_before_preflight = fetchone(connection, """
+            SELECT * FROM coverage_schema_migrations WHERE migration_id=?
+        """, (migration_id,))
+    allow_initialized = str(
+        (existing_before_preflight or {}).get("state") or ""
+    ).upper() in {"APPLIED", "PREFLIGHTED", "STARTED", "FAILED"}
+    preflight = assert_empty_vnext_target(
+        connection, migration_id=migration_id,
+        allow_initialized_schema=allow_initialized,
+    )
+    if (existing_before_preflight and
+            str(existing_before_preflight.get("state") or "").upper() == "APPLIED"):
+        if str(existing_before_preflight.get("ddl_sha256") or "") != ddl_sha256:
+            raise ValueError("schema migration checksum changed after APPLIED state")
+        return {"status": "PASSED", "migration_id": migration_id,
+                "idempotent": True, "ddl_sha256": ddl_sha256,
+                "target_preflight": preflight}
+
     if is_sqlite(connection):
+        # Create only the bootstrap ledger before any business table.  This
+        # makes the preflight evidence durable even if the following schema
+        # construction is interrupted.
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS coverage_schema_migrations (
+                migration_id TEXT PRIMARY KEY, schema_key TEXT NOT NULL,
+                from_version INTEGER NOT NULL DEFAULT 0, to_version INTEGER NOT NULL,
+                ddl_sha256 TEXT NOT NULL, state TEXT NOT NULL,
+                started_at TEXT NOT NULL, finished_at TEXT,
+                release_sha TEXT NOT NULL DEFAULT '',
+                error_class TEXT NOT NULL DEFAULT '',
+                target_database TEXT NOT NULL DEFAULT '',
+                target_runtime_fingerprint TEXT NOT NULL DEFAULT '',
+                target_table_inventory_hash TEXT NOT NULL DEFAULT '',
+                target_emptiness_result TEXT NOT NULL DEFAULT '',
+                target_preflight_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS coverage_schema_meta (
+                schema_key TEXT PRIMARY KEY, schema_version INTEGER NOT NULL,
+                applied_at TEXT NOT NULL, release_sha TEXT NOT NULL DEFAULT '',
+                migration_id TEXT NOT NULL DEFAULT ''
+            );
+        """)
+        _record_target_preflight(
+            connection, migration_id, preflight, state="PREFLIGHTED",
+            ddl_sha256=ddl_sha256, release_sha=release_sha,
+        )
+        connection.commit()
         create_sqlite_schema(connection)
         existing = fetchone(connection, """
             SELECT * FROM coverage_schema_migrations WHERE migration_id=?
@@ -1128,7 +1352,8 @@ def apply_schema(connection, ddl_path, release_sha=""):
             if str(existing.get("ddl_sha256") or "") != ddl_sha256:
                 raise ValueError("schema migration checksum changed after APPLIED state")
             return {"status": "PASSED", "migration_id": migration_id,
-                    "idempotent": True, "ddl_sha256": ddl_sha256}
+                    "idempotent": True, "ddl_sha256": ddl_sha256,
+                    "target_preflight": preflight}
         now = _now()
         cursor = connection.cursor()
         if existing:
@@ -1165,7 +1390,9 @@ def apply_schema(connection, ddl_path, release_sha=""):
         cursor.close()
         connection.commit()
         return {"status": "PASSED", "migration_id": migration_id,
-                "idempotent": bool(existing), "ddl_sha256": ddl_sha256}
+                "idempotent": bool(existing and str(existing.get("state") or "").upper() == "APPLIED"),
+                "ddl_sha256": ddl_sha256,
+                "target_preflight": preflight}
 
     # The ledger itself must exist before the first non-transactional MariaDB
     # DDL statement.  It is intentionally additive and safe on a partially
@@ -1182,12 +1409,41 @@ def apply_schema(connection, ddl_path, release_sha=""):
             finished_at DATETIME NULL,
             release_sha CHAR(40) NOT NULL DEFAULT '',
             error_class VARCHAR(128) NOT NULL DEFAULT '',
+            target_database VARCHAR(128) NOT NULL DEFAULT '',
+            target_runtime_fingerprint VARCHAR(255) NOT NULL DEFAULT '',
+            target_table_inventory_hash CHAR(64) NOT NULL DEFAULT '',
+            target_emptiness_result VARCHAR(64) NOT NULL DEFAULT '',
+            target_preflight_at DATETIME NULL,
             PRIMARY KEY (migration_id)
         )
     """
     cursor = connection.cursor()
     cursor.execute(adapt_sql(connection, ledger_ddl))
     cursor.close()
+    connection.commit()
+    # Older Candidate ledgers may predate the evidence columns.  Upgrade only
+    # the bootstrap ledger before recording the new preflight; this is not a
+    # business-table migration and remains additive/idempotent.
+    for column_name, definition in (
+        ("target_database", "VARCHAR(128) NOT NULL DEFAULT ''"),
+        ("target_runtime_fingerprint", "VARCHAR(255) NOT NULL DEFAULT ''"),
+        ("target_table_inventory_hash", "CHAR(64) NOT NULL DEFAULT ''"),
+        ("target_emptiness_result", "VARCHAR(64) NOT NULL DEFAULT ''"),
+        ("target_preflight_at", "DATETIME NULL"),
+    ):
+        if _column_exists(connection, "coverage_schema_migrations", column_name):
+            continue
+        cursor = connection.cursor()
+        try:
+            cursor.execute(adapt_sql(connection,
+                                     "ALTER TABLE coverage_schema_migrations "
+                                     "ADD COLUMN {} {}".format(column_name, definition)))
+        finally:
+            cursor.close()
+    _record_target_preflight(
+        connection, migration_id, preflight, state="PREFLIGHTED",
+        ddl_sha256=ddl_sha256, release_sha=release_sha,
+    )
     connection.commit()
     # ``coverage_schema_meta`` is part of the same additive core schema, but
     # the migration ledger needs it before the full DDL loop so it can derive
@@ -1214,7 +1470,8 @@ def apply_schema(connection, ddl_path, release_sha=""):
         if str(existing_migration.get("ddl_sha256") or "") != ddl_sha256:
             raise ValueError("schema migration checksum changed after APPLIED state")
         return {"status": "PASSED", "migration_id": migration_id,
-                "idempotent": True, "ddl_sha256": ddl_sha256}
+                "idempotent": True, "ddl_sha256": ddl_sha256,
+                "target_preflight": preflight}
 
     schema_version_row = fetchone(connection, """
         SELECT schema_version FROM coverage_schema_meta WHERE schema_key = ?
@@ -1345,7 +1602,8 @@ def apply_schema(connection, ddl_path, release_sha=""):
         connection.commit()
         raise
     return {"status": "PASSED", "migration_id": migration_id,
-            "idempotent": False, "ddl_sha256": ddl_sha256}
+            "idempotent": False, "ddl_sha256": ddl_sha256,
+            "target_preflight": preflight}
 
 
 def validate_migration_database_separation(source_config, target_config,

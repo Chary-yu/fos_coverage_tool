@@ -23,6 +23,11 @@ CREATE TABLE IF NOT EXISTS coverage_schema_migrations (
     finished_at DATETIME NULL,
     release_sha CHAR(40) NOT NULL DEFAULT '',
     error_class VARCHAR(128) NOT NULL DEFAULT '',
+    target_database VARCHAR(128) NOT NULL DEFAULT '',
+    target_runtime_fingerprint VARCHAR(255) NOT NULL DEFAULT '',
+    target_table_inventory_hash CHAR(64) NOT NULL DEFAULT '',
+    target_emptiness_result VARCHAR(64) NOT NULL DEFAULT '',
+    target_preflight_at DATETIME NULL,
     PRIMARY KEY (migration_id),
     KEY idx_schema_migrations_key (schema_key, started_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

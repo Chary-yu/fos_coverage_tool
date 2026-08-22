@@ -18,8 +18,18 @@ from app.release_identity import generate_release_identity, save_release_manifes
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", required=True)
+    parser.add_argument("--repo-root", default=ROOT)
+    parser.add_argument(
+        "--commit-sha", default="",
+        help="build provenance SHA when packaging from a tree without .git",
+    )
     args = parser.parse_args()
-    identity = generate_release_identity(ROOT)
+    repo_root = os.path.abspath(args.repo_root)
+    identity = generate_release_identity(
+        repo_root,
+        commit_sha=args.commit_sha or None,
+        build_provenance="release-build",
+    )
     save_release_manifest(os.path.abspath(args.output), identity)
     print(identity["build_id"])
 

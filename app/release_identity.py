@@ -46,6 +46,29 @@ def _get_git_commit_sha(repo_root: str) -> str:
         pass
     return "0000000000000000000000000000000000000000"
 
+
+def _has_git_metadata(repo_root: str) -> bool:
+    """Whether runtime can legitimately use checkout metadata as evidence."""
+    return os.path.exists(os.path.join(os.path.abspath(repo_root), ".git"))
+
+
+def _default_asset_files(repo_root: str) -> list:
+    files = []
+    for relative in DEFAULT_RELEASE_ASSET_RELATIVE_PATHS:
+        candidate = os.path.join(repo_root, *relative.split("/"))
+        if os.path.isfile(candidate) and candidate not in files:
+            files.append(candidate)
+    return files
+
+
+def _manifest_build_id(manifest: Dict[str, Any]) -> str:
+    version = str(manifest.get("version") or "")
+    commit_sha = str(manifest.get("commit_sha") or "")
+    asset_hash = str(manifest.get("asset_hash") or "")
+    return "{}-{}-{}".format(
+        version.split()[0], commit_sha[:8], asset_hash[:8]
+    )
+
 def compute_asset_hash(file_paths: list) -> str:
     """Compute deterministic SHA256 hash over a list of static asset files."""
     hasher = hashlib.sha256()
@@ -63,21 +86,18 @@ def generate_release_identity(
     repo_root: Optional[str] = None,
     version: str = DEFAULT_VERSION,
     schema_version: int = DEFAULT_SCHEMA_VERSION,
-    asset_files: Optional[list] = None
+    asset_files: Optional[list] = None,
+    commit_sha: Optional[str] = None,
+    build_provenance: str = "git-checkout",
 ) -> Dict[str, Any]:
     """Generate a full release identity dictionary."""
     if repo_root is None:
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     
-    commit_sha = _get_git_commit_sha(repo_root)
+    commit_sha = str(commit_sha or _get_git_commit_sha(repo_root))
     
     if asset_files is None:
-        asset_files = []
-        candidates = [os.path.join(repo_root, *path.split("/"))
-                      for path in DEFAULT_RELEASE_ASSET_RELATIVE_PATHS]
-        for c in candidates:
-            if os.path.isfile(c) and c not in asset_files:
-                asset_files.append(c)
+        asset_files = _default_asset_files(repo_root)
                 
     asset_hash = compute_asset_hash(asset_files)
     clean_ver = version.split()[0]
@@ -89,6 +109,7 @@ def generate_release_identity(
         "build_id": build_id,
         "asset_hash": asset_hash,
         "schema_version": schema_version,
+        "build_provenance": str(build_provenance or "git-checkout"),
         "built_at": utc_iso()
     }
     return identity
@@ -120,13 +141,35 @@ def get_current_release_identity(repo_root: Optional[str] = None) -> Dict[str, A
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     manifest_path = os.path.join(repo_root, RELEASE_MANIFEST_NAME)
     manifest = load_release_manifest(manifest_path)
-    
-    current_head = _get_git_commit_sha(repo_root)
     if not manifest:
         raise RuntimeError("release_manifest.json is missing; generate it during build")
-    expected = generate_release_identity(repo_root=repo_root, version=manifest.get("version", DEFAULT_VERSION))
-    mismatches = [key for key in ("version", "commit_sha", "asset_hash", "schema_version")
-                  if manifest.get(key) != expected.get(key)]
+    required = ("version", "commit_sha", "build_id", "asset_hash", "schema_version")
+    missing = [key for key in required if manifest.get(key) in (None, "")]
+    if missing:
+        raise RuntimeError("release identity manifest is incomplete: " + ", ".join(missing))
+
+    actual_asset_hash = compute_asset_hash(_default_asset_files(repo_root))
+    mismatches = []
+    if str(manifest.get("asset_hash")) != actual_asset_hash:
+        mismatches.append("asset_hash")
+    if str(manifest.get("build_id")) != _manifest_build_id(manifest):
+        mismatches.append("build_id")
+    if _has_git_metadata(repo_root):
+        current_head = _get_git_commit_sha(repo_root)
+        if str(manifest.get("commit_sha")) != current_head:
+            mismatches.append("commit_sha")
+    else:
+        # Artifact mode intentionally trusts only the immutable build manifest
+        # for source identity.  It must still contain a concrete SHA-shaped
+        # value; a build system must never turn a missing Git checkout into a
+        # silently accepted all-zero release.
+        commit = str(manifest.get("commit_sha") or "")
+        if len(commit) != 40 or any(char not in "0123456789abcdefABCDEF" for char in commit):
+            raise RuntimeError("release artifact manifest has no exact commit SHA")
+    if manifest.get("version") in (None, ""):
+        mismatches.append("version")
+    if manifest.get("schema_version") is None:
+        mismatches.append("schema_version")
     if mismatches:
         raise RuntimeError("release identity drift: " + ", ".join(mismatches))
     return manifest

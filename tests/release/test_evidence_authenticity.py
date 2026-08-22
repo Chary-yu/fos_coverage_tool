@@ -8,7 +8,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from app.release_identity import get_current_release_identity
+from app.release_identity import (
+    get_current_release_identity, generate_release_identity, save_release_manifest,
+)
 from scripts.upgrade.evidence_manifest import EvidenceManifestV2, ProductionEvidenceManifest
 
 
@@ -16,6 +18,34 @@ class TestEvidenceAuthenticity(unittest.TestCase):
     def test_missing_runtime_release_manifest_fails_closed(self):
         with tempfile.TemporaryDirectory() as root:
             with self.assertRaises(RuntimeError):
+                get_current_release_identity(root)
+
+    def test_no_git_release_artifact_uses_manifest_sha_and_verifies_assets(self):
+        with tempfile.TemporaryDirectory() as root:
+            asset = os.path.join(root, "web", "assets", "js", "coverage_progress.js")
+            os.makedirs(os.path.dirname(asset))
+            with open(asset, "w", encoding="utf-8") as stream:
+                stream.write("asset-v1")
+            identity = generate_release_identity(
+                root, commit_sha="a" * 40, build_provenance="release-build"
+            )
+            save_release_manifest(os.path.join(root, "release_manifest.json"), identity)
+            self.assertEqual(
+                get_current_release_identity(root)["commit_sha"], "a" * 40
+            )
+            with open(asset, "w", encoding="utf-8") as stream:
+                stream.write("asset-tampered")
+            with self.assertRaisesRegex(RuntimeError, "asset_hash"):
+                get_current_release_identity(root)
+
+    def test_no_git_release_artifact_rejects_non_exact_manifest_sha(self):
+        with tempfile.TemporaryDirectory() as root:
+            identity = generate_release_identity(
+                root, commit_sha="not-a-sha", asset_files=[],
+                build_provenance="release-build",
+            )
+            save_release_manifest(os.path.join(root, "release_manifest.json"), identity)
+            with self.assertRaisesRegex(RuntimeError, "exact commit SHA"):
                 get_current_release_identity(root)
 
     def test_mock_backup_and_browser_cannot_pass_final_gate(self):

@@ -36,7 +36,7 @@ from scripts.upgrade.evidence_manifest import EvidenceManifestV2
 from scripts.upgrade.legacy_fixture import create_legacy_fixture_schema, seed_legacy_fixture
 from scripts.upgrade.migration_runner import (
     capture_legacy_semantic_snapshot, capture_vnext_semantic_snapshot,
-    create_sqlite_schema, migrate_legacy, semantic_hash,
+    migrate_legacy, semantic_hash,
     apply_schema,
 )
 
@@ -211,7 +211,6 @@ def _sqlite_migration(repo_root):
                              analysis_count=20, job_count=1)
         seed_legacy_fixture(source, project_name="bundle-b", line_count=16,
                              analysis_count=8, job_count=0)
-        create_sqlite_schema(target)
         apply_schema(
             target,
             os.path.join(repo_root, "scripts", "upgrade", "vnext_schema.sql"),
