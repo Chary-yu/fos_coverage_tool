@@ -2,7 +2,11 @@
 
 import json
 import os
+import warnings
 from typing import Any, Dict, Optional
+
+
+CONFIG_SCHEMA_VERSION = 2
 
 
 def _merge(base, overlay):
@@ -63,6 +67,7 @@ def default_runtime_config(base_dir: str, project_name: str = "Gemini-NOS") -> D
         # through an explicit compatibility configuration/entrypoint.
         "runtime_mode": "vnext",
         "schema_version": 1,
+        "config_schema_version": CONFIG_SCHEMA_VERSION,
         "project_name": project_name,
     }
 
@@ -77,9 +82,30 @@ def load_application_config(path: Optional[str] = None, base_dir: Optional[str] 
     if configured_path and not os.path.isfile(configured_path):
         raise FileNotFoundError(configured_path)
     defaults = default_runtime_config(base_dir, project_name=project_name)
-    result = load_runtime_config(configured_path, defaults) if configured_path else defaults
+    raw_loaded = {}
+    if configured_path:
+        with open(configured_path, "r", encoding="utf-8-sig") as stream:
+            raw_loaded = json.load(stream)
+        if not isinstance(raw_loaded, dict):
+            raise ValueError("runtime config root must be an object")
+    result = _merge(defaults, raw_loaded) if configured_path else defaults
+    result = _apply_compatibility_aliases(result)
+    result["_config_metadata"] = {
+        "path": configured_path or "",
+        "source_config_schema_version": int(
+            raw_loaded.get("config_schema_version") or 0
+        ) if configured_path else CONFIG_SCHEMA_VERSION,
+        "effective_config_schema_version": int(
+            result.get("config_schema_version") or 0
+        ),
+    }
     result = normalize_candidate_paths(result, base_dir)
-    validate_production_config(result)
+    validate_production_config(
+        result, source_schema_version=(
+            int(raw_loaded.get("config_schema_version") or 0)
+            if configured_path else CONFIG_SCHEMA_VERSION
+        )
+    )
     return result
 
 
@@ -124,7 +150,53 @@ def normalize_candidate_paths(config: Dict[str, Any], base_dir: str) -> Dict[str
     return result
 
 
-def validate_production_config(config: Dict[str, Any]) -> None:
+def _apply_compatibility_aliases(config: Dict[str, Any]) -> Dict[str, Any]:
+    result = _merge({}, config)
+    aliases = (
+        (("database", "host"), ("mysql", "host")),
+        (("database", "port"), ("mysql", "port")),
+        (("database", "user"), ("mysql", "user")),
+        (("database", "password"), ("mysql", "password")),
+        (("database", "name"), ("mysql", "database")),
+        (("server", "bind"), ("server", "host")),
+        (("server", "bind_address"), ("server", "host")),
+    )
+    warnings_out = []
+    for source_path, target_path in aliases:
+        source = result
+        target = result
+        for key in source_path[:-1]:
+            source = source.get(key) if isinstance(source, dict) else None
+        for key in target_path[:-1]:
+            target = target.setdefault(key, {})
+        if isinstance(source, dict) and source_path[-1] in source and \
+                target_path[-1] not in target:
+            target[target_path[-1]] = source[source_path[-1]]
+            warnings_out.append(
+                "{} -> {}".format(".".join(source_path), ".".join(target_path))
+            )
+    if warnings_out:
+        result["_config_metadata"] = dict(result.get("_config_metadata") or {})
+        result["_config_metadata"]["compatibility_aliases"] = warnings_out
+        for item in warnings_out:
+            warnings.warn("deprecated runtime config alias: {}".format(item),
+                          DeprecationWarning, stacklevel=2)
+    return result
+
+
+def validate_production_config(config: Dict[str, Any],
+                               source_schema_version: Optional[int] = None) -> None:
+    effective_source_schema_version = (
+        config.get("config_schema_version")
+        if source_schema_version is None else source_schema_version
+    )
+    if int(effective_source_schema_version or 0) < CONFIG_SCHEMA_VERSION:
+        if str(os.environ.get("COVERAGE_ENV", "development")).lower() == "production":
+            raise RuntimeError(
+                "production runtime config requires config_schema_version >= {}".format(
+                    CONFIG_SCHEMA_VERSION
+                )
+            )
     runtime_mode = str(config.get("runtime_mode") or "legacy").lower()
     if runtime_mode not in ("legacy", "vnext"):
         raise RuntimeError("runtime_mode must be 'legacy' or 'vnext'")

@@ -35,6 +35,7 @@ from app.inheritance.engine import InheritanceEngine
 from app.inheritance.toolchain import parser_from_config
 from app.jobs.bounded_executor import BoundedJobExecutor
 from app.jobs.service import VNextBackgroundJobService
+from app.observability import PerformanceEvidenceCollector
 
 
 class _ConnectionLease(object):
@@ -115,6 +116,7 @@ class VNextRuntime(object):
         self.analysis_service = AnalysisService(
             self.analyses, self.projects, self.states, self.lines,
             domain_repo=self.analysis_domain_repository,
+            file_state_repo=self.file_states,
         )
         state_root = state_config.get("root") or os.path.join(self.repo_root, ".runtime-state")
         if not os.path.isabs(state_root):
@@ -158,13 +160,19 @@ class VNextRuntime(object):
         # manifest must stop composition; generating a replacement here would
         # turn an exact-release failure into a silently accepted runtime.
         self.release_identity = get_current_release_identity(self.repo_root)
+        self.performance = PerformanceEvidenceCollector(
+            self.release_identity, workload_id="vnext-runtime"
+        )
         self.export_service = ExportService(
             self.projects, export_root, release_identity=self.release_identity
         )
         job_config = self.config.get("jobs") or {}
+        worker_count = max(1, int(job_config.get("max_workers", 4)))
+        global_budget = job_config.get("global_worker_budget", worker_count)
+        if int(global_budget) < 1:
+            raise ValueError("jobs.global_worker_budget must be positive")
         resource_limits = job_config.get("resource_limits")
         if resource_limits is None:
-            worker_count = max(1, int(job_config.get("max_workers", 4)))
             queue_size = max(1, int(job_config.get("max_queue_size", 100)))
             resource_limits = {
                 "database": {"max_workers": max(1, min(2, worker_count)),
@@ -181,7 +189,7 @@ class VNextRuntime(object):
                 max_workers=int(job_config.get("max_workers", 4)),
                 max_queue_size=int(job_config.get("max_queue_size", 100)),
                 resource_limits=resource_limits,
-                global_worker_budget=job_config.get("global_worker_budget"),
+                global_worker_budget=int(global_budget),
             ),
             heartbeat_timeout=float(job_config.get("heartbeat_timeout", 300)),
             heartbeat_interval=float(job_config.get("heartbeat_interval", 15)),
@@ -190,6 +198,7 @@ class VNextRuntime(object):
                 "rebuild_progress": self._rebuild_progress_recovery_handler,
                 "export": self._export_recovery_handler,
             },
+            execution_guard=self._validate_job_execution_fence,
         )
         # scan_import has its own checkpoint/fencing recovery owner.  The
         # generic stale-job reaper must not silently mark those candidates
@@ -216,6 +225,32 @@ class VNextRuntime(object):
         if not isinstance(payload, dict):
             raise ValueError("JOB_INPUT_PAYLOAD_INVALID")
         return payload
+
+    def _validate_job_execution_fence(self, job):
+        """Reject durable callbacks whose immutable input is no longer current."""
+        payload = self._job_payload(job)
+        project_id = int(job.get("project_id") or payload.get("project_id") or 0)
+        scan_id = int(job.get("scan_id") or payload.get("scan_id") or 0)
+        expected_version = int(job.get("data_version") or 0)
+        with self.connection_context(read_only=True) as connection:
+            state = self.states.get(connection, project_id) or {}
+            scan = self.projects.get_scan(connection, scan_id)
+        actual_version = int(state.get("data_version") or 0)
+        if actual_version != expected_version:
+            from app.jobs.service import JobSupersededError
+            raise JobSupersededError(
+                "JOB_SUPERSEDED:data_version:{}!={}".format(
+                    expected_version, actual_version
+                )
+            )
+        if not scan or int(scan.get("project_id") or 0) != project_id:
+            from app.jobs.service import JobSupersededError
+            raise JobSupersededError("JOB_SUPERSEDED:scan_identity")
+        requirement = payload.get("current_requirement") or {}
+        if requirement.get("required") and int(state.get("current_scan_id") or 0) != scan_id:
+            from app.jobs.service import JobSupersededError
+            raise JobSupersededError("JOB_SUPERSEDED:current_scan")
+        return True
 
     def _rebuild_progress_recovery_handler(self, job):
         payload = self._job_payload(job)

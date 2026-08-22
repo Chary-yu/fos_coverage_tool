@@ -192,7 +192,10 @@ class MySQLConnectionPool:
         
         self._pool: Queue = Queue(maxsize=self.max_connections)
         self._active_count = 0
+        self._connecting_count = 0
+        self._waiters = 0
         self._lock = threading.Lock()
+        self._capacity = threading.Condition(self._lock)
         self._is_shutdown = False
         self._metrics = {
             "acquires": 0, "acquire_timeouts": 0, "reconnects": 0,
@@ -209,6 +212,7 @@ class MySQLConnectionPool:
         wrapper.close()
         with self._lock:
             self._active_count = max(0, self._active_count - 1)
+            self._capacity.notify_all()
 
     def _create_raw_connection(self):
         if not HAVE_PYMYSQL:
@@ -247,18 +251,36 @@ class MySQLConnectionPool:
                 pass
                 
             # 2. Try create new if below max
+            should_connect = False
             with self._lock:
-                if self._active_count < self.max_connections:
+                if self._active_count + self._connecting_count < self.max_connections:
+                    # Reserve a slot while the network operation happens
+                    # outside the global pool lock.  A second borrower sees
+                    # the reservation and waits instead of racing creation.
+                    self._connecting_count += 1
+                    should_connect = True
+            if should_connect:
+                try:
                     raw = self._create_raw_connection()
+                except Exception:
+                    with self._lock:
+                        self._connecting_count = max(0, self._connecting_count - 1)
+                        self._capacity.notify_all()
+                    raise
+                with self._lock:
+                    self._connecting_count = max(0, self._connecting_count - 1)
                     self._active_count += 1
-                    wrapper = PooledConnectionWrapper(raw, self)
-                    return wrapper
+                    self._capacity.notify_all()
+                wrapper = PooledConnectionWrapper(raw, self)
+                return wrapper
                     
             # 3. Wait for returned connection
             remaining = deadline - time.time()
             if remaining <= 0:
                 self._record_metric("acquire_timeouts")
                 raise TimeoutError("Connection pool exhausted ({}/{} active).".format(self._active_count, self.max_connections))
+            with self._lock:
+                self._waiters += 1
             try:
                 wrapper = self._pool.get(timeout=min(remaining, 0.5))
                 if (time.time() - wrapper.created_at) > self.max_lifetime_sec or not wrapper.is_alive():
@@ -270,6 +292,10 @@ class MySQLConnectionPool:
                 return wrapper
             except Empty:
                 continue
+            finally:
+                with self._lock:
+                    self._waiters = max(0, self._waiters - 1)
+                    self._capacity.notify_all()
 
     def return_connection(self, wrapper: Optional[PooledConnectionWrapper]) -> None:
         """Return a connection to the pool after rolling back uncommitted state."""
@@ -284,6 +310,8 @@ class MySQLConnectionPool:
         wrapper.last_returned_at = time.time()
         try:
             self._pool.put_nowait(wrapper)
+            with self._lock:
+                self._capacity.notify_all()
         except Exception:
             # Queue full, close it
             self._discard_wrapper(wrapper)
@@ -326,7 +354,11 @@ class MySQLConnectionPool:
         with self._lock:
             active = self._active_count
             metrics = dict(self._metrics)
-        return dict(metrics, active=active, idle=self._pool.qsize(), waiters=0)
+            connecting = self._connecting_count
+            waiters = self._waiters
+        return dict(metrics, active=active, idle=self._pool.qsize(),
+                    waiters=waiters, connecting=connecting,
+                    capacity=self.max_connections)
 
 _GLOBAL_POOLS = {}
 _GLOBAL_POOL_REFS = {}

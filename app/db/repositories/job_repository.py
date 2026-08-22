@@ -10,7 +10,7 @@ class JobRepository(object):
     def get(self, connection, job_id: str):
         return fetchone(connection, "SELECT * FROM coverage_background_jobs WHERE job_id = ?", (job_id,))
 
-    def list(self, connection, project_id=None, states=None):
+    def list(self, connection, project_id=None, states=None, limit=100, cursor=None):
         sql = "SELECT * FROM coverage_background_jobs"
         clauses = []
         params = []
@@ -21,10 +21,34 @@ class JobRepository(object):
             placeholders = ", ".join("?" for _ in states)
             clauses.append("state IN ({})".format(placeholders))
             params.extend(states)
+        if cursor:
+            clauses.append("(created_at > ? OR (created_at = ? AND job_id > ?))")
+            params.extend((
+                str(cursor.get("created_at") or ""),
+                str(cursor.get("created_at") or ""),
+                str(cursor.get("job_id") or ""),
+            ))
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY created_at, job_id"
+        sql += " ORDER BY created_at, job_id LIMIT ?"
+        params.append(min(501, max(1, int(limit or 100))))
         return fetchall(connection, sql, params)
+
+    def list_page(self, connection, project_id=None, states=None,
+                  limit=100, cursor=None):
+        page_limit = min(500, max(1, int(limit or 100)))
+        rows = self.list(connection, project_id, states, limit=page_limit + 1,
+                         cursor=cursor)
+        has_more = len(rows) > page_limit
+        rows = rows[:page_limit]
+        next_cursor = None
+        if has_more and rows:
+            last = rows[-1]
+            next_cursor = {
+                "created_at": str(last.get("created_at") or ""),
+                "job_id": str(last.get("job_id") or ""),
+            }
+        return {"rows": rows, "has_more": has_more, "next_cursor": next_cursor}
 
     def find_active(self, connection, project_id, scan_id, kind, data_version):
         return fetchone(connection, """
@@ -44,13 +68,15 @@ class JobRepository(object):
             job.get("heartbeat_at"), job.get("created_at") or _now(),
             job.get("started_at"), job.get("finished_at"), utc_sql(),
             job.get("lease_owner") or "",
+            job.get("handler_version") or "",
         )
         if existing:
             cursor = execute(connection, """
                 UPDATE coverage_background_jobs SET project_id = ?, scan_id = ?, kind = ?,
                     state = ?, progress = ?, input_payload = ?, result_path = ?,
                     error_message = ?, data_version = ?, heartbeat_at = ?, created_at = ?,
-                    started_at = ?, finished_at = ?, updated_at = ?, lease_owner = ?
+                    started_at = ?, finished_at = ?, updated_at = ?, lease_owner = ?,
+                    handler_version = ?
                 WHERE job_id = ?
             """, fields + (job["job_id"],))
             cursor.close()
@@ -59,8 +85,8 @@ class JobRepository(object):
                 INSERT INTO coverage_background_jobs(
                     job_id, project_id, scan_id, kind, state, progress, input_payload,
                     result_path, error_message, data_version, heartbeat_at, created_at,
-                    started_at, finished_at, updated_at, lease_owner
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    started_at, finished_at, updated_at, lease_owner, handler_version
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (job["job_id"],) + fields)
             cursor.close()
         return self.get(connection, job["job_id"])

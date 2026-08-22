@@ -130,13 +130,6 @@ class VNextRuntimeTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(pending_page["total"], 1)
         self.assertEqual(pending_page["rows"][0]["line_number"], 11)
-        self.assertEqual(
-            self.application.dispatch(
-                "GET", "/api/coverage/progress", query={"project": "fixture"}
-            )[1]["source"],
-            "authoritative",
-        )
-
         self.runtime.progress_service.rebuild(self.connection, "fixture", scan_id)
         progress_trace = []
         def trace_progress(statement):

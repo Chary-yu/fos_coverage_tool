@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS coverage_background_jobs (
     job_id TEXT PRIMARY KEY, project_id INTEGER, scan_id INTEGER, kind TEXT NOT NULL,
     state TEXT NOT NULL, progress REAL NOT NULL DEFAULT 0, input_payload TEXT NOT NULL,
     result_path TEXT NOT NULL DEFAULT '', error_message TEXT, data_version INTEGER,
+    handler_version TEXT NOT NULL DEFAULT '',
     heartbeat_at TEXT, lease_owner TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
     started_at TEXT, finished_at TEXT, updated_at TEXT NOT NULL
 );

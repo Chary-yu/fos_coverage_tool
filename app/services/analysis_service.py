@@ -3,6 +3,7 @@
 from app.db.repositories import (
     AnalysisDomainRepository,
     AnalysisRepository,
+    FileStateRepository,
     LineIndexRepository,
     ProjectRepository,
     ProjectStateRepository,
@@ -19,12 +20,13 @@ MAX_EXPANDED_ANALYSIS_LINES = 20000
 
 class AnalysisService(object):
     def __init__(self, analysis_repo=None, project_repo=None, state_repo=None,
-                 line_repo=None, domain_repo=None):
+                 line_repo=None, domain_repo=None, file_state_repo=None):
         self.analyses = analysis_repo or AnalysisRepository()
         self.projects = project_repo or ProjectRepository()
         self.states = state_repo or ProjectStateRepository()
         self.lines = line_repo or LineIndexRepository()
         self.domain = domain_repo or AnalysisDomainRepository()
+        self.file_states = file_state_repo or FileStateRepository()
 
     def _project(self, connection, project_name=None, project_id=None):
         if project_id is not None:
@@ -52,7 +54,7 @@ class AnalysisService(object):
                 return {"saved": 0, "data_version": state.get("data_version", 0)}
             resolved = self._resolve_records(conn, int(scan_id), records, reviewer)
             self._validate_concurrency(conn, int(scan_id), resolved)
-            self._save_domain_records(conn, int(scan_id), resolved)
+            affected_file_ids = self._save_domain_records(conn, int(scan_id), resolved)
             self.domain.close_active_rejections_many(
                 conn, int(scan_id),
                 sorted({int(item["line_id"]) for item in resolved}),
@@ -64,6 +66,15 @@ class AnalysisService(object):
             self.analyses.upsert_many(conn, resolved)
             saved = len(resolved)
             next_state = self.states.advance(conn, project["id"])
+            for file_id in sorted(set(affected_file_ids or [])):
+                self.file_states.rebuild_file(
+                    conn, int(scan_id), int(file_id), int(next_state["data_version"])
+                )
+            next_state = self.states.mark_ready(
+                conn, project["id"], int(next_state["data_version"])
+            )
+            if int(next_state.get("file_state_version") or 0) != int(next_state["data_version"]):
+                raise RuntimeError("FILE_STATE_VERSION_NOT_READY")
         return {"saved": saved, "data_version": next_state["data_version"]}
 
     def _validate_concurrency(self, connection, scan_id, resolved):
@@ -276,6 +287,7 @@ class AnalysisService(object):
                     ),
                 })
         self.domain.create_links_many(connection, links)
+        return sorted({int(file_id) for plan in plans for file_id in plan["file_ids"]})
 
     @staticmethod
     def _review_state(item):

@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 from app.config.runtime_config import load_application_config
+from scripts.config_preflight import preflight_config
 from app.legacy_runtime import get_arg_value, load_config
 
 
@@ -77,6 +78,48 @@ class RuntimeConfigTest(unittest.TestCase):
                 config["report_roots"],
                 [os.path.realpath(os.path.join(root, "reports"))],
             )
+
+    def test_legacy_config_preflight_writes_independent_candidate_and_preserves_source(self):
+        with tempfile.TemporaryDirectory(prefix="config-preflight-") as root:
+            source = os.path.join(root, "v10.json")
+            candidate = os.path.join(root, "candidate", "vnext.json")
+            original = {
+                "database": {"host": "legacy-db", "port": 3307},
+                "server": {"bind": "127.0.0.1", "port": 9529},
+                "runtime_state": {"root": "legacy-state"},
+            }
+            with open(source, "w", encoding="utf-8") as stream:
+                json.dump(original, stream, sort_keys=True)
+            with open(source, "rb") as stream:
+                before = stream.read()
+            result = preflight_config(source, base_dir=root, output_path=candidate,
+                                      write_candidate=True)
+            self.assertEqual(result["status"], "REVIEW_REQUIRED")
+            self.assertTrue(result["diff"])
+            self.assertTrue(result["source_unchanged"])
+            with open(source, "rb") as stream:
+                self.assertEqual(stream.read(), before)
+            with open(candidate, "r", encoding="utf-8") as stream:
+                upgraded = json.load(stream)
+            self.assertEqual(upgraded["config_schema_version"], 2)
+            self.assertEqual(upgraded["mysql"]["host"], "legacy-db")
+            self.assertEqual(upgraded["server"]["host"], "127.0.0.1")
+
+    def test_production_old_config_schema_fails_closed(self):
+        with tempfile.TemporaryDirectory(prefix="config-production-") as root:
+            path = os.path.join(root, "old.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({"runtime_mode": "vnext", "schema_version": 1}, stream)
+            old_env = os.environ.get("COVERAGE_ENV")
+            os.environ["COVERAGE_ENV"] = "production"
+            try:
+                with self.assertRaisesRegex(RuntimeError, "config_schema_version"):
+                    load_application_config(path, base_dir=root)
+            finally:
+                if old_env is None:
+                    os.environ.pop("COVERAGE_ENV", None)
+                else:
+                    os.environ["COVERAGE_ENV"] = old_env
 
 
 if __name__ == "__main__":

@@ -16,7 +16,9 @@ from app.db.repositories.analysis_domain_repository import (
 )
 from app.db.repositories.base import adapt_sql, execute, fetchall, fetchone
 from app.inheritance.cpp_parser import CppSourceAnalyzer
-from app.inheritance.dependencies import DependencyResolver, SourceAnalysisIndex
+from app.inheritance.dependencies import (
+    DependencyResolver, LazySourceAnalysisIndex, SourceAnalysisIndex,
+)
 from app.inheritance.git_snapshot import GitSnapshotProvider, GitTechnicalFailure
 from app.inheritance.line_map import GitLineMapEngine
 from app.inheritance.normalizer import normalize_cpp
@@ -43,6 +45,7 @@ class InheritanceEngine(object):
         self._source_index_cache = {}
         self._ancestry_cache = {}
         self._metrics = {}
+        self.max_source_cache_bytes = 32 * 1024 * 1024
 
     def compare_line(self, old_line, new_line, old_analysis=None, new_analysis=None,
                      old_line_number=None, new_line_number=None,
@@ -111,6 +114,16 @@ class InheritanceEngine(object):
             "callee_unresolved_by_reason": {},
             "macro_unresolved_by_reason": {},
             "const_unresolved_by_reason": {},
+            "relation_total": 0,
+            "file_work_units": 0,
+            "git_snapshot_total": 0,
+            "mapping_total": 0,
+            "parser_file_total": 0,
+            "decision_read_total": 0,
+            "source_files_total": 0,
+            "source_files_loaded": 0,
+            "source_cache_bytes": 0,
+            "source_budget_exhausted": 0,
         }
         candidate = fetchone(connection, "SELECT * FROM coverage_scans WHERE id=?",
                              (int(candidate_scan_id),))
@@ -177,7 +190,9 @@ class InheritanceEngine(object):
         }
         decisions = []
         decided_line_ids = set()
+        file_contexts = {}
         for relation in source_relations:
+            self._metrics["relation_total"] += 1
             key = (str(relation.get("repository_name") or ""),
                    str(relation.get("file_path") or ""))
             repository_status = repository_resolution.get(key[0])
@@ -193,16 +208,32 @@ class InheritanceEngine(object):
             target_file_id = candidate_file_id_by_path.get(key)
             if not target_file_id or key in ambiguous_file_paths:
                 continue
-            repo_path = repository_paths.get(key[0])
-            candidate_snapshot = self._repository_snapshot(
-                connection, candidate_scan_id, key[0]
-            )
-            predecessor_snapshot = self._repository_snapshot(
-                connection, predecessor_id, key[0]
-            )
-            source_snapshot = self._snapshot_for_relation(
-                relation, repo_path, predecessor_snapshot, candidate_snapshot
-            )
+            source_snapshot = file_contexts.get(key)
+            if source_snapshot is None:
+                repo_path = repository_paths.get(key[0])
+                candidate_snapshot = self._repository_snapshot(
+                    connection, candidate_scan_id, key[0]
+                )
+                predecessor_snapshot = self._repository_snapshot(
+                    connection, predecessor_id, key[0]
+                )
+                source_snapshot = self._snapshot_for_relation(
+                    relation, repo_path, predecessor_snapshot, candidate_snapshot
+                )
+                self._metrics["file_work_units"] += 1
+                if not source_snapshot.get("reason_code"):
+                    old_lines = source_snapshot["old_text"].splitlines()
+                    new_lines = source_snapshot["new_text"].splitlines()
+                    source_snapshot["old_analysis"] = self.parser.analyze(
+                        source_snapshot["old_text"], relation.get("file_path") or ""
+                    )
+                    source_snapshot["new_analysis"] = self.parser.analyze(
+                        source_snapshot["new_text"], relation.get("file_path") or ""
+                    )
+                    source_snapshot["old_lines"] = old_lines
+                    source_snapshot["new_lines"] = new_lines
+                    self._metrics["parser_file_total"] += 2
+                file_contexts[key] = source_snapshot
             if source_snapshot.get("reason_code"):
                 decisions.append(self._write_decision(
                     connection, run_id, candidate_scan_id, None, relation,
@@ -212,6 +243,8 @@ class InheritanceEngine(object):
             mapping = source_snapshot.get("mapping") or self.line_mapper.map_text(
                 source_snapshot["old_text"], source_snapshot["new_text"]
             )
+            if not source_snapshot.get("mapping"):
+                self._metrics["mapping_total"] += 1
             new_line_number = mapping.get(int(relation["source_line_number"]))
             if new_line_number is None:
                 reason = "LINE_DELETED" if int(relation["source_line_number"]) in mapping.deleted else "LINE_AMBIGUOUS"
@@ -225,18 +258,15 @@ class InheritanceEngine(object):
             )
             if not target_line:
                 continue
+            self._metrics["decision_read_total"] += 1
             existing_decision = fetchone(connection, """
                 SELECT * FROM coverage_inheritance_decisions
                 WHERE decision_run_id=? AND candidate_line_id=?
             """, (run_id, int(target_line["id"])))
-            old_analysis = self.parser.analyze(
-                source_snapshot["old_text"], relation.get("file_path") or ""
-            )
-            new_analysis = self.parser.analyze(
-                source_snapshot["new_text"], relation.get("file_path") or ""
-            )
-            old_lines = source_snapshot["old_text"].splitlines()
-            new_lines = source_snapshot["new_text"].splitlines()
+            old_analysis = source_snapshot["old_analysis"]
+            new_analysis = source_snapshot["new_analysis"]
+            old_lines = source_snapshot["old_lines"]
+            new_lines = source_snapshot["new_lines"]
             old_line_text = (old_lines[int(relation["source_line_number"]) - 1]
                              if 0 < int(relation["source_line_number"]) <= len(old_lines)
                              else relation.get("source_line_text") or "")
@@ -454,16 +484,24 @@ class InheritanceEngine(object):
         return {"reason_code": "REPOSITORY_PATH_UNAVAILABLE"}
 
     def _source_index(self, provider, commit):
-        key = (provider.repo_path, str(commit), self.parser.__class__.__name__)
+        parser_version = getattr(self.parser, "version", self.parser.__class__.__name__)
+        key = (provider.repo_path, str(commit), str(parser_version))
         if key in self._source_index_cache:
             self._metrics["parser_cache_hit"] += 1
             return self._source_index_cache[key]
         self._metrics["parser_cache_miss"] += 1
-        analyses = {}
-        for path in provider.list_source_files(commit):
+        paths = provider.list_source_files(commit)
+        self._metrics["source_files_total"] += len(paths)
+
+        def load(path):
             text = provider.read_file(commit, path)
-            analyses[path] = self.parser.analyze(text, path)
-        index = SourceAnalysisIndex(analyses)
+            self._metrics["parser_file_total"] += 1
+            return self.parser.analyze(text, path), len(text.encode("utf-8"))
+
+        index = LazySourceAnalysisIndex(
+            paths=paths, loader=load, max_cached_bytes=self.max_source_cache_bytes,
+            metrics=self._metrics,
+        )
         self._source_index_cache[key] = index
         return index
 

@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+from bisect import bisect_right
 
 from app.inject.parse_once import parse_gcov_source_once
 from app.incremental.lcov import load_info
@@ -93,8 +94,11 @@ class ScanImportService(object):
             ranges = item.get("function_ranges") or []
             fallback = bool(item.get("function_range_fallback"))
             line_records = []
-            for line_number, execution_count in sorted(item.get("lines", {}).items()):
-                function = self._function_for_line(ranges, line_number) if not fallback else None
+            sorted_lines = sorted(item.get("lines", {}).items())
+            function_lookup = self._function_lookup(ranges) if not fallback else None
+            for line_number, execution_count in sorted_lines:
+                function = (function_lookup(line_number)
+                            if function_lookup is not None else None)
                 line_records.append({
                     "line_number": line_number,
                     "line_text": "",
@@ -146,7 +150,56 @@ class ScanImportService(object):
 
     @staticmethod
     def _function_for_line(ranges, line_number):
-        for item in ranges:
-            if item.get("start_line", 0) <= line_number <= item.get("end_line", 0):
-                return item
-        return None
+        """Resolve one line without making the normal path O(lines*functions).
+
+        LCOV ranges are expected to be non-overlapping after parser
+        validation.  Keep the historical first-match behaviour for a direct
+        compatibility call, but make malformed overlaps fail closed when the
+        bulk lookup is built.  The bulk resolver uses a monotonic sweep, so
+        sorted line numbers and ranges are O(L+F).
+        """
+        lookup = ScanImportService._function_lookup(ranges)
+        return lookup(line_number) if lookup is not None else None
+
+    @staticmethod
+    def _function_lookup(ranges):
+        normalized = []
+        for index, item in enumerate(ranges or []):
+            try:
+                start = int(item.get("start_line", 0))
+                end = int(item.get("end_line", 0))
+            except (AttributeError, TypeError, ValueError):
+                return None
+            if start < 1 or end < start:
+                return None
+            normalized.append((start, end, index, item))
+        normalized.sort(key=lambda value: (value[0], value[1], value[2]))
+        for previous, current in zip(normalized, normalized[1:]):
+            if current[0] <= previous[1]:
+                # Crossing/nested ranges have no unique physical ownership.
+                return None
+        starts = [item[0] for item in normalized]
+        pointer = [0]
+
+        def resolve(line_number):
+            try:
+                line_number = int(line_number)
+            except (TypeError, ValueError):
+                return None
+            while pointer[0] < len(normalized) and normalized[pointer[0]][1] < line_number:
+                pointer[0] += 1
+            if pointer[0] >= len(normalized):
+                return None
+            candidate = normalized[pointer[0]]
+            if candidate[0] <= line_number <= candidate[1]:
+                return candidate[3]
+            # A caller may use the helper with a non-monotonic line.  Locate
+            # the only possible range without mutating the sweep pointer.
+            index = bisect_right(starts, line_number) - 1
+            if index >= 0:
+                candidate = normalized[index]
+                if candidate[0] <= line_number <= candidate[1]:
+                    return candidate[3]
+            return None
+
+        return resolve

@@ -196,6 +196,8 @@ class VNextApplication(object):
             "process": {
                 "peak_rss_bytes": _process_peak_rss_bytes(),
             },
+            "performance": self.runtime.performance.snapshot("runtime")
+            if getattr(self.runtime, "performance", None) else {},
         }
         if runtime.database_manager is not None:
             payload["db_pool"] = runtime.database_manager.health()
@@ -214,10 +216,30 @@ class VNextApplication(object):
         states = query.get("state")
         if isinstance(states, str):
             states = [states]
+        page_size = min(200, max(1, int(query.get("page_size") or 100)))
+        cursor = query.get("cursor")
+        if cursor:
+            try:
+                raw = base64.urlsafe_b64decode(str(cursor).encode("ascii"))
+                cursor = json.loads(raw.decode("utf-8"))
+            except Exception:
+                raise ValueError("PAGINATION_CURSOR_STALE")
         with self._read_connection() as connection:
-            return 200, {"jobs": self.runtime.jobs.list(
-                connection, int(project_id) if project_id else None, states
-            )}
+            page = self.runtime.jobs.list_page(
+                connection, int(project_id) if project_id else None, states,
+                limit=page_size, cursor=cursor,
+            )
+        next_cursor = page.get("next_cursor")
+        if next_cursor:
+            raw = json.dumps(next_cursor, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")
+            next_cursor = base64.urlsafe_b64encode(raw).decode("ascii")
+        return 200, {
+            "jobs": page.get("rows") or [],
+            "page_size": page_size,
+            "next_cursor": next_cursor,
+            "has_more": bool(page.get("has_more")),
+        }
 
     def recover_jobs(self, query, body, headers, remote_address):
         self._require_mutation(headers, remote_address)
@@ -273,6 +295,11 @@ class VNextApplication(object):
                 "report_id": report_id if kind == "export" else "",
                 "output_path": output_path if kind == "export" else None,
                 "payload": body.get("input_payload") or {},
+                "current_requirement": {
+                    "required": bool(body.get("require_current", False)),
+                    "scan_id": int(scan_id),
+                },
+                "handler_version": "VNEXT_JOB_HANDLER_V1",
             },
         )
         return 202, {"job": job}
@@ -590,14 +617,32 @@ class VNextApplication(object):
 
     def unanalyzed(self, query, body, headers, remote_address):
         project_name = progress_endpoint.project_name(query, self.config.get("project_name") or "")
+        page_size = min(200, max(1, int(query.get("page_size") or 200)))
+        cursor = query.get("cursor")
+        if cursor:
+            try:
+                raw = base64.urlsafe_b64decode(str(cursor).encode("ascii"))
+                cursor = json.loads(raw.decode("utf-8"))
+            except Exception:
+                raise ValueError("PAGINATION_CURSOR_STALE")
         with self._read_connection() as connection:
-            return 200, {
+            page = self.runtime.progress_service.pending_by_file(
+                connection, project_name,
+                int(query.get("scan_id")) if query.get("scan_id") else None,
+                page_size=page_size, cursor=cursor,
+            )
+        next_cursor = page.get("next_cursor")
+        if next_cursor:
+            raw = json.dumps(next_cursor, sort_keys=True,
+                             separators=(",", ":")).encode("utf-8")
+            next_cursor = base64.urlsafe_b64encode(raw).decode("ascii")
+        return 200, {
                 "project_name": project_name,
                 "scan_id": int(query.get("scan_id")) if query.get("scan_id") else None,
-                "files": self.runtime.progress_service.pending_by_file(
-                    connection, project_name,
-                    int(query.get("scan_id")) if query.get("scan_id") else None,
-                ),
+                "files": page.get("rows") or [],
+                "page_size": page_size,
+                "has_more": bool(page.get("has_more")),
+                "next_cursor": next_cursor,
             }
 
     def incremental(self, query, body, headers, remote_address):

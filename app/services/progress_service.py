@@ -101,24 +101,17 @@ class ProgressService(object):
             self.states.mark_ready(conn, project["id"], int(state.get("data_version") or 0))
         return self.summary(connection, project_name, scan_id)
 
-    def pending_by_file(self, connection, project_name, scan_id=None):
+    def pending_by_file(self, connection, project_name, scan_id=None,
+                        page_size=200, cursor=None):
         project = self._project(connection, project_name)
         state = self.states.get(connection, project["id"]) or {}
         scan_id = scan_id or state.get("current_scan_id")
         if not scan_id:
             return []
-        from app.db.repositories.base import fetchall
-        rows = self.file_states.pending_line_references(connection, scan_id)
-        grouped = {}
-        for row in rows:
-            key = (row.get("repository_name") or "", row.get("file_path") or "")
-            grouped.setdefault(key, []).append(int(row["line_number"]))
-        return [{
-            "scan_id": int(scan_id),
-            "repository_name": key[0], "file_path": key[1],
-            "pending_line_numbers": values,
-            "unanalyzed": len(values),
-        } for key, values in grouped.items()]
+        page = self.file_states.pending_file_page(
+            connection, int(scan_id), limit=page_size, cursor=cursor
+        )
+        return page
 
     def pending_page(self, connection, project_name, scan_id=None,
                      page=1, page_size=100):

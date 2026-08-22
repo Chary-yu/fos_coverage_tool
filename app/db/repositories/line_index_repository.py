@@ -2,7 +2,9 @@
 
 from typing import Any, Dict, Iterable
 
-from app.db.repositories.base import adapt_sql, execute, fetchall, fetchone, insert_id
+from app.db.repositories.base import (
+    adapt_sql, bind_chunk_size, execute, fetchall, fetchone, insert_id,
+)
 
 
 LINE_FIELDS = (
@@ -43,7 +45,9 @@ class LineIndexRepository(object):
         if not line_ids:
             return []
         rows = []
-        for id_chunk in _chunks(line_ids, MAX_LOOKUP_VALUES):
+        chunk_size = bind_chunk_size(connection, parameter_width=1,
+                                     maximum=MAX_LOOKUP_VALUES)
+        for id_chunk in _chunks(line_ids, chunk_size):
             placeholders = ", ".join("?" for _ in id_chunk)
             rows.extend(fetchall(connection, """
                 SELECT l.*, f.scan_id, f.repository_name, f.file_path, f.file_path_hash
@@ -59,7 +63,9 @@ class LineIndexRepository(object):
         if not pairs:
             return []
         rows = []
-        for pair_chunk in _chunks(pairs, MAX_LOOKUP_VALUES):
+        chunk_size = bind_chunk_size(connection, parameter_width=2,
+                                     reserved=0, maximum=MAX_LOOKUP_VALUES)
+        for pair_chunk in _chunks(pairs, chunk_size):
             clauses = []
             params = []
             for file_id, line_number in pair_chunk:
@@ -104,7 +110,8 @@ class LineIndexRepository(object):
         cursor.close()
         return fetchone(connection, "SELECT * FROM coverage_lines WHERE id = ?", (line_id,))
 
-    def upsert_lines(self, connection, file_id: int, records: Iterable[Dict[str, Any]]):
+    def upsert_lines(self, connection, file_id: int, records: Iterable[Dict[str, Any]],
+                     return_rows=False):
         self._assert_file_scan_building(connection, file_id)
         normalized = []
         for record in records or []:
@@ -123,12 +130,14 @@ class LineIndexRepository(object):
                 values.append(defaults.get(field) if value is None else value)
             normalized.append(tuple(values))
         if not normalized:
-            return []
+            return [] if return_rows else 0
         line_numbers = [item[0] for item in normalized]
         if len(set(line_numbers)) != len(line_numbers):
             raise ValueError("duplicate physical line identity in batch")
         existing = []
-        for number_chunk in _chunks(line_numbers, MAX_LOOKUP_VALUES):
+        lookup_size = bind_chunk_size(connection, parameter_width=1, reserved=1,
+                                      maximum=MAX_LOOKUP_VALUES)
+        for number_chunk in _chunks(line_numbers, lookup_size):
             existing.extend(fetchall(connection, """
                 SELECT * FROM coverage_lines WHERE file_id = ?
                   AND line_number IN ({})
@@ -141,7 +150,8 @@ class LineIndexRepository(object):
                 raise ValueError("physical line fact is immutable")
         missing = [values for values in normalized if values[0] not in by_line]
         if not missing:
-            return [by_line[values[0]] for values in normalized]
+            return ([by_line[values[0]] for values in normalized]
+                    if return_rows else len(normalized))
         for missing_chunk in _chunks(missing, MAX_INSERT_VALUES):
             cursor = connection.cursor()
             try:
@@ -154,7 +164,10 @@ class LineIndexRepository(object):
                 """), [(int(file_id),) + values for values in missing_chunk])
             finally:
                 cursor.close()
-        return self.list_lines(connection, file_id)
+        if return_rows:
+            return [self.get_line(connection, file_id, values[0])
+                    for values in normalized]
+        return len(normalized)
 
     def list_lines(self, connection, file_id: int):
         return fetchall(connection, """

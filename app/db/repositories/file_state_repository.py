@@ -288,6 +288,119 @@ class FileStateRepository(object):
             "pending_line_references": [],
         }
 
+    def pending_file_page(self, connection, scan_id: int, limit=200, cursor=None):
+        """Return bounded file-level pending aggregates without line materialization."""
+        page_limit = min(500, max(1, int(limit or 200)))
+        after_id = int((cursor or {}).get("file_id") or 0)
+        coverage = fetchone(connection, """
+            SELECT COUNT(DISTINCT f.id) AS files,
+                   COUNT(DISTINCT fs.file_id) AS states
+            FROM coverage_files f
+            LEFT JOIN coverage_file_state fs
+              ON fs.scan_id=f.scan_id AND fs.file_id=f.id
+            WHERE f.scan_id=?
+        """, (int(scan_id),)) or {}
+        use_derived = (
+            int(coverage.get("files") or 0) > 0 and
+            int(coverage.get("files") or 0) == int(coverage.get("states") or 0)
+        )
+        if use_derived:
+            rows = fetchall(connection, """
+                SELECT f.id AS file_id, f.repository_name, f.file_path,
+                       fs.total_lines, fs.total_uncovered, fs.filled_total,
+                       fs.draft_total, fs.confirmed_total, fs.pending_total,
+                       fs.ordinary_pending_total, fs.inherited_pending_total,
+                       fs.manual_draft_pending_total
+                FROM coverage_files f
+                JOIN coverage_file_state fs
+                  ON fs.scan_id=f.scan_id AND fs.file_id=f.id
+                WHERE f.scan_id=? AND fs.pending_total > 0 AND f.id > ?
+                ORDER BY f.id
+                LIMIT ?
+            """, (int(scan_id), after_id, page_limit + 1))
+        else:
+            uncovered = self._UNCOVERED_SQL
+            confirmed = self._CONFIRMED_SQL
+            rows = fetchall(connection, """
+                SELECT * FROM (
+                    SELECT f.id AS file_id, f.repository_name, f.file_path,
+                           COUNT(l.id) AS total_lines,
+                           COALESCE(SUM(CASE WHEN {uncovered} THEN 1 ELSE 0 END), 0)
+                               AS total_uncovered,
+                           COALESCE(SUM(CASE WHEN ({status}) <> '' THEN 1 ELSE 0 END), 0)
+                               AS filled_total,
+                           COALESCE(SUM(CASE WHEN ({draft}) = 1 THEN 1 ELSE 0 END), 0)
+                               AS draft_total,
+                           COALESCE(SUM(CASE WHEN {uncovered} AND {confirmed}
+                                             THEN 1 ELSE 0 END), 0)
+                               AS confirmed_total,
+                           COALESCE(SUM(CASE WHEN {uncovered} AND NOT ({confirmed})
+                                             THEN 1 ELSE 0 END), 0)
+                               AS pending_total,
+                           COALESCE(SUM(CASE WHEN {ordinary} THEN 1 ELSE 0 END), 0)
+                               AS ordinary_pending_total,
+                           COALESCE(SUM(CASE WHEN {inherited} THEN 1 ELSE 0 END), 0)
+                               AS inherited_pending_total,
+                           COALESCE(SUM(CASE WHEN {manual} THEN 1 ELSE 0 END), 0)
+                               AS manual_draft_pending_total
+                    FROM coverage_files f
+                    LEFT JOIN coverage_lines l ON l.file_id=f.id
+                    LEFT JOIN coverage_analyses a ON a.line_id=l.id
+                    LEFT JOIN coverage_analysis_line_links q
+                      ON q.scan_id=f.scan_id AND q.line_id=l.id AND q.is_active=1
+                    LEFT JOIN coverage_analysis_records r ON r.id=q.analysis_record_id
+                    WHERE f.scan_id=?
+                    GROUP BY f.id, f.repository_name, f.file_path
+                ) grouped
+                WHERE grouped.pending_total > 0 AND grouped.file_id > ?
+                ORDER BY grouped.file_id
+                LIMIT ?
+            """.format(
+                uncovered=uncovered, status=self._STATUS_SQL, draft=self._DRAFT_SQL,
+                confirmed=confirmed, ordinary=self._ORDINARY_PENDING_SQL,
+                inherited=self._INHERITED_PENDING_SQL,
+                manual=self._MANUAL_DRAFT_PENDING_SQL,
+            ), (int(scan_id), after_id, page_limit + 1))
+        has_more = len(rows) > page_limit
+        rows = rows[:page_limit]
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["scan_id"] = int(scan_id)
+            item["file_id"] = int(item.get("file_id") or 0)
+            item["repository_name"] = item.get("repository_name") or ""
+            item["file_path"] = item.get("file_path") or ""
+            item["unanalyzed"] = int(item.get("pending_total") or 0)
+            # The legacy field remains present but deliberately empty: the
+            # homepage must never materialize a large physical pending list.
+            item["pending_line_numbers"] = (
+                self.pending_line_numbers_for_file(
+                    connection, int(scan_id), item["file_id"], limit=200
+                ) if item["unanalyzed"] <= 200 else []
+            )
+            result.append(item)
+        next_cursor = (
+            {"file_id": result[-1]["file_id"]} if has_more and result else None
+        )
+        return {"rows": result, "has_more": has_more, "next_cursor": next_cursor}
+
+    def pending_line_numbers_for_file(self, connection, scan_id, file_id, limit=200):
+        uncovered = self._UNCOVERED_SQL
+        confirmed = self._CONFIRMED_SQL
+        rows = fetchall(connection, """
+            SELECT l.line_number
+            FROM coverage_lines l
+            LEFT JOIN coverage_analyses a ON a.line_id=l.id
+            LEFT JOIN coverage_analysis_line_links q
+              ON q.scan_id=? AND q.line_id=l.id AND q.is_active=1
+            LEFT JOIN coverage_analysis_records r ON r.id=q.analysis_record_id
+            WHERE l.file_id=? AND {uncovered} AND NOT ({confirmed})
+            ORDER BY l.line_number
+            LIMIT ?
+        """.format(uncovered=uncovered, confirmed=confirmed),
+            (int(scan_id), int(file_id), min(200, max(1, int(limit or 200)))))
+        return [int(row["line_number"]) for row in rows]
+
     def pending_line_references(self, connection, scan_id: int, limit=None, offset=0):
         """Return file-qualified pending physical lines for a scan.
 

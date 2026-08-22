@@ -23,6 +23,31 @@ def adapt_sql(connection, sql: str) -> str:
     return sql.replace("?", "%s")
 
 
+def db_capabilities(connection) -> Dict[str, Any]:
+    """Return conservative bind/query capabilities for the active driver.
+
+    SQLite's portable parameter limit is 999. Some newer builds raise it,
+    but keeping the repository contract below that limit makes the same code
+    safe on older embedded and MariaDB-compatible test environments. MySQL
+    drivers do not need the SQLite restriction, while bounded chunks still
+    protect packet size and query planning.
+    """
+    return {
+        "dialect": "sqlite" if is_sqlite(connection) else "mysql",
+        "max_bind_params": 900 if is_sqlite(connection) else 2000,
+        "preferred_chunk_size": 450 if is_sqlite(connection) else 500,
+    }
+
+
+def bind_chunk_size(connection, parameter_width=1, reserved=0, maximum=None):
+    capabilities = db_capabilities(connection)
+    available = max(1, int(capabilities["max_bind_params"]) - int(reserved or 0))
+    size = max(1, available // max(1, int(parameter_width)))
+    if maximum is not None:
+        size = min(size, max(1, int(maximum)))
+    return size
+
+
 def execute(connection, sql: str, params: Iterable[Any] = ()):
     cursor = connection.cursor()
     cursor.execute(adapt_sql(connection, sql), tuple(params or ()))

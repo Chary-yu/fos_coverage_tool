@@ -10,12 +10,18 @@
     "inheritance_confirm": "POST /api/coverage/scans/{scan_id}/inheritance/confirm",
     "inheritance_edit_confirm": "POST /api/coverage/scans/{scan_id}/inheritance/edit-confirm",
     "inheritance_reject": "POST /api/coverage/scans/{scan_id}/inheritance/reject",
-    "inheritance_undo": "POST /api/coverage/scans/{scan_id}/inheritance/rejections/{rejection_id}/undo"
+    "inheritance_undo": "POST /api/coverage/scans/{scan_id}/inheritance/rejections/{rejection_id}/undo",
+    "progress": "GET /api/coverage/progress",
+    "progress_details": "GET /api/coverage/progress/details",
+    "progress_pending": "GET /api/coverage/progress/pending",
+    "pending_files": "GET /api/coverage/incremental/unanalyzed"
   },
   "pagination": {
     "default_limit": 100,
     "maximum_limit": 500,
-    "cursor_binding": ["scan_id", "data_version", "filter"]
+    "cursor_binding": ["scan_id", "data_version", "filter"],
+    "progress_details_envelope": ["page", "page_size", "total", "total_pages", "rows"],
+    "pending_files_envelope": ["files", "page_size", "has_more", "next_cursor"]
   },
   "mutation_identity": [
     "project",

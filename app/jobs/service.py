@@ -11,6 +11,10 @@ from app.db.transaction import transaction
 from app.jobs.bounded_executor import BoundedJobExecutor
 
 
+class JobSupersededError(Exception):
+    """Durable job no longer satisfies its execution fence."""
+
+
 class BackgroundJobService:
     def __init__(self, executor: Optional[BoundedJobExecutor] = None, store=None,
                  heartbeat_timeout: float = 300.0):
@@ -41,7 +45,7 @@ class VNextBackgroundJobService(object):
 
     def __init__(self, connection_factory, repository=None, executor=None,
                  heartbeat_timeout=300.0, heartbeat_interval=15.0,
-                 lease_owner=None, recovery_handlers=None):
+                 lease_owner=None, recovery_handlers=None, execution_guard=None):
         self.connection_factory = connection_factory
         self.repository = repository or JobRepository()
         self.executor = executor or BoundedJobExecutor()
@@ -53,6 +57,7 @@ class VNextBackgroundJobService(object):
         lease_prefix = str(lease_owner or "worker")
         self.lease_owner = "{}_{}".format(lease_prefix, uuid.uuid4().hex)
         self.recovery_handlers = dict(recovery_handlers or {})
+        self.execution_guard = execution_guard
         self._submit_lock = threading.Lock()
 
     def _save(self, job):
@@ -86,6 +91,10 @@ class VNextBackgroundJobService(object):
                 "kind": kind, "state": "queued", "progress": 0,
                 "input_payload": json.dumps(input_payload or {}, sort_keys=True),
                 "data_version": data_version, "lease_owner": self.lease_owner,
+                "handler_version": str(
+                    (input_payload or {}).get("handler_version") or
+                    "VNEXT_JOB_HANDLER_V1"
+                ),
             }
             persisted = self._save(job)
             try:
@@ -152,6 +161,8 @@ class VNextBackgroundJobService(object):
             )
             heartbeat_thread.start()
             try:
+                if self.execution_guard is not None:
+                    self.execution_guard(dict(started))
                 result = callback()
                 completed = dict(started)
                 completed.update({
@@ -161,6 +172,15 @@ class VNextBackgroundJobService(object):
                 })
                 self._save(completed)
                 return result
+            except JobSupersededError as exc:
+                superseded = dict(started)
+                superseded.update({
+                    "state": "superseded",
+                    "error_message": str(exc) or "JOB_SUPERSEDED",
+                    "finished_at": _now(), "heartbeat_at": _now(),
+                })
+                self._save(superseded)
+                return None
             except Exception as exc:
                 failed = dict(started)
                 failed.update({

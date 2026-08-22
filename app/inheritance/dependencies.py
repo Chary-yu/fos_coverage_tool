@@ -11,6 +11,7 @@ from __future__ import absolute_import
 
 import hashlib
 import re
+from collections import OrderedDict
 
 from app.inheritance.normalizer import normalize_cpp
 
@@ -52,6 +53,136 @@ class SourceAnalysisIndex(object):
             return values
         definitions = (local_analysis.get(kind) or {}).get(str(name))
         return [(local_analysis.get("path") or "", definitions)] if definitions else []
+
+
+class LazySourceAnalysisIndex(SourceAnalysisIndex):
+    """Lazy dependency closure with a byte-aware bounded LRU.
+
+    The repository file list is cheap metadata. Source text and parser objects
+    are loaded only when a dependency symbol is queried. If the configured
+    byte budget cannot admit another file, lookup returns the same
+    conservative unresolved result as an ambiguous/missing dependency.
+    """
+
+    def __init__(self, paths=None, loader=None, analyses=None,
+                 max_cached_bytes=32 * 1024 * 1024, metrics=None):
+        self._lazy_paths = [str(path) for path in (paths or [])]
+        self._lazy_loader = loader
+        self._max_cached_bytes = max(1, int(max_cached_bytes))
+        self._cached_bytes = 0
+        self._cache = OrderedDict()
+        self._pinned = set((analyses or {}).keys())
+        self._metrics = metrics if isinstance(metrics, dict) else {}
+        self.budget_exhausted = False
+        super(LazySourceAnalysisIndex, self).__init__(analyses=analyses or {})
+        for path in sorted(self.analyses):
+            self._cache[path] = self._estimate_size(self.analyses[path])
+            self._cached_bytes += self._cache[path]
+
+    @staticmethod
+    def _estimate_size(analysis):
+        try:
+            return len(repr(analysis).encode("utf-8"))
+        except (TypeError, ValueError):
+            return 1
+
+    def _rebuild(self):
+        self._functions = {}
+        self._macros = {}
+        self._constants = {}
+        for path, analysis in sorted(self.analyses.items()):
+            for function in analysis.get("functions", []) or []:
+                self._functions.setdefault(function.identity.name, []).append(function)
+            for name, definition in (analysis.get("macros") or {}).items():
+                self._macros.setdefault(str(name), []).append((path, definition))
+            for name, definition in (analysis.get("constants") or {}).items():
+                self._constants.setdefault(str(name), []).append((path, definition))
+
+    def _load_path(self, path):
+        path = str(path)
+        if path in self.analyses:
+            self._cache.move_to_end(path)
+            return True
+        if self._lazy_loader is None:
+            return False
+        try:
+            loaded = self._lazy_loader(path)
+        except Exception:
+            return False
+        if isinstance(loaded, tuple) and len(loaded) == 2:
+            analysis, size = loaded
+        else:
+            analysis, size = loaded, None
+        if not isinstance(analysis, dict):
+            return False
+        size = max(1, int(size or self._estimate_size(analysis)))
+        if size > self._max_cached_bytes:
+            self.budget_exhausted = True
+            self._metrics["source_budget_exhausted"] = (
+                int(self._metrics.get("source_budget_exhausted") or 0) + 1
+            )
+            return False
+        while self._cached_bytes + size > self._max_cached_bytes:
+            evicted = next(
+                (item for item in self._cache if item not in self._pinned), None
+            )
+            if evicted is None:
+                self.budget_exhausted = True
+                self._metrics["source_budget_exhausted"] = (
+                    int(self._metrics.get("source_budget_exhausted") or 0) + 1
+                )
+                return False
+            evicted_size = self._cache.pop(evicted)
+            self.analyses.pop(evicted, None)
+            self._cached_bytes -= int(evicted_size)
+        self.analyses[path] = analysis
+        self._cache[path] = size
+        self._cached_bytes += size
+        self._rebuild()
+        self._metrics["source_files_loaded"] = (
+            int(self._metrics.get("source_files_loaded") or 0) + 1
+        )
+        self._metrics["source_cache_bytes"] = self._cached_bytes
+        return True
+
+    def _ensure_symbol(self, kind, name):
+        source = self._functions if kind == "functions" else (
+            self._macros if kind == "macros" else self._constants
+        )
+        if str(name) in source:
+            # A second definition may still be hidden. Continue loading until
+            # all paths are visited or the byte budget makes the result
+            # explicitly unresolved.
+            pass
+        for path in self._lazy_paths:
+            if path not in self.analyses:
+                if not self._load_path(path) and self.budget_exhausted:
+                    break
+
+    def functions(self, name, local_analysis=None):
+        self._ensure_symbol("functions", name)
+        values = list(self._functions.get(str(name), ()))
+        if values or local_analysis is None:
+            return values
+        return [item for item in local_analysis.get("functions", [])
+                if item.identity.name == str(name)]
+
+    def definitions(self, kind, name, local_analysis=None):
+        self._ensure_symbol(kind, name)
+        source = self._macros if kind == "macros" else self._constants
+        values = list(source.get(str(name), ()))
+        if values or local_analysis is None:
+            return values
+        definitions = (local_analysis.get(kind) or {}).get(str(name))
+        return [(local_analysis.get("path") or "", definitions)] if definitions else []
+
+    def cache_stats(self):
+        return {
+            "cached_files": len(self._cache),
+            "cache_bytes": int(self._cached_bytes),
+            "max_cached_bytes": int(self._max_cached_bytes),
+            "budget_exhausted": bool(self.budget_exhausted),
+        }
 
 
 class DependencyResolver(object):
