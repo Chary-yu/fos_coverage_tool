@@ -118,6 +118,11 @@ class InheritanceEngine(object):
             raise KeyError("candidate scan not found")
         predecessor = self.predecessor.resolve(connection, candidate_scan_id)
         predecessor_id = predecessor.get("predecessor_scan_id")
+        repository_resolution = {
+            str(item.get("candidate_repository") or ""): item
+            for item in (predecessor.get("repositories") or [])
+        }
+        repository_resolution_available = "repositories" in predecessor
         run_id = decision_run_id or hashlib.sha256(json.dumps({
             "candidate_scan_id": int(candidate_scan_id),
             "predecessor_scan_id": predecessor_id,
@@ -152,10 +157,20 @@ class InheritanceEngine(object):
             WHERE f.scan_id=?
             ORDER BY f.repository_name, f.file_path, l.line_number
         """, (int(candidate_scan_id),))
-        candidate_by_path = {
-            (str(row.get("repository_name") or ""), str(row.get("file_path") or "")): row
-            for row in candidate_lines
-        }
+        # A path identifies a Candidate file, not a Candidate line. Keeping a
+        # line row here used to overwrite the entry once per physical line;
+        # the later lookup then used that line id as if it were file_id.
+        candidate_file_id_by_path = {}
+        ambiguous_file_paths = set()
+        for row in candidate_lines:
+            key = (str(row.get("repository_name") or ""),
+                   str(row.get("file_path") or ""))
+            file_id = int(row.get("file_id") or 0)
+            previous = candidate_file_id_by_path.get(key)
+            if previous is None:
+                candidate_file_id_by_path[key] = file_id
+            elif int(previous) != file_id:
+                ambiguous_file_paths.add(key)
         candidate_by_file_line = {
             (int(row.get("file_id") or 0), int(row.get("line_number") or 0)): row
             for row in candidate_lines
@@ -165,8 +180,18 @@ class InheritanceEngine(object):
         for relation in source_relations:
             key = (str(relation.get("repository_name") or ""),
                    str(relation.get("file_path") or ""))
-            target_file = candidate_by_path.get(key)
-            if not target_file:
+            repository_status = repository_resolution.get(key[0])
+            if repository_resolution_available and (
+                    not repository_status or
+                    str(repository_status.get("reason_code") or "NO_PREDECESSOR") != "READY"):
+                # Repository eligibility is decided before Git ancestry. In
+                # particular, an ancestor commit on another branch must never
+                # reach _snapshot_for_relation(). The final candidate-line
+                # pass persists the repository-level reason for every pending
+                # line so the rejection remains explainable.
+                continue
+            target_file_id = candidate_file_id_by_path.get(key)
+            if not target_file_id or key in ambiguous_file_paths:
                 continue
             repo_path = repository_paths.get(key[0])
             candidate_snapshot = self._repository_snapshot(
@@ -196,7 +221,7 @@ class InheritanceEngine(object):
                 ))
                 continue
             target_line = candidate_by_file_line.get(
-                (int(target_file.get("id") or 0), int(new_line_number))
+                (int(target_file_id), int(new_line_number))
             )
             if not target_line:
                 continue
@@ -300,9 +325,18 @@ class InheritanceEngine(object):
             line_id = int(candidate_line.get("id") or 0)
             if line_id in decided_line_ids or not self._is_review_candidate(candidate_line):
                 continue
+            candidate_key = (str(candidate_line.get("repository_name") or ""),
+                             str(candidate_line.get("file_path") or ""))
+            repository_status = repository_resolution.get(candidate_key[0])
+            reason = "NO_SOURCE_RELATION"
+            if repository_resolution_available:
+                repository_reason = str((repository_status or {}).get("reason_code") or
+                                        "NO_PREDECESSOR")
+                if repository_reason != "READY":
+                    reason = repository_reason
             decisions.append(self._write_decision(
                 connection, run_id, candidate_scan_id, candidate_line, None,
-                "NO_SOURCE_RELATION", algorithm_version,
+                reason, algorithm_version,
             ))
         return {"status": "PASSED", "decision_run_id": run_id,
                 "decisions": decisions,
@@ -365,11 +399,17 @@ class InheritanceEngine(object):
 
     def _repository_snapshot(self, connection, scan_id, repository_name):
         return fetchone(connection, """
-            SELECT * FROM coverage_scan_repositories
-            WHERE scan_id=? AND repository_name=?
+            SELECT s.*, r.canonical_remote
+            FROM coverage_scan_repositories s
+            LEFT JOIN coverage_repositories r ON r.id=s.repository_id
+            WHERE s.scan_id=? AND s.repository_name=?
         """, (int(scan_id), str(repository_name or ""))) or {}
 
     def _snapshot_for_relation(self, relation, repo_path, old_snapshot, new_snapshot):
+        old_branch = str(old_snapshot.get("branch_name") or "").strip()
+        new_branch = str(new_snapshot.get("branch_name") or "").strip()
+        if old_branch and new_branch and old_branch != new_branch:
+            return {"reason_code": "BRANCH_MISMATCH"}
         old_commit = old_snapshot.get("commit_sha")
         new_commit = new_snapshot.get("commit_sha")
         if old_commit and new_commit and not (
@@ -380,7 +420,11 @@ class InheritanceEngine(object):
             return {"reason_code": "REPOSITORY_IDENTITY_UNVERIFIED"}
         if repo_path and old_commit and new_commit:
             try:
-                provider = GitSnapshotProvider(repo_path)
+                provider = GitSnapshotProvider(
+                    repo_path,
+                    fetch_remote=(old_snapshot.get("canonical_remote") or
+                                  new_snapshot.get("canonical_remote") or None),
+                )
                 provider.ensure_commit(old_commit)
                 provider.ensure_commit(new_commit)
                 ancestry_key = (provider.repo_path, str(old_commit), str(new_commit))

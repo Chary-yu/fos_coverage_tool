@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 import tempfile
 import time
@@ -8,6 +9,7 @@ from app.bootstrap import VNextRuntime
 from app.jobs.bounded_executor import BoundedJobExecutor
 from app.jobs.service import VNextBackgroundJobService
 from scripts.upgrade.migration_runner import create_sqlite_schema
+from tests.vnext.release_fixture import prepare_release_root
 
 
 class VNextJobsTest(unittest.TestCase):
@@ -73,9 +75,71 @@ class VNextJobsTest(unittest.TestCase):
             self.assertEqual(service.get(job["job_id"])["state"], "interrupted")
             service.shutdown()
 
+    def test_generic_job_recovery_reconstructs_callback(self):
+        """A restarted worker must rebuild a callback from durable input."""
+        with tempfile.TemporaryDirectory(prefix="vnext-job-recovery-") as root:
+            db_path = os.path.join(root, "jobs.db")
+            connection = sqlite3.connect(db_path)
+            create_sqlite_schema(connection)
+            connection.close()
+
+            def factory():
+                item = sqlite3.connect(db_path)
+                item.row_factory = sqlite3.Row
+                return item
+
+            class RecordingExecutor(object):
+                def submit_job(self, **kwargs):
+                    return kwargs
+
+            original = VNextBackgroundJobService(
+                factory, executor=RecordingExecutor(), lease_owner="old-worker"
+            )
+            job = original.submit(
+                1, 2, "export", 3, lambda: "must-not-run",
+                input_payload={"report_id": "report-2", "output_path": "result.zip"},
+            )
+            stale = factory()
+            stale.execute(
+                "UPDATE coverage_background_jobs SET state='running', "
+                "lease_owner='old-worker', heartbeat_at='2000-01-01 00:00:00' "
+                "WHERE job_id=?", (job["job_id"],)
+            )
+            stale.commit()
+            stale.close()
+
+            rebuilt = []
+
+            def reconstruct(durable_job):
+                payload = json.loads(durable_job["input_payload"])
+                rebuilt.append(payload)
+                return lambda: payload["output_path"]
+
+            restarted = VNextBackgroundJobService(
+                factory,
+                executor=BoundedJobExecutor(max_workers=1, max_queue_size=1),
+                heartbeat_timeout=0.01,
+                lease_owner="new-worker",
+                recovery_handlers={"export": reconstruct},
+            )
+            try:
+                self.assertEqual(restarted.recover(), 1)
+                deadline = time.time() + 3
+                while time.time() < deadline:
+                    if restarted.get(job["job_id"])["state"] == "completed":
+                        break
+                    time.sleep(0.02)
+                self.assertEqual(restarted.get(job["job_id"])["state"], "completed")
+                self.assertEqual(
+                    rebuilt, [{"output_path": "result.zip", "report_id": "report-2"}]
+                )
+            finally:
+                restarted.shutdown()
+
     def test_vnext_runtime_connection_factory_supports_worker_threads(self):
         with tempfile.TemporaryDirectory(prefix="vnext-runtime-job-") as root:
             db_path = os.path.join(root, "runtime.db")
+            prepare_release_root(root)
             initial = sqlite3.connect(db_path)
             initial.row_factory = sqlite3.Row
             create_sqlite_schema(initial)
@@ -92,7 +156,7 @@ class VNextJobsTest(unittest.TestCase):
                     "auth": {"mode": "disabled"},
                     "runtime_state": {"root": os.path.join(root, "state")},
                 },
-                os.getcwd(), connection_factory=factory,
+                root, connection_factory=factory,
             )
             try:
                 app = runtime.application()

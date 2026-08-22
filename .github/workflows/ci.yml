@@ -126,25 +126,30 @@ jobs:
           COVERAGE_LEGACY_COMPAT_TESTS_MANIFEST: .artifacts/vnext/legacy-compatibility.json
         run: mkdir -p .artifacts/vnext && python scripts/diagnostics/build_vnext_evidence.py .artifacts/vnext/architecture_ownership_matrix.json
       - name: Build fail-closed Gate A-F evidence matrix
+        # Push/PR runs collect local evidence only; an incomplete local
+        # artifact must not be presented as release readiness. Explicit
+        # workflow_dispatch candidate runs are strict and fail closed.
+        continue-on-error: ${{ github.event_name != 'workflow_dispatch' }}
         env:
           COVERAGE_LEGACY_COMPAT_TESTS_MANIFEST: .artifacts/vnext/legacy-compatibility.json
         run: >-
-          python scripts/diagnostics/gate_matrix.py --allow-incomplete
+          python scripts/diagnostics/gate_matrix.py
           --output .artifacts/vnext/gate-matrix.json
       - name: Build per-task Gate A-F status
+        continue-on-error: ${{ github.event_name != 'workflow_dispatch' }}
         run: >-
           python scripts/diagnostics/gate_task_status.py
           --matrix .artifacts/vnext/gate-matrix.json
           --output .artifacts/vnext/gate-task-status.json
-          --allow-incomplete
       - name: Build Definition-of-Done status
+        continue-on-error: ${{ github.event_name != 'workflow_dispatch' }}
         run: >-
           python scripts/diagnostics/dod_status.py
           --matrix .artifacts/vnext/gate-matrix.json
           --task-status .artifacts/vnext/gate-task-status.json
           --output .artifacts/vnext/gate-dod-status.json
-          --allow-incomplete
       - name: Evaluate release readiness decision
+        continue-on-error: ${{ github.event_name != 'workflow_dispatch' }}
         run: |
           python - <<'PY'
           import json
@@ -160,12 +165,11 @@ jobs:
             --task-status .artifacts/vnext/gate-task-status.json \
             --dod-status .artifacts/vnext/gate-dod-status.json \
             --risk-register .artifacts/vnext/release-risk-register.json \
-            --output .artifacts/vnext/release-readiness.json \
-            --allow-not-ready
+            --output .artifacts/vnext/release-readiness.json
       - name: Assemble Gate A-F evidence bundle
+        continue-on-error: ${{ github.event_name != 'workflow_dispatch' }}
         run: >-
           python scripts/diagnostics/build_gate_evidence.py
-          --allow-incomplete
           --output-root .artifacts/vnext/gate-bundle
           --output .artifacts/vnext/gate-bundle-summary.json
       - name: Upload VNext machine evidence

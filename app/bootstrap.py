@@ -16,7 +16,7 @@ from app.db.repositories import (
     RepositoryRepository,
     AnalysisDomainRepository,
 )
-from app.release_identity import generate_release_identity, get_current_release_identity
+from app.release_identity import get_current_release_identity
 from app.inject.service import ScanImportService
 from app.code_detail.vnext_service import VNextCodeDetailService
 from app.reports.registry import ReportRegistry
@@ -154,6 +154,13 @@ class VNextRuntime(object):
         export_root = state_config.get("exports_dir") or os.path.join(state_root, "exports")
         if not os.path.isabs(export_root):
             export_root = os.path.join(self.repo_root, export_root)
+        # Runtime identity is a startup invariant. A missing or drifting
+        # manifest must stop composition; generating a replacement here would
+        # turn an exact-release failure into a silently accepted runtime.
+        self.release_identity = get_current_release_identity(self.repo_root)
+        self.export_service = ExportService(
+            self.projects, export_root, release_identity=self.release_identity
+        )
         job_config = self.config.get("jobs") or {}
         resource_limits = job_config.get("resource_limits")
         if resource_limits is None:
@@ -179,6 +186,10 @@ class VNextRuntime(object):
             heartbeat_timeout=float(job_config.get("heartbeat_timeout", 300)),
             heartbeat_interval=float(job_config.get("heartbeat_interval", 15)),
             lease_owner=job_config.get("lease_owner"),
+            recovery_handlers={
+                "rebuild_progress": self._rebuild_progress_recovery_handler,
+                "export": self._export_recovery_handler,
+            },
         )
         # scan_import has its own checkpoint/fencing recovery owner.  The
         # generic stale-job reaper must not silently mark those candidates
@@ -195,13 +206,48 @@ class VNextRuntime(object):
         self.resumed_scan_imports = []
         for recoverable in self.recoverable_scan_imports:
             self._resume_scan_import(recoverable)
+    @staticmethod
+    def _job_payload(job):
+        import json
         try:
-            self.release_identity = get_current_release_identity(self.repo_root)
-        except Exception:
-            self.release_identity = generate_release_identity(repo_root=self.repo_root)
-        self.export_service = ExportService(
-            self.projects, export_root, release_identity=self.release_identity
-        )
+            payload = json.loads(job.get("input_payload") or "{}")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("JOB_INPUT_PAYLOAD_INVALID") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("JOB_INPUT_PAYLOAD_INVALID")
+        return payload
+
+    def _rebuild_progress_recovery_handler(self, job):
+        payload = self._job_payload(job)
+        project_name = str(payload.get("project_name") or "").strip()
+        if not project_name:
+            raise ValueError("JOB_INPUT_PAYLOAD_INCOMPLETE:project_name")
+        scan_id = int(job.get("scan_id") or 0)
+
+        def callback():
+            with self.connection_context(read_only=False) as connection:
+                self.progress_service.rebuild(connection, project_name, scan_id)
+            return ""
+        return callback
+
+    def _export_recovery_handler(self, job):
+        payload = self._job_payload(job)
+        if "report_id" not in payload or "output_path" not in payload:
+            raise ValueError("JOB_INPUT_PAYLOAD_INCOMPLETE:export")
+        project_name = str(payload.get("project_name") or "").strip()
+        if not project_name:
+            raise ValueError("JOB_INPUT_PAYLOAD_INCOMPLETE:project_name")
+        report_id = str(payload.get("report_id") or "")
+        output_path = payload.get("output_path")
+        scan_id = int(job.get("scan_id") or 0)
+
+        def callback():
+            with self.connection_context(read_only=True) as connection:
+                return self.export_service.export_scan(
+                    connection, project_name, scan_id,
+                    report_id=report_id, output_path=output_path,
+                )
+        return callback
 
     def _resume_scan_import(self, job):
         """Reclaim and resume one durable import after a process restart."""

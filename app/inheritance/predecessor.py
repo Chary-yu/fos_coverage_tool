@@ -35,9 +35,12 @@ class PredecessorResolver(object):
             rows = [row for row in rows if str(row.get("candidate_repository") or "") == str(repository_name)]
         result = []
         for row in rows:
+            candidate_branch = str(row.get("candidate_branch") or "").strip()
+            predecessor_branch = str(row.get("predecessor_branch") or "").strip()
             if not row.get("predecessor_repository_id"):
                 reason = "NO_PREDECESSOR"
-            elif row.get("candidate_branch") != row.get("predecessor_branch"):
+            elif (not candidate_branch or not predecessor_branch or
+                  candidate_branch != predecessor_branch):
                 reason = "BRANCH_MISMATCH"
             else:
                 reason = "READY"

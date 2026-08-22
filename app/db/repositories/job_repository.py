@@ -97,6 +97,86 @@ class JobRepository(object):
         cursor.close()
         return count
 
+    def list_recoverable(self, connection, timeout_seconds: float, now=None,
+                         lease_owner=None, exclude_kinds=None):
+        """List queued or fenced/stale jobs before a recovery claim.
+
+        A recovery worker must inspect the durable input before changing state;
+        blindly marking every row interrupted loses the only callback identity
+        that can safely resume a long task after process shutdown.
+        """
+        now_value = now or utc_now_naive()
+        cutoff_text = (now_value - timedelta(seconds=float(timeout_seconds))).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        if lease_owner:
+            clauses = [
+                "((state = 'queued' AND COALESCE(lease_owner, '') <> ?) OR "
+                "(state = 'running' AND (heartbeat_at IS NULL OR "
+                "heartbeat_at < ? OR COALESCE(lease_owner, '') <> ?)))"
+            ]
+            params = [str(lease_owner), cutoff_text, str(lease_owner)]
+        else:
+            clauses = [
+                "(state = 'queued' OR (state = 'running' AND "
+                "(heartbeat_at IS NULL OR heartbeat_at < ?)))"
+            ]
+            params = [cutoff_text]
+        if exclude_kinds:
+            values = list(exclude_kinds)
+            clauses.append("kind NOT IN ({})".format(
+                ", ".join("?" for _ in values)
+            ))
+            params.extend(str(value) for value in values)
+        return fetchall(connection, """
+            SELECT * FROM coverage_background_jobs
+            WHERE {}
+            ORDER BY created_at, job_id
+        """.format(" AND ".join(clauses)), params)
+
+    def claim_for_recovery(self, connection, job_id, lease_owner, now=None,
+                           expected_state=None, expected_lease_owner=None,
+                           expected_heartbeat_at=None):
+        """Atomically fence one observed recoverable job.
+
+        The observed state/owner/heartbeat form a compare-and-set fence. Two
+        workers may list the same durable row, but only the worker that still
+        sees the exact row it inspected may enqueue the callback.
+        """
+        stamp = now or utc_sql()
+        clauses = ["job_id=?", "state IN ('queued', 'running')"]
+        params = [str(job_id)]
+        if expected_state is not None:
+            clauses.append("state=?")
+            params.append(str(expected_state))
+        if expected_lease_owner is not None:
+            clauses.append("COALESCE(lease_owner, '')=?")
+            params.append(str(expected_lease_owner or ""))
+        if expected_heartbeat_at is not None:
+            clauses.append("COALESCE(heartbeat_at, '')=COALESCE(?, '')")
+            params.append(expected_heartbeat_at)
+        cursor = execute(connection, """
+            UPDATE coverage_background_jobs
+            SET state='queued', lease_owner=?, heartbeat_at=?,
+                error_message='', finished_at=NULL, updated_at=?
+            WHERE {}
+        """.format(" AND ".join(clauses)),
+                       (str(lease_owner or ""), stamp, stamp) + tuple(params))
+        claimed = int(getattr(cursor, "rowcount", 0) or 0)
+        cursor.close()
+        return self.get(connection, job_id) if claimed else None
+
+    def mark_interrupted(self, connection, job_id, message="worker lease expired"):
+        cursor = execute(connection, """
+            UPDATE coverage_background_jobs
+            SET state='interrupted', error_message=?,
+                updated_at=CURRENT_TIMESTAMP, finished_at=CURRENT_TIMESTAMP
+            WHERE job_id=? AND state IN ('queued', 'running')
+        """, (str(message), str(job_id)))
+        count = int(getattr(cursor, "rowcount", 0) or 0)
+        cursor.close()
+        return count
+
 
 def _now():
     return utc_sql()

@@ -17,7 +17,9 @@ from app.bootstrap import VNextRuntime, create_vnext_server
 from app.code_detail.sidecar_store import SidecarStore
 from app.code_detail.source_reader import SourceContext, SourceLineDTO, calc_sidecar_file_key
 from app.code_detail.code_region import FunctionRange
+from app.services.project_service import ProjectService
 from scripts.upgrade.migration_runner import create_sqlite_schema
+from tests.vnext.release_fixture import prepare_release_root
 
 
 class VNextRuntimeTest(unittest.TestCase):
@@ -25,17 +27,34 @@ class VNextRuntimeTest(unittest.TestCase):
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
         create_sqlite_schema(self.connection)
+        self.release_root = tempfile.TemporaryDirectory(prefix="vnext-release-")
+        prepare_release_root(self.release_root.name)
         config = {
             "project_name": "fixture",
             "auth": {"mode": "disabled"},
             "runtime_state": {"root": tempfile.mkdtemp(prefix="vnext-state-")},
         }
-        self.runtime = VNextRuntime(config, os.getcwd(), connection=self.connection)
+        self.runtime = VNextRuntime(
+            config, self.release_root.name, connection=self.connection
+        )
         self.application = self.runtime.application()
 
     def tearDown(self):
         self.runtime.close()
         self.connection.close()
+        self.release_root.cleanup()
+
+    def test_scan_identity_separates_old_new_commit_pairs(self):
+        base = [{
+            "repository_name": "repo-a", "branch_name": "main",
+            "commit_sha": "new", "old_commit_sha": "old-a",
+            "new_commit_sha": "new",
+        }]
+        changed = [dict(base[0], old_commit_sha="old-b")]
+        self.assertNotEqual(
+            ProjectService.scan_key("fixture", "info", base, "full"),
+            ProjectService.scan_key("fixture", "info", changed, "full"),
+        )
 
     def test_runtime_metrics_expose_cache_and_resource_counters(self):
         status, payload = self.application.dispatch("GET", "/api/coverage/metrics")
@@ -242,7 +261,7 @@ class VNextRuntimeTest(unittest.TestCase):
             "runtime_state": {"root": tempfile.mkdtemp(prefix="vnext-http-")},
         }
         server = create_vnext_server(
-            ("127.0.0.1", 0), config, repo_root=os.getcwd(),
+            ("127.0.0.1", 0), config, repo_root=self.release_root.name,
             connection=self.connection,
         )
         thread = threading.Thread(target=server.serve_forever)

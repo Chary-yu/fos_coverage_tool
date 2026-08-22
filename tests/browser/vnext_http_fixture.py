@@ -20,6 +20,7 @@ from app.code_detail.code_region import FunctionRange
 from app.code_detail.sidecar_store import SidecarStore
 from app.code_detail.source_reader import SourceContext, SourceLineDTO, calc_sidecar_file_key
 from scripts.upgrade.migration_runner import create_sqlite_schema
+from tests.vnext.release_fixture import prepare_release_root
 
 
 DEFAULT_FIXTURE_LINES = 120
@@ -94,6 +95,7 @@ def build_fixture():
     line_count = _fixture_line_count()
     temporary = tempfile.TemporaryDirectory(prefix="vnext-http-browser-")
     root = temporary.name
+    prepare_release_root(root)
     db_path = os.path.join(root, "fixture.db")
     state_root = os.path.join(root, "state")
     report_root = os.path.join(root, "report")

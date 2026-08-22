@@ -67,6 +67,7 @@ class ExportService(object):
         }
         target = self._safe_output_path(project_name, scan_id, output_path)
         part_path = target + ".part"
+        rows_path = None
         try:
             with zipfile.ZipFile(part_path, "w", zipfile.ZIP_DEFLATED) as archive:
                 archive.writestr(
@@ -85,13 +86,7 @@ class ExportService(object):
                             item, ensure_ascii=False, sort_keys=True, default=str
                         ))
                         rows_file.write("\n")
-                try:
-                    archive.write(rows_path, "coverage_lines.jsonl")
-                finally:
-                    try:
-                        os.remove(rows_path)
-                    except OSError:
-                        pass
+                archive.write(rows_path, "coverage_lines.jsonl")
             os.replace(part_path, target)
             return target
         except Exception:
@@ -100,3 +95,9 @@ class ExportService(object):
             except OSError:
                 pass
             raise
+        finally:
+            if rows_path:
+                try:
+                    os.remove(rows_path)
+                except OSError:
+                    pass

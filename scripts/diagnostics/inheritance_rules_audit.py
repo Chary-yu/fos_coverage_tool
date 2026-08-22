@@ -8,6 +8,7 @@ import collections
 import hashlib
 import json
 import os
+import re
 import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
@@ -15,11 +16,28 @@ MATRIX_RELATIVE_PATH = os.path.join("contracts", "inheritance_test_matrix.json")
 PLAN_RELATIVE_PATH = os.path.join(
     "docs", "FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md"
 )
+AUTHORITATIVE_RULE_SOURCE = PLAN_RELATIVE_PATH
+# Pin the semantic snapshot independently of the JSON and Markdown mirrors.
+# Updating a rule requires an intentional contract/audit change, rather than
+# allowing both mirrors to drift together and still report 83/83.
+EXPECTED_SEMANTIC_RULES_SHA256 = (
+    "e4ebe2dfe471fe0455fd52d5953e4346338a069898b8ebdafc752ffa2fa81ab2"
+)
 
 
 def _read_json(path):
     with open(path, "r", encoding="utf-8") as stream:
         return json.load(stream)
+
+
+def _authoritative_rule_texts(repo_root):
+    path = os.path.join(repo_root, AUTHORITATIVE_RULE_SOURCE)
+    with open(path, "r", encoding="utf-8") as stream:
+        document = stream.read()
+    return dict(re.findall(
+        r"^\*\*(R\d{2})\*\*\s*(.+?)\s*$",
+        document, flags=re.MULTILINE,
+    ))
 
 
 def _module_path(repo_root, module_name):
@@ -61,6 +79,45 @@ def _test_selector_exists(repo_root, selector):
     return False, "test class does not exist"
 
 
+def _test_selector_behavior(repo_root, selector):
+    """Return lightweight source evidence that a selector asserts behavior.
+
+    A selector/ID lookup alone is not evidence that a business rule is tested.
+    This deliberately stays static and deterministic: the selected method must
+    contain at least one unittest assertion (or a bare ``assert`` statement).
+    The test runner remains responsible for executing the selector.
+    """
+    module_name, class_name, method_name = _selector_parts(selector)
+    path = _module_path(repo_root, module_name)
+    if not path:
+        return {"assertion_count": 0, "reason": "test module does not exist"}
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            tree = ast.parse(stream.read(), filename=path)
+    except (OSError, SyntaxError, UnicodeError) as exc:
+        return {"assertion_count": 0, "reason": "cannot parse test module: {}".format(exc)}
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef) or node.name != class_name:
+            continue
+        for child in node.body:
+            if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) or \
+                    child.name != method_name:
+                continue
+            count = 0
+            for item in ast.walk(child):
+                if isinstance(item, ast.Assert):
+                    count += 1
+                elif isinstance(item, ast.Call):
+                    function = item.func
+                    name = (function.attr if isinstance(function, ast.Attribute)
+                            else function.id if isinstance(function, ast.Name) else "")
+                    if name.startswith("assert") or name in ("fail", "failUnless"):
+                        count += 1
+            return {"assertion_count": count, "reason": ""}
+        return {"assertion_count": 0, "reason": "test method does not exist"}
+    return {"assertion_count": 0, "reason": "test class does not exist"}
+
+
 def audit(repo_root=ROOT):
     path = os.path.join(repo_root, "contracts", "inheritance_rules_v1.json")
     matrix_path = os.path.join(repo_root, MATRIX_RELATIVE_PATH)
@@ -79,6 +136,11 @@ def audit(repo_root=ROOT):
         matrix = _read_json(matrix_path)
     except Exception as exc:
         violations.append("cannot load test matrix: {}".format(exc))
+    try:
+        authoritative_texts = _authoritative_rule_texts(repo_root)
+    except Exception as exc:
+        authoritative_texts = {}
+        violations.append("cannot load authoritative rule text: {}".format(exc))
     expected = ["R{:02d}".format(index) for index in range(1, 84)]
     actual = [str(item.get("rule_id") or "") for item in rules]
     if actual != expected:
@@ -90,6 +152,13 @@ def audit(repo_root=ROOT):
                 violations.append("{} missing {}".format(item.get("rule_id"), field))
         if item.get("status") == "TODO":
             violations.append("{} is still TODO".format(item.get("rule_id")))
+        rule_id = str(item.get("rule_id") or "")
+        expected_text = authoritative_texts.get(rule_id)
+        observed_text = str(item.get("rule_text") or "").strip()
+        if not observed_text:
+            violations.append("{} is missing rule_text".format(rule_id))
+        elif expected_text and observed_text != expected_text:
+            violations.append("{} rule_text does not match authoritative source".format(rule_id))
         test_ids = item.get("test_ids") or []
         if not isinstance(test_ids, list):
             violations.append("{} test_ids must be a list".format(item.get("rule_id")))
@@ -114,14 +183,18 @@ def audit(repo_root=ROOT):
         cases = []
     mapped_test_ids = []
     invalid_selectors = []
+    behavioral_evidence = []
     for case in cases:
         if not isinstance(case, dict):
             violations.append("test matrix contains a non-object case")
             continue
         selector = str(case.get("selector") or "")
         test_ids = case.get("test_ids") or []
-        if not selector or not isinstance(test_ids, list) or not test_ids:
-            violations.append("test matrix cases require selector and non-empty test_ids")
+        kind = str(case.get("kind") or "").strip()
+        if not selector or not isinstance(test_ids, list) or not test_ids or not kind:
+            violations.append(
+                "test matrix cases require selector, kind and non-empty test_ids"
+            )
             continue
         module_name, _, _ = _selector_parts(selector)
         if module_name not in targeted_suites:
@@ -130,6 +203,24 @@ def audit(repo_root=ROOT):
         if not valid:
             invalid_selectors.append({"selector": selector, "reason": reason})
             violations.append("invalid test selector {}: {}".format(selector, reason))
+        behavior = _test_selector_behavior(repo_root, selector)
+        behavioral_evidence.append({
+            "selector": selector, "kind": kind,
+            "assertion_count": behavior["assertion_count"],
+        })
+        if not behavior["assertion_count"]:
+            violations.append(
+                "test selector has no behavior assertion: {}".format(selector)
+            )
+        # This was the known false-green mapping: an import smoke test created
+        # a new project and never exercised a predecessor/engine decision.
+        if "test_execute_imports_staged_info_computes_inheritance_and_publishes" in selector \
+                and any(str(test_id).startswith(("D-GIT", "D-DEC", "D-ENG"))
+                        for test_id in test_ids):
+            violations.append(
+                "import smoke selector cannot be evidence for Git/decision/engine rules: {}"
+                .format(selector)
+            )
         mapped_test_ids.extend(str(test_id) for test_id in test_ids)
     contract_counts = collections.Counter(contract_test_ids)
     mapped_counts = collections.Counter(mapped_test_ids)
@@ -157,6 +248,31 @@ def audit(repo_root=ROOT):
         ))
     with open(path, "rb") as stream:
         digest = hashlib.sha256(stream.read()).hexdigest()
+    semantic_rules_sha256 = ""
+    if authoritative_texts:
+        semantic_lines = "\n".join(
+            "{} {}".format(rule_id, authoritative_texts[rule_id])
+            for rule_id in sorted(authoritative_texts)
+        ) + "\n"
+        semantic_rules_sha256 = hashlib.sha256(
+            semantic_lines.encode("utf-8")
+        ).hexdigest()
+        if semantic_rules_sha256 != EXPECTED_SEMANTIC_RULES_SHA256:
+            violations.append(
+                "authoritative R01-R83 semantic hash is not the pinned release snapshot"
+            )
+        if matrix.get("rule_contract") != "contracts/inheritance_rules_v1.json":
+            violations.append("test matrix does not name the canonical rule contract")
+        try:
+            observed_semantic_sha256 = _read_json(path).get(
+                "semantic_rules_sha256"
+            ) or ""
+        except Exception:
+            observed_semantic_sha256 = ""
+        if observed_semantic_sha256 != semantic_rules_sha256:
+            violations.append(
+                "rule contract semantic_rules_sha256 does not match authoritative source"
+            )
     document_sha256 = ""
     document_sha256_match = False
     try:
@@ -179,6 +295,9 @@ def audit(repo_root=ROOT):
             "evidence_class": "inheritance_rules_audit",
             "rules_contract_path": os.path.relpath(path, repo_root),
             "rule_count": len(rules), "contract_sha256": digest,
+            "semantic_rules_sha256": semantic_rules_sha256,
+            "authoritative_rule_source": AUTHORITATIVE_RULE_SOURCE,
+            "rule_text_count": len(authoritative_texts),
             "test_matrix_path": os.path.relpath(matrix_path, repo_root),
             "test_matrix_sha256": matrix_digest,
             "plan_path": os.path.relpath(plan_path, repo_root),
@@ -191,6 +310,7 @@ def audit(repo_root=ROOT):
             "missing_test_ids": missing_test_ids,
             "unexpected_test_ids": unexpected_test_ids,
             "invalid_test_selectors": invalid_selectors,
+            "behavioral_evidence": behavioral_evidence,
             "targeted_suites": targeted_suites,
             "violations": violations}
 

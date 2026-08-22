@@ -33,6 +33,8 @@ MAPPINGS = [
      "tests.vnext.test_legacy_telemetry tests.vnext.test_runtime_config tests.code_detail.test_phase2_core tests.incremental.test_phase5_inject_path"),
     ({"app/inheritance/*", "contracts/inheritance*", "tests/fixtures/inheritance_deterministic_corpus.json"},
      "tests.vnext.test_inheritance_engine tests.vnext.test_deterministic_inheritance_corpus tests.vnext.test_parser_toolchain tests.vnext.test_analysis_domain tests.vnext.test_scan_import_lifecycle"),
+    ({"app/scan_import/*"},
+     "tests.vnext.test_scan_import_lifecycle tests.vnext.test_jobs tests.vnext.test_vnext_runtime"),
     ({"app/services/analysis_service.py", "app/services/project_service.py", "app/reports/*"},
      "tests.vnext.test_vnext_runtime tests.vnext.test_registry_and_api_contract tests.vnext.test_api_export_security"),
     ({"app/services/inheritance_review_service.py"},

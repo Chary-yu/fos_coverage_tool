@@ -263,7 +263,17 @@ class VNextApplication(object):
         job = self.runtime.job_service.submit(
             project_id=project["id"], scan_id=int(scan_id), kind=kind,
             data_version=int(state.get("data_version") or 0), callback=callback,
-            input_payload={"requested_by": identity, "payload": body.get("input_payload") or {}},
+            input_payload={
+                "requested_by": identity,
+                "kind": kind,
+                "project_name": project["project_name"],
+                # These are callback reconstruction inputs, not merely
+                # presentation fields. Persist them at submission time so a
+                # restarted worker can run the exact same export.
+                "report_id": report_id if kind == "export" else "",
+                "output_path": output_path if kind == "export" else None,
+                "payload": body.get("input_payload") or {},
+            },
         )
         return 202, {"job": job}
 

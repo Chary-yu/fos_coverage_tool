@@ -349,6 +349,13 @@ class ScanImportCoordinator(object):
 
     def _verify_git_snapshots(self, snapshots, repositories, repository_paths=None):
         paths = self._repository_path_map(repositories, repository_paths)
+        remotes = {}
+        for item in (repositories or []):
+            if isinstance(item, dict):
+                name = str(item.get("repository_name") or "")
+                remote = str(item.get("canonical_remote") or "").strip()
+                if name and remote:
+                    remotes[name] = remote
         for snapshot in snapshots or []:
             old_commit = snapshot.get("old_commit_sha")
             new_commit = snapshot.get("new_commit_sha") or snapshot.get("commit_sha")
@@ -360,7 +367,10 @@ class ScanImportCoordinator(object):
                 raise GitTechnicalFailure(
                     "repository path is required for Git verification: {}".format(name)
                 )
-            provider = GitSnapshotProvider(repo_path)
+            provider = GitSnapshotProvider(
+                repo_path,
+                fetch_remote=remotes.get(name) or None,
+            )
             provider.ensure_commit(old_commit)
             provider.ensure_commit(new_commit)
             if not provider.is_ancestor(old_commit, new_commit):
@@ -517,14 +527,17 @@ class ScanImportCoordinator(object):
                 "repository_name": str(item.get("repository_name") or ""),
                 "branch_name": str(item.get("branch_name") or ""),
                 "commit_sha": str(item.get("commit_sha") or ""),
+                "old_commit_sha": str(item.get("old_commit_sha") or ""),
+                "new_commit_sha": str(item.get("new_commit_sha") or ""),
             })
         payload = {
             "project_name": project_name, "info_sha256": info_sha256 or "",
             "review_scope": review_scope or "full",
             "repositories": sorted(identity, key=lambda value: (
-                value["repository_name"], value["branch_name"], value["commit_sha"]
+                value["repository_name"], value["branch_name"], value["commit_sha"],
+                value["old_commit_sha"], value["new_commit_sha"],
             )), "report_source_signature": report_signature or "",
-            "identity_contract_version": 2,
+            "identity_contract_version": 3,
         }
         return hashlib.sha256(json.dumps(
             payload, sort_keys=True, separators=(",", ":")

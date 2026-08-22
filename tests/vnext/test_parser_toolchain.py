@@ -10,6 +10,7 @@ from app.inheritance.toolchain import (
     parser_toolchain_preflight, parser_toolchain_preflight_from_config,
 )
 from scripts.upgrade.migration_runner import create_sqlite_schema
+from tests.vnext.release_fixture import prepare_release_root
 
 
 class ParserToolchainTest(unittest.TestCase):
@@ -104,6 +105,7 @@ print(json.dumps({
             connection = sqlite3.connect(":memory:")
             connection.row_factory = sqlite3.Row
             create_sqlite_schema(connection)
+            prepare_release_root(directory)
             runtime = VNextRuntime({
                 "project_name": "parser-fixture",
                 "auth": {"mode": "disabled"},
@@ -112,7 +114,7 @@ print(json.dumps({
                     "adapter": "json-cli-v1", "command": command,
                     "require_external": True,
                 },
-            }, os.getcwd(), connection=connection)
+            }, directory, connection=connection)
             try:
                 self.assertIsInstance(
                     runtime.scan_import_coordinator.inheritance.parser,

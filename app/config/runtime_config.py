@@ -131,6 +131,11 @@ def validate_production_config(config: Dict[str, Any]) -> None:
     if runtime_mode == "vnext" and int(config.get("schema_version") or 0) < 1:
         raise RuntimeError("VNext runtime requires schema_version >= 1")
     auth = config.get("auth") or {}
+    host = str((config.get("server") or {}).get("host") or
+               "127.0.0.1").strip().lower()
+    loopback_hosts = {"127.0.0.1", "localhost", "::1", "[::1]"}
+    if host not in loopback_hosts and str(auth.get("mode") or "").lower() == "disabled":
+        raise RuntimeError("authentication cannot be disabled on a public bind")
     if str(os.environ.get("COVERAGE_ENV", "development")).lower() == "production":
         if auth.get("mode") == "disabled":
             raise RuntimeError("production authentication cannot be disabled")

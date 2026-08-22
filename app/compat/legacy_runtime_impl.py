@@ -3208,7 +3208,19 @@ class _LegacyDatabaseManager:
             return False
 
     def inherit_analysis(self, source_project, target_project, batch_size=1000):
-        """Copy reviewed analysis from an earlier project to unchanged functions in a later project."""
+        """Retired legacy inheritance API.
+
+        VNext Scan Import is the only supported inheritance authority. Keep
+        this method as an explicit failure for old integrations so a caller
+        cannot accidentally invoke the basename/hash algorithm against a
+        VNext database.
+        """
+        raise RuntimeError(
+            "legacy analysis inheritance is retired; use VNext Scan Import"
+        )
+
+        # The unreachable body below is retained only as historical source
+        # context for the compatibility module and is never an execution path.
         if not source_project or not target_project or source_project == target_project:
             raise ValueError("source_project and target_project must be different")
 
@@ -6733,7 +6745,7 @@ def print_help():
     print("  python scripts/enhance_coverage.py server [--config <config.json>]")
     print("    - Start the configured legacy or VNext server runtime.")
     print("  python scripts/enhance_coverage.py inherit --from <old_project> --to <new_project>")
-    print("    - Reuse reviewed analysis for unchanged functions in a later project/version.")
+    print("    - RETIRED: automatic inheritance is only available through VNext Scan Import.")
     print("  python scripts/enhance_coverage.py incremental --project <project_name> --repo <git_repo> --oldgit <old_commit> --newgit <new_commit> --info <coverage.info|dir> --dir <lcov_html_dir> --out <output_dir>")
     print("    - Build an incremental review website; only Git-added, LCOV-uncovered lines are editable.")
     print("    - Optional: --workers <N> --mode <lazy_collapse|lazy|immediate> --excel <result.xlsx>")
@@ -6800,35 +6812,8 @@ if __name__ == "__main__":
             sys.exit(1)
         run_server(config_path)
     elif cmd == "inherit":
-        args = sys.argv[2:]
-        source_project = get_arg_value(args, "--from")
-        target_project = get_arg_value(args, "--to")
-
-        if not source_project or not target_project:
-            print("[Error] inherit requires --from <old_project> and --to <new_project>.")
-            print_help()
-            sys.exit(1)
-
-        config = load_config()
-        print(f"[Inherit] Source project: {source_project}")
-        print(f"[Inherit] Target project: {target_project}")
-        manager = DatabaseManager(config)
-        result = manager.inherit_analysis(source_project, target_project)
-        if manager.conn:
-            manager.conn.close()
-        print("[Inherit] Completed.")
-        print(f"[Inherit] Source analysis records: {result['source_analysis_records']}")
-        print(f"[Inherit] Source reviewed analysis records: {result['source_reviewed_analysis_records']}")
-        print(f"[Inherit] Source index records: {result['source_index_records']}")
-        print(f"[Inherit] Source hashable index records: {result['source_hashable_index_records']}")
-        print(f"[Inherit] Source reviewed records joined with index: {result['source_reviewed_records']}")
-        print(f"[Inherit] Target index records: {result['target_index_records']}")
-        print(f"[Inherit] Target hashable index records: {result['target_hashable_index_records']}")
-        print(f"[Inherit] Target unfilled records: {result['target_unfilled_records']}")
-        print(f"[Inherit] Filename matched records: {result['name_matched_records']}")
-        print(f"[Inherit] Ambiguous filename keys: {result['ambiguous_name_keys']}")
-        print(f"[Inherit] Target records skipped by filename ambiguity: {result['ambiguous_name_skipped_records']}")
-        print(f"[Inherit] Inherited records: {result['inherited_records']}")
+        print("[Error] legacy inherit is retired; use VNext Scan Import and its fixed predecessor.")
+        sys.exit(2)
     elif cmd == "incremental":
         args = sys.argv[2:]
         repo_path = get_arg_value(args, "--repo")

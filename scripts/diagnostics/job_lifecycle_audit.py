@@ -17,7 +17,6 @@ try:
 except ModuleNotFoundError:
     from contract import with_contract
 
-from app.db.repositories.job_repository import JobRepository
 from app.jobs.bounded_executor import BoundedJobExecutor
 from app.jobs.service import VNextBackgroundJobService
 from scripts.upgrade.migration_runner import create_sqlite_schema
@@ -30,6 +29,9 @@ class _RecordingExecutor(object):
     def submit_job(self, **kwargs):
         self.calls.append(kwargs)
         return kwargs
+
+    def shutdown(self, wait=True):
+        return None
 
 
 class _RejectingExecutor(object):
@@ -78,24 +80,34 @@ def audit():
              "old-worker", now, now),
         )
         connection.commit()
-        recovered = JobRepository().mark_stale(
-            connection, timeout_seconds=3600, lease_owner="new-worker"
+        connection.close()
+        recovery_executor = _RecordingExecutor()
+        recovery_service = VNextBackgroundJobService(
+            factory, executor=recovery_executor, lease_owner="new-worker",
+            recovery_handlers={
+                "export": lambda job: lambda: job["job_id"],
+            },
         )
+        recovered = recovery_service.recover(heartbeat_timeout=3600)
+        inspection = factory()
         states = {
             row[0]: row[1]
-            for row in connection.execute(
+            for row in inspection.execute(
                 "SELECT job_id, state FROM coverage_background_jobs "
                 "WHERE job_id IN (?, ?)",
                 ("running-foreign", "queued-restart"),
             ).fetchall()
         }
-        connection.close()
+        inspection.close()
         checks["fresh_foreign_lease_recovery"] = (
             recovered == 2
-            and states == {"running-foreign": "interrupted", "queued-restart": "interrupted"}
+            and states == {"running-foreign": "queued", "queued-restart": "queued"}
+            and sorted(call.get("metadata", {}).get("scan_id")
+                       for call in recovery_executor.calls) == [11, 12]
         )
         if not checks["fresh_foreign_lease_recovery"]:
-            failures.append("fresh foreign running/queued jobs were not fenced on recovery")
+            failures.append("fresh foreign running/queued jobs were not reconstructed and requeued")
+        recovery_service.shutdown()
 
         # Durable repository identity owns dedupe. Executor reuse must be off
         # so different scans of one project cannot steal each other's callback.

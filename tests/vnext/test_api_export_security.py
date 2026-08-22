@@ -12,11 +12,14 @@ from app.services.export_service import ExportService
 from app.services.project_service import ProjectService
 from app.db.repositories.analysis_domain_repository import INHERITED_PENDING
 from scripts.upgrade.migration_runner import create_sqlite_schema
+from tests.vnext.release_fixture import prepare_release_root
 
 
 class VNextApiExportSecurityTest(unittest.TestCase):
     def setUp(self):
         self.state_root = tempfile.mkdtemp(prefix="vnext-api-state-")
+        self.release_root = tempfile.TemporaryDirectory(prefix="vnext-api-release-")
+        prepare_release_root(self.release_root.name)
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
         create_sqlite_schema(self.connection)
@@ -26,6 +29,7 @@ class VNextApiExportSecurityTest(unittest.TestCase):
         if runtime is not None:
             runtime.close()
         self.connection.close()
+        self.release_root.cleanup()
 
     def _runtime(self, auth=None, server=None):
         config = {
@@ -35,7 +39,9 @@ class VNextApiExportSecurityTest(unittest.TestCase):
         }
         if server is not None:
             config["server"] = server
-        self.runtime = VNextRuntime(config, os.getcwd(), connection=self.connection)
+        self.runtime = VNextRuntime(
+            config, self.release_root.name, connection=self.connection
+        )
         return self.runtime
 
     def test_mutation_auth_origin_and_write_freeze_are_uniform(self):
@@ -120,6 +126,17 @@ class VNextApiExportSecurityTest(unittest.TestCase):
             headers={"X-Remote-User": "operator"}, remote_address="10.0.0.5",
         )
         self.assertEqual(status, 200)
+
+    def test_disabled_auth_cannot_mutate_on_public_bind(self):
+        runtime = self._runtime(
+            {"mode": "disabled"}, server={"host": "0.0.0.0", "port": 9528}
+        )
+        status, payload = runtime.application().dispatch(
+            "POST", "/api/coverage/projects",
+            body={"project_name": "anonymous"}, remote_address="10.0.0.5",
+        )
+        self.assertEqual(status, 503)
+        self.assertEqual(payload["error"], "forbidden")
 
     def test_malformed_identity_and_batch_limits_fail_closed(self):
         app = self._runtime().application()

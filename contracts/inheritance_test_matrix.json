@@ -6,28 +6,48 @@
     "tests.vnext.test_parser_toolchain",
     "tests.vnext.test_analysis_domain",
     "tests.vnext.test_scan_import_lifecycle",
+    "tests.vnext.test_jobs",
     "tests.vnext.test_api_export_security"
   ],
   "cases": [
     {
       "selector": "tests.vnext.test_scan_import_lifecycle.ScanImportLifecycleTest.test_staged_import_has_fixed_predecessor_checkpoint_and_atomic_publish",
       "test_ids": [
-        "D-PRE-01", "D-PRE-02", "D-PRE-04", "D-PRE-05", "D-PRE-06",
+        "D-PRE-01", "D-PRE-04", "D-PRE-05", "D-PRE-06",
         "C-IMPORT-01", "C-IMPORT-02", "C-CP-01", "C-LOCK-01", "C-LOCK-02",
-        "C-LOCK-03", "C-LOCK-04", "C-PUB-01", "C-PUB-02", "C-PUB-03",
-        "C-PUB-04", "C-PUB-05", "C-REC-01", "C-REC-02", "C-REC-03",
+        "C-LOCK-04", "C-PUB-01", "C-PUB-02", "C-PUB-03",
+        "C-PUB-04", "C-PUB-05", "C-REC-01", "C-REC-02",
         "C-REC-04"
       ],
       "kind": "durable_lifecycle"
     },
     {
-      "selector": "tests.vnext.test_scan_import_lifecycle.ScanImportLifecycleTest.test_execute_imports_staged_info_computes_inheritance_and_publishes",
+      "selector": "tests.vnext.test_inheritance_engine.InheritanceEngineTest.test_git_hunk_recovery_does_not_cross_hunks",
+      "test_ids": ["D-GIT-01", "D-MAP-07", "D-MAP-08", "D-REJECT-05"],
+      "kind": "git_hunk_behavior"
+    },
+    {
+      "selector": "tests.vnext.test_inheritance_engine.InheritanceEngineTest.test_missing_history_fetches_from_configured_remote",
+      "test_ids": ["D-GIT-04"],
+      "kind": "git_fetch_behavior"
+    },
+    {
+      "selector": "tests.vnext.test_inheritance_engine.InheritanceEngineTest.test_engine_uses_candidate_file_id_for_each_physical_line",
       "test_ids": [
-        "D-GIT-01", "D-DEC-01", "D-DEC-02", "D-DEC-03",
-        "D-DEC-04", "D-DEC-05", "D-DEC-06", "D-DEC-07", "D-ENG-01",
-        "D-ENG-02", "D-ENG-03"
+        "D-DEC-01", "D-DEC-02", "D-DEC-03", "D-DEC-04", "D-DEC-05",
+        "D-DEC-06", "D-DEC-07", "D-ENG-01", "D-ENG-02", "D-ENG-03"
       ],
-      "kind": "durable_engine_wiring"
+      "kind": "durable_engine_behavior"
+    },
+    {
+      "selector": "tests.vnext.test_inheritance_engine.InheritanceEngineTest.test_engine_hard_blocks_repository_branch_mismatch",
+      "test_ids": ["D-PRE-02"],
+      "kind": "repository_branch_behavior"
+    },
+    {
+      "selector": "tests.vnext.test_jobs.VNextJobsTest.test_generic_job_recovery_reconstructs_callback",
+      "test_ids": ["C-REC-03"],
+      "kind": "generic_job_recovery"
     },
     {
       "selector": "tests.vnext.test_inheritance_engine.InheritanceEngineTest.test_durable_run_requires_verified_git_snapshot_identity",
@@ -41,7 +61,7 @@
     },
     {
       "selector": "tests.vnext.test_inheritance_engine.InheritanceEngineTest.test_line_map_is_one_to_one_and_fail_closed_for_replacement",
-      "test_ids": ["D-MAP-01", "D-MAP-02", "D-MAP-03", "D-MAP-06", "D-MAP-07", "D-MAP-08"],
+      "test_ids": ["D-MAP-01", "D-MAP-02", "D-MAP-03", "D-MAP-06"],
       "kind": "line_mapping"
     },
     {
@@ -91,12 +111,12 @@
     },
     {
       "selector": "tests.vnext.test_analysis_domain.AnalysisDomainTest.test_reject_and_undo_preserve_lineage_without_active_overlay",
-      "test_ids": ["D-REVIEW-03", "D-REJECT-01", "D-REJECT-02", "D-REJECT-03", "D-REJECT-04", "D-REJECT-06"],
+      "test_ids": ["D-REVIEW-03", "D-REJECT-01", "D-REJECT-02", "D-REJECT-03", "D-REJECT-04"],
       "kind": "rejection_lineage"
     },
     {
       "selector": "tests.vnext.test_api_export_security.VNextApiExportSecurityTest.test_inheritance_reject_and_undo_api_is_current_and_revision_bound",
-      "test_ids": ["D-REJECT-05"],
+      "test_ids": ["D-REJECT-06"],
       "kind": "api_mutation_contract"
     },
     {

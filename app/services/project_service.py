@@ -60,18 +60,22 @@ class ProjectService(object):
                 "repository_name": str((item or {}).get("repository_name") or ""),
                 "branch_name": str((item or {}).get("branch_name") or ""),
                 "commit_sha": str((item or {}).get("commit_sha") or ""),
+                "old_commit_sha": str((item or {}).get("old_commit_sha") or ""),
+                "new_commit_sha": str((item or {}).get("new_commit_sha") or ""),
             } for item in (repositories or [])],
             key=lambda item: (
                 str(item.get("repository_name") or ""),
                 str(item.get("branch_name") or ""),
                 str(item.get("commit_sha") or ""),
+                str(item.get("old_commit_sha") or ""),
+                str(item.get("new_commit_sha") or ""),
             ),
         )
         payload = {
             "project": project_name, "info_sha256": info_sha256 or "",
             "review_scope": review_scope or "full", "repositories": repositories,
             "report_source_signature": report_source_signature or "",
-            "identity_contract_version": 2,
+            "identity_contract_version": 3,
         }
         return hashlib.sha256(json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
@@ -111,7 +115,7 @@ class ProjectService(object):
                 conn, project["id"], scan_key, scan_type, review_scope,
                 info_file_name=info_file_name, info_sha256=info_sha256,
                 status=status, predecessor_scan_id=predecessor_scan_id,
-                algorithm_version="vnext-scan-identity-v2",
+                algorithm_version="vnext-scan-identity-v3",
             )
             for snapshot in repositories:
                 repository_id = None
@@ -194,7 +198,7 @@ class ProjectService(object):
                 conn, project["id"], scan_key, scan_type, review_scope,
                 info_file_name=info_file_name, info_sha256=info_sha256,
                 status=status, predecessor_scan_id=predecessor_scan_id,
-                algorithm_version="vnext-scan-identity-v2",
+                algorithm_version="vnext-scan-identity-v3",
             )
             for snapshot in repositories:
                 repository_id = None

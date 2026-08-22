@@ -1,88 +1,1087 @@
 {
   "contract_version": "inheritance-v1",
   "rules": [
-    {"rule_id":"R01","owner_module":"app.inheritance.predecessor","test_ids":["D-PRE-01"],"reason_codes":["NO_PREDECESSOR"],"status":"IMPLEMENTED"},
-    {"rule_id":"R02","owner_module":"app.inheritance.predecessor","test_ids":["D-PRE-02"],"reason_codes":["BRANCH_MISMATCH"],"status":"IMPLEMENTED"},
-    {"rule_id":"R03","owner_module":"app.inheritance.git_snapshot","test_ids":["D-GIT-01"],"reason_codes":["NON_ANCESTOR"],"status":"IMPLEMENTED"},
-    {"rule_id":"R04","owner_module":"app.inheritance.git_snapshot","test_ids":["D-GIT-02"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R05","owner_module":"app.inheritance.git_snapshot","test_ids":["D-GIT-03"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R06","owner_module":"app.inheritance.line_map","test_ids":["D-MAP-01"],"reason_codes":["PATH_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R07","owner_module":"app.inheritance.line_map","test_ids":["D-MAP-02"],"reason_codes":["LINE_DELETED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R08","owner_module":"app.inheritance.line_map","test_ids":["D-MAP-03"],"reason_codes":["LINE_AMBIGUOUS"],"status":"IMPLEMENTED"},
-    {"rule_id":"R09","owner_module":"app.inheritance.line_map","test_ids":["D-MAP-04"],"reason_codes":["LINE_CODE_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R10","owner_module":"app.inheritance.line_map","test_ids":["D-MAP-05"],"reason_codes":["LINE_DELETED_REINTRODUCED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R11","owner_module":"app.inheritance.normalizer","test_ids":["D-TOK-01"],"reason_codes":["LINE_CODE_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R12","owner_module":"app.inheritance.normalizer","test_ids":["D-TOK-02"],"reason_codes":["LINE_CODE_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R13","owner_module":"app.inheritance.cpp_parser","test_ids":["D-FN-01"],"reason_codes":["FUNCTION_ID_UNRESOLVED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R14","owner_module":"app.inheritance.cpp_parser","test_ids":["D-FN-02"],"reason_codes":["FUNCTION_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R15","owner_module":"app.inheritance.cpp_parser","test_ids":["D-FN-03"],"reason_codes":["FUNCTION_ID_UNRESOLVED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R16","owner_module":"app.inheritance.dependencies","test_ids":["D-DEP-01"],"reason_codes":["MACRO_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R17","owner_module":"app.inheritance.dependencies","test_ids":["D-DEP-02"],"reason_codes":["CONST_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R18","owner_module":"app.inheritance.dependencies","test_ids":["D-DEP-03"],"reason_codes":["CALLEE_CHANGED","CALLEE_UNRESOLVED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R19","owner_module":"app.inheritance.engine","test_ids":["D-BLOCK-01"],"reason_codes":["BLOCK_AMBIGUOUS"],"status":"IMPLEMENTED"},
-    {"rule_id":"R20","owner_module":"app.inheritance.engine","test_ids":["D-BLOCK-02"],"reason_codes":["BLOCK_FORK_OR_MERGE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R21","owner_module":"app.inheritance.engine","test_ids":["D-BLOCK-03"],"reason_codes":["INHERITED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R22","owner_module":"app.inheritance.engine","test_ids":["D-DEC-01"],"reason_codes":["INHERITED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R23","owner_module":"app.inheritance.engine","test_ids":["D-DEC-02"],"reason_codes":["INHERITED_PENDING"],"status":"IMPLEMENTED"},
-    {"rule_id":"R24","owner_module":"app.inheritance.engine","test_ids":["D-DEC-03"],"reason_codes":["CARRIED_COVERED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R25","owner_module":"app.inheritance.engine","test_ids":["D-DEC-04"],"reason_codes":["REJECTION_ACTIVE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R26","owner_module":"app.db.repositories.file_state_repository","test_ids":["D-PROG-01"],"reason_codes":["INHERITED_PENDING"],"status":"IMPLEMENTED"},
-    {"rule_id":"R27","owner_module":"app.db.repositories.analysis_domain_repository","test_ids":["D-PROG-02"],"reason_codes":["MANUAL_DRAFT"],"status":"IMPLEMENTED"},
-    {"rule_id":"R28","owner_module":"app.scan_import.coordinator","test_ids":["C-IMPORT-01"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R29","owner_module":"app.scan_import.coordinator","test_ids":["C-IMPORT-02"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R30","owner_module":"app.scan_import.checkpoints","test_ids":["C-CP-01"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R31","owner_module":"app.inheritance.predecessor","test_ids":["D-PRE-04"],"reason_codes":["NO_PREDECESSOR"],"status":"IMPLEMENTED"},
-    {"rule_id":"R32","owner_module":"app.inheritance.predecessor","test_ids":["D-PRE-05"],"reason_codes":["BRANCH_MISMATCH"],"status":"IMPLEMENTED"},
-    {"rule_id":"R33","owner_module":"app.inheritance.predecessor","test_ids":["D-PRE-06"],"reason_codes":["NON_ANCESTOR"],"status":"IMPLEMENTED"},
-    {"rule_id":"R34","owner_module":"app.scan_import.locks","test_ids":["C-LOCK-01"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R35","owner_module":"app.scan_import.locks","test_ids":["C-LOCK-02"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R36","owner_module":"app.scan_import.publication","test_ids":["C-PUB-01"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R37","owner_module":"app.db.repositories.analysis_domain_repository","test_ids":["D-REVIEW-01"],"reason_codes":["INHERITED_PENDING"],"status":"IMPLEMENTED"},
-    {"rule_id":"R38","owner_module":"app.services.analysis_service","test_ids":["D-REVIEW-02"],"reason_codes":["MANUAL_CONFIRMED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R39","owner_module":"app.inheritance.rejections","test_ids":["D-REVIEW-03"],"reason_codes":["REJECTION_ACTIVE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R40","owner_module":"app.services.analysis_service","test_ids":["D-REVIEW-04"],"reason_codes":["MANUAL_DRAFT"],"status":"IMPLEMENTED"},
-    {"rule_id":"R41","owner_module":"app.db.repositories.file_state_repository","test_ids":["D-PROG-03"],"reason_codes":["INHERITED_PENDING"],"status":"IMPLEMENTED"},
-    {"rule_id":"R42","owner_module":"app.db.repositories.file_state_repository","test_ids":["D-PROG-04"],"reason_codes":["CARRIED_COVERED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R43","owner_module":"app.inheritance.engine","test_ids":["D-DEC-05"],"reason_codes":["INHERITED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R44","owner_module":"app.inheritance.engine","test_ids":["D-DEC-06"],"reason_codes":["LINE_AMBIGUOUS"],"status":"IMPLEMENTED"},
-    {"rule_id":"R45","owner_module":"app.inheritance.engine","test_ids":["D-DEC-07"],"reason_codes":["PARSER_UNRELIABLE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R46","owner_module":"app.inheritance.rejections","test_ids":["D-REJECT-01"],"reason_codes":["REJECTION_ACTIVE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R47","owner_module":"app.inheritance.rejections","test_ids":["D-REJECT-02"],"reason_codes":["REJECTION_ACTIVE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R48","owner_module":"app.inheritance.rejections","test_ids":["D-REJECT-03"],"reason_codes":["MANUAL_DRAFT"],"status":"IMPLEMENTED"},
-    {"rule_id":"R49","owner_module":"app.inheritance.rejections","test_ids":["D-REJECT-04"],"reason_codes":["REJECTION_ACTIVE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R50","owner_module":"app.db.repositories.file_state_repository","test_ids":["D-PROG-05"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R51","owner_module":"app.db.repositories.repository_repository","test_ids":["B-REPO-01"],"reason_codes":["PATH_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R52","owner_module":"app.db.repositories.repository_repository","test_ids":["B-REPO-02"],"reason_codes":["PATH_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R53","owner_module":"app.scan_import.locks","test_ids":["C-LOCK-03"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R54","owner_module":"app.scan_import.locks","test_ids":["C-LOCK-04"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R55","owner_module":"app.scan_import.publication","test_ids":["C-PUB-02"],"reason_codes":["CURRENT_POINTER_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R56","owner_module":"app.scan_import.publication","test_ids":["C-PUB-03"],"reason_codes":["READ_SET_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R57","owner_module":"app.scan_import.coordinator","test_ids":["C-REC-01"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R58","owner_module":"app.scan_import.publication","test_ids":["C-PUB-04"],"reason_codes":["CURRENT_POINTER_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R59","owner_module":"app.scan_import.publication","test_ids":["C-PUB-05"],"reason_codes":["READ_SET_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R60","owner_module":"app.scan_import.coordinator","test_ids":["C-REC-02"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R61","owner_module":"app.inheritance.cpp_parser","test_ids":["D-PARSE-01"],"reason_codes":["UNSUPPORTED_LANGUAGE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R62","owner_module":"app.inheritance.cpp_parser","test_ids":["D-PARSE-02"],"reason_codes":["PARSER_UNRELIABLE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R63","owner_module":"app.inheritance.normalizer","test_ids":["D-TOK-03"],"reason_codes":["LINE_CODE_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R64","owner_module":"app.inheritance.cpp_parser","test_ids":["D-FN-04"],"reason_codes":["FUNCTION_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R65","owner_module":"app.inheritance.dependencies","test_ids":["D-DEP-04"],"reason_codes":["CALLEE_UNRESOLVED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R66","owner_module":"app.inheritance.dependencies","test_ids":["D-DEP-05"],"reason_codes":["CALLEE_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R67","owner_module":"app.inheritance.dependencies","test_ids":["D-DEP-06"],"reason_codes":["MACRO_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R68","owner_module":"app.inheritance.dependencies","test_ids":["D-DEP-07"],"reason_codes":["CONST_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R69","owner_module":"app.inheritance.cpp_parser","test_ids":["D-CTX-01"],"reason_codes":["CONTROL_CONTEXT_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R70","owner_module":"app.inheritance.cpp_parser","test_ids":["D-CTX-02"],"reason_codes":["PP_CONTEXT_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R71","owner_module":"app.inheritance.cpp_parser","test_ids":["D-CTX-03"],"reason_codes":["CONTROL_CONTEXT_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R72","owner_module":"app.inheritance.cpp_parser","test_ids":["D-CTX-04"],"reason_codes":["PP_CONTEXT_CHANGED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R73","owner_module":"app.inheritance.line_map","test_ids":["D-MAP-06"],"reason_codes":["LINE_AMBIGUOUS"],"status":"IMPLEMENTED"},
-    {"rule_id":"R74","owner_module":"app.inheritance.line_map","test_ids":["D-MAP-07"],"reason_codes":["BLOCK_FORK_OR_MERGE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R75","owner_module":"app.inheritance.line_map","test_ids":["D-MAP-08"],"reason_codes":["LINE_DELETED_REINTRODUCED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R76","owner_module":"app.inheritance.rejections","test_ids":["D-REJECT-05"],"reason_codes":["REJECTION_ACTIVE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R77","owner_module":"app.scan_import.coordinator","test_ids":["C-REC-03"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R78","owner_module":"app.scan_import.coordinator","test_ids":["C-REC-04"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R79","owner_module":"app.inheritance.engine","test_ids":["D-ENG-01"],"reason_codes":["INHERITED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R80","owner_module":"app.inheritance.dependencies","test_ids":["D-DEP-08"],"reason_codes":["CALLEE_UNRESOLVED"],"status":"IMPLEMENTED"},
-    {"rule_id":"R81","owner_module":"app.inheritance.engine","test_ids":["D-ENG-02"],"reason_codes":["TECHNICAL_FAILURE"],"status":"IMPLEMENTED"},
-    {"rule_id":"R82","owner_module":"app.inheritance.engine","test_ids":["D-ENG-03"],"reason_codes":["INHERITED_PENDING"],"status":"IMPLEMENTED"},
-    {"rule_id":"R83","owner_module":"app.inheritance.rejections","test_ids":["D-REJECT-06"],"reason_codes":["MANUAL_DRAFT"],"status":"IMPLEMENTED"}
-  ]
+    {
+      "rule_id": "R01",
+      "owner_module": "app.inheritance.predecessor",
+      "test_ids": [
+        "D-PRE-01"
+      ],
+      "reason_codes": [
+        "NO_PREDECESSOR"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "Git 身份是自动继承必需证据；旧/新 Scan 需要可验证 commit，禁止数据库猜测语义等价。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R02",
+      "owner_module": "app.inheritance.predecessor",
+      "test_ids": [
+        "D-PRE-02"
+      ],
+      "reason_codes": [
+        "BRANCH_MISMATCH"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "只比较当前 Scan 与“立即前序合格 Scan”，不搜索更老历史。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R03",
+      "owner_module": "app.inheritance.git_snapshot",
+      "test_ids": [
+        "D-GIT-01"
+      ],
+      "reason_codes": [
+        "NON_ANCESTOR"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "前序 Scan 必须与当前 Scan 同 branch 且已成功完成。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R04",
+      "owner_module": "app.inheritance.git_snapshot",
+      "test_ids": [
+        "D-GIT-02"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "历史分析内容可以携带，但当前 Scan 继承后必须是 `INHERITED_PENDING`，不能直接算已分析。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R05",
+      "owner_module": "app.inheritance.git_snapshot",
+      "test_ids": [
+        "D-GIT-03"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "多行允许共享 AnalysisRecord，当前 Scan 通过 LineLink 引用。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R06",
+      "owner_module": "app.inheritance.line_map",
+      "test_ids": [
+        "D-MAP-01"
+      ],
+      "reason_codes": [
+        "PATH_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "AnalysisRecord 内容可在当前模型中直接更新；部分行编辑必须按 R27 拆分。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R07",
+      "owner_module": "app.inheritance.line_map",
+      "test_ids": [
+        "D-MAP-02"
+      ],
+      "reason_codes": [
+        "LINE_DELETED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "不维护完整内容修改历史；权威内容只保留当前最终结论及必要 provenance/revision。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R08",
+      "owner_module": "app.inheritance.line_map",
+      "test_ids": [
+        "D-MAP-03"
+      ],
+      "reason_codes": [
+        "LINE_AMBIGUOUS"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "仅允许忽略非语义格式变化；identifier/variable rename 受 R66 限制。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R09",
+      "owner_module": "app.inheritance.line_map",
+      "test_ids": [
+        "D-MAP-04"
+      ],
+      "reason_codes": [
+        "LINE_CODE_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "Analysis Block 继承映射必须 1:1。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R10",
+      "owner_module": "app.inheritance.line_map",
+      "test_ids": [
+        "D-MAP-05"
+      ],
+      "reason_codes": [
+        "LINE_DELETED_REINTRODUCED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "Analysis Block 是语义审查组织单位，但最终分析状态权威落到物理行。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R11",
+      "owner_module": "app.inheritance.normalizer",
+      "test_ids": [
+        "D-TOK-01"
+      ],
+      "reason_codes": [
+        "LINE_CODE_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "多个旧 Block 合并成一个新 Block（N:1）不继承。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R12",
+      "owner_module": "app.inheritance.normalizer",
+      "test_ids": [
+        "D-TOK-02"
+      ],
+      "reason_codes": [
+        "LINE_CODE_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "文件 identity 使用 repository-relative exact path；rename/move 不继承。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R13",
+      "owner_module": "app.inheritance.cpp_parser",
+      "test_ids": [
+        "D-FN-01"
+      ],
+      "reason_codes": [
+        "FUNCTION_ID_UNRESOLVED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "Git ancestry 必须满足 `old==new` 或 `merge-base --is-ancestor old new`。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R14",
+      "owner_module": "app.inheritance.cpp_parser",
+      "test_ids": [
+        "D-FN-02"
+      ],
+      "reason_codes": [
+        "FUNCTION_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "候选行所属函数 identity 必须匹配。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R15",
+      "owner_module": "app.inheritance.cpp_parser",
+      "test_ids": [
+        "D-FN-03"
+      ],
+      "reason_codes": [
+        "FUNCTION_ID_UNRESOLVED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "完整函数 identity 至少包含 repo-relative path + namespace/class scope + function name + parameter signature。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R16",
+      "owner_module": "app.inheritance.dependencies",
+      "test_ids": [
+        "D-DEP-01"
+      ],
+      "reason_codes": [
+        "MACRO_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "候选行实际依赖的直接宏/编译期常量必须检查变化。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R17",
+      "owner_module": "app.inheritance.dependencies",
+      "test_ids": [
+        "D-DEP-02"
+      ],
+      "reason_codes": [
+        "CONST_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "候选行实际依赖的一层同仓库直接调用函数必须检查；不递归，不跨仓库。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R18",
+      "owner_module": "app.inheritance.dependencies",
+      "test_ids": [
+        "D-DEP-03"
+      ],
+      "reason_codes": [
+        "CALLEE_CHANGED",
+        "CALLEE_UNRESOLVED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "direct callee 的“等价”最终以 R68 的规范化完整函数体 exact 为准。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R19",
+      "owner_module": "app.inheritance.engine",
+      "test_ids": [
+        "D-BLOCK-01"
+      ],
+      "reason_codes": [
+        "BLOCK_AMBIGUOUS"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "Covered bridge 允许：V4 未覆盖且有结论 R → V5 covered → V6 再未覆盖，只要代码身份链持续成立，V6 可恢复 R 为 `INHERITED_PENDING`；V5 不要求复核。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R20",
+      "owner_module": "app.inheritance.engine",
+      "test_ids": [
+        "D-BLOCK-02"
+      ],
+      "reason_codes": [
+        "BLOCK_FORK_OR_MERGE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "只有旧 Scan 中实际有分析关系的物理行可以继承；新出现/新未覆盖行不能凭 Block 结果自动获得结论。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R21",
+      "owner_module": "app.inheritance.engine",
+      "test_ids": [
+        "D-BLOCK-03"
+      ],
+      "reason_codes": [
+        "INHERITED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "物理行映射必须 1:1；1→many 或 many→1 格式映射不继承。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R22",
+      "owner_module": "app.inheritance.engine",
+      "test_ids": [
+        "D-DEC-01"
+      ],
+      "reason_codes": [
+        "INHERITED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "物理行映射必须唯一；歧义即不继承。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R23",
+      "owner_module": "app.inheritance.engine",
+      "test_ids": [
+        "D-DEC-02"
+      ],
+      "reason_codes": [
+        "INHERITED_PENDING"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "全局约束：一个 old physical line 最多映射到一个 new physical line。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R24",
+      "owner_module": "app.inheritance.engine",
+      "test_ids": [
+        "D-DEC-03"
+      ],
+      "reason_codes": [
+        "CARRIED_COVERED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "Block 1→N 复制/分叉不继承。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R25",
+      "owner_module": "app.inheritance.engine",
+      "test_ids": [
+        "D-DEC-04"
+      ],
+      "reason_codes": [
+        "REJECTION_ACTIVE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "合法 1:1 Block 内允许“部分物理行继承”。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R26",
+      "owner_module": "app.db.repositories.file_state_repository",
+      "test_ids": [
+        "D-PROG-01"
+      ],
+      "reason_codes": [
+        "INHERITED_PENDING"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "同一 Block 内不同物理行可以引用不同 AnalysisRecord。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R27",
+      "owner_module": "app.db.repositories.analysis_domain_repository",
+      "test_ids": [
+        "D-PROG-02"
+      ],
+      "reason_codes": [
+        "MANUAL_DRAFT"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "共享 Record 的部分编辑必须 split：只修改的行改绑新 Record；只有全部当前引用行明确一起编辑时才允许更新原 Record。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R28",
+      "owner_module": "app.scan_import.coordinator",
+      "test_ids": [
+        "C-IMPORT-01"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "`.info` 导入后自动执行继承计算，不需要额外人工启动。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R29",
+      "owner_module": "app.scan_import.coordinator",
+      "test_ids": [
+        "C-IMPORT-02"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "继承过程发生技术失败时，整个新 Scan Import 回滚，旧 CURRENT 不变。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R30",
+      "owner_module": "app.scan_import.checkpoints",
+      "test_ids": [
+        "C-CP-01"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "只有技术/完整性错误触发 Scan 回滚；普通不符合继承条件只让对应行 ordinary pending。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R31",
+      "owner_module": "app.inheritance.predecessor",
+      "test_ids": [
+        "D-PRE-04"
+      ],
+      "reason_codes": [
+        "NO_PREDECESSOR"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "没有任何前序合格 Scan 属于正常情况：Scan 成功，无继承。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R32",
+      "owner_module": "app.inheritance.predecessor",
+      "test_ids": [
+        "D-PRE-05"
+      ],
+      "reason_codes": [
+        "BRANCH_MISMATCH"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "最近同 branch Scan 若不是 ancestor，不再向更老 Scan 搜索；当前 Scan 成功但无该继承链。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R33",
+      "owner_module": "app.inheritance.predecessor",
+      "test_ids": [
+        "D-PRE-06"
+      ],
+      "reason_codes": [
+        "NON_ANCESTOR"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "多 Repository 项目按 Repository 独立判定继承资格。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R34",
+      "owner_module": "app.scan_import.locks",
+      "test_ids": [
+        "C-LOCK-01"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "任一 Repository 发生技术失败，整个 Scan 回滚。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R35",
+      "owner_module": "app.scan_import.locks",
+      "test_ids": [
+        "C-LOCK-02"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "不追踪跨 Repository direct callee。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R36",
+      "owner_module": "app.scan_import.publication",
+      "test_ids": [
+        "C-PUB-01"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "第一阶段不追踪普通 enum/struct/typedef/global variable 数据依赖；只检查候选行实际依赖的宏/编译期常量和同仓库 direct callee。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R37",
+      "owner_module": "app.db.repositories.analysis_domain_repository",
+      "test_ids": [
+        "D-REVIEW-01"
+      ],
+      "reason_codes": [
+        "INHERITED_PENDING"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "旧 Scan 的 manual draft 和 confirmed 内容均可作为内容来源，但新 Scan 一律进入 `INHERITED_PENDING`。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R38",
+      "owner_module": "app.services.analysis_service",
+      "test_ids": [
+        "D-REVIEW-02"
+      ],
+      "reason_codes": [
+        "MANUAL_CONFIRMED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "所有未人工确认的继承项在当前 Scan 都计入未分析/待分析。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R39",
+      "owner_module": "app.inheritance.rejections",
+      "test_ids": [
+        "D-REVIEW-03"
+      ],
+      "reason_codes": [
+        "REJECTION_ACTIVE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "人工复核默认支持 Block 批量确认，并允许逐行 opt-out。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R40",
+      "owner_module": "app.services.analysis_service",
+      "test_ids": [
+        "D-REVIEW-04"
+      ],
+      "reason_codes": [
+        "MANUAL_DRAFT"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "reviewer 可以编辑内容并确认；部分编辑遵守 R27。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R41",
+      "owner_module": "app.db.repositories.file_state_repository",
+      "test_ids": [
+        "D-PROG-03"
+      ],
+      "reason_codes": [
+        "INHERITED_PENDING"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "下一 Scan 继承最近人工复核形成的当前有效结论。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R42",
+      "owner_module": "app.db.repositories.file_state_repository",
+      "test_ids": [
+        "D-PROG-04"
+      ],
+      "reason_codes": [
+        "CARRIED_COVERED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "`INHERITED_PENDING` 未复核也可以继续传递到下一 Scan，但下一 Scan 仍为 `INHERITED_PENDING`。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R43",
+      "owner_module": "app.inheritance.engine",
+      "test_ids": [
+        "D-DEC-05"
+      ],
+      "reason_codes": [
+        "INHERITED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "用户可以直接复核最新 Scan，不要求逐个复核中间 Scan。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R44",
+      "owner_module": "app.inheritance.engine",
+      "test_ids": [
+        "D-DEC-06"
+      ],
+      "reason_codes": [
+        "LINE_AMBIGUOUS"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "活跃“拒绝继承”会阻断继承链；后续 Scan 不允许回溯更老结论绕过拒绝。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R45",
+      "owner_module": "app.inheritance.engine",
+      "test_ids": [
+        "D-DEC-07"
+      ],
+      "reason_codes": [
+        "PARSER_UNRELIABLE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "拒绝事实按 Scan + commit + physical line + source relation 持久化；重算不得自动重新挂回旧 Record。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R46",
+      "owner_module": "app.inheritance.rejections",
+      "test_ids": [
+        "D-REJECT-01"
+      ],
+      "reason_codes": [
+        "REJECTION_ACTIVE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "两个不同 Scan 即使 commit 相同，只要其他硬条件全部满足，仍允许继承。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R47",
+      "owner_module": "app.inheritance.rejections",
+      "test_ids": [
+        "D-REJECT-02"
+      ],
+      "reason_codes": [
+        "REJECTION_ACTIVE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "外部 build 参数/环境（如编译命令注入 `-D`）不进入第一阶段依赖证明；只使用 Git 可读源码事实。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R48",
+      "owner_module": "app.inheritance.rejections",
+      "test_ids": [
+        "D-REJECT-03"
+      ],
+      "reason_codes": [
+        "MANUAL_DRAFT"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "旧 Scan/旧关系不因失去 CURRENT 而删除；保留 identity、line relation、rejection 等继承所需事实。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R49",
+      "owner_module": "app.inheritance.rejections",
+      "test_ids": [
+        "D-REJECT-04"
+      ],
+      "reason_codes": [
+        "REJECTION_ACTIVE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "`INHERITED_PENDING` 全量计入 `pending_total`。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R50",
+      "owner_module": "app.db.repositories.file_state_repository",
+      "test_ids": [
+        "D-PROG-05"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "Progress/UI 必须提供 `inherited_pending` 子统计、筛选和批量复核。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R51",
+      "owner_module": "app.db.repositories.repository_repository",
+      "test_ids": [
+        "B-REPO-01"
+      ],
+      "reason_codes": [
+        "PATH_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "文件 path identity 是 repo-relative；服务器物理仓库目录迁移不改变 Repository/File identity。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R52",
+      "owner_module": "app.db.repositories.repository_repository",
+      "test_ids": [
+        "B-REPO-02"
+      ],
+      "reason_codes": [
+        "PATH_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "一个 Project Repository 对应一个逻辑 Repository Master 和一份活动物理 Git repo；历史 commit 使用临时只读 worktree，不为每个 Scan clone 一份，也绝不切生产 working tree HEAD。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R53",
+      "owner_module": "app.inheritance.git_snapshot",
+      "test_ids": [
+        "D-GIT-04"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "本地缺少历史 commit 时允许自动 `git fetch`；远端仍取不到必需 commit 属于 technical failure。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R54",
+      "owner_module": "app.scan_import.locks",
+      "test_ids": [
+        "C-LOCK-04"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "同一 repository_id 的 Import/Inheritance 串行；不同 repository_id 可以并行。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R55",
+      "owner_module": "app.scan_import.publication",
+      "test_ids": [
+        "C-PUB-02"
+      ],
+      "reason_codes": [
+        "CURRENT_POINTER_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "同 Repository 忙时立即拒绝新 Scan，不排队、不取消当前任务。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R56",
+      "owner_module": "app.scan_import.publication",
+      "test_ids": [
+        "C-PUB-03"
+      ],
+      "reason_codes": [
+        "READ_SET_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "Busy rejection 必须发生在创建 Scan/写 coverage 之前，不允许 DB 残留。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R57",
+      "owner_module": "app.scan_import.coordinator",
+      "test_ids": [
+        "C-REC-01"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "自动发布：全部技术处理成功后最终短事务原子更新 `current_scan_id`；无管理员发布确认环节。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R58",
+      "owner_module": "app.scan_import.publication",
+      "test_ids": [
+        "C-PUB-04"
+      ],
+      "reason_codes": [
+        "CURRENT_POINTER_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "Import 期间旧 CURRENT 允许继续人工分析；继承 Job 必须记录实际依赖的旧 Analysis/Relation revision，并在 Publish 前重检。变化则候选失败/回滚。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R59",
+      "owner_module": "app.scan_import.publication",
+      "test_ids": [
+        "C-PUB-05"
+      ],
+      "reason_codes": [
+        "READ_SET_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "一致性检查只锁定和比较本次真正读取/继承的数据，不因无关旧 Analysis 修改而失败。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R60",
+      "owner_module": "app.scan_import.coordinator",
+      "test_ids": [
+        "C-REC-02"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "不存在相似度分数；确定性硬条件是 AND，无法证明即不继承。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R61",
+      "owner_module": "app.inheritance.cpp_parser",
+      "test_ids": [
+        "D-PARSE-01"
+      ],
+      "reason_codes": [
+        "UNSUPPORTED_LANGUAGE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "源码可读但 parser 无法可靠解析完整函数 identity 时，只让受影响文件/行 ordinary pending；源码不可读取、DB/流程异常属于 technical failure。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R62",
+      "owner_module": "app.inheritance.cpp_parser",
+      "test_ids": [
+        "D-PARSE-02"
+      ],
+      "reason_codes": [
+        "PARSER_UNRELIABLE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "当前 covered 的继承关系静默 `CARRIED_COVERED`，不要求人工复核；后续再 uncovered 时恢复为 `INHERITED_PENDING`。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R63",
+      "owner_module": "app.inheritance.normalizer",
+      "test_ids": [
+        "D-TOK-03"
+      ],
+      "reason_codes": [
+        "LINE_CODE_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "人工确认继承时 reviewer/time 更新为当前 reviewer/当前时间；不伪装为旧分析人的新确认。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R64",
+      "owner_module": "app.inheritance.cpp_parser",
+      "test_ids": [
+        "D-FN-04"
+      ],
+      "reason_codes": [
+        "FUNCTION_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "第一阶段正式自动继承只支持 C/C++；其他语言继续导入、展示，但不自动继承。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R65",
+      "owner_module": "app.inheritance.dependencies",
+      "test_ids": [
+        "D-DEP-04"
+      ],
+      "reason_codes": [
+        "CALLEE_UNRESOLVED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "Analysis Block 精确定义为用户保存分析时实际选择范围，AST 不得自动扩缩。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R66",
+      "owner_module": "app.inheritance.dependencies",
+      "test_ids": [
+        "D-DEP-05"
+      ],
+      "reason_codes": [
+        "CALLEE_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "variable/identifier rename 属于有效代码变化，受影响行不继承。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R67",
+      "owner_module": "app.inheritance.dependencies",
+      "test_ids": [
+        "D-DEP-06"
+      ],
+      "reason_codes": [
+        "MACRO_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "行规范化只忽略空格、Tab、缩进、行尾空白和注释；真实 Token（identifier/literal/operator/keyword/call）必须完全一致。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R68",
+      "owner_module": "app.inheritance.dependencies",
+      "test_ids": [
+        "D-DEP-07"
+      ],
+      "reason_codes": [
+        "CONST_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "direct same-repo callee 的完整函数体规范化后必须 exact；只忽略空白/缩进/注释，任何真实 Token 变化都阻断相关 caller candidate。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R69",
+      "owner_module": "app.inheritance.cpp_parser",
+      "test_ids": [
+        "D-CTX-01"
+      ],
+      "reason_codes": [
+        "CONTROL_CONTEXT_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "macro/compile-time constant definition 规范化后必须 exact；value/expression/params/object-vs-function/constexpr/const-value/resolved definition 变化都阻断；无法唯一解析也不继承。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R70",
+      "owner_module": "app.inheritance.cpp_parser",
+      "test_ids": [
+        "D-CTX-02"
+      ],
+      "reason_codes": [
+        "PP_CONTEXT_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "Block 内其他与候选行无关的有效代码可以增删改，不要求整个 Block body exact；继续按物理行独立判定。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R71",
+      "owner_module": "app.inheritance.cpp_parser",
+      "test_ids": [
+        "D-CTX-03"
+      ],
+      "reason_codes": [
+        "CONTROL_CONTEXT_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "每条候选物理行的完整控制流上下文必须保持一致；相关 if/else/switch-case/for/while 等条件或分支变化阻断该行。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R72",
+      "owner_module": "app.inheritance.cpp_parser",
+      "test_ids": [
+        "D-CTX-04"
+      ],
+      "reason_codes": [
+        "PP_CONTEXT_CHANGED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "比较候选行到 function body 的完整 control-flow ancestor chain；Block 内其他不在祖先链上的分支变化不影响该行。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R73",
+      "owner_module": "app.inheritance.line_map",
+      "test_ids": [
+        "D-MAP-06"
+      ],
+      "reason_codes": [
+        "LINE_AMBIGUOUS"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "每个祖先 condition expression 使用 exact normalized token；不做逻辑等价推导。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R74",
+      "owner_module": "app.inheritance.line_map",
+      "test_ids": [
+        "D-MAP-07"
+      ],
+      "reason_codes": [
+        "BLOCK_FORK_OR_MERGE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "Git diff 是物理行映射主要证据；Git 明确 old delete + new add 时默认不继承，除 R75 的同 hunk 纯格式恢复。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R75",
+      "owner_module": "app.inheritance.line_map",
+      "test_ids": [
+        "D-MAP-08"
+      ],
+      "reason_codes": [
+        "LINE_DELETED_REINTRODUCED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "只允许在同一 Git hunk 内，对仅因 whitespace/indent/comment 导致原始映射丢失的 normalized identical line 做唯一 1:1 恢复；禁止跨 hunk 搜索/相似度/猜测。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R76",
+      "owner_module": "app.inheritance.line_map",
+      "test_ids": [
+        "D-REJECT-05"
+      ],
+      "reason_codes": [
+        "LINE_DELETED_REINTRODUCED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "Source-line deletion 永久断链：V4 有 R → V5 line deleted → V6 同文本 re-add，V6 视为新代码 ordinary pending；与 R19 covered bridge 区分。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R77",
+      "owner_module": "app.jobs.service",
+      "test_ids": [
+        "C-REC-03"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "Scan Import/Inheritance 必须持久可恢复：重启从安全 checkpoint 继续，恢复前重新验证 Scan/repo/commit/worktree/lock fencing/read-set/expected CURRENT；不一致则 fail closed。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R78",
+      "owner_module": "app.scan_import.coordinator",
+      "test_ids": [
+        "C-REC-04"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "C/C++ 支持扩展名：`.c .cc .cpp .cxx .h .hh .hpp .hxx`。Header 仅在 `.info` 实际覆盖、Git 源可读且函数/行/控制上下文可可靠解析时参与；解析不确定时对应行普通 pending。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R79",
+      "owner_module": "app.inheritance.engine",
+      "test_ids": [
+        "D-ENG-01"
+      ],
+      "reason_codes": [
+        "INHERITED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "Git-visible preprocessor control 属于 line context：完整 `#if/#ifdef/#ifndef/#elif` ancestor chain 与 branch relationship 必须 exact normalized；外部 build `-D` 仍按 R47 不纳入。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R80",
+      "owner_module": "app.inheritance.dependencies",
+      "test_ids": [
+        "D-DEP-08"
+      ],
+      "reason_codes": [
+        "CALLEE_UNRESOLVED"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "direct call 无法唯一静态解析（function pointer、virtual dispatch、复杂 templates、macro-wrapped call、ambiguous overload 等）时，受影响候选行不自动继承，Scan 正常继续。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R81",
+      "owner_module": "app.inheritance.engine",
+      "test_ids": [
+        "D-ENG-02"
+      ],
+      "reason_codes": [
+        "TECHNICAL_FAILURE"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "宏/编译期常量/direct callee 依赖按“候选物理行实际依赖”检查：候选行自身 + 完整 control-flow ancestor + 完整 preprocessor ancestor；同 Block 其他无关依赖变化不阻断该行。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R82",
+      "owner_module": "app.inheritance.engine",
+      "test_ids": [
+        "D-ENG-03"
+      ],
+      "reason_codes": [
+        "INHERITED_PENDING"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "新 Scan 完成 `.info`、Git、继承、统计和一致性全部处理后自动原子切换 CURRENT；任一技术失败不切换。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    },
+    {
+      "rule_id": "R83",
+      "owner_module": "app.inheritance.rejections",
+      "test_ids": [
+        "D-REJECT-06"
+      ],
+      "reason_codes": [
+        "MANUAL_DRAFT"
+      ],
+      "status": "IMPLEMENTED",
+      "rule_text": "当前 Scan 的拒绝继承，在尚未形成新的人工分析结果前允许人工显式撤销；撤销只恢复当前 Scan 的 `INHERITED_PENDING`，系统不得自动撤销；已经计算完成的后续 Scan 不做追溯重写。",
+      "semantic_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10"
+    }
+  ],
+  "authoritative_source": "docs/FOS_Coverage_Gate_A-F_详细开发与验证总方案_v1.2.md#10",
+  "semantic_rules_sha256": "e4ebe2dfe471fe0455fd52d5953e4346338a069898b8ebdafc752ffa2fa81ab2"
 }

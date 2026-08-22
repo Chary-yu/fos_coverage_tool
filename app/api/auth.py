@@ -5,6 +5,15 @@ import os
 from app.upgrade.lifecycle import writes_are_frozen
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
+def _public_bind(config):
+    host = str((config or {}).get("server", {}).get("host") or
+               "127.0.0.1").strip().lower()
+    return host not in _LOOPBACK_HOSTS
+
+
 class MutationAuthorizer(object):
     def __init__(self, repo_root, config):
         self.repo_root = os.path.realpath(repo_root)
@@ -26,6 +35,8 @@ class MutationAuthorizer(object):
         if origin and allowed_origins and origin not in allowed_origins:
             return False, 403, "origin is not allowed"
         if mode == "disabled":
+            if _public_bind(self.config):
+                return False, 503, "disabled authentication is not allowed on a public bind"
             return True, 200, ""
         trusted = [str(item) for item in self.auth.get("trusted_proxy_addresses") or []]
         if str(remote_address or "") not in trusted:

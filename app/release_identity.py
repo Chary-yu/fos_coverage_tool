@@ -16,6 +16,22 @@ DEFAULT_VERSION = "v11.7 2026-08-19"
 DEFAULT_SCHEMA_VERSION = 2
 RELEASE_MANIFEST_NAME = "release_manifest.json"
 
+# Keep this list in one place for both build-time generation and any release
+# governance checker.  The root-level files are retained compatibility assets;
+# the web/assets files are the canonical browser sources.
+DEFAULT_RELEASE_ASSET_RELATIVE_PATHS = (
+    "coverage_enhance.js",
+    "coverage_enhance.css",
+    "coverage_progress.js",
+    "incremental_coverage.js",
+    "incremental_developer_tasks.js",
+    "web/assets/js/coverage_enhance.js",
+    "web/assets/js/coverage_progress.js",
+    "web/assets/js/incremental_coverage.js",
+    "web/assets/js/incremental_developer_tasks.js",
+    "web/assets/css/coverage_enhance.css",
+)
+
 def _get_git_commit_sha(repo_root: str) -> str:
     """Safely get git commit SHA or return fallback."""
     try:
@@ -57,15 +73,8 @@ def generate_release_identity(
     
     if asset_files is None:
         asset_files = []
-        candidates = [
-            os.path.join(repo_root, "coverage_enhance.js"),
-            os.path.join(repo_root, "coverage_enhance.css"),
-            os.path.join(repo_root, "coverage_progress.js"),
-            os.path.join(repo_root, "incremental_coverage.js"),
-            os.path.join(repo_root, "incremental_developer_tasks.js"),
-            os.path.join(repo_root, "web", "assets", "js", "coverage_enhance.js"),
-            os.path.join(repo_root, "web", "assets", "css", "coverage_enhance.css"),
-        ]
+        candidates = [os.path.join(repo_root, *path.split("/"))
+                      for path in DEFAULT_RELEASE_ASSET_RELATIVE_PATHS]
         for c in candidates:
             if os.path.isfile(c) and c not in asset_files:
                 asset_files.append(c)

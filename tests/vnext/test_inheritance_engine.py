@@ -1,19 +1,122 @@
 import json
 import os
 import sqlite3
+import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from app.inheritance.cpp_parser import CppSourceAnalyzer
 from app.inheritance.engine import InheritanceEngine
 from app.inheritance.dependencies import SourceAnalysisIndex
+from app.inheritance.git_snapshot import GitSnapshotProvider
 from app.inheritance.line_map import GitLineMapEngine
 from app.inheritance.normalizer import CppLexer, normalize_cpp
+from app.db.repositories import (
+    AnalysisDomainRepository, LineIndexRepository, ProjectRepository,
+    ProjectStateRepository, RepositoryRepository,
+)
+from app.services.project_service import ProjectService
 from scripts.diagnostics.inheritance_rules_audit import audit as audit_rules
 from scripts.upgrade.migration_runner import create_sqlite_schema
 
 
 class InheritanceEngineTest(unittest.TestCase):
+    @staticmethod
+    def _git_fixture():
+        root = tempfile.TemporaryDirectory(prefix="inheritance-git-")
+        subprocess.check_call(["git", "init", "-q", root.name])
+        subprocess.check_call(["git", "-C", root.name, "config", "user.email", "test@example.invalid"])
+        subprocess.check_call(["git", "-C", root.name, "config", "user.name", "inheritance-test"])
+        path = os.path.join(root.name, "src", "a.c")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write("int f() {\n  return 0;\n}\n")
+        subprocess.check_call(["git", "-C", root.name, "add", "."])
+        subprocess.check_call(["git", "-C", root.name, "commit", "-qm", "old"])
+        old_commit = subprocess.check_output(
+            ["git", "-C", root.name, "rev-parse", "HEAD"], universal_newlines=True
+        ).strip()
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write("int f() {\n  // formatting-only context\n  return 0;\n}\n")
+        subprocess.check_call(["git", "-C", root.name, "add", "."])
+        subprocess.check_call(["git", "-C", root.name, "commit", "-qm", "new"])
+        new_commit = subprocess.check_output(
+            ["git", "-C", root.name, "rev-parse", "HEAD"], universal_newlines=True
+        ).strip()
+        return root, old_commit, new_commit
+
+    def _inheritance_db_fixture(self, branch="main"):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        create_sqlite_schema(connection)
+        root, old_commit, new_commit = self._git_fixture()
+        projects = ProjectRepository()
+        states = ProjectStateRepository()
+        repositories = RepositoryRepository()
+        service = ProjectService(
+            projects, states, LineIndexRepository(), repository_repo=repositories
+        )
+        old = service.create_scan_and_ingest(
+            connection, "engine-fixture", [{
+                "repository_name": "repo-a", "file_path": "src/a.c",
+                "file_path_hash": "o" * 32,
+                "lines": [
+                    {"line_number": 1, "line_text": "int f() {", "coverage_state": "covered"},
+                    {"line_number": 2, "line_text": "  return 0;", "coverage_state": "uncovered"},
+                    {"line_number": 3, "line_text": "}", "coverage_state": "covered"},
+                ],
+            }], repositories=[{
+                "repository_name": "repo-a", "repository_path": root.name,
+                "branch_name": "main", "commit_sha": old_commit,
+                "old_commit_sha": old_commit, "new_commit_sha": old_commit,
+                "identity_verified": True, "identity_provenance": "test",
+            }], info_sha256="engine-old",
+        )
+        domain = AnalysisDomainRepository()
+        old_file = projects.get_file(
+            connection, old["id"], "repo-a", "o" * 32
+        )
+        old_line = connection.execute(
+            "SELECT * FROM coverage_lines WHERE file_id=? AND line_number=2",
+            (old_file["id"],),
+        ).fetchone()
+        record = domain.create_record(
+            connection, {"status": "可覆盖", "coverage_method": "unit"},
+            origin="MANUAL",
+        )
+        repo_id = connection.execute(
+            "SELECT repository_id FROM coverage_scan_repositories WHERE scan_id=?",
+            (old["id"],),
+        ).fetchone()[0]
+        block = domain.create_block(
+            connection, old["id"], old_file["id"], 2, 2,
+            record_id=record["id"], repository_id=repo_id, verified=True,
+        )
+        domain.create_link(
+            connection, old["id"], old_line["id"], record["id"],
+            block_id=block["id"], review_state="MANUAL_CONFIRMED",
+            relation_origin="MANUAL",
+        )
+        candidate = service.create_scan_and_ingest(
+            connection, "engine-fixture", [{
+                "repository_name": "repo-a", "file_path": "src/a.c",
+                "file_path_hash": "n" * 32,
+                "lines": [
+                    {"line_number": 1, "line_text": "int f() {", "coverage_state": "covered"},
+                    {"line_number": 2, "line_text": "  // formatting-only context", "coverage_state": "covered"},
+                    {"line_number": 3, "line_text": "  return 0;", "coverage_state": "uncovered"},
+                    {"line_number": 4, "line_text": "}", "coverage_state": "covered"},
+                ],
+            }], repositories=[{
+                "repository_name": "repo-a", "repository_path": root.name,
+                "branch_name": branch, "commit_sha": new_commit,
+                "old_commit_sha": old_commit, "new_commit_sha": new_commit,
+                "identity_verified": True, "identity_provenance": "test",
+            }], info_sha256="engine-new-" + branch,
+        )
+        return connection, root, old, candidate
+
     def test_lexer_preserves_literals_and_ignores_comments(self):
         source = r'''int f() { const char *x = "// not a comment"; /* comment */ return x[0]; }'''
         self.assertIn('"// not a comment"', normalize_cpp(source))
@@ -82,6 +185,104 @@ class InheritanceEngineTest(unittest.TestCase):
         changed = engine.map_text("return a + b;\n", "return a - b;\n")
         self.assertIsNone(changed.get(1))
         self.assertIn(1, changed.ambiguous)
+
+    def test_git_hunk_recovery_does_not_cross_hunks(self):
+        root, old_commit, new_commit = self._git_fixture()
+        try:
+            path = os.path.join(root.name, "src", "a.c")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write(
+                    "int f() {\n"
+                    "  return 0;\n"
+                    "  int a = 1;\n"
+                    "  int b = 2;\n"
+                    "  int c = 3;\n"
+                    "  int d = 4;\n"
+                    "  int e = 5;\n"
+                    "  int f = 6;\n"
+                    "  int g = 7;\n"
+                    "}\n"
+                )
+            subprocess.check_call(["git", "-C", root.name, "add", "."])
+            subprocess.check_call(["git", "-C", root.name, "commit", "-qm", "expanded"])
+            expanded = subprocess.check_output(
+                ["git", "-C", root.name, "rev-parse", "HEAD"], universal_newlines=True
+            ).strip()
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write(
+                    "int f() {\n"
+                    "  int a = 1;\n"
+                    "  int b = 2;\n"
+                    "  int c = 3;\n"
+                    "  int d = 4;\n"
+                    "  int e = 5;\n"
+                    "  int f = 6;\n"
+                    "  int g = 7;\n"
+                    "  return 0;\n"
+                    "}\n"
+                )
+            subprocess.check_call(["git", "-C", root.name, "add", "."])
+            subprocess.check_call(["git", "-C", root.name, "commit", "-qm", "reintroduced"])
+            reintroduced = subprocess.check_output(
+                ["git", "-C", root.name, "rev-parse", "HEAD"], universal_newlines=True
+            ).strip()
+            mapping = GitLineMapEngine().map_git_file(
+                root.name, expanded, reintroduced, "src/a.c"
+            )
+            self.assertIsNone(mapping.get(2))
+            self.assertIn(2, mapping.deleted)
+        finally:
+            root.cleanup()
+
+    def test_missing_history_fetches_from_configured_remote(self):
+        provider = GitSnapshotProvider("/tmp/repository", fetch_remote="origin")
+        with mock.patch.object(
+                provider, "commit_available", side_effect=[False, True]
+        ) as available, mock.patch.object(provider, "_run", return_value="") as run:
+            self.assertTrue(provider.ensure_commit("deadbeef"))
+        self.assertEqual(available.call_count, 2)
+        run.assert_called_once_with(
+            ["fetch", "--no-tags", "origin", "deadbeef"]
+        )
+
+    def test_engine_uses_candidate_file_id_for_each_physical_line(self):
+        connection, root, old, candidate = self._inheritance_db_fixture()
+        try:
+            result = InheritanceEngine().run(
+                connection, candidate["id"], repository_paths={"repo-a": root.name}
+            )
+            candidate_line = connection.execute(
+                "SELECT l.id FROM coverage_lines l JOIN coverage_files f ON f.id=l.file_id "
+                "WHERE f.scan_id=? AND f.file_path=? AND l.line_number=3",
+                (candidate["id"], "src/a.c"),
+            ).fetchone()[0]
+            decision = connection.execute(
+                "SELECT candidate_line_id, decision, reason_code "
+                "FROM coverage_inheritance_decisions WHERE candidate_scan_id=? "
+                "AND candidate_line_id=?",
+                (candidate["id"], candidate_line),
+            ).fetchone()
+            self.assertEqual(result["inherited"], 1)
+            self.assertEqual(tuple(decision), (candidate_line, "INHERITED", "INHERITED"))
+        finally:
+            root.cleanup()
+            connection.close()
+
+    def test_engine_hard_blocks_repository_branch_mismatch(self):
+        connection, root, old, candidate = self._inheritance_db_fixture(branch="feature")
+        try:
+            result = InheritanceEngine().run(
+                connection, candidate["id"], repository_paths={"repo-a": root.name}
+            )
+            reasons = [row[0] for row in connection.execute(
+                "SELECT reason_code FROM coverage_inheritance_decisions "
+                "WHERE candidate_scan_id=?", (candidate["id"],)
+            ).fetchall()]
+            self.assertEqual(result["inherited"], 0)
+            self.assertIn("BRANCH_MISMATCH", reasons)
+        finally:
+            root.cleanup()
+            connection.close()
 
     def test_compare_line_allows_comment_only_change_and_rejects_control_change(self):
         engine = InheritanceEngine()
