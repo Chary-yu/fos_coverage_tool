@@ -30,6 +30,8 @@ DEFAULT_RELEASE_ASSET_RELATIVE_PATHS = (
     "web/assets/js/incremental_coverage.js",
     "web/assets/js/incremental_developer_tasks.js",
     "web/assets/css/coverage_enhance.css",
+    "coverage_progress.html",
+    "web/templates/coverage_progress.html",
 )
 
 def _get_git_commit_sha(repo_root: str) -> str:

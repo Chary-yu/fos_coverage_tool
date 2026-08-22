@@ -9,12 +9,40 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from app.release_identity import (
+    DEFAULT_RELEASE_ASSET_RELATIVE_PATHS,
     get_current_release_identity, generate_release_identity, save_release_manifest,
 )
 from scripts.upgrade.evidence_manifest import EvidenceManifestV2, ProductionEvidenceManifest
 
 
 class TestEvidenceAuthenticity(unittest.TestCase):
+    def test_default_release_assets_include_progress_template_pair(self):
+        required = {
+            "coverage_progress.html",
+            "web/templates/coverage_progress.html",
+        }
+        self.assertTrue(required.issubset(set(DEFAULT_RELEASE_ASSET_RELATIVE_PATHS)))
+
+        with tempfile.TemporaryDirectory() as root:
+            for relative, contents in (
+                ("coverage_progress.html", "compatibility-v1"),
+                ("web/templates/coverage_progress.html", "canonical-v1"),
+            ):
+                path = os.path.join(root, *relative.split("/"))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write(contents)
+
+            original = generate_release_identity(root, commit_sha="a" * 40)
+            with open(
+                os.path.join(root, "web", "templates", "coverage_progress.html"),
+                "a",
+                encoding="utf-8",
+            ) as stream:
+                stream.write("-tampered")
+            changed = generate_release_identity(root, commit_sha="a" * 40)
+            self.assertNotEqual(original["asset_hash"], changed["asset_hash"])
+
     def test_missing_runtime_release_manifest_fails_closed(self):
         with tempfile.TemporaryDirectory() as root:
             with self.assertRaises(RuntimeError):
