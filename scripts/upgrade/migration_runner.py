@@ -244,10 +244,11 @@ CREATE TABLE IF NOT EXISTS coverage_import_failures (
 );
 CREATE TABLE IF NOT EXISTS coverage_migration_checkpoints (
     migration_id TEXT NOT NULL, checkpoint_key TEXT NOT NULL,
+    checkpoint_key_hash TEXT NOT NULL,
     phase TEXT NOT NULL, source_cursor TEXT NOT NULL DEFAULT '',
     semantic_fragment_hash TEXT NOT NULL DEFAULT '', target_counts TEXT NOT NULL DEFAULT '',
     migration_version INTEGER NOT NULL DEFAULT 1, state TEXT NOT NULL,
-    updated_at TEXT NOT NULL, PRIMARY KEY (migration_id, checkpoint_key)
+    updated_at TEXT NOT NULL, PRIMARY KEY (checkpoint_key_hash)
 );
 """
 
@@ -306,6 +307,18 @@ def _table_exists(connection, table_name):
     return bool(row)
 
 
+def _migration_checkpoint_key_hash(migration_id, checkpoint_key):
+    """Return the bounded, backend-neutral identity for one checkpoint.
+
+    The human-readable key is deliberately retained for diagnostics, but it
+    can contain a Unicode path and therefore cannot safely participate in a
+    MariaDB 5.5 utf8mb4 primary key. Hashing the pair preserves exact
+    identity without relying on a lossy prefix index.
+    """
+    payload = "{}\x00{}".format(migration_id, checkpoint_key).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _ensure_migration_checkpoint_table(connection):
     """Install the additive migration checkpoint table on older VNext DBs.
 
@@ -315,12 +328,11 @@ def _ensure_migration_checkpoint_table(connection):
     both SQLite and MariaDB 5.5 without relying on ``ADD COLUMN IF NOT
     EXISTS``.
     """
-    if _table_exists(connection, "coverage_migration_checkpoints"):
-        return
     ddl = """
         CREATE TABLE IF NOT EXISTS coverage_migration_checkpoints (
             migration_id {migration_id} NOT NULL,
             checkpoint_key {checkpoint_key} NOT NULL,
+            checkpoint_key_hash {checkpoint_key_hash} NOT NULL,
             phase {phase} NOT NULL,
             source_cursor {source_cursor} NOT NULL DEFAULT '',
             semantic_fragment_hash {fragment_hash} NOT NULL DEFAULT '',
@@ -328,27 +340,124 @@ def _ensure_migration_checkpoint_table(connection):
             migration_version INTEGER NOT NULL DEFAULT 1,
             state {state} NOT NULL,
             updated_at {updated_at} NOT NULL,
-            PRIMARY KEY (migration_id, checkpoint_key)
+            PRIMARY KEY (checkpoint_key_hash)
         )
     """
     if is_sqlite(connection):
         statement = ddl.format(
             migration_id="TEXT", checkpoint_key="TEXT", phase="TEXT",
+            checkpoint_key_hash="TEXT",
             source_cursor="TEXT", fragment_hash="TEXT", target_counts="TEXT",
             state="TEXT", updated_at="TEXT",
         )
     else:
         statement = ddl.format(
-            migration_id="VARCHAR(128)", checkpoint_key="VARCHAR(512)",
+            migration_id="VARCHAR(128)", checkpoint_key="TEXT",
+            checkpoint_key_hash=(
+                "CHAR(64) CHARACTER SET ascii COLLATE ascii_bin"
+            ),
             phase="VARCHAR(64)", source_cursor="VARCHAR(512)",
             fragment_hash="CHAR(64)", target_counts="LONGTEXT",
             state="VARCHAR(32)", updated_at="DATETIME",
         )
+    if not _table_exists(connection, "coverage_migration_checkpoints"):
+        cursor = connection.cursor()
+        try:
+            cursor.execute(adapt_sql(connection, statement))
+        finally:
+            cursor.close()
+        return
+
+    # Older VNext targets used a composite utf8mb4 primary key. Upgrade that
+    # metadata table in place so a MariaDB 5.5 retry has the same bounded key
+    # contract as a fresh target. The readable columns remain unchanged.
+    if not _column_exists(
+            connection, "coverage_migration_checkpoints", "checkpoint_key_hash"):
+        definition = (
+            "TEXT NOT NULL DEFAULT ''" if is_sqlite(connection) else
+            "CHAR(64) CHARACTER SET ascii COLLATE ascii_bin "
+            "NOT NULL DEFAULT ''"
+        )
+        cursor = connection.cursor()
+        try:
+            cursor.execute(adapt_sql(connection, "ALTER TABLE "
+                                      "coverage_migration_checkpoints "
+                                      "ADD COLUMN checkpoint_key_hash " + definition))
+        finally:
+            cursor.close()
+
+    rows = fetchall(connection, """
+        SELECT migration_id, checkpoint_key, checkpoint_key_hash
+        FROM coverage_migration_checkpoints
+    """)
     cursor = connection.cursor()
     try:
-        cursor.execute(adapt_sql(connection, statement))
+        for row in rows:
+            migration_id = row.get("migration_id")
+            checkpoint_key = row.get("checkpoint_key")
+            expected = _migration_checkpoint_key_hash(migration_id, checkpoint_key)
+            if str(row.get("checkpoint_key_hash") or "") == expected:
+                continue
+            cursor.execute(adapt_sql(connection, """
+                UPDATE coverage_migration_checkpoints
+                SET checkpoint_key_hash=?
+                WHERE migration_id=? AND checkpoint_key=?
+            """), (expected, migration_id, checkpoint_key))
     finally:
         cursor.close()
+
+    if is_sqlite(connection):
+        return
+
+    primary_rows = fetchall(connection, """
+        SELECT COLUMN_NAME
+        FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA=DATABASE()
+          AND TABLE_NAME=?
+          AND INDEX_NAME='PRIMARY'
+        ORDER BY SEQ_IN_INDEX
+    """, ("coverage_migration_checkpoints",))
+    primary_columns = [str(row.get("COLUMN_NAME") or "") for row in primary_rows]
+    needs_new_primary = primary_columns != ["checkpoint_key_hash"]
+    if needs_new_primary and primary_columns:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(adapt_sql(
+                connection,
+                "ALTER TABLE coverage_migration_checkpoints DROP PRIMARY KEY",
+            ))
+        finally:
+            cursor.close()
+
+    if not is_sqlite(connection):
+        key_type = fetchone(connection, """
+            SELECT DATA_TYPE
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA=DATABASE()
+              AND TABLE_NAME=?
+              AND COLUMN_NAME='checkpoint_key'
+        """, ("coverage_migration_checkpoints",))
+        if str((key_type or {}).get("DATA_TYPE") or "").lower() != "text":
+            cursor = connection.cursor()
+            try:
+                cursor.execute(adapt_sql(
+                    connection,
+                    "ALTER TABLE coverage_migration_checkpoints "
+                    "MODIFY checkpoint_key TEXT NOT NULL",
+                ))
+            finally:
+                cursor.close()
+
+    if not is_sqlite(connection) and needs_new_primary:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(adapt_sql(
+                connection,
+                "ALTER TABLE coverage_migration_checkpoints "
+                "ADD PRIMARY KEY (checkpoint_key_hash)",
+            ))
+        finally:
+            cursor.close()
 
 
 def _column_exists(connection, table_name, column_name):
@@ -1021,12 +1130,19 @@ def _stream_legacy_semantic_hash(connection, projects, data_versions):
 def _upsert_migration_checkpoint(connection, migration_id, checkpoint_key,
                                  phase, source_cursor="", semantic_fragment_hash="",
                                  target_counts=None, state="COMPLETED"):
+    checkpoint_key_hash = _migration_checkpoint_key_hash(
+        migration_id, checkpoint_key
+    )
     payload = json.dumps(target_counts or {}, ensure_ascii=False, sort_keys=True,
                          separators=(",", ":"))
     existing = fetchone(connection, """
-        SELECT migration_id FROM coverage_migration_checkpoints
-        WHERE migration_id=? AND checkpoint_key=?
-    """, (migration_id, checkpoint_key))
+        SELECT migration_id, checkpoint_key FROM coverage_migration_checkpoints
+        WHERE checkpoint_key_hash=?
+    """, (checkpoint_key_hash,))
+    if existing and (
+            str(existing.get("migration_id") or "") != str(migration_id) or
+            str(existing.get("checkpoint_key") or "") != str(checkpoint_key)):
+        raise RuntimeError("migration checkpoint hash collision")
     values = (phase, source_cursor, semantic_fragment_hash, payload, state, _now())
     cursor = connection.cursor()
     try:
@@ -1035,27 +1151,36 @@ def _upsert_migration_checkpoint(connection, migration_id, checkpoint_key,
                 UPDATE coverage_migration_checkpoints
                 SET phase=?, source_cursor=?, semantic_fragment_hash=?, target_counts=?,
                     state=?, updated_at=?
-                WHERE migration_id=? AND checkpoint_key=?
-            """), values + (migration_id, checkpoint_key))
+                WHERE checkpoint_key_hash=?
+            """), values + (checkpoint_key_hash,))
         else:
             cursor.execute(adapt_sql(connection, """
                 INSERT INTO coverage_migration_checkpoints(
-                    migration_id, checkpoint_key, phase, source_cursor,
+                    migration_id, checkpoint_key, checkpoint_key_hash, phase, source_cursor,
                     semantic_fragment_hash, target_counts, migration_version,
                     state, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
-            """), (migration_id, checkpoint_key, phase, source_cursor,
-                    semantic_fragment_hash, payload, state, _now()))
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            """), (migration_id, checkpoint_key, checkpoint_key_hash, phase,
+                    source_cursor, semantic_fragment_hash, payload, state,
+                    _now()))
     finally:
         cursor.close()
 
 
 def _migration_checkpoint_done(connection, migration_id, checkpoint_key,
                                semantic_fragment_hash=""):
+    checkpoint_key_hash = _migration_checkpoint_key_hash(
+        migration_id, checkpoint_key
+    )
     row = fetchone(connection, """
-        SELECT state, semantic_fragment_hash FROM coverage_migration_checkpoints
-        WHERE migration_id=? AND checkpoint_key=?
-    """, (migration_id, checkpoint_key))
+        SELECT migration_id, checkpoint_key, state, semantic_fragment_hash
+        FROM coverage_migration_checkpoints
+        WHERE checkpoint_key_hash=?
+    """, (checkpoint_key_hash,))
+    if row and (
+            str(row.get("migration_id") or "") != str(migration_id) or
+            str(row.get("checkpoint_key") or "") != str(checkpoint_key)):
+        raise RuntimeError("migration checkpoint hash collision")
     return bool(row and str(row.get("state") or "") == "COMPLETED" and
                 (not semantic_fragment_hash or
                  str(row.get("semantic_fragment_hash") or "") == semantic_fragment_hash))

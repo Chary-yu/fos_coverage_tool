@@ -11,6 +11,9 @@ from scripts.upgrade.migration_runner import (
     create_sqlite_schema,
     migrate_legacy,
     semantic_hash,
+    _migration_checkpoint_done,
+    _migration_checkpoint_key_hash,
+    _upsert_migration_checkpoint,
     _split_sql,
 )
 from scripts.upgrade.schema_preflight import (
@@ -69,6 +72,36 @@ def legacy_connection():
 
 
 class MigrationRunnerTest(unittest.TestCase):
+    def test_checkpoint_identity_hash_handles_long_unicode_keys(self):
+        target = sqlite3.connect(":memory:")
+        target.row_factory = sqlite3.Row
+        self.addCleanup(target.close)
+        create_sqlite_schema(target)
+
+        migration_id = "legacy-v3-unicode"
+        checkpoint_key = "file:{}:{}:{}".format(
+            "项目" * 30, "a" * 32, "路径/源文件.c" * 80,
+        )
+        _upsert_migration_checkpoint(
+            target, migration_id, checkpoint_key, "FILE",
+            source_cursor=checkpoint_key, semantic_fragment_hash="b" * 64,
+        )
+        target.commit()
+
+        self.assertEqual(
+            _migration_checkpoint_key_hash(migration_id, checkpoint_key),
+            target.execute(
+                "SELECT checkpoint_key_hash FROM coverage_migration_checkpoints"
+            ).fetchone()[0],
+        )
+        self.assertTrue(_migration_checkpoint_done(
+            target, migration_id, checkpoint_key, "b" * 64,
+        ))
+        saved = target.execute(
+            "SELECT checkpoint_key FROM coverage_migration_checkpoints"
+        ).fetchone()[0]
+        self.assertEqual(saved, checkpoint_key)
+
     def test_semantic_hash_normalizes_mariadb_datetime_values(self):
         self.assertEqual(
             semantic_hash({

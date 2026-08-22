@@ -530,7 +530,8 @@ CREATE TABLE IF NOT EXISTS coverage_import_failures (
 
 CREATE TABLE IF NOT EXISTS coverage_migration_checkpoints (
     migration_id VARCHAR(128) NOT NULL,
-    checkpoint_key VARCHAR(512) NOT NULL,
+    checkpoint_key TEXT NOT NULL,
+    checkpoint_key_hash CHAR(64) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
     phase VARCHAR(64) NOT NULL,
     source_cursor VARCHAR(512) NOT NULL DEFAULT '',
     semantic_fragment_hash CHAR(64) NOT NULL DEFAULT '',
@@ -538,5 +539,5 @@ CREATE TABLE IF NOT EXISTS coverage_migration_checkpoints (
     migration_version INT NOT NULL DEFAULT 1,
     state VARCHAR(32) NOT NULL,
     updated_at DATETIME NOT NULL,
-    PRIMARY KEY (migration_id, checkpoint_key)
+    PRIMARY KEY (checkpoint_key_hash)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
