@@ -9,6 +9,7 @@ import time
 import tempfile
 import shutil
 import zipfile
+from unittest import mock
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _REPO_ROOT not in sys.path:
@@ -19,6 +20,8 @@ from app.jobs.excel_streaming import (
     build_directory_detail_workbook,
     export_project_coverage_streaming_zip,
 )
+from app.services import export_service as export_service_module
+from app.services.export_service import ExportService
 
 class TestPhase3JobsExport(unittest.TestCase):
 
@@ -117,6 +120,44 @@ class TestPhase3JobsExport(unittest.TestCase):
         finally:
             if os.path.isfile(path):
                 os.remove(path)
+
+    def test_jsonl_temp_is_removed_when_archive_write_fails(self):
+        """The JSONL spill file is cleaned even after archive assembly fails."""
+        output_path = os.path.join(self.test_dir, "vnext-export.zip")
+        project_repo = mock.Mock()
+        project_repo.get_project_by_name.return_value = {"id": 7}
+        project_repo.get_scan.return_value = {"id": 11, "project_id": 7}
+        project_repo.get_report_for_scan.return_value = {"report_id": "report-11"}
+        project_repo.list_repository_snapshots.return_value = []
+        project_repo.iter_scan_export_rows.return_value = iter([{
+            "file_path": "src/main.c", "line_number": 1,
+            "status": "未确认", "reviewer": "", "suggested_reviewer": "",
+        }])
+        service = ExportService(project_repo, self.test_dir)
+        created_paths = []
+        real_named_temporary_file = export_service_module.tempfile.NamedTemporaryFile
+
+        def recording_named_temporary_file(*args, **kwargs):
+            handle = real_named_temporary_file(*args, **kwargs)
+            created_paths.append(handle.name)
+            return handle
+
+        with mock.patch.object(
+            export_service_module.tempfile,
+            "NamedTemporaryFile",
+            side_effect=recording_named_temporary_file,
+        ), mock.patch.object(
+            export_service_module.zipfile.ZipFile,
+            "write",
+            side_effect=OSError("archive write failed"),
+        ):
+            with self.assertRaisesRegex(OSError, "archive write failed"):
+                service.export_scan(object(), "fixture", 11,
+                                    report_id="report-11", output_path=output_path)
+
+        self.assertEqual(len(created_paths), 1)
+        self.assertFalse(os.path.exists(created_paths[0]))
+        self.assertFalse(os.path.exists(output_path + ".part"))
 
 if __name__ == "__main__":
     unittest.main()

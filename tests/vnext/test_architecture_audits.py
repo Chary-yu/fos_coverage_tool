@@ -202,6 +202,14 @@ class ArchitectureAuditTest(unittest.TestCase):
             {"enhance_coverage.py", "coverage_check.py"},
         )
         self.assertTrue(all(item["exit_code"] == 0 for item in result["cli_surfaces"]))
+        self.assertEqual(
+            {item["surface"] for item in result["retired_cli_surfaces"]},
+            {"enhance_coverage.py"},
+        )
+        self.assertTrue(all(
+            item["status"] == "PASSED" and item["exit_code"] == 2
+            for item in result["retired_cli_surfaces"]
+        ))
 
     def test_active_runtime_binding_uses_process_candidate_config(self):
         process = {

@@ -36,6 +36,14 @@ CLI_SURFACES = (
     "coverage_check.py",
 )
 
+# ``inherit`` is intentionally no longer a compatibility writer.  Exercise
+# the public command itself so a future refactor cannot accidentally restore
+# the old project-name/hash inheritance path behind the shim.
+RETIRED_CLI_SURFACES = (
+    ("enhance_coverage.py", ("inherit", "--from", "v1", "--to", "v2"),
+     2, "legacy inherit is retired"),
+)
+
 
 def _revision(repo_root):
     try:
@@ -100,6 +108,48 @@ def audit(repo_root=ROOT):
                 "exit_code": None,
                 "error": str(exc),
             })
+    retired_cli_results = []
+    for script_name, args, expected_exit, marker in RETIRED_CLI_SURFACES:
+        script_path = os.path.join(repo_root, script_name)
+        try:
+            completed = subprocess.run(
+                [sys.executable, script_path] + list(args),
+                cwd=repo_root,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                timeout=30,
+            )
+            output = ((completed.stdout or "") + (completed.stderr or "")).lower()
+            status = "PASSED" if (
+                completed.returncode == expected_exit and marker.lower() in output
+            ) else "FAILED"
+            result = {
+                "surface": script_name,
+                "operation": "retired-inherit",
+                "status": status,
+                "exit_code": completed.returncode,
+                "expected_exit_code": expected_exit,
+                "marker": marker,
+            }
+            if status != "PASSED":
+                result["output"] = output[-1000:]
+                failures.append(
+                    "{} retired-inherit did not fail closed with exit {}".format(
+                        script_name, expected_exit
+                    )
+                )
+            retired_cli_results.append(result)
+        except (OSError, subprocess.SubprocessError) as exc:
+            failures.append("{} retired-inherit failed: {}".format(script_name, exc))
+            retired_cli_results.append({
+                "surface": script_name,
+                "operation": "retired-inherit",
+                "status": "FAILED",
+                "exit_code": None,
+                "expected_exit_code": expected_exit,
+                "error": str(exc),
+            })
     started = utc_iso()
     return with_contract({
         "status": "PASSED" if not failures else "FAILED",
@@ -114,6 +164,7 @@ def audit(repo_root=ROOT):
         "synthetic": False,
         "surfaces": results,
         "cli_surfaces": cli_results,
+        "retired_cli_surfaces": retired_cli_results,
         "violations": failures,
         "legacy_implementation_status": "TRANSITIONAL_LEGACY",
     })
