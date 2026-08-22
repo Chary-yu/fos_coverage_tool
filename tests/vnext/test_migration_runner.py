@@ -157,6 +157,12 @@ class MigrationRunnerTest(unittest.TestCase):
         self.assertEqual(
             target.execute("SELECT COUNT(*) FROM coverage_background_jobs").fetchone()[0], 1
         )
+        checkpoint = target.execute(
+            "SELECT phase, state FROM coverage_migration_checkpoints "
+            "WHERE checkpoint_key=?",
+            ("project:project-a",),
+        ).fetchone()
+        self.assertEqual(tuple(checkpoint), ("PUBLISHED", "PUBLISHED"))
         after = capture_vnext_snapshot(target)
         self.assertEqual(after["projects"], before["projects"])
         self.assertEqual(after["project_data_versions"], before["project_data_versions"])

@@ -12,6 +12,7 @@ from typing import List, Tuple, Dict, Any
 PROTECTED_TABLES = {
     "coverage_schema_meta",
     "coverage_schema_migrations",
+    "coverage_migration_checkpoints",
     "coverage_projects",
     "coverage_scans",
     "coverage_scan_repositories",

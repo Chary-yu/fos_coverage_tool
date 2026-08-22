@@ -242,6 +242,13 @@ CREATE TABLE IF NOT EXISTS coverage_import_failures (
     message_redacted TEXT, fencing_token INTEGER, occurred_at TEXT NOT NULL,
     UNIQUE(failure_key_hash)
 );
+CREATE TABLE IF NOT EXISTS coverage_migration_checkpoints (
+    migration_id TEXT NOT NULL, checkpoint_key TEXT NOT NULL,
+    phase TEXT NOT NULL, source_cursor TEXT NOT NULL DEFAULT '',
+    semantic_fragment_hash TEXT NOT NULL DEFAULT '', target_counts TEXT NOT NULL DEFAULT '',
+    migration_version INTEGER NOT NULL DEFAULT 1, state TEXT NOT NULL,
+    updated_at TEXT NOT NULL, PRIMARY KEY (migration_id, checkpoint_key)
+);
 """
 
 
@@ -297,6 +304,51 @@ def _table_exists(connection, table_name):
         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
     """, (table_name,))
     return bool(row)
+
+
+def _ensure_migration_checkpoint_table(connection):
+    """Install the additive migration checkpoint table on older VNext DBs.
+
+    The table is migration metadata, not business data. It is nevertheless
+    required by the streaming runner, so an already-created VNext schema must
+    receive it before a migration is resumed. Keep the DDL compatible with
+    both SQLite and MariaDB 5.5 without relying on ``ADD COLUMN IF NOT
+    EXISTS``.
+    """
+    if _table_exists(connection, "coverage_migration_checkpoints"):
+        return
+    ddl = """
+        CREATE TABLE IF NOT EXISTS coverage_migration_checkpoints (
+            migration_id {migration_id} NOT NULL,
+            checkpoint_key {checkpoint_key} NOT NULL,
+            phase {phase} NOT NULL,
+            source_cursor {source_cursor} NOT NULL DEFAULT '',
+            semantic_fragment_hash {fragment_hash} NOT NULL DEFAULT '',
+            target_counts {target_counts} NOT NULL,
+            migration_version INTEGER NOT NULL DEFAULT 1,
+            state {state} NOT NULL,
+            updated_at {updated_at} NOT NULL,
+            PRIMARY KEY (migration_id, checkpoint_key)
+        )
+    """
+    if is_sqlite(connection):
+        statement = ddl.format(
+            migration_id="TEXT", checkpoint_key="TEXT", phase="TEXT",
+            source_cursor="TEXT", fragment_hash="TEXT", target_counts="TEXT",
+            state="TEXT", updated_at="TEXT",
+        )
+    else:
+        statement = ddl.format(
+            migration_id="VARCHAR(128)", checkpoint_key="VARCHAR(512)",
+            phase="VARCHAR(64)", source_cursor="VARCHAR(512)",
+            fragment_hash="CHAR(64)", target_counts="LONGTEXT",
+            state="VARCHAR(32)", updated_at="DATETIME",
+        )
+    cursor = connection.cursor()
+    try:
+        cursor.execute(adapt_sql(connection, statement))
+    finally:
+        cursor.close()
 
 
 def _column_exists(connection, table_name, column_name):
@@ -521,7 +573,11 @@ def _project_names(connection):
     names = set()
     for table in ("coverage_analysis", "coverage_line_index",
                   "coverage_project_state", "coverage_background_jobs"):
-        for row in _rows(connection, table):
+        if not _table_exists(connection, table):
+            continue
+        for row in fetchall(connection, """
+            SELECT DISTINCT project_name FROM {} WHERE project_name IS NOT NULL
+        """.format(table)):
             name = row.get("project_name")
             if name:
                 names.add(str(name))
@@ -559,12 +615,568 @@ def _nullable_int(value):
         return None
 
 
+LEGACY_STREAM_BATCH_SIZE = 500
+
+
+def _iter_legacy_rows(connection, table_name, where="", params=(),
+                      batch_size=LEGACY_STREAM_BATCH_SIZE):
+    """Yield legacy rows through an immutable primary-key cursor.
+
+    The source schema is historical but all business tables in the supported
+    v10 inventory have a primary key (``id`` for facts, ``job_id`` for jobs).
+    Fact migration uses this helper instead of a cursor that remains open
+    across target transactions, so the source connection can stay read-only.
+    """
+    if not _table_exists(connection, table_name):
+        return
+    if table_name == "coverage_background_jobs":
+        cursor_value = ""
+        key_column = "job_id"
+        order = "job_id"
+        predicate = "job_id > ?"
+    elif table_name == "coverage_project_state":
+        cursor_value = ""
+        key_column = "project_name"
+        order = "project_name"
+        predicate = "project_name > ?"
+    else:
+        cursor_value = 0
+        key_column = "id"
+        order = "id"
+        predicate = "id > ?"
+    while True:
+        clauses = [predicate]
+        values = [cursor_value]
+        if where:
+            clauses.insert(0, "(" + where + ")")
+            values = list(params) + values
+        rows = fetchall(connection, """
+            SELECT * FROM {table}
+            WHERE {where}
+            ORDER BY {order} LIMIT ?
+        """.format(table=table_name, where=" AND ".join(clauses), order=order),
+            values + [int(batch_size)])
+        if not rows:
+            return
+        for row in rows:
+            yield row
+        next_cursor = rows[-1].get(key_column)
+        if next_cursor in (None, cursor_value):
+            raise RuntimeError("legacy keyset cursor did not advance")
+        cursor_value = next_cursor
+        if len(rows) < int(batch_size):
+            return
+
+
+def _legacy_analysis_fact(row):
+    file_hash, line_number, path = _legacy_key(row)
+    return {
+        "source_pk": _nullable_int(row.get("id")),
+        "project_name": str(row.get("project_name") or ""),
+        "file_path_hash": file_hash, "file_path": path,
+        "line_number": line_number, "status": str(row.get("status") or ""),
+        "is_draft": int(row.get("is_draft") or 0),
+        "reviewer": str(row.get("reviewer") or ""),
+        "coverage_method": _legacy_text(row, ("coverage_method", "method")),
+        "uncovered_reason": _legacy_text(row, ("uncovered_reason", "reason")),
+        "comment": _legacy_text(row, ("comment", "comments", "remark")),
+        "legacy_created_at": row.get("created_at"),
+        "legacy_updated_at": row.get("updated_at"),
+        "raw_payload_sha256": _legacy_payload_hash(row),
+    }
+
+
+def _legacy_line_fact(row):
+    file_hash, line_number, path = _legacy_key(row)
+    return {
+        "source_pk": _nullable_int(row.get("id")),
+        "project_name": str(row.get("project_name") or ""),
+        "file_path_hash": file_hash, "file_path": path,
+        "line_number": line_number, "line_text": str(row.get("line_text") or ""),
+        "block_start_line": int(row.get("block_start_line") or line_number),
+        "block_end_line": int(row.get("block_end_line") or line_number),
+        "block_type": str(row.get("block_type") or "single"),
+        "function_name": str(row.get("function_name") or ""),
+        "function_hash": str(row.get("function_hash") or ""),
+        "code_line_hash": str(row.get("code_line_hash") or ""),
+        "code_occurrence": int(row.get("code_occurrence") or 1),
+        "legacy_created_at": row.get("created_at"),
+        "legacy_updated_at": row.get("updated_at"),
+        "raw_payload_sha256": _legacy_payload_hash(row),
+    }
+
+
+def _legacy_job_fact(row):
+    return {
+        "job_id": str(row.get("job_id") or ""),
+        "project_name": str(row.get("project_name") or ""),
+        "kind": str(row.get("kind") or ""),
+        "state": str(row.get("state") or ""),
+        "data_version": int(row.get("data_version") or 0),
+        "error_message": str(row.get("error_message") or ""),
+        "legacy_raw_percent": row.get("percent"),
+        "legacy_percent_unit": str(row.get("progress_unit") or ""),
+        "stage": str(row.get("stage") or ""),
+        "message": str(row.get("message") or ""),
+        "input_payload": row.get("input_payload"),
+        "result_path": str(row.get("result_path") or ""),
+        "filename": str(row.get("filename") or ""),
+        "row_count": _nullable_int(row.get("row_count")),
+        "heartbeat_at": row.get("heartbeat_at"),
+        "finished_at": row.get("finished_at"),
+        "created_at": row.get("created_at"),
+        "started_at": row.get("started_at"),
+        "updated_at": row.get("updated_at"),
+        "raw_payload_sha256": _legacy_payload_hash(row),
+    }
+
+
+def _legacy_project_data_versions(connection, projects):
+    result = {}
+    if not _table_exists(connection, "coverage_project_state"):
+        return result
+    for project_name in projects:
+        row = fetchone(connection, """
+            SELECT data_version FROM coverage_project_state WHERE project_name=?
+        """, (project_name,))
+        result[project_name] = int((row or {}).get("data_version") or 0)
+    return result
+
+
+def _legacy_file_hash_page(connection, project_name, cursor="", limit=500):
+    sources = []
+    if _table_exists(connection, "coverage_line_index"):
+        sources.append(
+            "SELECT file_path_hash FROM coverage_line_index WHERE project_name=?"
+        )
+    if _table_exists(connection, "coverage_analysis"):
+        sources.append(
+            "SELECT file_path_hash FROM coverage_analysis WHERE project_name=?"
+        )
+    if not sources:
+        return []
+    query = " UNION ".join(sources)
+    rows = fetchall(connection, """
+        SELECT file_path_hash FROM ({}) AS legacy_file_keys
+        WHERE file_path_hash > ? ORDER BY file_path_hash LIMIT ?
+    """.format(query), [project_name] * len(sources) + [cursor, int(limit)])
+    return [str(row.get("file_path_hash") or "") for row in rows]
+
+
+def _legacy_file_contexts(connection, project_name, file_hash):
+    """Materialize one physical file/hash group, never the whole project."""
+    lines = [
+        _legacy_line_fact(row) for row in _iter_legacy_rows(
+            connection, "coverage_line_index",
+            "project_name=? AND file_path_hash=?", (project_name, file_hash)
+        )
+    ]
+    analyses = [
+        _legacy_analysis_fact(row) for row in _iter_legacy_rows(
+            connection, "coverage_analysis",
+            "project_name=? AND file_path_hash=?", (project_name, file_hash)
+        )
+    ]
+    paths_by_line = {}
+    for line in lines:
+        path = line.get("file_path") or ""
+        if path:
+            paths_by_line.setdefault(int(line["line_number"]), set()).add(path)
+    conflict = any(len(paths) > 1 for paths in paths_by_line.values())
+    contexts = {}
+
+    def context_for(path):
+        path = str(path or file_hash)
+        key = ("legacy-conflict-" + hashlib.sha256(path.encode("utf-8")).hexdigest()[:16]
+               if conflict else "", file_hash, path)
+        if key not in contexts:
+            contexts[key] = {
+                "repository_name": key[0], "file_path_hash": file_hash,
+                "file_path": path, "source_file_name": os.path.basename(path),
+                "lines": {}, "source_lines": {}, "analyses": {},
+                "path_conflict": conflict,
+                "path_candidates": {
+                    number: sorted(values) for number, values in paths_by_line.items()
+                },
+                "missing_file_path_lines": [], "ambiguous_analysis_lines": [],
+                "missing_line_index_lines": [],
+            }
+        return contexts[key]
+
+    for line in lines:
+        path = line.get("file_path") or ""
+        if not path:
+            context["missing_file_path_lines"].append(int(line["line_number"]))
+            path = file_hash
+        context = context_for(path)
+        number = int(line["line_number"])
+        context["source_lines"][number] = line
+        context["lines"][number] = dict(
+            line, coverage_state="uncovered", suggested_reviewer=""
+        )
+    for analysis in analyses:
+        number = int(analysis["line_number"])
+        path = analysis.get("file_path") or ""
+        candidates = paths_by_line.get(number, set())
+        if not path:
+            if len(candidates) != 1:
+                # Keep the explicit ambiguity evidence with the bounded file
+                # context; the write path still uses the deterministic hash
+                # namespace fallback below.
+                context = context_for(file_hash)
+                context["ambiguous_analysis_lines"].append(number)
+            path = next(iter(candidates)) if len(candidates) == 1 else file_hash
+        context = context_for(path)
+        context["analyses"][number] = analysis
+        if number not in context["lines"]:
+            context["missing_line_index_lines"].append(number)
+            context["lines"][number] = {
+                "line_number": number, "line_text": "", "coverage_state": "uncovered",
+                "block_start_line": number, "block_end_line": number,
+                "block_type": "unknown", "function_name": "", "function_hash": "",
+                "code_line_hash": "", "code_occurrence": 1, "suggested_reviewer": "",
+            }
+    return [contexts[key] for key in sorted(contexts)]
+
+
+def _iter_legacy_file_contexts(connection, project_name, batch_size=500):
+    cursor = ""
+    while True:
+        hashes = _legacy_file_hash_page(connection, project_name, cursor, batch_size)
+        if not hashes:
+            return
+        for file_hash in hashes:
+            for context in _legacy_file_contexts(connection, project_name, file_hash):
+                yield context
+        next_cursor = hashes[-1]
+        if next_cursor == cursor:
+            raise RuntimeError("legacy file hash cursor did not advance")
+        cursor = next_cursor
+        if len(hashes) < int(batch_size):
+            return
+
+
+def _json_compact(value):
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        default=_semantic_json_default,
+    ).encode("utf-8")
+
+
+def _stream_json_array(hasher, items):
+    hasher.update(b"[")
+    first = True
+    for item in items:
+        if not first:
+            hasher.update(b",")
+        hasher.update(_json_compact(item))
+        first = False
+    hasher.update(b"]")
+
+
+def _semantic_line_item(line):
+    return {key: line.get(key) for key in (
+        "project_name", "file_path_hash", "file_path", "line_number", "line_text",
+        "block_start_line", "block_end_line", "block_type", "function_name",
+        "function_hash", "code_line_hash", "code_occurrence",
+    )}
+
+
+def _semantic_analysis_item(row):
+    return {key: row.get(key) for key in (
+        "project_name", "file_path_hash", "file_path", "line_number", "status",
+        "is_draft", "reviewer", "coverage_method", "uncovered_reason", "comment",
+    )}
+
+
+def _source_provenance_item(entity_type, source_table, identity, row,
+                            raw_status=None, raw_is_draft=None):
+    return {
+        "target_entity_type": entity_type, "source_table": source_table,
+        "source_identity": identity,
+        "legacy_created_at": row.get("legacy_created_at", row.get("created_at")),
+        "legacy_updated_at": row.get("legacy_updated_at", row.get("updated_at")),
+        "legacy_raw_status": raw_status, "legacy_raw_is_draft": raw_is_draft,
+        "raw_payload_sha256": row.get("raw_payload_sha256") or "",
+    }
+
+
+def _stream_legacy_semantic_hash(connection, projects, data_versions):
+    """Hash normalized legacy facts incrementally and return migration metadata."""
+    project_fragments = {name: hashlib.sha256() for name in projects}
+    counts = {"lines": 0, "analyses": 0, "jobs": 0}
+
+    def line_items():
+        for project_name in projects:
+            for context in _iter_legacy_file_contexts(connection, project_name):
+                for number in sorted(context["lines"]):
+                    item = _semantic_line_item(dict(
+                        context["lines"][number], project_name=project_name,
+                        file_path_hash=context["file_path_hash"],
+                        file_path=context["file_path"],
+                    ))
+                    project_fragments[project_name].update(b"L" + _json_compact(item))
+                    if number in context.get("source_lines", {}):
+                        counts["lines"] += 1
+                    yield item
+
+    def analysis_items():
+        for project_name in projects:
+            for context in _iter_legacy_file_contexts(connection, project_name):
+                for number in sorted(context["analyses"]):
+                    item = _semantic_analysis_item(dict(
+                        context["analyses"][number], project_name=project_name,
+                        file_path_hash=context["file_path_hash"],
+                        file_path=context["file_path"],
+                    ))
+                    project_fragments[project_name].update(b"A" + _json_compact(item))
+                    counts["analyses"] += 1
+                    yield item
+
+    def source_provenance(source_table):
+        if source_table == "coverage_analysis":
+            for project_name in projects:
+                for context in _iter_legacy_file_contexts(connection, project_name):
+                    for number, row in sorted(context["analyses"].items(),
+                                              key=lambda item: str(item[0])):
+                        yield _source_provenance_item(
+                            "legacy_analysis", source_table,
+                            "{}:{}:{}".format(project_name, context["file_path_hash"], number),
+                            row, raw_status=row.get("status"), raw_is_draft=row.get("is_draft"),
+                        )
+        elif source_table == "coverage_background_jobs":
+            for row in _iter_legacy_rows(connection, "coverage_background_jobs"):
+                fact = _legacy_job_fact(row)
+                yield _source_provenance_item(
+                    "job", source_table, fact["job_id"], fact,
+                    raw_status=fact.get("state"),
+                )
+        elif source_table == "coverage_line_index":
+            for project_name in projects:
+                for context in _iter_legacy_file_contexts(connection, project_name):
+                    for number, row in sorted(context["source_lines"].items(),
+                                              key=lambda item: str(item[0])):
+                        yield _source_provenance_item(
+                            "line", source_table,
+                            "{}:{}:{}".format(project_name, context["file_path_hash"], number),
+                            row,
+                        )
+        else:
+            for project_name in projects:
+                state = fetchone(connection, """
+                    SELECT * FROM coverage_project_state WHERE project_name=?
+                """, (project_name,)) or {}
+                yield _source_provenance_item(
+                    "project_state", source_table, project_name,
+                    {"legacy_created_at": None, "legacy_updated_at": state.get("updated_at"),
+                     "raw_payload_sha256": _legacy_payload_hash(state)},
+                )
+
+    def semantic_jobs():
+        for row in _iter_legacy_rows(connection, "coverage_background_jobs"):
+            fact = _legacy_job_fact(row)
+            state = fact["state"]
+            error = fact["error_message"]
+            if state in ("queued", "running", "interrupted"):
+                state = "interrupted"
+                error = error or "legacy active job requires manual migration decision"
+            counts["jobs"] += 1
+            yield {
+                "job_id": fact["job_id"], "project_name": fact["project_name"],
+                "kind": fact["kind"], "state": state,
+                "data_version": fact["data_version"], "error_message": error,
+            }
+
+    provenance_items = (
+        item for source_table in (
+            "coverage_analysis", "coverage_background_jobs",
+            "coverage_line_index", "coverage_project_state",
+        ) for item in source_provenance(source_table)
+    )
+    hasher = hashlib.sha256()
+    hasher.update(b"{")
+    fields = (
+        ("analyses", analysis_items()), ("jobs", semantic_jobs()),
+        ("legacy_provenance", provenance_items), ("lines", line_items()),
+        ("project_data_versions", dict(sorted(data_versions.items()))),
+        ("projects", sorted(projects)),
+    )
+    for index, (key, value) in enumerate(fields):
+        if index:
+            hasher.update(b",")
+        hasher.update(_json_compact(key))
+        hasher.update(b":")
+        _stream_json_array(hasher, value) if not isinstance(value, dict) else hasher.update(_json_compact(value))
+    hasher.update(b"}")
+    return {
+        "semantic_hash": hasher.hexdigest(), "projects": sorted(projects),
+        "project_data_versions": dict(sorted(data_versions.items())),
+        "source_line_facts": counts["lines"], "source_analysis_facts": counts["analyses"],
+        "source_jobs": counts["jobs"], "project_fragments": {
+            name: value.hexdigest() for name, value in project_fragments.items()
+        },
+    }
+
+
+def _upsert_migration_checkpoint(connection, migration_id, checkpoint_key,
+                                 phase, source_cursor="", semantic_fragment_hash="",
+                                 target_counts=None, state="COMPLETED"):
+    payload = json.dumps(target_counts or {}, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"))
+    existing = fetchone(connection, """
+        SELECT migration_id FROM coverage_migration_checkpoints
+        WHERE migration_id=? AND checkpoint_key=?
+    """, (migration_id, checkpoint_key))
+    values = (phase, source_cursor, semantic_fragment_hash, payload, state, _now())
+    cursor = connection.cursor()
+    try:
+        if existing:
+            cursor.execute(adapt_sql(connection, """
+                UPDATE coverage_migration_checkpoints
+                SET phase=?, source_cursor=?, semantic_fragment_hash=?, target_counts=?,
+                    state=?, updated_at=?
+                WHERE migration_id=? AND checkpoint_key=?
+            """), values + (migration_id, checkpoint_key))
+        else:
+            cursor.execute(adapt_sql(connection, """
+                INSERT INTO coverage_migration_checkpoints(
+                    migration_id, checkpoint_key, phase, source_cursor,
+                    semantic_fragment_hash, target_counts, migration_version,
+                    state, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+            """), (migration_id, checkpoint_key, phase, source_cursor,
+                    semantic_fragment_hash, payload, state, _now()))
+    finally:
+        cursor.close()
+
+
+def _migration_checkpoint_done(connection, migration_id, checkpoint_key,
+                               semantic_fragment_hash=""):
+    row = fetchone(connection, """
+        SELECT state, semantic_fragment_hash FROM coverage_migration_checkpoints
+        WHERE migration_id=? AND checkpoint_key=?
+    """, (migration_id, checkpoint_key))
+    return bool(row and str(row.get("state") or "") == "COMPLETED" and
+                (not semantic_fragment_hash or
+                 str(row.get("semantic_fragment_hash") or "") == semantic_fragment_hash))
+
+
+def _legacy_context_fragment(context, project_name):
+    hasher = hashlib.sha256()
+    provenance_rows = []
+    line_count = 0
+    analysis_count = 0
+    for number in sorted(context.get("lines") or {}):
+        item = _semantic_line_item(dict(
+            context["lines"][number], project_name=project_name,
+            file_path_hash=context["file_path_hash"], file_path=context["file_path"],
+        ))
+        hasher.update(b"L" + _json_compact(item))
+        line_count += 1
+        source_line = context.get("source_lines", {}).get(number)
+        if source_line is not None:
+            provenance_rows.append({
+                "entity_type": "line", "target_entity_id": None,
+                "source_table": "coverage_line_index",
+                "source_identity": "{}:{}:{}".format(
+                    project_name, context["file_path_hash"], number
+                ),
+                "legacy_created_at": source_line.get("legacy_created_at"),
+                "legacy_updated_at": source_line.get("legacy_updated_at"),
+                "legacy_raw_status": None, "legacy_raw_is_draft": None,
+                "raw_payload_sha256": source_line.get("raw_payload_sha256", ""),
+            })
+    for number in sorted(context.get("analyses") or {}):
+        source_analysis = context["analyses"][number]
+        item = _semantic_analysis_item(dict(
+            source_analysis, project_name=project_name,
+            file_path_hash=context["file_path_hash"], file_path=context["file_path"],
+        ))
+        hasher.update(b"A" + _json_compact(item))
+        analysis_count += 1
+        provenance_rows.append({
+            "entity_type": "legacy_analysis", "target_entity_id": None,
+            "source_table": "coverage_analysis",
+            "source_identity": "{}:{}:{}".format(
+                project_name, context["file_path_hash"], number
+            ),
+            "legacy_created_at": source_analysis.get("legacy_created_at"),
+            "legacy_updated_at": source_analysis.get("legacy_updated_at"),
+            "legacy_raw_status": source_analysis.get("status"),
+            "legacy_raw_is_draft": source_analysis.get("is_draft"),
+            "raw_payload_sha256": source_analysis.get("raw_payload_sha256", ""),
+        })
+    return hasher.hexdigest(), line_count, analysis_count, provenance_rows
+
+
+def _persist_legacy_context(connection, project_name, scan_id, context,
+                            migration_id, project_repo, line_repo, analysis_repo):
+    files = project_repo.ensure_files(connection, scan_id, [{
+        "repository_name": context["repository_name"],
+        "file_path_hash": context["file_path_hash"],
+        "file_path": context["file_path"],
+        "source_file_name": context["source_file_name"],
+    }])
+    file_row = files[(context["repository_name"], context["file_path_hash"])]
+    line_rows = line_repo.upsert_lines(
+        connection, file_row["id"],
+        [context["lines"][number] for number in sorted(context["lines"])],
+        return_rows=True,
+    )
+    lines_by_number = {int(row["line_number"]): row for row in line_rows}
+    provenance_rows = []
+    for number, source_line in sorted(context.get("source_lines", {}).items()):
+        line = lines_by_number.get(int(number))
+        if not line:
+            raise RuntimeError("migrated line identity was not returned")
+        provenance_rows.append({
+            "entity_type": "line", "target_entity_id": line["id"],
+            "source_table": "coverage_line_index",
+            "source_identity": "{}:{}:{}".format(
+                project_name, context["file_path_hash"], number
+            ),
+            "legacy_created_at": source_line.get("legacy_created_at"),
+            "legacy_updated_at": source_line.get("legacy_updated_at"),
+            "legacy_raw_status": None, "legacy_raw_is_draft": None,
+            "raw_payload_sha256": source_line.get("raw_payload_sha256", ""),
+        })
+    analysis_batch = []
+    analysis_source_rows = []
+    for number, source_analysis in sorted(context.get("analyses", {}).items()):
+        line = lines_by_number.get(int(number))
+        if not line:
+            raise RuntimeError("analysis line identity was not returned")
+        analysis_batch.append(dict(source_analysis, line_id=line["id"]))
+        analysis_source_rows.append((line["id"], source_analysis))
+    saved_analyses = analysis_repo.upsert_many(connection, analysis_batch)
+    analyses_by_line = {int(row["line_id"]): row for row in saved_analyses}
+    for line_id, source_analysis in analysis_source_rows:
+        analysis = analyses_by_line.get(int(line_id))
+        if not analysis:
+            raise RuntimeError("bulk analysis upsert did not return line identity")
+        provenance_rows.append({
+            "entity_type": "legacy_analysis", "target_entity_id": analysis["id"],
+            "source_table": "coverage_analysis",
+            "source_identity": "{}:{}:{}".format(
+                project_name, context["file_path_hash"], source_analysis["line_number"]
+            ),
+            "legacy_created_at": source_analysis.get("legacy_created_at"),
+            "legacy_updated_at": source_analysis.get("legacy_updated_at"),
+            "legacy_raw_status": source_analysis.get("status"),
+            "legacy_raw_is_draft": source_analysis.get("is_draft"),
+            "raw_payload_sha256": source_analysis.get("raw_payload_sha256", ""),
+        })
+    _upsert_legacy_provenance_many(connection, migration_id, provenance_rows)
+    return file_row, lines_by_number, saved_analyses
+
+
 # These are the only objects that may exist before the first VNext business
 # DDL.  The list is intentionally explicit: a prefix/suffix rule would allow
 # a legacy table or an operator-created staging table to slip through the
 # Empty Target gate.
 TARGET_BOOTSTRAP_TABLES = frozenset((
     "coverage_schema_meta", "coverage_schema_migrations",
+    "coverage_migration_checkpoints",
 ))
 VNEXT_BUSINESS_TABLES = frozenset((
     "coverage_projects", "coverage_scans", "coverage_scan_repositories",
@@ -723,49 +1335,15 @@ def _record_target_preflight(connection, migration_id, preflight, state="PREFLIG
         cursor.close()
 def capture_legacy_snapshot(connection):
     """Normalize legacy facts without changing their source semantics."""
-    analysis = []
-    for row in _rows(connection, "coverage_analysis"):
-        file_hash, line_number, path = _legacy_key(row)
-        analysis.append({
-            "source_pk": _nullable_int(row.get("id")),
-            "project_name": str(row.get("project_name") or ""),
-            "file_path_hash": file_hash,
-            "file_path": path,
-            "line_number": line_number,
-            "status": str(row.get("status") or ""),
-            "is_draft": int(row.get("is_draft") or 0),
-            "reviewer": str(row.get("reviewer") or ""),
-            "coverage_method": _legacy_text(row, ("coverage_method", "method")),
-            "uncovered_reason": _legacy_text(row, ("uncovered_reason", "reason")),
-            "comment": _legacy_text(row, ("comment", "comments", "remark")),
-            "legacy_created_at": row.get("created_at"),
-            "legacy_updated_at": row.get("updated_at"),
-            "raw_payload_sha256": _legacy_payload_hash(row),
-        })
-    lines = []
-    for row in _rows(connection, "coverage_line_index"):
-        file_hash, line_number, path = _legacy_key(row)
-        lines.append({
-            "source_pk": _nullable_int(row.get("id")),
-            "project_name": str(row.get("project_name") or ""),
-            "file_path_hash": file_hash,
-            "file_path": path,
-            "line_number": line_number,
-            "line_text": str(row.get("line_text") or ""),
-            "block_start_line": int(row.get("block_start_line") or line_number),
-            "block_end_line": int(row.get("block_end_line") or line_number),
-            "block_type": str(row.get("block_type") or "single"),
-            "function_name": str(row.get("function_name") or ""),
-            "function_hash": str(row.get("function_hash") or ""),
-            "code_line_hash": str(row.get("code_line_hash") or ""),
-            "code_occurrence": int(row.get("code_occurrence") or 1),
-            "legacy_created_at": row.get("created_at"),
-            "legacy_updated_at": row.get("updated_at"),
-            "raw_payload_sha256": _legacy_payload_hash(row),
-        })
+    analysis = [_legacy_analysis_fact(row) for row in _iter_legacy_rows(
+        connection, "coverage_analysis"
+    )]
+    lines = [_legacy_line_fact(row) for row in _iter_legacy_rows(
+        connection, "coverage_line_index"
+    )]
     projects = {}
     project_metadata = {}
-    for row in _rows(connection, "coverage_project_state"):
+    for row in _iter_legacy_rows(connection, "coverage_project_state"):
         name = str(row.get("project_name") or "")
         projects[name] = int(row.get("data_version") or 0)
         project_metadata[name] = {
@@ -775,29 +1353,8 @@ def capture_legacy_snapshot(connection):
             "raw_payload_sha256": _legacy_payload_hash(row),
         }
     jobs = []
-    for row in _rows(connection, "coverage_background_jobs"):
-        jobs.append({
-            "job_id": str(row.get("job_id") or ""),
-            "project_name": str(row.get("project_name") or ""),
-            "kind": str(row.get("kind") or ""),
-            "state": str(row.get("state") or ""),
-            "data_version": int(row.get("data_version") or 0),
-            "error_message": str(row.get("error_message") or ""),
-            "legacy_raw_percent": row.get("percent"),
-            "legacy_percent_unit": str(row.get("progress_unit") or ""),
-            "stage": str(row.get("stage") or ""),
-            "message": str(row.get("message") or ""),
-            "input_payload": row.get("input_payload"),
-            "result_path": str(row.get("result_path") or ""),
-            "filename": str(row.get("filename") or ""),
-            "row_count": _nullable_int(row.get("row_count")),
-            "heartbeat_at": row.get("heartbeat_at"),
-            "finished_at": row.get("finished_at"),
-            "created_at": row.get("created_at"),
-            "started_at": row.get("started_at"),
-            "updated_at": row.get("updated_at"),
-            "raw_payload_sha256": _legacy_payload_hash(row),
-        })
+    for row in _iter_legacy_rows(connection, "coverage_background_jobs"):
+        jobs.append(_legacy_job_fact(row))
     return {
         "projects": sorted(name for name in _project_names(connection) if name),
         "project_data_versions": dict(sorted(projects.items())),
@@ -1349,6 +1906,7 @@ def apply_schema(connection, ddl_path, release_sha=""):
             str(existing_before_preflight.get("state") or "").upper() == "APPLIED"):
         if str(existing_before_preflight.get("ddl_sha256") or "") != ddl_sha256:
             raise ValueError("schema migration checksum changed after APPLIED state")
+        _ensure_migration_checkpoint_table(connection)
         _ensure_runtime_indexes(connection)
         connection.commit()
         return {"status": "PASSED", "migration_id": migration_id,
@@ -1385,6 +1943,7 @@ def apply_schema(connection, ddl_path, release_sha=""):
         )
         connection.commit()
         create_sqlite_schema(connection)
+        _ensure_migration_checkpoint_table(connection)
         existing = fetchone(connection, """
             SELECT * FROM coverage_schema_migrations WHERE migration_id=?
         """, (migration_id,))
@@ -1502,6 +2061,8 @@ def apply_schema(connection, ddl_path, release_sha=""):
     cursor = connection.cursor()
     cursor.execute(adapt_sql(connection, meta_ddl))
     cursor.close()
+    connection.commit()
+    _ensure_migration_checkpoint_table(connection)
     connection.commit()
     existing_migration = fetchone(connection, """
         SELECT * FROM coverage_schema_migrations WHERE migration_id = ?
@@ -1683,9 +2244,9 @@ def validate_migration_database_separation(source_config, target_config,
     return result
 
 
-def migrate_legacy(source_connection, target_connection, anomaly_path=None,
-                   release_sha="", migration_id=None):
-    """Migrate one legacy current-state snapshot idempotently."""
+def _migrate_legacy_materialized(source_connection, target_connection, anomaly_path=None,
+                                  release_sha="", migration_id=None):
+    """Compatibility implementation retained only for historical diagnostics."""
     source = capture_legacy_snapshot(source_connection)
     source_semantic = capture_legacy_semantic_snapshot(
         source_connection, snapshot=source
@@ -1992,6 +2553,244 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None,
         "migration_id": migration_id,
         "captured_at": utc_iso(),
     }
+    if anomaly_path:
+        parent = os.path.dirname(os.path.abspath(anomaly_path))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(anomaly_path, "w", encoding="utf-8") as stream:
+            json.dump(result, stream, ensure_ascii=False, indent=2, sort_keys=True)
+    return result
+
+
+def migrate_legacy(source_connection, target_connection, anomaly_path=None,
+                   release_sha="", migration_id=None):
+    """Stream a read-only legacy source into a non-published VNext target.
+
+    Source facts are read in bounded file-hash groups.  Each target file/job
+    batch commits its business rows and its durable checkpoint together, while
+    CURRENT and sealed Scan state are withheld until the final semantic gate.
+    """
+    if source_connection is target_connection:
+        raise ValueError("legacy source and VNext target must be separate")
+    _ensure_migration_checkpoint_table(target_connection)
+    target_connection.commit()
+    project_names = _project_names(source_connection)
+    data_versions = _legacy_project_data_versions(source_connection, project_names)
+    source_descriptor = _stream_legacy_semantic_hash(
+        source_connection, project_names, data_versions
+    )
+    migration_id = migration_id or "legacy-v3-{}".format(
+        source_descriptor["semantic_hash"][:32]
+    )
+    anomalies = []
+    project_repo = ProjectRepository()
+    line_repo = LineIndexRepository()
+    analysis_repo = AnalysisRepository()
+    state_repo = ProjectStateRepository()
+    file_state_repo = FileStateRepository()
+    job_repo = JobRepository()
+    scan_ids = {}
+    project_ids = {}
+
+    def setup_project(project_name):
+        project_fragment = source_descriptor["project_fragments"].get(project_name, "")
+        scan_key = hashlib.sha256(_json_compact({
+            "project": project_name, "source": "legacy_migrated_v3",
+            "fragment": project_fragment,
+        })).hexdigest()
+        with transaction(target_connection) as conn:
+            project = project_repo.ensure_project(conn, project_name)
+            scan = project_repo.create_scan(
+                conn, project["id"], scan_key, "legacy_migrated", "full",
+                status="building", legacy_migrated=1,
+            )
+            if str(scan.get("status") or "").lower() in {"ready", "sealed"}:
+                project_ids[project_name] = int(project["id"])
+                scan_ids[project_name] = int(scan["id"])
+                return
+            project_repo.upsert_repository_snapshot(
+                conn, scan["id"], "", verified=0, provenance="legacy_migration_v3"
+            )
+            project_repo.bind_report(
+                conn, scan["id"], "legacy_{}".format(scan_key[:16]),
+                source_signature="legacy_migration_v3", sidecar_schema=0,
+            )
+            state_repo.ensure(
+                conn, project["id"], current_scan_id=None,
+                data_version=int(data_versions.get(project_name, 0)),
+            )
+            project_ids[project_name] = int(project["id"])
+            scan_ids[project_name] = int(scan["id"])
+
+    for project_name in project_names:
+        setup_project(project_name)
+        scan_id = scan_ids[project_name]
+        project_id = project_ids[project_name]
+        project_fragment = source_descriptor["project_fragments"].get(project_name, "")
+        project_checkpoint = "project:{}".format(project_name)
+        for context in _iter_legacy_file_contexts(source_connection, project_name):
+            fragment, line_count, analysis_count, _ = _legacy_context_fragment(
+                context, project_name
+            )
+            for number in context.get("missing_file_path_lines", []):
+                anomalies.append({
+                    "type": "missing_file_path", "project_name": project_name,
+                    "file_path_hash": context["file_path_hash"], "line_number": number,
+                })
+            if context.get("path_conflict"):
+                for number, paths in sorted(context.get("path_candidates", {}).items()):
+                    if len(paths) > 1:
+                        anomalies.append({
+                            "type": "path_conflict", "project_name": project_name,
+                            "file_path_hash": context["file_path_hash"],
+                            "line_number": number, "paths": paths,
+                        })
+            for number in context.get("ambiguous_analysis_lines", []):
+                anomalies.append({
+                    "type": "analysis_path_ambiguous", "project_name": project_name,
+                    "file_path_hash": context["file_path_hash"], "line_number": number,
+                    "paths": context.get("path_candidates", {}).get(number, []),
+                })
+            for number in context.get("missing_line_index_lines", []):
+                anomalies.append({
+                    "type": "missing_line_index_context", "project_name": project_name,
+                    "file_path_hash": context["file_path_hash"], "line_number": number,
+                })
+            checkpoint_key = "file:{}:{}:{}".format(
+                project_name, context["file_path_hash"], context["file_path"]
+            )
+            if _migration_checkpoint_done(
+                    target_connection, migration_id, checkpoint_key, fragment):
+                continue
+            with transaction(target_connection) as conn:
+                _persist_legacy_context(
+                    conn, project_name, scan_id, context, migration_id,
+                    project_repo, line_repo, analysis_repo,
+                )
+                _upsert_migration_checkpoint(
+                    conn, migration_id, checkpoint_key, "FILE", context["file_path"],
+                    fragment, {"lines": line_count, "analyses": analysis_count},
+                )
+
+        with transaction(target_connection) as conn:
+            project_metadata = fetchone(source_connection, """
+                SELECT * FROM coverage_project_state WHERE project_name=?
+            """, (project_name,)) or {}
+            _upsert_legacy_provenance_many(conn, migration_id, [{
+                "entity_type": "project_state", "target_entity_id": project_id,
+                "source_table": "coverage_project_state", "source_identity": project_name,
+                "legacy_created_at": None,
+                "legacy_updated_at": project_metadata.get("updated_at"),
+                "legacy_raw_status": None, "legacy_raw_is_draft": None,
+                "raw_payload_sha256": _legacy_payload_hash(project_metadata),
+            }])
+            file_state_repo.rebuild_scan(
+                conn, scan_id, int(data_versions.get(project_name, 0)), None
+            )
+            _upsert_migration_checkpoint(
+                conn, migration_id, project_checkpoint, "PROJECT",
+                project_name, project_fragment,
+                {"scan_id": scan_id, "project_id": project_id}, state="READY_TO_PUBLISH",
+            )
+
+    # Jobs are independent keyset batches.  Active legacy work is retained as
+    # an explicit interrupted/manual-decision fact, never silently requeued.
+    for old_row in _iter_legacy_rows(source_connection, "coverage_background_jobs"):
+        old_job = _legacy_job_fact(old_row)
+        project = project_ids.get(old_job["project_name"])
+        if not project:
+            anomalies.append({"type": "orphan_job", "job_id": old_job["job_id"]})
+            continue
+        if old_job["state"] in ("queued", "running", "interrupted"):
+            anomalies.append({
+                "type": "active_job_requires_decision", "job_id": old_job["job_id"],
+                "legacy_state": old_job["state"],
+            })
+        job_checkpoint = "job:{}".format(old_job["job_id"])
+        job_fragment = hashlib.sha256(_json_compact(old_job)).hexdigest()
+        if _migration_checkpoint_done(
+                target_connection, migration_id, job_checkpoint, job_fragment):
+            continue
+        state = old_job["state"]
+        if state in ("queued", "running", "interrupted"):
+            state = "interrupted"
+        with transaction(target_connection) as conn:
+            job_repo.upsert(conn, {
+                "job_id": old_job["job_id"], "project_id": project,
+                "kind": old_job["kind"], "state": state, "progress": 0,
+                "input_payload": json.dumps(old_job, sort_keys=True,
+                                             default=_semantic_json_default),
+                "error_message": old_job["error_message"] if state != "interrupted"
+                else "legacy active job requires manual migration decision",
+                "data_version": old_job["data_version"],
+                "handler_version": "legacy-migration-v3",
+                "legacy_raw_percent": old_job.get("legacy_raw_percent"),
+                "legacy_percent_unit": old_job.get("legacy_percent_unit", ""),
+            })
+            target_entity_id = int(hashlib.sha256(
+                old_job["job_id"].encode("utf-8")
+            ).hexdigest()[:15], 16)
+            _upsert_legacy_provenance_many(conn, migration_id, [{
+                "entity_type": "job", "target_entity_id": target_entity_id,
+                "source_table": "coverage_background_jobs",
+                "source_identity": old_job["job_id"],
+                "legacy_created_at": old_job.get("created_at"),
+                "legacy_updated_at": old_job.get("updated_at"),
+                "legacy_raw_status": old_job.get("state"),
+                "legacy_raw_is_draft": None,
+                "raw_payload_sha256": old_job.get("raw_payload_sha256", ""),
+                "raw_payload": json.dumps(
+                    old_job, ensure_ascii=False, sort_keys=True,
+                    default=_semantic_json_default,
+                ),
+            }])
+            _upsert_migration_checkpoint(
+                conn, migration_id, job_checkpoint, "JOB", old_job["job_id"],
+                job_fragment, {"job_id": old_job["job_id"]},
+            )
+
+    target_semantic = capture_vnext_semantic_snapshot(target_connection)
+    target_hash = semantic_hash(target_semantic)
+    result = {
+        "status": "FAILED", "source_projects": len(project_names),
+        "source_line_facts": source_descriptor["source_line_facts"],
+        "source_analysis_facts": source_descriptor["source_analysis_facts"],
+        "source_jobs": source_descriptor["source_jobs"], "anomalies": anomalies,
+        "source_semantic_hash": source_descriptor["semantic_hash"],
+        "target_semantic_hash": target_hash,
+        "authoritative_semantic_match": source_descriptor["semantic_hash"] == target_hash,
+        "release_sha": release_sha or "", "migration_id": migration_id,
+        "captured_at": utc_iso(), "checkpointed": True,
+    }
+    if source_descriptor["semantic_hash"] != target_hash:
+        result["error_class"] = "semantic_zero_loss_gate_failed"
+        if anomaly_path:
+            parent = os.path.dirname(os.path.abspath(anomaly_path))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(anomaly_path, "w", encoding="utf-8") as stream:
+                json.dump(result, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        return result
+
+    # Publication is the final transaction and occurs only after the
+    # authoritative semantic zero-loss gate. A process kill before this point
+    # leaves only building Scans and durable file/job checkpoints.
+    with transaction(target_connection) as conn:
+        for project_name in project_names:
+            project_id = project_ids[project_name]
+            scan_id = scan_ids[project_name]
+            state_repo.set_current_scan(conn, project_id, scan_id)
+            state_repo.mark_ready(conn, project_id, int(data_versions.get(project_name, 0)))
+            current = project_repo.get_scan(conn, scan_id)
+            if str(current.get("status") or "").lower() in {"building", "importing", "constructing"}:
+                project_repo.seal_scan(conn, scan_id)
+            _upsert_migration_checkpoint(
+                conn, migration_id, "project:{}".format(project_name), "PUBLISHED",
+                project_name,
+                source_descriptor["project_fragments"].get(project_name, ""),
+                {"scan_id": scan_id, "project_id": project_id}, state="PUBLISHED",
+            )
+    result["status"] = "PASSED"
     if anomaly_path:
         parent = os.path.dirname(os.path.abspath(anomaly_path))
         if parent:

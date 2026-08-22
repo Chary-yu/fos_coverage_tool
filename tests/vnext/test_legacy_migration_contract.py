@@ -69,6 +69,10 @@ class LegacyMigrationContractTest(unittest.TestCase):
             "FROM coverage_schema_meta WHERE schema_key='coverage_vnext_core'"
         ).fetchone()
         self.assertEqual(tuple(row), ("coverage_vnext_core", 1, "coverage-vnext-core-v2"))
+        self.assertIsNotNone(connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='coverage_migration_checkpoints'"
+        ).fetchone())
         second = apply_schema(connection, ddl_path, release_sha="b" * 40)
         self.assertTrue(second["idempotent"])
 

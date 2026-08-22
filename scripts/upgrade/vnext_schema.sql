@@ -527,3 +527,16 @@ CREATE TABLE IF NOT EXISTS coverage_import_failures (
     CONSTRAINT fk_import_failure_scan FOREIGN KEY (scan_id)
         REFERENCES coverage_scans(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS coverage_migration_checkpoints (
+    migration_id VARCHAR(128) NOT NULL,
+    checkpoint_key VARCHAR(512) NOT NULL,
+    phase VARCHAR(64) NOT NULL,
+    source_cursor VARCHAR(512) NOT NULL DEFAULT '',
+    semantic_fragment_hash CHAR(64) NOT NULL DEFAULT '',
+    target_counts LONGTEXT NOT NULL,
+    migration_version INT NOT NULL DEFAULT 1,
+    state VARCHAR(32) NOT NULL,
+    updated_at DATETIME NOT NULL,
+    PRIMARY KEY (migration_id, checkpoint_key)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

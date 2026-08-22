@@ -31,6 +31,7 @@ GIB = 1024 ** 3
 
 _INVENTORY_TABLES = (
     "coverage_schema_meta", "coverage_schema_migrations",
+    "coverage_migration_checkpoints",
     "coverage_projects", "coverage_scans", "coverage_scan_repositories",
     "coverage_reports", "coverage_files", "coverage_lines",
     "coverage_analyses", "coverage_project_state", "coverage_file_state",
