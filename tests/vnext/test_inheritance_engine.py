@@ -12,6 +12,7 @@ from app.inheritance.dependencies import SourceAnalysisIndex
 from app.inheritance.git_snapshot import GitSnapshotProvider
 from app.inheritance.line_map import GitLineMapEngine
 from app.inheritance.normalizer import CppLexer, normalize_cpp
+from app.scan_import.publication import ScanPublicationService
 from app.db.repositories import (
     AnalysisDomainRepository, LineIndexRepository, ProjectRepository,
     ProjectStateRepository, RepositoryRepository,
@@ -249,7 +250,8 @@ class InheritanceEngineTest(unittest.TestCase):
         connection, root, old, candidate = self._inheritance_db_fixture()
         try:
             result = InheritanceEngine().run(
-                connection, candidate["id"], repository_paths={"repo-a": root.name}
+                connection, candidate["id"], repository_paths={"repo-a": root.name},
+                batch_size=1,
             )
             candidate_line = connection.execute(
                 "SELECT l.id FROM coverage_lines l JOIN coverage_files f ON f.id=l.file_id "
@@ -264,6 +266,27 @@ class InheritanceEngineTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(result["inherited"], 1)
             self.assertEqual(tuple(decision), (candidate_line, "INHERITED", "INHERITED"))
+            self.assertEqual(result["read_set"]["format"], "inheritance-read-set-v1")
+            self.assertEqual(result["read_set"]["relations"]["count"], 1)
+            self.assertEqual(result["read_set"]["records"]["count"], 1)
+            self.assertEqual(result["metrics"]["source_relation_page_peak"], 1)
+            self.assertEqual(result["metrics"]["target_line_page_peak"], 1)
+            ScanPublicationService._validate_compact_read_set(
+                connection, result["read_set"], candidate["id"], old["id"]
+            )
+            source_record_id = connection.execute(
+                "SELECT analysis_record_id FROM coverage_analysis_line_links "
+                "WHERE scan_id=? AND is_active=1", (old["id"],)
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE coverage_analysis_records SET content_revision="
+                "content_revision + 1 WHERE id=?", (source_record_id,)
+            )
+            with self.assertRaises(ValueError) as raised:
+                ScanPublicationService._validate_compact_read_set(
+                    connection, result["read_set"], candidate["id"], old["id"]
+                )
+            self.assertEqual(str(raised.exception), "READ_SET_CHANGED")
         finally:
             root.cleanup()
             connection.close()

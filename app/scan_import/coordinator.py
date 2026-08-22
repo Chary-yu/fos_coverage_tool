@@ -243,9 +243,9 @@ class ScanImportCoordinator(object):
             )
             def compute_inheritance(conn):
                 result = inheritance.run(conn, scan_id, repository_paths=path_map)
-                phase_payload["read_set"] = list(
-                    result.get("read_set", phase_payload.get("read_set") or []) or []
-                )
+                phase_payload["read_set"] = result.get(
+                    "read_set", phase_payload.get("read_set") or []
+                ) or []
             self._run_phase_operation(
                 connection, job_id, owner_token, fencing_token,
                 "INHERITANCE_COMPUTED", phase_payload, compute_inheritance,
