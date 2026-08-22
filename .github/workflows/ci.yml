@@ -345,6 +345,33 @@ jobs:
             tests.vnext.test_migration_runner \
             tests.vnext.test_runtime_config \
             tests.vnext.test_vnext_runtime -v 2>&1 | tee .artifacts/py36-compat.log
+      - name: Isolate failing Python 3.6 compatibility module
+        if: ${{ failure() }}
+        run: |
+          set +e
+          failed=0
+          for test_module in \
+            tests.code_detail.test_phase2_core \
+            tests.incremental.test_phase5_inject_path \
+            tests.vnext.test_api_export_security \
+            tests.vnext.test_analysis_domain \
+            tests.vnext.test_jobs \
+            tests.vnext.test_migration_runner \
+            tests.vnext.test_runtime_config \
+            tests.vnext.test_vnext_runtime; do
+            docker run --rm \
+              -v "$PWD:/workspace" -w /workspace python@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc \
+              python -m unittest "$test_module" -v
+            status=$?
+            if [ "$status" -ne 0 ]; then
+              echo "::error title=Python 3.6 module failure::$test_module exited with status $status"
+              failed=1
+            fi
+          done
+          if [ "$failed" -ne 0 ]; then
+            echo "Python 3.6 compatibility module isolation found one or more failures" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
       - name: Upload Python 3.6 compatibility log
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
