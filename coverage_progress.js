@@ -239,9 +239,12 @@
       : '当前窗口暂无文件';
   }
 
-  function renderFileTable(rows, append) {
+  function renderFileTable(rows) {
     const nextRows = Array.isArray(rows) ? rows : [];
-    currentFileRows = append ? currentFileRows.concat(nextRows) : nextRows;
+    // A cursor advances the server window; it does not authorize retaining
+    // every prior page in the DOM. This keeps the Progress table bounded even
+    // when the operator walks through a very large project.
+    currentFileRows = nextRows;
     const body = currentFileRows.length === 0
       ? '<tr><td colspan="14" style="text-align:center; padding: 24px; color:#8e8e93;">✨ 暂无文件覆盖率数据</td></tr>'
       : currentFileRows.map((row, index) => {
@@ -387,7 +390,7 @@
     renderOwnershipStatus(data.ownership || { available: false, warning: 'VNext 汇总不提供旧版目录归属表。' });
     renderTeamTable(data.teams || []);
     renderTable('dirTable', data.dirs || [], 'dir_path');
-    if (Array.isArray(data.files)) renderFileTable(data.files, false);
+    if (Array.isArray(data.files)) renderFileTable(data.files);
     if (projectRows.length === 0) {
       statusEl.innerHTML = `<span class="warning">未找到项目“${escapeHtml(project)}”的审查行索引。请在数据库可连接时重新执行 incremental 或 inject。</span>`;
     } else {
@@ -409,7 +412,7 @@
     }
     pendingFileCursor = payload.next_cursor || null;
     pendingFileHasMore = Boolean(payload.has_more && pendingFileCursor);
-    renderFileTable(payload.files || [], Boolean(append));
+    renderFileTable(payload.files || []);
     return payload;
   }
 
@@ -592,13 +595,24 @@
   const collapseAllBtn = document.getElementById('collapseAllTeamModulesBtn');
   if (expandAllBtn) {
     expandAllBtn.addEventListener('click', function() {
-      document.querySelectorAll('.module-subrow').forEach(r => r.style.display = 'table-row');
-      document.querySelectorAll('.toggle-team-btn').forEach(b => b.textContent = '▼');
+      document.querySelectorAll('.toggle-team-btn').forEach(button => {
+        const idx = Number(button.getAttribute('data-team-index'));
+        const parent = document.querySelector(
+          `.team-parent-row[data-team-index="${idx}"]`
+        );
+        const existing = document.querySelectorAll(`.team-subrow-${idx}`);
+        if (parent && existing.length === 0) {
+          parent.insertAdjacentHTML(
+            'afterend', moduleRowsHtml(currentTeamRows[idx] || {}, idx)
+          );
+        }
+        button.textContent = '▼';
+      });
     });
   }
   if (collapseAllBtn) {
     collapseAllBtn.addEventListener('click', function() {
-      document.querySelectorAll('.module-subrow').forEach(r => r.style.display = 'none');
+      document.querySelectorAll('.module-subrow').forEach(row => row.remove());
       document.querySelectorAll('.toggle-team-btn').forEach(b => b.textContent = '▶');
     });
   }

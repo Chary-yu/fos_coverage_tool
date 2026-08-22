@@ -199,6 +199,9 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
     if (inheritanceLifecycle && pathname === '/api/coverage/scans/1/inheritance/pending' && req.method === 'GET') {
       return json(200, { items: inheritanceRejected ? [] : [inheritanceCandidate()], has_more: false });
     }
+    if (inheritanceLifecycle && pathname === '/api/coverage/scans/1/inheritance/relation' && req.method === 'GET') {
+      return json(200, { item: inheritanceRejected ? null : inheritanceCandidate() });
+    }
     if (inheritanceLifecycle && pathname === '/api/coverage/scans/1/inheritance/reject' && req.method === 'POST') {
       inheritanceRejected = true;
       inheritanceRevision += 1;

@@ -166,6 +166,43 @@ test('canonical frontend talks to the real VNext HTTP server', async ({ page }) 
   }
 });
 
+test('Progress page keeps the file DOM bounded while advancing cursor windows', async ({ page, browserName }) => {
+  test.setTimeout(60000);
+  expect(browserName).toBe('chromium');
+  const fixture = await startFixture();
+  const fileRequests = [];
+  page.on('request', request => {
+    const url = new URL(request.url());
+    if (url.pathname === '/api/coverage/progress/files') {
+      fileRequests.push(url);
+    }
+  });
+
+  try {
+    await page.goto(
+      `${fixture.info.base_url}/coverage_progress.html?project=HttpFixture&repository_name=repo-a`,
+      { waitUntil: 'networkidle' },
+    );
+    await expect(page.locator('#fileTable tbody tr')).toHaveCount(100, { timeout: 15000 });
+    await expect(page.locator('#loadMoreFilesBtn')).toBeVisible();
+    expect(await page.locator('#fileTable tbody tr').count()).toBeLessThanOrEqual(100);
+
+    await page.locator('#loadMoreFilesBtn').click();
+    await expect(page.locator('#fileTable tbody tr')).toHaveCount(21, { timeout: 15000 });
+    expect(await page.locator('#fileTable tbody tr').count()).toBeLessThanOrEqual(100);
+    await expect(page.locator('#loadMoreFilesBtn')).toBeHidden();
+    expect(fileRequests).toHaveLength(2);
+    expect(fileRequests[0].searchParams.get('cursor')).toBeNull();
+    expect(fileRequests[1].searchParams.get('cursor')).toBeTruthy();
+
+    await page.locator('.file-detail-link').first().click();
+    await expect(page.locator('#detailSection')).toBeVisible();
+    await expect(page.locator('#detailTable tbody tr')).toHaveCount(1);
+  } finally {
+    await stopFixture(fixture);
+  }
+});
+
 test('instrumented real VNext HTTP fixture records 100k cross-layer workload', async ({ page, browserName }) => {
   test.setTimeout(120000);
   expect(browserName).toBe('chromium');

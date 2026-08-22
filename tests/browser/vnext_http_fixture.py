@@ -129,18 +129,37 @@ def build_fixture():
         SidecarStore([report_root], chunk_size=2000).save_chunked_sidecar(
             report_root, "report_http_fixture", file_key, context
         )
+        progress_files = [{
+            "repository_name": "repo-a",
+            "file_path": file_path,
+            "file_path_hash": "",
+            "source_file_name": "http_fixture.c",
+            "lines": _fixture_lines(line_count),
+        }]
+        # Keep the browser fixture large enough to exercise the canonical
+        # Progress cursor window without making the Code Detail page itself
+        # larger than the workload under test.
+        for index in range(1, 121):
+            progress_files.append({
+                "repository_name": "repo-a",
+                "file_path": "src/progress_{:03d}.c".format(index),
+                "file_path_hash": "",
+                "source_file_name": "progress_{:03d}.c".format(index),
+                "lines": [{
+                    "line_number": 1,
+                    "line_text": "progress_{}();".format(index),
+                    "coverage_state": "uncovered",
+                    "block_start_line": 1,
+                    "block_end_line": 1,
+                    "code_line_hash": "progress-{}".format(index),
+                }],
+            })
         connection = factory()
         try:
             scan = seed_runtime.project_service.create_scan_and_ingest(
                 connection,
                 "HttpFixture",
-                [{
-                    "repository_name": "repo-a",
-                    "file_path": file_path,
-                    "file_path_hash": "",
-                    "source_file_name": "http_fixture.c",
-                    "lines": _fixture_lines(line_count),
-                }],
+                progress_files,
                 info_file_name="http_fixture.info",
                 info_sha256="a" * 64,
                 repositories=[{
@@ -203,6 +222,11 @@ def build_fixture():
                     self._asset("web/assets/js/coverage_enhance.js"),
                     "text/javascript; charset=utf-8",
                 )
+            if path == "/coverage_progress.js":
+                return self._send_static(
+                    self._asset("web/assets/js/coverage_progress.js"),
+                    "text/javascript; charset=utf-8",
+                )
             if path == "/coverage_enhance.css":
                 return self._send_static(
                     self._asset("web/assets/css/coverage_enhance.css"),
@@ -228,6 +252,11 @@ def build_fixture():
                     scan_id=scan["id"]
                 ).encode("utf-8")
                 return self._send_static(html, "text/html; charset=utf-8")
+            if path == "/coverage_progress.html":
+                return self._send_static(
+                    self._asset("web/templates/coverage_progress.html"),
+                    "text/html; charset=utf-8",
+                )
             return super(FixtureHandler, self).do_GET()
 
         def do_POST(self):
