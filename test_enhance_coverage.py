@@ -441,10 +441,13 @@ class TestIntegration(unittest.TestCase):
         self.assertIn('function apiBaseCandidates', content)
         self.assertIn("progressLink.innerText = '查看进展 / 导出';", content)
         self.assertIn('setStoredPanelValues(panel, {', content)
-        self.assertIn("status: getStoredPanelValue(previous, 'status')", content)
-        self.assertIn("batchInheritBtn.innerText = '批量继承';", content)
+        self.assertIn("status: getStoredPanelValue(sourcePanel, 'status') || '未确认'", content)
+        self.assertIn("batchInheritBtn.innerText = '手工复制上一条';", content)
+        self.assertIn("batchInheritBtn.setAttribute('data-panel-action', 'manual-copy');", content)
         self.assertIn('function findPreviousFilledPanelEntry', content)
         self.assertIn('lineNum > sourceLineNum && lineNum <= panel.lineNum', content)
+        self.assertIn('isDraft: true', content)
+        self.assertIn('isDirty: true', content)
         self.assertIn('setStoredPanelValues(targetPanel, inheritedValues);', content)
 
     @unittest.mock.patch('enhance_coverage.DatabaseManager')
@@ -504,159 +507,13 @@ class TestIntegration(unittest.TestCase):
 
 
 class TestInheritAnalysis(unittest.TestCase):
-    """Targeted testing for the cross-version analysis inheritance algorithm."""
+    """The compatibility surface must fail closed instead of writing legacy inheritance."""
 
-    @unittest.mock.patch('enhance_coverage.db_module')
-    def test_inherit_analysis_dict_rows(self, mock_db_module):
-        # Setup mock database connection and cursor
-        mock_db_module.__name__ = 'pymysql'
-        mock_conn = unittest.mock.MagicMock()
-        mock_cursor = unittest.mock.MagicMock()
-        mock_conn.cursor.return_value = mock_cursor
-        mock_db_module.connect.return_value = mock_conn
+    def test_legacy_inherit_analysis_is_retired(self):
+        manager = object.__new__(enhance_coverage.DatabaseManager)
 
-        # Mock counts returning values in order
-        mock_cursor.fetchone.side_effect = [
-            {"count": 10},  # source_analysis_records
-            {"count": 5},   # source_reviewed_records
-            {"count": 20},  # source_index_records
-            {"count": 18},  # source_hashable_index_records
-            {"count": 30},  # target_index_records
-            {"count": 25},  # target_hashable_index_records
-        ]
-
-        # Mock fetchall returning dictionaries
-        source_rows = [
-            {
-                "file_path": "src/main.c",
-                "source_file_name": "main.c",
-                "function_hash": "func_hash_1",
-                "code_line_hash": "line_hash_1",
-                "code_occurrence": 1,
-                "reviewer": "Alice",
-                "status": "已审核",
-                "coverage_method": "Covered via UT",
-                "uncovered_reason": ""
-            }
-        ]
-
-        target_rows = [
-            {
-                "file_path": "src/main.c",
-                "file_path_hash": "path_hash_1",
-                "source_file_name": "main.c",
-                "line_number": 42,
-                "function_hash": "func_hash_1",
-                "code_line_hash": "line_hash_1",
-                "code_occurrence": 1,
-                "status": "未确认",
-                "coverage_method": "",
-                "uncovered_reason": "",
-                "reviewer": ""
-            }
-        ]
-
-        mock_cursor.fetchall.side_effect = [
-            source_rows,
-            target_rows
-        ]
-
-        config = {
-            "mysql": {
-                "host": "127.0.0.1",
-                "port": 3306,
-                "user": "root",
-                "password": "",
-                "database": "coverage"
-            }
-        }
-
-        with unittest.mock.patch.object(enhance_coverage.DatabaseManager, 'get_connection', return_value=mock_conn):
-            manager = enhance_coverage.DatabaseManager(config, exit_on_error=False, init_schema=False)
-            manager.conn = mock_conn
-
-        # Execute inheritance
-        result = manager.inherit_analysis("v1", "v2")
-
-        # Verify results
-        self.assertEqual(result["inherited_records"], 1)
-
-        # Verify SQL execution args
-        self.assertTrue(mock_cursor.executemany.called)
-        exec_args = mock_cursor.executemany.call_args[0]
-        self.assertIn("INSERT INTO coverage_analysis", exec_args[0])
-        batch = exec_args[1]
-        self.assertEqual(len(batch), 1)
-        self.assertEqual(batch[0][0], "v2")
-        self.assertEqual(batch[0][1], "src/main.c")
-        self.assertEqual(batch[0][5], "Alice")
-        self.assertEqual(batch[0][6], "已审核")
-        self.assertEqual(batch[0][8], "")
-
-    @unittest.mock.patch('enhance_coverage.db_module')
-    def test_inherit_analysis_tuple_rows(self, mock_db_module):
-        # Setup mock database connection and cursor
-        mock_db_module.__name__ = 'pymysql'
-        mock_conn = unittest.mock.MagicMock()
-        mock_cursor = unittest.mock.MagicMock()
-        mock_conn.cursor.return_value = mock_cursor
-        mock_db_module.connect.return_value = mock_conn
-
-        # Mock counts returning values in order
-        mock_cursor.fetchone.side_effect = [
-            (10,),  # source_analysis_records
-            (5,),   # source_reviewed_records
-            (20,),  # source_index_records
-            (18,),  # source_hashable_index_records
-            (30,),  # target_index_records
-            (25,),  # target_hashable_index_records
-        ]
-
-        # Mock fetchall returning tuples
-        source_rows = [
-            ("src/main.c", "main.c", "func_hash_1", "line_hash_1", 1, "Bob", "无法覆盖", "", "Hardware constraint")
-        ]
-
-        target_rows = [
-            ("src/main.c", "path_hash_1", "main.c", 42, "func_hash_1", "line_hash_1", 1, "未确认", "", "", "")
-        ]
-
-        mock_cursor.fetchall.side_effect = [
-            source_rows,
-            target_rows
-        ]
-
-        config = {
-            "mysql": {
-                "host": "127.0.0.1",
-                "port": 3306,
-                "user": "root",
-                "password": "",
-                "database": "coverage"
-            }
-        }
-
-        with unittest.mock.patch.object(enhance_coverage.DatabaseManager, 'get_connection', return_value=mock_conn):
-            manager = enhance_coverage.DatabaseManager(config, exit_on_error=False, init_schema=False)
-            manager.conn = mock_conn
-
-        # Execute inheritance
-        result = manager.inherit_analysis("v1", "v2")
-
-        # Verify results
-        self.assertEqual(result["inherited_records"], 1)
-
-        # Verify SQL execution args
-        self.assertTrue(mock_cursor.executemany.called)
-        exec_args = mock_cursor.executemany.call_args[0]
-        self.assertIn("INSERT INTO coverage_analysis", exec_args[0])
-        batch = exec_args[1]
-        self.assertEqual(len(batch), 1)
-        self.assertEqual(batch[0][0], "v2")
-        self.assertEqual(batch[0][1], "src/main.c")
-        self.assertEqual(batch[0][5], "Bob")
-        self.assertEqual(batch[0][6], "无法覆盖")
-        self.assertEqual(batch[0][8], "Hardware constraint")
+        with self.assertRaisesRegex(RuntimeError, "legacy analysis inheritance is retired"):
+            manager.inherit_analysis("v1", "v2")
 
 
 class TestThreadLocalDatabase(unittest.TestCase):
