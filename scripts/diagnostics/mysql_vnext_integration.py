@@ -34,7 +34,9 @@ except ModuleNotFoundError:
 import pymysql
 
 from app.bootstrap import VNextRuntime, create_vnext_server
-from app.release_identity import generate_release_identity
+from app.release_identity import (
+    generate_release_identity, save_release_manifest,
+)
 from app.time_utils import utc_iso
 from app.code_detail.code_region import FunctionRange
 from app.code_detail.sidecar_store import SidecarStore
@@ -90,6 +92,24 @@ def _connect(host, port, user, password, database=None, autocommit=True):
 
 def _database_name():
     return "coverage_vnext_audit_{}".format(uuid.uuid4().hex[:12])
+
+
+def _prepare_runtime_release_identity(root):
+    """Create the exact manifest required by the disposable runtime root.
+
+    The integration process deliberately runs from a temporary artifact root
+    without ``.git`` and without copied frontend assets.  VNext runtime
+    verification must still see a real, exact checkout SHA; a missing manifest
+    is a production fail-closed condition, not a reason for this harness to
+    bypass verification.
+    """
+    source_identity = generate_release_identity(_REPO_ROOT)
+    identity = generate_release_identity(
+        root, asset_files=[], commit_sha=source_identity["commit_sha"],
+        build_provenance="integration-fixture",
+    )
+    save_release_manifest(os.path.join(root, "release_manifest.json"), identity)
+    return identity
 
 
 def _command_or_action(args):
@@ -504,6 +524,7 @@ def run(args):
     root = tempfile.mkdtemp(prefix="vnext-mysql-audit-")
     report_root = os.path.join(root, "report")
     os.makedirs(report_root)
+    _prepare_runtime_release_identity(root)
     project_name = "MySQLAudit_{}".format(os.getpid())
     required_version_prefix = str(
         getattr(args, "require_version_prefix", "") or ""

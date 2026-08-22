@@ -1292,6 +1292,66 @@ def assert_empty_vnext_target(connection, migration_id="coverage-vnext-core-v2",
     }
 
 
+def assert_applied_vnext_target(connection, migration_id="coverage-vnext-core-v2",
+                                ddl_sha256=""):
+    """Validate an already-applied schema before an idempotent re-run.
+
+    ``assert_empty_vnext_target`` is intentionally strict: it must reject a
+    populated or untracked business schema before the first migration.  The
+    normal migration lifecycle also calls ``apply_schema`` after business
+    rows exist to prove idempotency, however.  Treating that legitimate
+    post-APPLIED check as an empty-target preflight makes every real MariaDB
+    rehearsal fail with ``MIGRATION_TARGET_NOT_EMPTY``.
+
+    This separate check preserves the boundary: it only accepts the exact
+    applied ledger state, the matching DDL checksum, the known VNext table
+    namespace, and a recorded core schema marker.  It never makes a populated
+    database eligible for an initial migration.
+    """
+    tables = _database_table_names(connection)
+    unknown = sorted(set(tables) - TARGET_BOOTSTRAP_TABLES - VNEXT_BUSINESS_TABLES)
+    if unknown:
+        raise RuntimeError(
+            "MIGRATION_TARGET_NOT_EMPTY:unknown_tables=" + ",".join(unknown)
+        )
+    ledger = fetchone(connection, """
+        SELECT * FROM coverage_schema_migrations
+        WHERE migration_id=? ORDER BY started_at DESC LIMIT 1
+    """, (str(migration_id),)) if "coverage_schema_migrations" in tables else None
+    if not ledger or str(ledger.get("state") or "").upper() != "APPLIED":
+        raise RuntimeError("MIGRATION_TARGET_NOT_EMPTY:applied_ledger_missing")
+    recorded_sha = str(ledger.get("ddl_sha256") or "")
+    if ddl_sha256 and recorded_sha != str(ddl_sha256):
+        raise ValueError("schema migration checksum changed after APPLIED state")
+    marker = fetchone(connection, """
+        SELECT schema_version, migration_id
+        FROM coverage_schema_meta WHERE schema_key=?
+    """, ("coverage_vnext_core",)) if "coverage_schema_meta" in tables else None
+    if not marker or int(marker.get("schema_version") or 0) != 1:
+        raise RuntimeError("MIGRATION_TARGET_NOT_EMPTY:applied_schema_marker_missing")
+    if str(marker.get("migration_id") or "") not in ("", str(migration_id)):
+        raise RuntimeError("MIGRATION_TARGET_NOT_EMPTY:applied_schema_marker_mismatch")
+    counts = {table: _safe_table_count(connection, table) for table in tables}
+    runtime = _target_fingerprint(connection)
+    inventory_payload = {
+        "tables": tables, "counts": counts,
+        "migration_id": str(migration_id), "state": "APPLIED",
+    }
+    inventory_hash = hashlib.sha256(json.dumps(
+        inventory_payload, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), default=_semantic_json_default,
+    ).encode("utf-8")).hexdigest()
+    return {
+        "status": "PASSED", "result": "APPLIED_SCHEMA",
+        "migration_id": str(migration_id), "tables": tables,
+        "counts": counts, "unknown_tables": unknown,
+        "runtime_fingerprint": runtime,
+        "database": str(runtime.get("database") or ""),
+        "table_inventory_hash": inventory_hash,
+        "ledger_state": "APPLIED", "ddl_sha256": recorded_sha,
+    }
+
+
 def _record_target_preflight(connection, migration_id, preflight, state="PREFLIGHTED",
                              ddl_sha256="", release_sha=""):
     """Persist the exact preflight evidence in the bootstrap ledger."""
@@ -1895,23 +1955,26 @@ def apply_schema(connection, ddl_path, release_sha=""):
         existing_before_preflight = fetchone(connection, """
             SELECT * FROM coverage_schema_migrations WHERE migration_id=?
         """, (migration_id,))
-    allow_initialized = str(
+    existing_state = str(
         (existing_before_preflight or {}).get("state") or ""
-    ).upper() in {"APPLIED", "PREFLIGHTED", "STARTED", "FAILED"}
-    preflight = assert_empty_vnext_target(
-        connection, migration_id=migration_id,
-        allow_initialized_schema=allow_initialized,
-    )
-    if (existing_before_preflight and
-            str(existing_before_preflight.get("state") or "").upper() == "APPLIED"):
+    ).upper()
+    if existing_state == "APPLIED":
         if str(existing_before_preflight.get("ddl_sha256") or "") != ddl_sha256:
             raise ValueError("schema migration checksum changed after APPLIED state")
+        preflight = assert_applied_vnext_target(
+            connection, migration_id=migration_id, ddl_sha256=ddl_sha256,
+        )
         _ensure_migration_checkpoint_table(connection)
         _ensure_runtime_indexes(connection)
         connection.commit()
         return {"status": "PASSED", "migration_id": migration_id,
                 "idempotent": True, "ddl_sha256": ddl_sha256,
                 "target_preflight": preflight}
+    allow_initialized = existing_state in {"PREFLIGHTED", "STARTED", "FAILED"}
+    preflight = assert_empty_vnext_target(
+        connection, migration_id=migration_id,
+        allow_initialized_schema=allow_initialized,
+    )
 
     if is_sqlite(connection):
         # Create only the bootstrap ledger before any business table.  This

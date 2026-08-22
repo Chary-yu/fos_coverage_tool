@@ -76,6 +76,25 @@ class LegacyMigrationContractTest(unittest.TestCase):
         second = apply_schema(connection, ddl_path, release_sha="b" * 40)
         self.assertTrue(second["idempotent"])
 
+    def test_schema_apply_is_idempotent_after_business_rows_exist(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        ddl_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "scripts", "upgrade", "vnext_schema.sql",
+        )
+        apply_schema(connection, ddl_path, release_sha="a" * 40)
+        connection.execute(
+            "INSERT INTO coverage_projects(project_name, created_at, updated_at) "
+            "VALUES (?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            ("already-migrated",),
+        )
+        connection.commit()
+        result = apply_schema(connection, ddl_path, release_sha="b" * 40)
+        self.assertTrue(result["idempotent"])
+        self.assertEqual(result["target_preflight"]["result"], "APPLIED_SCHEMA")
+
     def test_database_identity_rejects_same_connection_and_allows_separate_sqlite(self):
         source = sqlite3.connect(":memory:")
         target = sqlite3.connect(":memory:")
