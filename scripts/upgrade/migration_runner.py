@@ -22,7 +22,10 @@ from app.db.repositories import (
     ProjectRepository,
     ProjectStateRepository,
 )
-from app.db.repositories.base import adapt_sql, fetchall, fetchone, is_sqlite, insert_id
+from app.db.repositories.base import (
+    adapt_sql, bind_chunk_size, fetchall, fetchone, insert_id, is_sqlite,
+    iter_rows,
+)
 from app.db.identity_keys import stable_identity_hash
 from app.db.transaction import transaction
 from app.time_utils import utc_iso, utc_sql
@@ -1647,6 +1650,156 @@ def capture_vnext_semantic_snapshot(connection):
     }
 
 
+def _stream_vnext_semantic_hash(connection, batch_size=LEGACY_STREAM_BATCH_SIZE):
+    """Hash the target semantic contract without materializing target facts.
+
+    ``capture_vnext_semantic_snapshot`` remains a small-fixture diagnostic
+    helper, but the migration gate must not use it for production-sized
+    targets.  The query order and selected fields below intentionally mirror
+    that helper and ``_stream_legacy_semantic_hash`` so the resulting hash is
+    byte-for-byte comparable while rows are consumed in bounded batches.
+    """
+    hasher = hashlib.sha256()
+    hasher.update(b"{")
+    first_field = True
+
+    def field_prefix(name):
+        nonlocal first_field
+        if not first_field:
+            hasher.update(b",")
+        hasher.update(_json_compact(name))
+        hasher.update(b":")
+        first_field = False
+
+    def stream_array(rows, transform):
+        hasher.update(b"[")
+        first_item = True
+        for row in rows:
+            if not first_item:
+                hasher.update(b",")
+            hasher.update(_json_compact(transform(row)))
+            first_item = False
+        hasher.update(b"]")
+
+    field_prefix("analyses")
+    stream_array(iter_rows(connection, """
+            SELECT p.project_name, f.file_path_hash, f.file_path, l.line_number,
+                   a.status, a.is_draft, a.reviewer, a.coverage_method,
+                   a.uncovered_reason, a.comment
+            FROM coverage_analyses a
+            JOIN coverage_lines l ON l.id = a.line_id
+            JOIN coverage_files f ON f.id = l.file_id
+            JOIN coverage_scans s ON s.id = f.scan_id
+            JOIN coverage_projects p ON p.id = s.project_id
+            ORDER BY p.project_name, f.file_path_hash, l.line_number
+        """, batch_size=batch_size), lambda row: {
+            key: row.get(key) for key in (
+                "project_name", "file_path_hash", "file_path", "line_number",
+                "status", "is_draft", "reviewer", "coverage_method",
+                "uncovered_reason", "comment",
+            )
+        })
+
+    field_prefix("jobs")
+
+    def normalize_job(row):
+        state = row.get("state")
+        error_message = row.get("error_message") or ""
+        if state in ("queued", "running", "interrupted"):
+            state = "interrupted"
+            error_message = error_message or (
+                "legacy active job requires manual migration decision"
+            )
+        return {
+            "job_id": row.get("job_id"),
+            "project_name": row.get("project_name"),
+            "kind": row.get("kind"),
+            "state": state,
+            "data_version": row.get("data_version"),
+            "error_message": error_message,
+        }
+
+    stream_array(iter_rows(connection, """
+            SELECT j.job_id, p.project_name, j.kind, j.state,
+                   COALESCE(j.data_version, 0) AS data_version,
+                   COALESCE(j.error_message, '') AS error_message
+            FROM coverage_background_jobs j
+            LEFT JOIN coverage_projects p ON p.id = j.project_id
+            ORDER BY j.job_id
+        """, batch_size=batch_size), normalize_job)
+
+    field_prefix("legacy_provenance")
+
+    def normalize_provenance(row):
+        item = {
+            key: row.get(key) for key in (
+                "target_entity_type", "source_table", "source_identity",
+                "legacy_created_at", "legacy_updated_at", "legacy_raw_status",
+                "legacy_raw_is_draft", "raw_payload_sha256",
+            )
+        }
+        if item.get("legacy_raw_status") == "":
+            item["legacy_raw_status"] = None
+        return item
+
+    if _table_exists(connection, "coverage_legacy_provenance"):
+        provenance_rows = iter_rows(connection, """
+                SELECT target_entity_type, source_table, source_identity,
+                       legacy_created_at, legacy_updated_at,
+                       legacy_raw_status, legacy_raw_is_draft,
+                       raw_payload_sha256
+                FROM coverage_legacy_provenance
+                ORDER BY source_table, source_identity, target_entity_type
+            """, batch_size=batch_size)
+    else:
+        provenance_rows = ()
+    stream_array(provenance_rows, normalize_provenance)
+
+    field_prefix("lines")
+    stream_array(iter_rows(connection, """
+            SELECT p.project_name, f.file_path_hash, f.file_path, l.line_number,
+                   l.line_text, l.block_start_line, l.block_end_line, l.block_type,
+                   l.function_name, l.function_hash, l.code_line_hash,
+                   l.code_occurrence
+            FROM coverage_lines l
+            JOIN coverage_files f ON f.id = l.file_id
+            JOIN coverage_scans s ON s.id = f.scan_id
+            JOIN coverage_projects p ON p.id = s.project_id
+            ORDER BY p.project_name, f.file_path_hash, l.line_number
+        """, batch_size=batch_size), lambda row: {
+            key: row.get(key) for key in (
+                "project_name", "file_path_hash", "file_path", "line_number",
+                "line_text", "block_start_line", "block_end_line", "block_type",
+                "function_name", "function_hash", "code_line_hash",
+                "code_occurrence",
+            )
+        })
+
+    field_prefix("project_data_versions")
+    hasher.update(b"{")
+    first_project = True
+    for row in iter_rows(connection, """
+            SELECT p.project_name, s.data_version
+            FROM coverage_project_state s
+            JOIN coverage_projects p ON p.id = s.project_id
+            ORDER BY p.project_name
+        """, batch_size=batch_size):
+        if not first_project:
+            hasher.update(b",")
+        hasher.update(_json_compact(str(row.get("project_name") or "")))
+        hasher.update(b":")
+        hasher.update(_json_compact(int(row.get("data_version") or 0)))
+        first_project = False
+    hasher.update(b"}")
+
+    field_prefix("projects")
+    stream_array(iter_rows(connection, """
+            SELECT project_name FROM coverage_projects ORDER BY project_name
+        """, batch_size=batch_size), lambda row: row.get("project_name"))
+    hasher.update(b"}")
+    return hasher.hexdigest()
+
+
 def capture_legacy_semantic_snapshot(connection, snapshot=None):
     """Normalize expected migration transformations for semantic comparison."""
     source_snapshot = snapshot if snapshot is not None else capture_legacy_snapshot(connection)
@@ -1884,9 +2037,10 @@ def _upsert_legacy_provenance_many(connection, migration_id, records):
     The first migration implementation called ``_upsert_legacy_provenance``
     once per line and once per analysis.  That made a production-sized
     rehearsal perform a SELECT/INSERT round trip for every fact even though
-    the target transaction was already authoritative.  Resolve the existing
-    identities once, validate their immutable hashes, and insert only missing
-    rows with ``executemany``.
+    the target transaction was already authoritative.  Resolve only the
+    current bounded batch of identities, validate their immutable hashes, and
+    insert only missing rows with ``executemany``.  Never materialize the
+    complete target provenance ledger just to process one file.
     """
     normalized = {}
     for item in records or []:
@@ -1908,20 +2062,33 @@ def _upsert_legacy_provenance_many(connection, migration_id, records):
     if not normalized:
         return {"inserted": 0, "existing": 0}
 
-    existing_rows = fetchall(connection, """
-        SELECT target_entity_type, target_entity_id, source_table,
-               raw_payload_sha256
-        FROM coverage_legacy_provenance
-        WHERE migration_id=?
-    """, (migration_id,))
-    existing = {
-        (str(row.get("target_entity_type") or ""),
-         int(row.get("target_entity_id") or 0),
-         str(row.get("source_table") or "")): str(
-             row.get("raw_payload_sha256") or ""
-         )
-        for row in existing_rows
-    }
+    existing = {}
+    keys = sorted(normalized)
+    key_chunk_size = bind_chunk_size(
+        connection, parameter_width=3, reserved=1, maximum=200
+    )
+    for offset in range(0, len(keys), key_chunk_size):
+        key_chunk = keys[offset:offset + key_chunk_size]
+        clauses = []
+        params = [migration_id]
+        for entity_type, entity_id, source_table in key_chunk:
+            clauses.append(
+                "(target_entity_type=? AND target_entity_id=? AND source_table=?)"
+            )
+            params.extend((entity_type, int(entity_id), source_table))
+        existing_rows = fetchall(connection, """
+            SELECT target_entity_type, target_entity_id, source_table,
+                   raw_payload_sha256
+            FROM coverage_legacy_provenance
+            WHERE migration_id=? AND ({})
+        """.format(" OR ".join(clauses)), params)
+        for row in existing_rows:
+            key = (
+                str(row.get("target_entity_type") or ""),
+                int(row.get("target_entity_id") or 0),
+                str(row.get("source_table") or ""),
+            )
+            existing[key] = str(row.get("raw_payload_sha256") or "")
     inserts = []
     existing_count = 0
     for key, item in sorted(normalized.items()):
@@ -2723,6 +2890,8 @@ def _migrate_legacy_materialized(source_connection, target_connection, anomaly_p
                 ),
             }])
 
+    target_hash = _stream_vnext_semantic_hash(target_connection)
+    source_hash = semantic_hash(source_semantic)
     result = {
         "status": "PASSED",
         "source_projects": len(source["projects"]),
@@ -2730,13 +2899,9 @@ def _migrate_legacy_materialized(source_connection, target_connection, anomaly_p
         "source_analysis_facts": len(source["analyses"]),
         "source_jobs": len(source["jobs"]),
         "anomalies": anomalies,
-        "source_semantic_hash": semantic_hash(source_semantic),
-        "target_semantic_hash": semantic_hash(
-            capture_vnext_semantic_snapshot(target_connection)
-        ),
-        "authoritative_semantic_match": semantic_hash(source_semantic) == semantic_hash(
-            capture_vnext_semantic_snapshot(target_connection)
-        ),
+        "source_semantic_hash": source_hash,
+        "target_semantic_hash": target_hash,
+        "authoritative_semantic_match": source_hash == target_hash,
         "release_sha": release_sha or "",
         "migration_id": migration_id,
         "captured_at": utc_iso(),
@@ -2937,8 +3102,11 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None,
                 job_fragment, {"job_id": old_job["job_id"]},
             )
 
-    target_semantic = capture_vnext_semantic_snapshot(target_connection)
-    target_hash = semantic_hash(target_semantic)
+    # Keep the final zero-loss gate bounded on the target as well as on the
+    # legacy source.  The diagnostic snapshot helper is intentionally retained
+    # for small fixtures, but must not turn a production-sized target into a
+    # resident Python object before publication.
+    target_hash = _stream_vnext_semantic_hash(target_connection)
     result = {
         "status": "FAILED", "source_projects": len(project_names),
         "source_line_facts": source_descriptor["source_line_facts"],
@@ -3051,18 +3219,20 @@ def main(argv=None):
             # The source connection is never used for writes.  Rollback also
             # releases any driver-side read snapshot before the second audit.
             source.rollback()
-            first_snapshot = capture_vnext_semantic_snapshot(target)
+            first_target_hash = _stream_vnext_semantic_hash(target)
             second = migrate_legacy(source, target, args.anomaly_path or None, args.release_sha)
-            second_snapshot = capture_vnext_semantic_snapshot(target)
+            second_target_hash = _stream_vnext_semantic_hash(target)
             result = {
                 "status": "PASSED" if (
                     first.get("authoritative_semantic_match")
                     and second.get("authoritative_semantic_match")
-                    and first_snapshot == second_snapshot
+                    and first_target_hash == second_target_hash
                 ) else "FAILED",
                 "first_run": first,
                 "second_run": second,
-                "idempotent": first_snapshot == second_snapshot,
+                "first_target_semantic_hash": first_target_hash,
+                "second_target_semantic_hash": second_target_hash,
+                "idempotent": first_target_hash == second_target_hash,
                 "source_revision": args.release_sha or "",
             }
             if args.anomaly_path:

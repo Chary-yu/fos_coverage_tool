@@ -8,9 +8,11 @@ import unittest
 from scripts.upgrade.migration_runner import (
     capture_legacy_snapshot,
     capture_vnext_snapshot,
+    capture_vnext_semantic_snapshot,
     create_sqlite_schema,
     migrate_legacy,
     semantic_hash,
+    _stream_vnext_semantic_hash,
     _migration_checkpoint_done,
     _migration_checkpoint_key_hash,
     _upsert_migration_checkpoint,
@@ -174,6 +176,14 @@ class MigrationRunnerTest(unittest.TestCase):
         self.assertEqual(first["source_analysis_facts"], 1)
         self.assertEqual(first["anomalies"], [])
         self.assertTrue(first["authoritative_semantic_match"])
+        self.assertEqual(
+            first["target_semantic_hash"],
+            _stream_vnext_semantic_hash(target, batch_size=1),
+        )
+        self.assertEqual(
+            first["target_semantic_hash"],
+            semantic_hash(capture_vnext_semantic_snapshot(target)),
+        )
         project = target.execute(
             "SELECT project_name FROM coverage_projects"
         ).fetchall()
