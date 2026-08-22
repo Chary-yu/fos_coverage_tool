@@ -247,13 +247,13 @@ class MigrationRunnerTest(unittest.TestCase):
             source, ["project-a"], {"project-a": 7},
         )
         self.assertEqual(descriptor["semantic_hash"], expected)
-        line_index_selects = [
+        line_context_reads = [
             sql for sql in statements
-            if "from coverage_line_index" in sql.lower()
+            if "select * from coverage_line_index" in sql.lower()
         ]
         self.assertEqual(
-            len(line_index_selects), 3,
-            "one file-key page and one context read per physical file are expected",
+            len(line_context_reads), 2,
+            "one legacy line-context read per physical file is expected",
         )
 
     def test_blank_analysis_path_uses_unique_line_identity(self):
