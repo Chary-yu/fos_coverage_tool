@@ -5,6 +5,7 @@ from __future__ import print_function
 import hashlib
 import json
 import os
+import pickle
 import sqlite3
 import sys
 import tempfile
@@ -1042,7 +1043,74 @@ class _JsonArraySpool(object):
         self.stream.close()
 
 
-def _stream_legacy_semantic_hash(connection, projects, data_versions):
+class _LegacySourceSpool(object):
+    """Replayable disk-backed source facts for the migration write pass.
+
+    The source semantic hash and the target write path need the same normalized
+    legacy contexts.  Keeping their byte offsets instead of the contexts in a
+    Python list makes the source DB a single-pass input while keeping replay
+    memory bounded by one physical file context.
+    """
+
+    def __init__(self):
+        self.stream = tempfile.TemporaryFile(mode="w+b")
+        self.context_offsets = {}
+        self.project_state_offsets = {}
+        self.job_offsets = []
+
+    def _append(self, record):
+        offset = self.stream.tell()
+        pickle.dump(record, self.stream, protocol=2)
+        return offset
+
+    def append_context(self, project_name, context):
+        offset = self._append(("context", project_name, context))
+        self.context_offsets.setdefault(project_name, []).append(offset)
+
+    def append_project_state(self, project_name, state):
+        self.project_state_offsets[project_name] = self._append(
+            ("project_state", project_name, state)
+        )
+
+    def append_job(self, fact):
+        self.job_offsets.append(self._append(("job", fact)))
+
+    def _read_at(self, offset):
+        self.stream.seek(offset)
+        return pickle.load(self.stream)
+
+    def iter_contexts(self, project_name):
+        self.stream.flush()
+        for offset in self.context_offsets.get(project_name, ()):
+            record = self._read_at(offset)
+            if record[0] != "context" or record[1] != project_name:
+                raise RuntimeError("legacy source spool context index mismatch")
+            yield record[2]
+
+    def project_state(self, project_name):
+        self.stream.flush()
+        offset = self.project_state_offsets.get(project_name)
+        if offset is None:
+            return {}
+        record = self._read_at(offset)
+        if record[0] != "project_state" or record[1] != project_name:
+            raise RuntimeError("legacy source spool project state index mismatch")
+        return record[2]
+
+    def iter_jobs(self):
+        self.stream.flush()
+        for offset in self.job_offsets:
+            record = self._read_at(offset)
+            if record[0] != "job":
+                raise RuntimeError("legacy source spool job index mismatch")
+            yield record[1]
+
+    def close(self):
+        self.stream.close()
+
+
+def _stream_legacy_semantic_hash(connection, projects, data_versions,
+                                 source_spool=None):
     """Hash normalized legacy facts with one bounded source traversal.
 
     The semantic contract keeps its historical field order, even though the
@@ -1073,6 +1141,8 @@ def _stream_legacy_semantic_hash(connection, projects, data_versions):
             line_start = line_fragment_spool.tell()
             analysis_start = analysis_fragment_spool.tell()
             for context in _iter_legacy_file_contexts(connection, project_name):
+                if source_spool is not None:
+                    source_spool.append_context(project_name, context)
                 for number in sorted(context["analyses"]):
                     row = context["analyses"][number]
                     item = _semantic_analysis_item(dict(
@@ -1126,6 +1196,8 @@ def _stream_legacy_semantic_hash(connection, projects, data_versions):
             state = fetchone(connection, """
                 SELECT * FROM coverage_project_state WHERE project_name=?
             """, (project_name,)) or {}
+            if source_spool is not None:
+                source_spool.append_project_state(project_name, state)
             provenance_spools["coverage_project_state"].append(
                 _source_provenance_item(
                     "project_state", "coverage_project_state", project_name,
@@ -1141,6 +1213,8 @@ def _stream_legacy_semantic_hash(connection, projects, data_versions):
 
         for row in _iter_legacy_rows(connection, "coverage_background_jobs"):
             fact = _legacy_job_fact(row)
+            if source_spool is not None:
+                source_spool.append_job(fact)
             state = fact["state"]
             error = fact["error_message"]
             if state in ("queued", "running", "interrupted"):
@@ -3024,8 +3098,9 @@ def _migrate_legacy_materialized(source_connection, target_connection, anomaly_p
     return result
 
 
-def migrate_legacy(source_connection, target_connection, anomaly_path=None,
-                   release_sha="", migration_id=None):
+def _migrate_legacy_with_source_spool(source_connection, target_connection,
+                                      source_spool, anomaly_path=None,
+                                      release_sha="", migration_id=None):
     """Stream a read-only legacy source into a non-published VNext target.
 
     Source facts are read in bounded file-hash groups.  Each target file/job
@@ -3039,7 +3114,8 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None,
     project_names = _project_names(source_connection)
     data_versions = _legacy_project_data_versions(source_connection, project_names)
     source_descriptor = _stream_legacy_semantic_hash(
-        source_connection, project_names, data_versions
+        source_connection, project_names, data_versions,
+        source_spool=source_spool,
     )
     migration_id = migration_id or "legacy-v3-{}".format(
         source_descriptor["semantic_hash"][:32]
@@ -3090,7 +3166,7 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None,
         project_id = project_ids[project_name]
         project_fragment = source_descriptor["project_fragments"].get(project_name, "")
         project_checkpoint = "project:{}".format(project_name)
-        for context in _iter_legacy_file_contexts(source_connection, project_name):
+        for context in source_spool.iter_contexts(project_name):
             fragment, line_count, analysis_count, _ = _legacy_context_fragment(
                 context, project_name
             )
@@ -3135,9 +3211,7 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None,
                 )
 
         with transaction(target_connection) as conn:
-            project_metadata = fetchone(source_connection, """
-                SELECT * FROM coverage_project_state WHERE project_name=?
-            """, (project_name,)) or {}
+            project_metadata = source_spool.project_state(project_name)
             _upsert_legacy_provenance_many(conn, migration_id, [{
                 "entity_type": "project_state", "target_entity_id": project_id,
                 "source_table": "coverage_project_state", "source_identity": project_name,
@@ -3157,8 +3231,7 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None,
 
     # Jobs are independent keyset batches.  Active legacy work is retained as
     # an explicit interrupted/manual-decision fact, never silently requeued.
-    for old_row in _iter_legacy_rows(source_connection, "coverage_background_jobs"):
-        old_job = _legacy_job_fact(old_row)
+    for old_job in source_spool.iter_jobs():
         project = project_ids.get(old_job["project_name"])
         if not project:
             anomalies.append({"type": "orphan_job", "job_id": old_job["job_id"]})
@@ -3263,6 +3336,20 @@ def migrate_legacy(source_connection, target_connection, anomaly_path=None,
         with open(anomaly_path, "w", encoding="utf-8") as stream:
             json.dump(result, stream, ensure_ascii=False, indent=2, sort_keys=True)
     return result
+
+
+def migrate_legacy(source_connection, target_connection, anomaly_path=None,
+                   release_sha="", migration_id=None):
+    """Migrate a read-only legacy source using one replayable source pass."""
+    source_spool = _LegacySourceSpool()
+    try:
+        return _migrate_legacy_with_source_spool(
+            source_connection, target_connection, source_spool,
+            anomaly_path=anomaly_path, release_sha=release_sha,
+            migration_id=migration_id,
+        )
+    finally:
+        source_spool.close()
 
 
 def _demo_connections():

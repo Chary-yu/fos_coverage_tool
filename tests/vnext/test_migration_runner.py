@@ -174,7 +174,14 @@ class MigrationRunnerTest(unittest.TestCase):
         target.row_factory = sqlite3.Row
         create_sqlite_schema(target)
         before = capture_legacy_snapshot(source)
-        first = migrate_legacy(source, target)
+        with mock.patch(
+                "scripts.upgrade.migration_runner._legacy_file_contexts",
+                wraps=_legacy_file_contexts) as context_reader:
+            first = migrate_legacy(source, target)
+        self.assertEqual(
+            context_reader.call_count, 1,
+            "the migration hash and write passes must share one source context read",
+        )
         self.assertEqual(first["status"], "PASSED")
         self.assertEqual(first["source_line_facts"], 1)
         self.assertEqual(first["source_analysis_facts"], 1)
