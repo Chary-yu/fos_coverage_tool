@@ -7,6 +7,7 @@ import json
 import os
 import sqlite3
 import sys
+import tempfile
 from datetime import date, datetime, time
 from decimal import Decimal
 
@@ -1013,78 +1014,131 @@ def _source_provenance_item(entity_type, source_table, identity, row,
     }
 
 
+class _JsonArraySpool(object):
+    """Disk-backed JSON-array body used to keep migration hashing bounded."""
+
+    def __init__(self):
+        self.stream = tempfile.TemporaryFile(mode="w+b")
+        self.has_items = False
+
+    def append(self, item):
+        self.append_encoded(_json_compact(item))
+
+    def append_encoded(self, encoded):
+        if self.has_items:
+            self.stream.write(b",")
+        self.stream.write(encoded)
+        self.has_items = True
+
+    def copy_to(self, target):
+        self.stream.seek(0)
+        while True:
+            chunk = self.stream.read(1024 * 1024)
+            if not chunk:
+                return
+            target.update(chunk)
+
+    def close(self):
+        self.stream.close()
+
+
 def _stream_legacy_semantic_hash(connection, projects, data_versions):
-    """Hash normalized legacy facts incrementally and return migration metadata."""
-    project_fragments = {name: hashlib.sha256() for name in projects}
+    """Hash normalized legacy facts with one bounded source traversal.
+
+    The semantic contract keeps its historical field order, even though the
+    source facts are naturally encountered file-by-file.  Disk-backed spools
+    let one traversal feed the analyses, lines, and provenance fields without
+    retaining the complete source snapshot or querying each file context again.
+    """
+    project_names = sorted(projects)
     counts = {"lines": 0, "analyses": 0, "jobs": 0}
+    array_spools = {
+        "analyses": _JsonArraySpool(),
+        "jobs": _JsonArraySpool(),
+        "lines": _JsonArraySpool(),
+        "projects": _JsonArraySpool(),
+    }
+    provenance_spools = {
+        "coverage_analysis": _JsonArraySpool(),
+        "coverage_background_jobs": _JsonArraySpool(),
+        "coverage_line_index": _JsonArraySpool(),
+        "coverage_project_state": _JsonArraySpool(),
+    }
+    line_fragment_spool = tempfile.TemporaryFile(mode="w+b")
+    analysis_fragment_spool = tempfile.TemporaryFile(mode="w+b")
+    fragment_offsets = {}
 
-    def line_items():
-        for project_name in projects:
-            for context in _iter_legacy_file_contexts(connection, project_name):
-                for number in sorted(context["lines"]):
-                    item = _semantic_line_item(dict(
-                        context["lines"][number], project_name=project_name,
-                        file_path_hash=context["file_path_hash"],
-                        file_path=context["file_path"],
-                    ))
-                    project_fragments[project_name].update(b"L" + _json_compact(item))
-                    if number in context.get("source_lines", {}):
-                        counts["lines"] += 1
-                    yield item
-
-    def analysis_items():
-        for project_name in projects:
+    try:
+        for project_name in project_names:
+            line_start = line_fragment_spool.tell()
+            analysis_start = analysis_fragment_spool.tell()
             for context in _iter_legacy_file_contexts(connection, project_name):
                 for number in sorted(context["analyses"]):
+                    row = context["analyses"][number]
                     item = _semantic_analysis_item(dict(
-                        context["analyses"][number], project_name=project_name,
+                        row, project_name=project_name,
                         file_path_hash=context["file_path_hash"],
                         file_path=context["file_path"],
                     ))
-                    project_fragments[project_name].update(b"A" + _json_compact(item))
+                    encoded = _json_compact(item)
+                    array_spools["analyses"].append_encoded(encoded)
+                    analysis_fragment_spool.write(b"A" + encoded)
                     counts["analyses"] += 1
-                    yield item
 
-    def source_provenance(source_table):
-        if source_table == "coverage_analysis":
-            for project_name in projects:
-                for context in _iter_legacy_file_contexts(connection, project_name):
-                    for number, row in sorted(context["analyses"].items(),
-                                              key=lambda item: str(item[0])):
-                        yield _source_provenance_item(
-                            "legacy_analysis", source_table,
-                            "{}:{}:{}".format(project_name, context["file_path_hash"], number),
-                            row, raw_status=row.get("status"), raw_is_draft=row.get("is_draft"),
+                for number in sorted(context["lines"]):
+                    row = context["lines"][number]
+                    item = _semantic_line_item(dict(
+                        row, project_name=project_name,
+                        file_path_hash=context["file_path_hash"],
+                        file_path=context["file_path"],
+                    ))
+                    encoded = _json_compact(item)
+                    array_spools["lines"].append_encoded(encoded)
+                    line_fragment_spool.write(b"L" + encoded)
+                    source_line = context.get("source_lines", {}).get(number)
+                    if source_line is not None:
+                        counts["lines"] += 1
+
+                for number, row in sorted(
+                        context["analyses"].items(),
+                        key=lambda item: str(item[0])):
+                    provenance_spools["coverage_analysis"].append(
+                        _source_provenance_item(
+                            "legacy_analysis", "coverage_analysis",
+                            "{}:{}:{}".format(
+                                project_name, context["file_path_hash"], number
+                            ), row, raw_status=row.get("status"),
+                            raw_is_draft=row.get("is_draft"),
                         )
-        elif source_table == "coverage_background_jobs":
-            for row in _iter_legacy_rows(connection, "coverage_background_jobs"):
-                fact = _legacy_job_fact(row)
-                yield _source_provenance_item(
-                    "job", source_table, fact["job_id"], fact,
-                    raw_status=fact.get("state"),
-                )
-        elif source_table == "coverage_line_index":
-            for project_name in projects:
-                for context in _iter_legacy_file_contexts(connection, project_name):
-                    for number, row in sorted(context["source_lines"].items(),
-                                              key=lambda item: str(item[0])):
-                        yield _source_provenance_item(
-                            "line", source_table,
-                            "{}:{}:{}".format(project_name, context["file_path_hash"], number),
-                            row,
+                    )
+                for number, row in sorted(
+                        context.get("source_lines", {}).items(),
+                        key=lambda item: str(item[0])):
+                    provenance_spools["coverage_line_index"].append(
+                        _source_provenance_item(
+                            "line", "coverage_line_index",
+                            "{}:{}:{}".format(
+                                project_name, context["file_path_hash"], number
+                            ), row,
                         )
-        else:
-            for project_name in projects:
-                state = fetchone(connection, """
-                    SELECT * FROM coverage_project_state WHERE project_name=?
-                """, (project_name,)) or {}
-                yield _source_provenance_item(
-                    "project_state", source_table, project_name,
-                    {"legacy_created_at": None, "legacy_updated_at": state.get("updated_at"),
+                    )
+
+            state = fetchone(connection, """
+                SELECT * FROM coverage_project_state WHERE project_name=?
+            """, (project_name,)) or {}
+            provenance_spools["coverage_project_state"].append(
+                _source_provenance_item(
+                    "project_state", "coverage_project_state", project_name,
+                    {"legacy_created_at": None,
+                     "legacy_updated_at": state.get("updated_at"),
                      "raw_payload_sha256": _legacy_payload_hash(state)},
                 )
+            )
+            fragment_offsets[project_name] = {
+                "lines": (line_start, line_fragment_spool.tell()),
+                "analyses": (analysis_start, analysis_fragment_spool.tell()),
+            }
 
-    def semantic_jobs():
         for row in _iter_legacy_rows(connection, "coverage_background_jobs"):
             fact = _legacy_job_fact(row)
             state = fact["state"]
@@ -1092,42 +1146,97 @@ def _stream_legacy_semantic_hash(connection, projects, data_versions):
             if state in ("queued", "running", "interrupted"):
                 state = "interrupted"
                 error = error or "legacy active job requires manual migration decision"
-            counts["jobs"] += 1
-            yield {
+            array_spools["jobs"].append({
                 "job_id": fact["job_id"], "project_name": fact["project_name"],
                 "kind": fact["kind"], "state": state,
                 "data_version": fact["data_version"], "error_message": error,
-            }
+            })
+            provenance_spools["coverage_background_jobs"].append(
+                _source_provenance_item(
+                    "job", "coverage_background_jobs", fact["job_id"], fact,
+                    raw_status=fact.get("state"),
+                )
+            )
+            counts["jobs"] += 1
 
-    provenance_items = (
-        item for source_table in (
-            "coverage_analysis", "coverage_background_jobs",
-            "coverage_line_index", "coverage_project_state",
-        ) for item in source_provenance(source_table)
-    )
-    hasher = hashlib.sha256()
-    hasher.update(b"{")
-    fields = (
-        ("analyses", analysis_items()), ("jobs", semantic_jobs()),
-        ("legacy_provenance", provenance_items), ("lines", line_items()),
-        ("project_data_versions", dict(sorted(data_versions.items()))),
-        ("projects", sorted(projects)),
-    )
-    for index, (key, value) in enumerate(fields):
-        if index:
-            hasher.update(b",")
-        hasher.update(_json_compact(key))
-        hasher.update(b":")
-        _stream_json_array(hasher, value) if not isinstance(value, dict) else hasher.update(_json_compact(value))
-    hasher.update(b"}")
-    return {
-        "semantic_hash": hasher.hexdigest(), "projects": sorted(projects),
-        "project_data_versions": dict(sorted(data_versions.items())),
-        "source_line_facts": counts["lines"], "source_analysis_facts": counts["analyses"],
-        "source_jobs": counts["jobs"], "project_fragments": {
-            name: value.hexdigest() for name, value in project_fragments.items()
-        },
-    }
+        for project_name in project_names:
+            array_spools["projects"].append(project_name)
+
+        hasher = hashlib.sha256()
+        hasher.update(b"{")
+        fields = (
+            ("analyses", array_spools["analyses"]),
+            ("jobs", array_spools["jobs"]),
+            ("legacy_provenance", provenance_spools),
+            ("lines", array_spools["lines"]),
+            ("project_data_versions", dict(sorted(data_versions.items()))),
+            ("projects", array_spools["projects"]),
+        )
+        for index, (key, value) in enumerate(fields):
+            if index:
+                hasher.update(b",")
+            hasher.update(_json_compact(key))
+            hasher.update(b":")
+            if key == "legacy_provenance":
+                hasher.update(b"[")
+                first_group = True
+                for group in (
+                        "coverage_analysis", "coverage_background_jobs",
+                        "coverage_line_index", "coverage_project_state"):
+                    spool = value[group]
+                    if not spool.has_items:
+                        continue
+                    if not first_group:
+                        hasher.update(b",")
+                    spool.copy_to(hasher)
+                    first_group = False
+                hasher.update(b"]")
+            elif isinstance(value, _JsonArraySpool):
+                hasher.update(b"[")
+                value.copy_to(hasher)
+                hasher.update(b"]")
+            else:
+                hasher.update(_json_compact(value))
+        hasher.update(b"}")
+
+        project_fragments = {}
+        for project_name in project_names:
+            line_start, line_end = fragment_offsets[project_name]["lines"]
+            analysis_start, analysis_end = fragment_offsets[project_name]["analyses"]
+            fragment = hashlib.sha256()
+            line_fragment_spool.seek(line_start)
+            remaining = line_end - line_start
+            while remaining > 0:
+                chunk = line_fragment_spool.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise RuntimeError("legacy line fragment spool ended early")
+                fragment.update(chunk)
+                remaining -= len(chunk)
+            analysis_fragment_spool.seek(analysis_start)
+            remaining = analysis_end - analysis_start
+            while remaining > 0:
+                chunk = analysis_fragment_spool.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise RuntimeError("legacy analysis fragment spool ended early")
+                fragment.update(chunk)
+                remaining -= len(chunk)
+            project_fragments[project_name] = fragment.hexdigest()
+
+        return {
+            "semantic_hash": hasher.hexdigest(), "projects": project_names,
+            "project_data_versions": dict(sorted(data_versions.items())),
+            "source_line_facts": counts["lines"],
+            "source_analysis_facts": counts["analyses"],
+            "source_jobs": counts["jobs"],
+            "project_fragments": project_fragments,
+        }
+    finally:
+        line_fragment_spool.close()
+        analysis_fragment_spool.close()
+        for spool in array_spools.values():
+            spool.close()
+        for spool in provenance_spools.values():
+            spool.close()
 
 
 def _upsert_migration_checkpoint(connection, migration_id, checkpoint_key,

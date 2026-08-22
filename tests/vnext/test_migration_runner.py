@@ -7,11 +7,13 @@ import unittest
 
 from scripts.upgrade.migration_runner import (
     capture_legacy_snapshot,
+    capture_legacy_semantic_snapshot,
     capture_vnext_snapshot,
     capture_vnext_semantic_snapshot,
     create_sqlite_schema,
     migrate_legacy,
     semantic_hash,
+    _stream_legacy_semantic_hash,
     _stream_vnext_semantic_hash,
     _migration_checkpoint_done,
     _migration_checkpoint_key_hash,
@@ -211,6 +213,48 @@ class MigrationRunnerTest(unittest.TestCase):
         self.assertEqual(after["project_data_versions"], before["project_data_versions"])
         self.assertEqual(len(after["lines"]), len(before["lines"]))
         self.assertEqual(len(after["analyses"]), len(before["analyses"]))
+
+    def test_legacy_semantic_hash_scans_each_file_context_once(self):
+        source = legacy_connection()
+        self.addCleanup(source.close)
+        path = "src/ordered.c"
+        file_hash = hashlib.md5(path.encode("utf-8")).hexdigest()
+        source.execute(
+            "INSERT INTO coverage_line_index VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (2, "project-a", path, file_hash, "migrated.c", 2, "return 2;",
+             2, 2, "single", "main", "fn", "line-2", 1),
+        )
+        source.execute(
+            "INSERT INTO coverage_line_index VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (3, "project-a", path, file_hash, "migrated.c", 10, "return 10;",
+             10, 10, "single", "main", "fn", "line-10", 1),
+        )
+        source.execute(
+            "INSERT INTO coverage_analysis VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (2, "project-a", path, file_hash, "migrated.c", 2, "alice",
+             "可覆盖", 0, "unit", "", "comment-2"),
+        )
+        source.execute(
+            "INSERT INTO coverage_analysis VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (3, "project-a", path, file_hash, "migrated.c", 10, "alice",
+             "可覆盖", 0, "unit", "", "comment-10"),
+        )
+        source.commit()
+        expected = semantic_hash(capture_legacy_semantic_snapshot(source))
+        statements = []
+        source.set_trace_callback(statements.append)
+        descriptor = _stream_legacy_semantic_hash(
+            source, ["project-a"], {"project-a": 7},
+        )
+        self.assertEqual(descriptor["semantic_hash"], expected)
+        line_index_selects = [
+            sql for sql in statements
+            if "from coverage_line_index" in sql.lower()
+        ]
+        self.assertEqual(
+            len(line_index_selects), 3,
+            "one file-key page and one context read per physical file are expected",
+        )
 
     def test_blank_analysis_path_uses_unique_line_identity(self):
         source = legacy_connection()
