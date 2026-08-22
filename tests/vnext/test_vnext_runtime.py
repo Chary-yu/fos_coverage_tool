@@ -212,6 +212,18 @@ class VNextRuntimeTest(unittest.TestCase):
             ("report_fixture",),
         ).fetchone()
         self.assertEqual(report[0], scan_id)
+        report_metadata = self.connection.execute(
+            "SELECT asset_identity FROM coverage_reports WHERE report_id = ?",
+            ("report_fixture",),
+        ).fetchone()
+        self.assertTrue(str(report_metadata[0]).startswith("v1:"))
+        status, release = self.application.dispatch(
+            "GET", "/api/coverage/release"
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            release["api_contract_version"], "vnext-api-20260822.1"
+        )
 
     def test_progress_files_uses_bounded_keyset_windows(self):
         status, body = self.application.dispatch(

@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "contract_version": "vnext-api-20260822.1",
   "contract_id": "vnext-inheritance-api-v1",
   "runtime": "vnext",
   "routes": {

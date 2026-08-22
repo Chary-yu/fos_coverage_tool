@@ -4,6 +4,12 @@ The VNext runtime is canonical. `app/legacy_runtime.py` and
 `app/incremental/legacy.py` are retained only for explicit compatibility
 entrypoints and are currently classified as `TRANSITIONAL_LEGACY`.
 
+The per-capability ownership and retirement status is maintained in
+[`legacy-retirement-matrix.md`](legacy-retirement-matrix.md); report contract
+compatibility is maintained in [`report-compatibility-matrix.md`](report-compatibility-matrix.md).
+The report inventory is deliberately an operator-supplied, read-only input;
+the absence of production evidence cannot be treated as zero legacy usage.
+
 They are not allowed to be imported by the VNext composition root. The root
 CLI/import names remain compatibility shims so existing integrations can be
 migrated without an abrupt break.

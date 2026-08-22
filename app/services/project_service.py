@@ -12,6 +12,7 @@ from app.db.repositories import (
 )
 from app.db.transaction import transaction
 from app.reports.identity import validate_report_id
+from app.reports.compatibility import with_report_compatibility
 from app.scan_import.publication import ScanPublicationService
 
 
@@ -20,7 +21,8 @@ CONSTRUCTION_STATUSES = {"building", "importing", "constructing"}
 
 class ProjectService(object):
     def __init__(self, project_repo=None, state_repo=None, line_repo=None,
-                 allowed_report_roots=None, repository_repo=None):
+                 allowed_report_roots=None, repository_repo=None,
+                 release_identity=None, api_contract_version=None):
         self.projects = project_repo or ProjectRepository()
         self.states = state_repo or ProjectStateRepository()
         self.lines = line_repo or LineIndexRepository()
@@ -28,6 +30,15 @@ class ProjectService(object):
         self.publication = ScanPublicationService(self.states)
         self.allowed_report_roots = [os.path.realpath(root) for root in
                                      (allowed_report_roots or [])]
+        self.release_identity = dict(release_identity or {})
+        self.api_contract_version = api_contract_version
+
+    def prepare_report(self, report):
+        """Normalize report metadata before binding it to an immutable Scan."""
+        return with_report_compatibility(
+            report, self.release_identity,
+            api_contract_version=self.api_contract_version,
+        )
 
     def _validate_report(self, report):
         if not report:
@@ -98,6 +109,7 @@ class ProjectService(object):
                     review_scope="full", repositories=None, report=None,
                     scan_type="import", status="building"):
         repositories = list(repositories or [])
+        report = self.prepare_report(report)
         scan_key = self.scan_key(
             project_name, info_sha256, repositories, review_scope,
             (report or {}).get("source_signature", "") if report else "",
@@ -181,6 +193,7 @@ class ProjectService(object):
                                status="building"):
         """Create, populate and seal one immutable scan transactionally."""
         repositories = list(repositories or [])
+        report = self.prepare_report(report)
         scan_key = self.scan_key(
             project_name, info_sha256, repositories, review_scope,
             (report or {}).get("source_signature", "") if report else "",

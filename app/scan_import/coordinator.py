@@ -57,6 +57,8 @@ class ScanImportCoordinator(object):
         The physical locks are acquired before the business Scan row is
         created, which gives the busy path its zero-residue guarantee.
         """
+        if self.project_service is not None:
+            report = self.project_service.prepare_report(report)
         job_id = uuid.uuid4().hex
         owner_token = uuid.uuid4().hex
         if not staging_root:

@@ -4,9 +4,38 @@ import tempfile
 import unittest
 
 from app.reports.registry import ReportRegistry
+from app.reports.compatibility import (
+    REPORT_API_CONTRACT_VERSION,
+    derive_asset_identity,
+    with_report_compatibility,
+)
 
 
 class ReportRegistryTest(unittest.TestCase):
+    def test_report_metadata_binds_api_and_release_identity(self):
+        release = {
+            "version": "vnext",
+            "commit_sha": "a" * 40,
+            "build_id": "vnext-aaaaaaaa-asset",
+            "asset_hash": "b" * 16,
+            "schema_version": 2,
+        }
+        report = with_report_compatibility(
+            {"report_id": "report-a"}, release
+        )
+        self.assertEqual(
+            report["api_contract_version"], REPORT_API_CONTRACT_VERSION
+        )
+        self.assertEqual(report["release_identity"], release)
+        self.assertEqual(
+            report["asset_identity"], derive_asset_identity(release)
+        )
+        with self.assertRaisesRegex(ValueError, "REPORT_API_CONTRACT_MISMATCH"):
+            with_report_compatibility(
+                {"report_id": "report-a", "api_contract_version": "old-api"},
+                release,
+            )
+
     def test_exact_report_lookup_and_prune_are_fail_closed(self):
         with tempfile.TemporaryDirectory(prefix="report-registry-") as root:
             output = os.path.join(root, "report")

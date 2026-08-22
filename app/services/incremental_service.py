@@ -6,14 +6,18 @@ from app.db.repositories import IncrementalRepository, ProjectRepository
 from app.db.transaction import transaction
 from app.incremental.orchestrator import IncrementalOrchestrator
 from app.config.path_policy import realpath_within, reject_relative_traversal
+from app.reports.compatibility import with_report_compatibility
 
 
 class IncrementalReportService(object):
-    def __init__(self, project_repo=None, result_repo=None, orchestrator=None):
+    def __init__(self, project_repo=None, result_repo=None, orchestrator=None,
+                 release_identity=None, api_contract_version=None):
         self.projects = project_repo or ProjectRepository()
         self.results = result_repo or IncrementalRepository()
         self.orchestrator = orchestrator or IncrementalOrchestrator()
         self.allowed_roots = []
+        self.release_identity = dict(release_identity or {})
+        self.api_contract_version = api_contract_version
 
     def build_and_persist(self, connection, project_name, scan_id, repo_path,
                           oldgit, newgit, info_path, repository_name="default",
@@ -41,6 +45,10 @@ class IncrementalReportService(object):
         report = self.orchestrator.build(
             project_name, repo_path, oldgit, newgit, info_path,
             repository_name=repository_name, scan_id=scan_id, report_id=report_id,
+        )
+        report = with_report_compatibility(
+            report, self.release_identity,
+            api_contract_version=self.api_contract_version,
         )
         with transaction(connection) as conn:
             row = self.results.upsert(

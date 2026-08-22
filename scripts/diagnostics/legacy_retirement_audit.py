@@ -18,6 +18,7 @@ from scripts.diagnostics.runtime_legacy_dependency_audit import audit as audit_b
 
 
 RETIREMENT_CONDITIONS = [
+    "the per-capability retirement matrix is present and complete",
     "no supported deployment selects runtime_mode=legacy",
     "compatibility CLI/import tests pass from the shim surface",
     "no VNext module imports a transitional implementation",
@@ -29,6 +30,15 @@ _FULL_GIT_SHA = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 _PLACEHOLDER_ROLLBACK_PLANS = {
     "n/a", "na", "none", "pending", "tbd", "todo", "to be determined",
 }
+_RETIREMENT_MATRIX = os.path.join(
+    "docs", "architecture", "legacy-retirement-matrix.md"
+)
+_MATRIX_CAPABILITIES = (
+    "HTTP server/runtime composition", "Auth and mutation policy",
+    "Jobs and recovery", "Progress aggregation", "Export",
+    "Incremental analysis", "Inject / report binding", "Static assets",
+    "`inherit` CLI mutation",
+)
 
 
 def _load_json(path):
@@ -171,6 +181,26 @@ def _retirement_manifest_check(path, expected_candidate_revision=""):
     return result
 
 
+def _retirement_matrix_check(repo_root):
+    path = os.path.join(repo_root, _RETIREMENT_MATRIX)
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            text = stream.read()
+    except OSError as exc:
+        return {
+            "path": os.path.relpath(path, repo_root), "available": False,
+            "passed": False, "missing": ["matrix: {}".format(exc)],
+        }
+    missing = [item for item in _MATRIX_CAPABILITIES if item not in text]
+    for marker in ("VNext authoritative owner", "Current status", "Rollback path"):
+        if marker not in text:
+            missing.append("column: {}".format(marker))
+    return {
+        "path": os.path.relpath(path, repo_root), "available": True,
+        "passed": not missing, "missing": missing,
+    }
+
+
 def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None):
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     candidate_revision = _revision(repo_root)
@@ -188,6 +218,7 @@ def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None)
     )
     telemetry = _usage_telemetry()
     runtime_modes = _runtime_mode_checks(repo_root)
+    retirement_matrix = _retirement_matrix_check(repo_root)
     compatibility = _manifest_check(
         compatibility_manifest, ("status", "candidate_revision"),
         expected_values={"status": "PASSED"},
@@ -214,6 +245,7 @@ def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None)
             for item in expected_legacy
         ]
     checks = {
+        "retirement_matrix": retirement_matrix["passed"],
         "no_legacy_deployment": runtime_modes["passed"],
         "compatibility_tests": compatibility["passed"],
         "no_vnext_transitional_import": boundary.get("status") == "PASSED",
@@ -251,6 +283,7 @@ def audit(repo_root=ROOT, compatibility_manifest=None, retirement_manifest=None)
         "retirement_conditions": RETIREMENT_CONDITIONS,
         "retirement_checks": checks,
         "runtime_modes": runtime_modes,
+        "retirement_matrix": retirement_matrix,
         "compatibility_evidence": compatibility,
         "retirement_manifest": release,
         "usage_telemetry": telemetry,

@@ -17,6 +17,7 @@ from app.db.repositories import (
     AnalysisDomainRepository,
 )
 from app.release_identity import get_current_release_identity
+from app.reports.compatibility import REPORT_API_CONTRACT_VERSION
 from app.inject.service import ScanImportService
 from app.code_detail.vnext_service import VNextCodeDetailService
 from app.reports.registry import ReportRegistry
@@ -68,6 +69,10 @@ class VNextRuntime(object):
         self._connection_factory = connection_factory
         self.database_manager = database_manager
         self._closed = False
+        # Runtime identity is a startup invariant. A missing or drifting
+        # manifest must stop composition; generating a replacement here would
+        # turn an exact-release failure into a silently accepted runtime.
+        self.release_identity = get_current_release_identity(self.repo_root)
         self.projects = ProjectRepository()
         self.lines = LineIndexRepository()
         self.analyses = AnalysisRepository()
@@ -104,6 +109,8 @@ class VNextRuntime(object):
             self.projects, self.states, self.lines,
             allowed_report_roots=report_roots,
             repository_repo=self.repository_repository,
+            release_identity=self.release_identity,
+            api_contract_version=REPORT_API_CONTRACT_VERSION,
         )
         input_roots = []
         for root in self.config.get("input_roots") or []:
@@ -150,16 +157,14 @@ class VNextRuntime(object):
         )
         self.progress_service = ProgressService(self.file_states, self.projects, self.states)
         self.incremental_service = IncrementalReportService(
-            self.projects, self.incremental_results
+            self.projects, self.incremental_results,
+            release_identity=self.release_identity,
+            api_contract_version=REPORT_API_CONTRACT_VERSION,
         )
         self.incremental_service.allowed_roots = list(input_roots)
         export_root = state_config.get("exports_dir") or os.path.join(state_root, "exports")
         if not os.path.isabs(export_root):
             export_root = os.path.join(self.repo_root, export_root)
-        # Runtime identity is a startup invariant. A missing or drifting
-        # manifest must stop composition; generating a replacement here would
-        # turn an exact-release failure into a silently accepted runtime.
-        self.release_identity = get_current_release_identity(self.repo_root)
         self.performance = PerformanceEvidenceCollector(
             self.release_identity, workload_id="vnext-runtime"
         )
