@@ -4,7 +4,9 @@ from __future__ import absolute_import
 
 import os
 import re
+import select
 import subprocess
+import time
 
 from app.inheritance.normalizer import CppLexer
 
@@ -21,7 +23,7 @@ _MACRO_CANDIDATE = re.compile(
     r"^\s*#\s*define\s+([A-Za-z_]\w*)", re.MULTILINE
 )
 _CONSTANT_DECLARATION = re.compile(
-    r"\b(?:const|constexpr)\b[^;{}]*(?:;|$)", re.MULTILINE
+    r"\b(?:const|constexpr)\b[^;]*(?:;|$)", re.MULTILINE
 )
 _IDENTIFIER = re.compile(
     r"\b([A-Za-z_]\w*)\b"
@@ -37,6 +39,63 @@ class GitTechnicalFailure(RuntimeError):
     pass
 
 
+class _DeadlinePipeReader(object):
+    """Read a Git batch pipe without allowing a stalled child to hang us."""
+
+    def __init__(self, stream, deadline):
+        self.stream = stream
+        self.file_descriptor = stream.fileno()
+        self.deadline = float(deadline)
+        self.buffer = bytearray()
+
+    def _fill(self):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise GitTechnicalFailure("git cat-file batch timed out")
+        try:
+            readable, _, _ = select.select(
+                [self.file_descriptor], [], [], remaining
+            )
+        except (OSError, select.error) as exc:
+            raise GitTechnicalFailure(
+                "git cat-file batch read failed: {}".format(exc)
+            )
+        if not readable:
+            raise GitTechnicalFailure("git cat-file batch timed out")
+        try:
+            chunk = os.read(self.file_descriptor, 65536)
+        except OSError as exc:
+            raise GitTechnicalFailure(
+                "git cat-file batch read failed: {}".format(exc)
+            )
+        if not chunk:
+            return False
+        self.buffer.extend(chunk)
+        return True
+
+    def read_line(self):
+        while True:
+            marker = self.buffer.find(b"\n")
+            if marker >= 0:
+                marker += 1
+                value = bytes(self.buffer[:marker])
+                del self.buffer[:marker]
+                return value
+            if not self._fill():
+                value = bytes(self.buffer)
+                self.buffer.clear()
+                return value
+
+    def read_exact(self, size):
+        size = int(size)
+        while len(self.buffer) < size:
+            if not self._fill():
+                break
+        value = bytes(self.buffer[:size])
+        del self.buffer[:size]
+        return value
+
+
 class GitSnapshotProvider(object):
     def __init__(self, repo_path, timeout=30, fetch_remote=None,
                  performance=None):
@@ -49,15 +108,22 @@ class GitSnapshotProvider(object):
         if self.performance is not None:
             self.performance.record_git_subprocess(bytes_read)
 
-    def _run(self, args, check=True):
+    def _run(self, args, check=True, strip_output=True, raw_output=False):
         output = ""
         try:
             output = subprocess.check_output(
                 ["git", "-C", self.repo_path] + list(args),
                 stderr=subprocess.STDOUT, timeout=self.timeout,
-                universal_newlines=True,
-            ).strip()
-            return output
+                universal_newlines=not raw_output,
+            )
+            if raw_output and isinstance(output, bytes):
+                try:
+                    output = output.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise GitTechnicalFailure(
+                        "git source blob is not UTF-8: {}".format(exc)
+                    )
+            return output.strip() if strip_output else output
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             if check:
                 raise GitTechnicalFailure(str(exc))
@@ -115,7 +181,14 @@ class GitSnapshotProvider(object):
 
     def read_file(self, commit, relative_path):
         relative_path = self._validate_relative_path(relative_path)
-        return self._run(["show", "{}:{}".format(commit, relative_path)])
+        # A source blob is not command-line output.  Preserve every byte that
+        # determines physical line identity, including leading/trailing blank
+        # lines and the final newline.
+        return self._run(
+            ["show", "{}:{}".format(commit, relative_path)],
+            strip_output=False,
+            raw_output=True,
+        )
 
     @staticmethod
     def _validate_relative_path(relative_path):
@@ -124,18 +197,6 @@ class GitSnapshotProvider(object):
                 ".." in relative_path.replace("\\", "/").split("/")):
             raise ValueError("source path must be repository-relative")
         return relative_path
-
-    @staticmethod
-    def _read_exact(stream, size):
-        chunks = []
-        remaining = int(size)
-        while remaining > 0:
-            chunk = stream.read(remaining)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
 
     def read_files(self, commit, relative_paths):
         """Yield source blobs through one persistent ``git cat-file`` process.
@@ -157,12 +218,16 @@ class GitSnapshotProvider(object):
                 ["git", "-C", self.repo_path, "cat-file", "--batch"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+            reader = _DeadlinePipeReader(
+                process.stdout, time.monotonic() + self.timeout
             )
             for path in paths:
                 request = "{}:{}\n".format(commit, path).encode("utf-8")
                 process.stdin.write(request)
                 process.stdin.flush()
-                header = process.stdout.readline()
+                header = reader.read_line()
                 if not header:
                     raise GitTechnicalFailure(
                         "git cat-file batch ended before {}".format(path)
@@ -182,8 +247,9 @@ class GitSnapshotProvider(object):
                     raise GitTechnicalFailure(
                         "invalid git blob size for source: {}".format(path)
                     )
-                data = self._read_exact(process.stdout, size)
-                if len(data) != size or process.stdout.read(1) != b"\n":
+                data = reader.read_exact(size)
+                separator = reader.read_exact(1)
+                if len(data) != size or separator != b"\n":
                     raise GitTechnicalFailure(
                         "truncated git source blob: {}".format(path)
                     )
@@ -194,7 +260,10 @@ class GitSnapshotProvider(object):
                     raise GitTechnicalFailure(
                         "source blob is not UTF-8: {} ({})".format(path, exc)
                     )
-                yield path, text.strip()
+                # Keep the Git blob byte-for-byte in text form.  The parser,
+                # diff hunk mapper, and database line numbers all use the
+                # physical lines represented by this string.
+                yield path, text
             try:
                 process.stdin.close()
             except (OSError, ValueError):
@@ -268,14 +337,22 @@ class GitSnapshotProvider(object):
             candidates[kind].setdefault(symbol, set()).add(str(path))
 
         for path, text in self.read_files(commit, source_paths):
-            for match in _FUNCTION_CANDIDATE.finditer(text):
-                add("functions", match.group(1), path)
-            for match in _MACRO_CANDIDATE.finditer(text):
-                add("macros", match.group(1), path)
+            # All three pre-indexes operate on the same translation-phase
+            # logical source.  They are recall-only hints; CppSourceAnalyzer
+            # remains the authority.  Keeping this shared and deliberately
+            # broad is what makes line-spliced declarations and definitions
+            # impossible to lose in a lexical shortcut.
             logical_lines = CppLexer._logical_lines(
                 str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n")
             )
+            logical_source = "\n".join(
+                logical_line for _, _, logical_line in logical_lines
+            )
+            for match in _FUNCTION_CANDIDATE.finditer(logical_source):
+                add("functions", match.group(1), path)
             for _, _, logical_line in logical_lines:
+                for match in _MACRO_CANDIDATE.finditer(logical_line):
+                    add("macros", match.group(1), path)
                 for declaration in _CONSTANT_DECLARATION.finditer(logical_line):
                     # Recall every identifier in a const declaration.  The
                     # canonical parser decides which one is the variable;

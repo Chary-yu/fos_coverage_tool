@@ -3,13 +3,16 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
 from app.inheritance.cpp_parser import CppSourceAnalyzer
 from app.inheritance.engine import InheritanceEngine
 from app.inheritance.dependencies import LazySourceAnalysisIndex, SourceAnalysisIndex
-from app.inheritance.git_snapshot import GitSnapshotProvider
+from app.inheritance.git_snapshot import (
+    GitSnapshotProvider, GitTechnicalFailure, _DeadlinePipeReader,
+)
 from app.inheritance.line_map import GitLineMapEngine
 from app.inheritance.normalizer import CppLexer, normalize_cpp
 from app.scan_import.publication import ScanPublicationService
@@ -540,10 +543,15 @@ class InheritanceEngineTest(unittest.TestCase):
         sources = {
             "src/constants.hpp": (
                 "constexpr int " + "\\" + "\n"
-                "FEATURE_FLAG = 1;\n"
+                "FEATURE_FLAG = {{1}};\n"
                 "const int ORDINARY_FLAG = 2;\n"
                 "const {} QUALIFIED_FLAG = 3;\n"
-                "#define MACRO_FLAG 1\n"
+                "#define " + "\\" + "\n"
+                "MACRO_FLAG 1\n"
+                "int line_spliced" + "\\" + "\n"
+                "function() {{ return 0; }}\n"
+                "int ordinary_split\n"
+                "function_two() {{ return 0; }}\n"
             ).format(long_type),
         }
         provider = GitSnapshotProvider("/candidate-index-repo")
@@ -569,10 +577,77 @@ class InheritanceEngineTest(unittest.TestCase):
                 candidates["constants"].get(name, ()),
                 "{} was not recalled by constant candidate index".format(name),
             )
+        for function in analysis["functions"]:
+            self.assertIn(
+                "src/constants.hpp",
+                candidates["functions"].get(function.identity.name, ()),
+                "{} was not recalled by function candidate index".format(
+                    function.identity.name
+                ),
+            )
         self.assertIn(
             "src/constants.hpp",
             candidates["macros"].get("MACRO_FLAG", ()),
         )
+
+    def test_git_source_reads_preserve_physical_line_identity(self):
+        """Git blob APIs must not trim lines before parser/diff mapping."""
+        root = tempfile.TemporaryDirectory(prefix="git-line-identity-")
+        try:
+            source_path = os.path.join(root.name, "src", "lines.cpp")
+            os.makedirs(os.path.dirname(source_path))
+            source = (
+                "\r\n\r\n"
+                "int caller() {\r\n"
+                "  if (FEATURE_FLAG) {\r\n"
+                "    return helper();\r\n"
+                "  }\r\n"
+                "}\r\n"
+                "\r\n"
+            )
+            with open(source_path, "wb") as stream:
+                stream.write(source.encode("utf-8"))
+            subprocess.check_call(["git", "init", "-q", root.name])
+            subprocess.check_call([
+                "git", "-C", root.name, "config", "user.email",
+                "test@example.invalid",
+            ])
+            subprocess.check_call([
+                "git", "-C", root.name, "config", "user.name",
+                "line-identity-test",
+            ])
+            subprocess.check_call(["git", "-C", root.name, "add", "."])
+            subprocess.check_call([
+                "git", "-C", root.name, "commit", "-qm", "line identity",
+            ])
+            commit = subprocess.check_output(
+                ["git", "-C", root.name, "rev-parse", "HEAD"],
+                universal_newlines=True,
+            ).strip()
+            provider = GitSnapshotProvider(root.name)
+            self.assertEqual(provider.read_file(commit, "src/lines.cpp"), source)
+            self.assertEqual(
+                list(provider.read_files(commit, ["src/lines.cpp"])),
+                [("src/lines.cpp", source)],
+            )
+            analysis = CppSourceAnalyzer().analyze(source, "src/lines.cpp")
+            self.assertEqual(analysis["functions"][0].start_line, 3)
+            self.assertIn("helper", analysis["calls"].get(5, ()))
+            self.assertTrue(analysis["controls"].get(5))
+        finally:
+            root.cleanup()
+
+    def test_batch_reader_deadline_covers_header_wait(self):
+        """A silent cat-file child must fail instead of blocking forever."""
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(read_fd, "rb", 0)
+        try:
+            reader = _DeadlinePipeReader(stream, time.monotonic() + 0.02)
+            with self.assertRaises(GitTechnicalFailure):
+                reader.read_line()
+        finally:
+            os.close(write_fd)
+            stream.close()
 
     def test_line_spliced_constant_candidate_cannot_hide_changed_dependency(self):
         """A changed constexpr on a logical line must block inheritance."""
