@@ -83,7 +83,7 @@ def fetchone(connection, sql: str, params: Iterable[Any] = ()) -> Optional[Dict[
         collector = _collector_for(connection)
         if collector is not None and not getattr(
                 cursor, "_performance_instrumented", False):
-            collector.record_db_rows(1 if row is not None else 0)
+            collector.record_db_rows_read(1 if row is not None else 0)
         return row_to_dict(cursor, row)
     finally:
         cursor.close()
@@ -96,7 +96,7 @@ def fetchall(connection, sql: str, params: Iterable[Any] = ()):
         collector = _collector_for(connection)
         if collector is not None and not getattr(
                 cursor, "_performance_instrumented", False):
-            collector.record_db_rows(len(rows))
+            collector.record_db_rows_read(len(rows))
         return [row_to_dict(cursor, row) for row in rows]
     finally:
         cursor.close()
@@ -115,7 +115,7 @@ def iter_rows(connection, sql: str, params: Iterable[Any] = (), batch_size=500):
             collector = _collector_for(connection)
             if collector is not None and not getattr(
                     cursor, "_performance_instrumented", False):
-                collector.record_db_rows(len(rows))
+                collector.record_db_rows_read(len(rows))
             for row in rows:
                 yield row_to_dict(cursor, row) if not isinstance(row, dict) else dict(row)
     finally:

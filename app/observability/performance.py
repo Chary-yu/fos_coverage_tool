@@ -10,6 +10,7 @@ from __future__ import absolute_import
 
 import hashlib
 import json
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -77,8 +78,10 @@ class InstrumentedCursor(object):
             result = getattr(self._cursor, method)(*args, **kwargs)
             collector = self._active_collector()
             rowcount = getattr(self._cursor, "rowcount", -1)
-            if collector is not None and int(rowcount or -1) >= 0:
-                collector.record_db_rows(int(rowcount))
+            affected_rows = self._valid_rowcount(rowcount)
+            if (collector is not None and self._is_affected_statement(args) and
+                    affected_rows is not None):
+                collector.record_db_rows_affected(affected_rows)
             return result
         finally:
             collector = self._active_collector()
@@ -93,11 +96,38 @@ class InstrumentedCursor(object):
     def executemany(self, *args, **kwargs):
         return self._query("executemany", *args, **kwargs)
 
+    @staticmethod
+    def _valid_rowcount(rowcount):
+        try:
+            value = int(rowcount)
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 0 else None
+
+    def _is_affected_statement(self, args=()):
+        """Return false for buffered result sets whose rowcount is a read.
+
+        MySQL-compatible buffered cursors may expose SELECT's full row count
+        immediately after ``execute``.  Counting that value as affected rows
+        and then counting ``fetch*`` would double-count the same records.
+        DB-API ``description`` is the portable result-set signal, so only a
+        cursor without a result set contributes execute-time rowcount.
+        """
+        if bool(getattr(self._cursor, "description", None)):
+            return False
+        statement = args[0] if args else ""
+        if isinstance(statement, bytes):
+            statement = statement.decode("utf-8", "ignore")
+        match = re.match(r"\s*(?:/\*.*?\*/\s*)?([A-Za-z]+)", str(statement))
+        return not match or match.group(1).upper() not in (
+            "SELECT", "SHOW", "DESCRIBE", "DESC", "EXPLAIN", "WITH",
+        )
+
     def _rows(self, method, *args, **kwargs):
         rows = getattr(self._cursor, method)(*args, **kwargs)
         collector = self._active_collector()
         if collector is not None:
-            collector.record_db_rows(
+            collector.record_db_rows_read(
                 len(rows) if method != "fetchone" else int(rows is not None)
             )
         return rows
@@ -121,7 +151,7 @@ class InstrumentedCursor(object):
             raise
         collector = self._active_collector()
         if collector is not None:
-            collector.record_db_rows(1)
+            collector.record_db_rows_read(1)
         return row
 
     next = __next__
@@ -201,7 +231,7 @@ def instrument_connection(connection, collector=None):
 
 
 class PerformanceEvidenceCollector(object):
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, release_identity=None, project_id=None, scan_id=None,
                  workload_id="runtime"):
@@ -213,9 +243,14 @@ class PerformanceEvidenceCollector(object):
         self.workload_id = str(workload_id or "runtime")
         self._lock = threading.Lock()
         self._started = time.perf_counter()
+        self._started_at = time.time()
+        self._finished_at = None
+        self._status = "RUNNING"
+        self._error_class = ""
         self._counters = {
             "request_count": 0, "request_bytes": 0, "response_bytes": 0,
-            "db_query_count": 0, "db_rows": 0, "db_time_ms": 0.0,
+            "db_query_count": 0, "db_rows": 0, "db_rows_read": 0,
+            "db_rows_affected": 0, "db_time_ms": 0.0,
             "git_subprocess_count": 0, "git_bytes_read": 0,
             "bytes_read": 0, "bytes_written": 0,
             "cache_hits": 0, "cache_misses": 0, "cache_evictions": 0,
@@ -224,7 +259,9 @@ class PerformanceEvidenceCollector(object):
         }
         self._durations = {}
         self._phase_durations = {}
+        self._scan_evidence = OrderedDict()
         self._completed_scan_evidence = OrderedDict()
+        self._max_scan_evidence = 64
         self._max_completed_scan_evidence = 64
 
     def bind(self, project_id=None, scan_id=None, workload_id=None):
@@ -254,12 +291,25 @@ class PerformanceEvidenceCollector(object):
         with bind_collector(child):
             try:
                 yield child
-            finally:
-                self._merge_child(child)
+            except BaseException as exc:
+                status = (
+                    "INTERRUPTED" if isinstance(
+                        exc, (KeyboardInterrupt, SystemExit, GeneratorExit)
+                    ) else "FAILED"
+                )
+                self._merge_child(child, status=status, error=exc)
+                raise
+            else:
+                self._merge_child(child, status="COMPLETED")
 
-    def _merge_child(self, child):
+    def _merge_child(self, child, status="COMPLETED", error=None):
+        child._finish(status, error)
         child_snapshot = child.snapshot("scan")
         identity = child_snapshot.get("identity") or {}
+        evidence_key = (
+            identity.get("project_id"), identity.get("scan_id"),
+            identity.get("workload_id"), child_snapshot.get("status"),
+        )
         key = (
             identity.get("project_id"), identity.get("scan_id"),
             identity.get("workload_id"),
@@ -280,10 +330,16 @@ class PerformanceEvidenceCollector(object):
                     )
             self._merge_timed_values(self._durations, child_durations)
             self._merge_timed_values(self._phase_durations, child_phases)
-            self._completed_scan_evidence[key] = child_snapshot
-            self._completed_scan_evidence.move_to_end(key)
-            while len(self._completed_scan_evidence) > self._max_completed_scan_evidence:
-                self._completed_scan_evidence.popitem(last=False)
+            self._scan_evidence[evidence_key] = child_snapshot
+            self._scan_evidence.move_to_end(evidence_key)
+            while len(self._scan_evidence) > self._max_scan_evidence:
+                self._scan_evidence.popitem(last=False)
+            if child_snapshot.get("status") == "COMPLETED":
+                self._completed_scan_evidence[key] = child_snapshot
+                self._completed_scan_evidence.move_to_end(key)
+                while (len(self._completed_scan_evidence) >
+                       self._max_completed_scan_evidence):
+                    self._completed_scan_evidence.popitem(last=False)
 
     @staticmethod
     def _merge_timed_values(target, source):
@@ -371,7 +427,18 @@ class PerformanceEvidenceCollector(object):
         self.increment("db_time_ms", float(elapsed_ms or 0.0))
 
     def record_db_rows(self, count):
-        self.increment("db_rows", int(count or 0))
+        """Backward-compatible alias for rows read by repository helpers."""
+        self.record_db_rows_read(count)
+
+    def record_db_rows_read(self, count):
+        value = int(count or 0)
+        self.increment("db_rows_read", value)
+        self.increment("db_rows", value)
+
+    def record_db_rows_affected(self, count):
+        value = int(count or 0)
+        self.increment("db_rows_affected", value)
+        self.increment("db_rows", value)
 
     def record_git_subprocess(self, bytes_read=0):
         self.increment("git_subprocess_count")
@@ -392,6 +459,18 @@ class PerformanceEvidenceCollector(object):
     def record_bytes_read(self, count):
         self.increment("bytes_read", max(0, int(count or 0)))
 
+    def _finish(self, status, error=None):
+        error_class = ""
+        if error is not None:
+            error_class = "{}.{}".format(
+                getattr(error.__class__, "__module__", "builtins"),
+                getattr(error.__class__, "__name__", "Exception"),
+            )[:128]
+        with self._lock:
+            self._status = str(status or "FAILED")
+            self._error_class = error_class
+            self._finished_at = time.time()
+
     def snapshot(self, operation="runtime"):
         with self._lock:
             counters = dict(self._counters)
@@ -400,6 +479,11 @@ class PerformanceEvidenceCollector(object):
             project_id = self.project_id
             scan_id = self.scan_id
             workload_id = self.workload_id
+            status = self._status
+            error_class = self._error_class
+            started_at = self._started_at
+            finished_at = self._finished_at
+            scan_evidence = list(self._scan_evidence.values())
             completed_scans = list(self._completed_scan_evidence.values())
         elapsed_ms = (time.perf_counter() - self._started) * 1000.0
         return {
@@ -412,11 +496,16 @@ class PerformanceEvidenceCollector(object):
                 "workload_id": workload_id,
                 "workload_hash": stable_identity(workload_id),
             },
+            "status": status,
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "error_class": error_class,
             "operation": str(operation or "runtime"),
             "elapsed_ms": elapsed_ms,
             "peak_rss_bytes": _peak_rss_bytes(),
             "counters": counters,
             "durations": durations,
             "scan_phases": phases,
+            "scan_evidence": scan_evidence,
             "completed_scan_evidence": completed_scans,
         }

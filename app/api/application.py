@@ -885,24 +885,28 @@ class VNextApplication(object):
 
                 def import_callback():
                     with self._write_connection() as callback_connection:
-                        try:
-                            return self.runtime.scan_import_coordinator.execute(
-                                callback_connection, import_job_id,
-                                owner_token=import_owner,
-                                fencing_token=import_fence,
-                            )
-                        except Exception as exc:
-                            current_job = self.runtime.jobs.get(
-                                callback_connection, import_job_id
-                            )
-                            if str((current_job or {}).get("state") or "").lower() \
-                                    not in ("failed", "completed"):
-                                self.runtime.scan_import_recovery.record_failure(
-                                    callback_connection, import_job_id, "EXECUTE",
-                                    exc.__class__.__name__, str(exc),
+                        with self.runtime.performance.child_context(
+                                project_id=import_job.get("project_id"),
+                                scan_id=import_job.get("scan_id"),
+                                workload_id="scan-import:{}".format(import_job_id)):
+                            try:
+                                return self.runtime.scan_import_coordinator.execute(
+                                    callback_connection, import_job_id,
+                                    owner_token=import_owner,
                                     fencing_token=import_fence,
                                 )
-                            raise
+                            except Exception as exc:
+                                current_job = self.runtime.jobs.get(
+                                    callback_connection, import_job_id
+                                )
+                                if str((current_job or {}).get("state") or "").lower() \
+                                        not in ("failed", "completed"):
+                                    self.runtime.scan_import_recovery.record_failure(
+                                        callback_connection, import_job_id, "EXECUTE",
+                                        exc.__class__.__name__, str(exc),
+                                        fencing_token=import_fence,
+                                    )
+                                raise
 
                 try:
                     queued_job = self.runtime.job_service.submit(

@@ -8,11 +8,13 @@ import subprocess
 
 
 SOURCE_EXTENSIONS = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx")
-_FUNCTION_CANDIDATE = re.compile(
-    r"\b([A-Za-z_]\w*)\s*\([^;{}]{0,400}\)\s*"
-    r"(?:const\b|noexcept\b|override\b|final\b|[\s&*])*\s*\{",
-    re.MULTILINE,
-)
+# This is intentionally a recall-only lexical hint.  The C++ analyzer remains
+# the authority for deciding whether a match is a function.  In particular,
+# do not add a bounded parameter/signature grammar here: trailing return types,
+# long parameter lists, requires clauses, and qualified/class members must all
+# be able to reach the real parser.  False positives cost parser work; false
+# negatives can turn a same-repository dependency into an external call.
+_FUNCTION_CANDIDATE = re.compile(r"\b([A-Za-z_]\w*)\s*\(", re.MULTILINE)
 _MACRO_CANDIDATE = re.compile(
     r"^\s*#\s*define\s+([A-Za-z_]\w*)", re.MULTILINE
 )

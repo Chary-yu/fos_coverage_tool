@@ -445,6 +445,90 @@ class InheritanceEngineTest(unittest.TestCase):
         self.assertEqual(loaded, ["src/helper.cpp"])
         self.assertGreaterEqual(index.cache_stats()["resolution_cache_entries"], 2)
 
+    def test_candidate_index_is_sound_over_parser_function_corpus(self):
+        """Lexical candidates must recall every function accepted by parser."""
+        sources = {
+            "src/trailing.cpp": (
+                "namespace demo {\n"
+                "class Box {\n"
+                "  auto member(int value) const noexcept -> int {\n"
+                "    return value;\n"
+                "  }\n"
+                "};\n"
+                "}\n"
+            ),
+            "src/long_signature.cpp": (
+                "int long_signature({}) {{\n"
+                "  return 1;\n"
+                "}}\n"
+            ).format(", ".join(
+                "int parameter_{}".format(number) for number in range(90)
+            )),
+            "src/qualified.cpp": (
+                "int qualified(int left, int right) noexcept {\n"
+                "  return left + right;\n"
+                "}\n"
+            ),
+        }
+        provider = GitSnapshotProvider("/candidate-index-repo")
+        with mock.patch.object(
+                provider, "read_file",
+                side_effect=lambda commit, path: sources[path]):
+            candidates = provider.build_symbol_candidate_index(
+                "commit", sorted(sources)
+            )
+
+        analyzer = CppSourceAnalyzer()
+        for path, source in sources.items():
+            analysis = analyzer.analyze(source, path)
+            for function in analysis["functions"]:
+                self.assertIn(
+                    path, candidates["functions"].get(function.identity.name, ()),
+                    "{} was not recalled for {}".format(
+                        function.identity.name, path
+                    ),
+                )
+
+    def test_trailing_return_candidate_cannot_hide_changed_callee(self):
+        """A trailing-return helper remains a same-repository dependency."""
+        analyzer = CppSourceAnalyzer()
+        caller = analyzer.analyze(
+            "int caller() {\n return helper();\n}\n", "src/caller.cpp"
+        )
+        old_helper = analyzer.analyze(
+            "auto helper() -> int {\n return 1;\n}\n", "src/helper.cpp"
+        )
+        new_helper = analyzer.analyze(
+            "auto helper() -> int {\n return 2;\n}\n", "src/helper.cpp"
+        )
+        provider = GitSnapshotProvider("/candidate-index-repo")
+        with mock.patch.object(
+                provider, "read_file",
+                return_value="auto helper() -> int {\n return 1;\n}\n"):
+            candidates = provider.build_symbol_candidate_index(
+                "commit", ["src/helper.cpp"]
+            )
+
+        old_index = LazySourceAnalysisIndex(
+            paths=["src/helper.cpp"],
+            loader=lambda path: (old_helper, 1024),
+            analyses={"src/caller.cpp": caller},
+            candidate_index=candidates,
+        )
+        new_index = LazySourceAnalysisIndex(
+            paths=["src/helper.cpp"],
+            loader=lambda path: (new_helper, 1024),
+            analyses={"src/caller.cpp": caller},
+            candidate_index=candidates,
+        )
+        result = InheritanceEngine().compare_line(
+            " return helper();", " return helper();",
+            caller, caller, 2, 2,
+            old_index=old_index, new_index=new_index,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "CALLEE_CHANGED")
+
     def test_engine_wires_lightweight_candidate_index_before_parser_loading(self):
         class Provider(object):
             repo_path = "/candidate-index-repo"

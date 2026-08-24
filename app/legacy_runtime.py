@@ -33,9 +33,17 @@ class _LegacyRuntimeModule(ModuleType):
             return ModuleType.__setattr__(self, name, value)
         return _adapter.set_legacy_attribute(name, value)
 
+    def __getattr__(self, name):
+        """Resolve old-only symbols without relying on PEP 562.
 
-def __getattr__(name):
-    return getattr(_adapter, name)
+        ``app.legacy_runtime`` is also imported by the Python 3.6 support
+        lane.  Module-level ``__getattr__`` was introduced in Python 3.7;
+        putting the read proxy on the ``ModuleType`` subclass keeps lazy
+        compatibility reads working on both runtimes.
+        """
+        if name.startswith("__"):
+            raise AttributeError(name)
+        return getattr(_adapter, name)
 
 
 _module = sys.modules.get(__name__)

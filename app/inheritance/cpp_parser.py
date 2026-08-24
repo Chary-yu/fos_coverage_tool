@@ -222,7 +222,8 @@ class CppSourceAnalyzer(object):
 
     @staticmethod
     def _looks_uncertain(prefix):
-        return any(token in prefix for token in ("<", ">", "operator", "->*"))
+        tokens = set(str(prefix or "").split())
+        return bool(tokens.intersection(("<", ">", "operator", "->*")))
 
     def _control_context(self, lines, token_lines, line_splices=None):
         context = {}

@@ -18,7 +18,7 @@ from app.scan_import.locks import RepositoryResourceLockService
 from app.scan_import.publication import ScanPublicationService
 from app.time_utils import utc_sql
 from app.inheritance.git_snapshot import GitSnapshotProvider, GitTechnicalFailure
-from app.observability.performance import instrument_connection
+from app.observability.performance import current_collector, instrument_connection
 
 
 class ScanImportCoordinator(object):
@@ -179,22 +179,37 @@ class ScanImportCoordinator(object):
         second hash pass; recovery explicitly requests one verification pass.
         """
         connection = instrument_connection(connection, self.performance)
-        context = self._load_execution_context(
-            connection, job_id, owner_token, fencing_token,
-            verify_artifact=verify_artifact,
-        )
-        payload = context["payload"]
+        active = current_collector()
+
+        def execute_bound(collector=None):
+            context = self._load_execution_context(
+                connection, job_id, owner_token, fencing_token,
+                verify_artifact=verify_artifact,
+            )
+            payload = context["payload"]
+            if collector is not None:
+                collector.bind(
+                    project_id=payload.get("project_id"),
+                    scan_id=context["scan_id"],
+                    workload_id="scan-import:{}".format(context["scan_id"]),
+                )
+            return self._execute_bound(
+                connection, job_id, context, repository_paths,
+                verify_artifact,
+            )
+
+        # A runtime root collector is bound by connection_context.  A
+        # recovery callback may already have opened the scan child before
+        # reclaiming its locks; reuse that child so reclaim and execution are
+        # one lifecycle record instead of nested/fragmented evidence.
+        if (self.performance is not None and active is not None and
+                active is not self.performance):
+            return execute_bound(active)
         if self.performance is not None:
             with self.performance.child_context(
-                    payload.get("project_id"), context["scan_id"],
-                    workload_id="scan-import:{}".format(context["scan_id"])):
-                return self._execute_bound(
-                    connection, job_id, context, repository_paths,
-                    verify_artifact,
-                )
-        return self._execute_bound(
-            connection, job_id, context, repository_paths, verify_artifact,
-        )
+                    workload_id="scan-import:{}".format(job_id)) as collector:
+                return execute_bound(collector)
+        return execute_bound()
 
     def _execute_bound(self, connection, job_id, context,
                        repository_paths=None, verify_artifact=False):

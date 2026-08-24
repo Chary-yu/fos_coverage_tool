@@ -71,6 +71,8 @@ class PerformanceObservabilityTest(unittest.TestCase):
         snapshot = collector.snapshot("fixed-cross-layer-fixture")
         self.assertGreater(snapshot["counters"]["db_query_count"], 0)
         self.assertEqual(snapshot["counters"]["db_rows"], 1)
+        self.assertEqual(snapshot["counters"]["db_rows_read"], 1)
+        self.assertEqual(snapshot["counters"]["db_rows_affected"], 0)
         self.assertGreater(snapshot["counters"]["db_time_ms"], 0)
         self.assertGreater(snapshot["counters"]["git_subprocess_count"], 0)
         self.assertGreater(snapshot["counters"]["git_bytes_read"], 0)
@@ -159,6 +161,25 @@ class PerformanceObservabilityTest(unittest.TestCase):
         }
         self.assertEqual(identities, {(7, 101), (8, 202)})
 
+    def test_failed_scan_evidence_is_not_marked_completed(self):
+        collector = PerformanceEvidenceCollector(
+            {"commit_sha": "g" * 40, "build_id": "build"},
+            workload_id="runtime",
+        )
+        with self.assertRaisesRegex(ValueError, "fixture failure"):
+            with collector.child_context(9, 303, workload_id="scan-303"):
+                collector.increment("db_query_count")
+                raise ValueError("fixture failure")
+
+        evidence = collector.snapshot("runtime")
+        self.assertEqual(len(evidence["completed_scan_evidence"]), 0)
+        self.assertEqual(len(evidence["scan_evidence"]), 1)
+        failed = evidence["scan_evidence"][0]
+        self.assertEqual(failed["status"], "FAILED")
+        self.assertEqual(failed["error_class"], "builtins.ValueError")
+        self.assertEqual(failed["identity"]["scan_id"], 303)
+        self.assertIsNotNone(failed["finished_at"])
+
     def test_instrumented_connection_captures_direct_cursor_writes(self):
         collector = PerformanceEvidenceCollector(
             {"commit_sha": "f" * 40, "build_id": "build"},
@@ -176,7 +197,47 @@ class PerformanceObservabilityTest(unittest.TestCase):
             cursor.close()
         counters = collector.snapshot("cursor-fixture")["counters"]
         self.assertGreaterEqual(counters["db_query_count"], 3)
-        self.assertGreaterEqual(counters["db_rows"], 2)
+        self.assertEqual(counters["db_rows_read"], 2)
+        self.assertEqual(counters["db_rows_affected"], 2)
+        self.assertEqual(counters["db_rows"], 4)
+
+    def test_buffered_select_rowcount_is_not_counted_as_affected_rows(self):
+        class BufferedCursor(object):
+            def __init__(self):
+                self.description = None
+                self.rowcount = -1
+
+            def execute(self, sql):
+                self.description = (("value",),)
+                self.rowcount = 2
+                return self
+
+            def fetchall(self):
+                return [(1,), (2,)]
+
+            def close(self):
+                return None
+
+        class BufferedConnection(object):
+            def __init__(self):
+                self._cursor = BufferedCursor()
+
+            def cursor(self):
+                return self._cursor
+
+        collector = PerformanceEvidenceCollector(
+            {"commit_sha": "h" * 40, "build_id": "build"},
+            workload_id="buffered-select-fixture",
+        )
+        connection = instrument_connection(BufferedConnection(), collector)
+        with bind_collector(collector):
+            cursor = connection.cursor()
+            cursor.execute("SELECT value FROM fixture")
+            self.assertEqual(cursor.fetchall(), [(1,), (2,)])
+        counters = collector.snapshot("buffered-select-fixture")["counters"]
+        self.assertEqual(counters["db_rows_read"], 2)
+        self.assertEqual(counters["db_rows_affected"], 0)
+        self.assertEqual(counters["db_rows"], 2)
 
 
 if __name__ == "__main__":

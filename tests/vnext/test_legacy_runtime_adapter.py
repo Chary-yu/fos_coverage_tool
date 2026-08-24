@@ -76,6 +76,16 @@ class LegacyRuntimeAdapterTest(unittest.TestCase):
             previous.db_manager = old_manager
             legacy.__dict__.pop("db_manager", None)
 
+    def test_legacy_module_class_proxy_reads_old_only_symbols(self):
+        legacy = importlib.import_module("app.legacy_runtime")
+        previous = importlib.import_module(
+            "app.compat.legacy_runtime_previous_release"
+        )
+        self.assertIs(
+            legacy.CoverageHTTPRequestHandler,
+            previous.CoverageHTTPRequestHandler,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
