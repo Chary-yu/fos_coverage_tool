@@ -180,12 +180,21 @@ class InheritanceEngine(object):
         pair_keys = self._active_pairs_by_scope.pop(scope_key, set())
         if not pair_keys:
             return
-        for pair_key in pair_keys:
+        # A single physical repository/commit pair may be referenced by more
+        # than one logical repository scope.  Releasing one scope must not
+        # unpin or evict an index that another scope still needs.
+        remaining_pairs = set(
+            pair_key
+            for pairs in self._active_pairs_by_scope.values()
+            for pair_key in pairs
+        )
+        releasable_pairs = set(pair_keys) - remaining_pairs
+        for pair_key in releasable_pairs:
             self._active_index_pairs.discard(pair_key)
         self._active_source_index_keys = set(
             key for pair in self._active_index_pairs for key in pair
         )
-        for pair_key in pair_keys:
+        for pair_key in releasable_pairs:
             for key in pair_key:
                 if key in self._active_source_index_keys:
                     continue

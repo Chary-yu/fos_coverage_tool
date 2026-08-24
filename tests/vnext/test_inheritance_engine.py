@@ -650,6 +650,64 @@ class InheritanceEngineTest(unittest.TestCase):
             ["a-new", "a-old", "b-new", "b-old"],
         )
 
+    def test_shared_pair_is_released_only_after_last_scope(self):
+        class Provider(object):
+            repo_path = "/shared-repository-scope-repo"
+
+            def __init__(self):
+                self.candidate_builds = []
+
+            def list_source_files(self, commit):
+                return ["src/helper.cpp"]
+
+            def build_symbol_candidate_index(self, commit, paths):
+                self.candidate_builds.append(str(commit))
+                return {
+                    "functions": {"helper": ["src/helper.cpp"]},
+                    "macros": {}, "constants": {},
+                }
+
+            def read_file(self, commit, path):
+                return "int helper() { return 1; }\n"
+
+        provider = Provider()
+        engine = InheritanceEngine(
+            max_source_cache_bytes=1024 * 1024,
+            max_source_cache_total_bytes=1024 * 1024,
+        )
+        engine._metrics = {
+            "parser_cache_hit": 0,
+            "parser_cache_miss": 0,
+            "source_files_total": 0,
+            "parser_file_total": 0,
+        }
+        old_a, new_a, reason = engine._source_index_pair(
+            provider, "same-old", "same-new", scope_key="repo-a"
+        )
+        old_b, new_b, reason = engine._source_index_pair(
+            provider, "same-old", "same-new", scope_key="repo-b"
+        )
+        self.assertEqual(reason, "")
+        self.assertIs(old_a, old_b)
+        self.assertIs(new_a, new_b)
+        old_a.functions("missing")
+        new_a.functions("missing")
+        self.assertEqual(
+            sorted(provider.candidate_builds), ["same-new", "same-old"]
+        )
+        self.assertEqual(len(engine._active_index_pairs), 1)
+        self.assertEqual(len(engine._source_index_cache), 2)
+
+        engine._release_index_pairs_for_scope("repo-a")
+        self.assertEqual(len(engine._active_index_pairs), 1)
+        self.assertEqual(len(engine._active_source_index_keys), 2)
+        self.assertEqual(len(engine._source_index_cache), 2)
+
+        engine._release_index_pairs_for_scope("repo-b")
+        self.assertEqual(len(engine._active_index_pairs), 0)
+        self.assertEqual(len(engine._active_source_index_keys), 0)
+        self.assertEqual(len(engine._source_index_cache), 0)
+
     def test_candidate_index_is_sound_over_parser_function_corpus(self):
         """Lexical candidates must recall every function accepted by parser."""
         sources = {
