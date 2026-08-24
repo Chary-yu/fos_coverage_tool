@@ -3,6 +3,7 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -448,6 +449,81 @@ class InheritanceEngineTest(unittest.TestCase):
         self.assertEqual(loaded, ["src/helper.cpp"])
         self.assertGreaterEqual(index.cache_stats()["resolution_cache_entries"], 2)
 
+    def test_index_cache_stats_include_candidate_and_resolution_bytes(self):
+        analyzer = CppSourceAnalyzer()
+        helper = analyzer.analyze(
+            "int helper() { return 1; }\n", "src/helper.cpp"
+        )
+        index = LazySourceAnalysisIndex(
+            paths=["src/helper.cpp"],
+            loader=lambda path: (helper, 1024),
+            candidate_index={
+                "functions": {"helper": ["src/helper.cpp"]},
+                "macros": {}, "constants": {},
+            },
+            max_cached_bytes=4096,
+        )
+        before = index.cache_stats()
+        self.assertEqual(before["candidate_index_entries"], 1)
+        self.assertGreater(before["candidate_index_bytes"], 0)
+        self.assertEqual(before["resolution_cache_bytes"], 0)
+        self.assertEqual(
+            before["total_index_bytes"],
+            before["cache_bytes"] + before["candidate_index_bytes"],
+        )
+
+        self.assertEqual(len(index.functions("helper")), 1)
+        after = index.cache_stats()
+        self.assertGreater(after["resolution_cache_bytes"], 0)
+        self.assertEqual(
+            after["total_index_bytes"],
+            after["cache_bytes"] + after["candidate_index_bytes"] +
+            after["resolution_cache_bytes"],
+        )
+
+    def test_engine_outer_budget_accounts_for_candidate_index_bytes(self):
+        class Provider(object):
+            repo_path = "/candidate-cache-repo"
+
+            def list_source_files(self, commit):
+                return ["src/helper.cpp"]
+
+            def build_symbol_candidate_index(self, commit, paths):
+                return {
+                    "functions": {"helper": ["src/helper.cpp"]},
+                    "macros": {}, "constants": {},
+                }
+
+            def read_file(self, commit, path):
+                return "int helper() { return 1; }\n"
+
+        provider = Provider()
+        engine = InheritanceEngine(
+            max_source_cache_bytes=1024 * 1024,
+            max_source_cache_total_bytes=1024 * 1024 * 2,
+        )
+        engine._metrics = {
+            "parser_cache_hit": 0,
+            "parser_cache_miss": 0,
+            "source_files_total": 0,
+            "parser_file_total": 0,
+        }
+        first = engine._source_index(provider, "commit-one")
+        self.assertEqual(len(first.functions("helper")), 1)
+        first_total = first.cache_stats()["total_index_bytes"]
+        self.assertGreater(
+            first.cache_stats()["candidate_index_bytes"], 0
+        )
+        self.assertEqual(engine._source_index_cache_bytes, first_total)
+
+        engine.max_source_cache_total_bytes = first_total + 1
+        second = engine._source_index(provider, "commit-two")
+        self.assertEqual(len(second.functions("helper")), 1)
+        self.assertEqual(len(engine._source_index_cache), 1)
+        self.assertEqual(engine._source_index_cache_bytes,
+                         second.cache_stats()["total_index_bytes"])
+        self.assertEqual(engine._metrics["source_index_evictions"], 1)
+
     def test_candidate_index_is_sound_over_parser_function_corpus(self):
         """Lexical candidates must recall every function accepted by parser."""
         sources = {
@@ -642,12 +718,46 @@ class InheritanceEngineTest(unittest.TestCase):
         read_fd, write_fd = os.pipe()
         stream = os.fdopen(read_fd, "rb", 0)
         try:
-            reader = _DeadlinePipeReader(stream, time.monotonic() + 0.02)
+            reader = _DeadlinePipeReader(stream, 0.02)
             with self.assertRaises(GitTechnicalFailure):
                 reader.read_line()
         finally:
             os.close(write_fd)
             stream.close()
+
+    def test_batch_reader_refreshes_deadline_after_progress(self):
+        """A long batch with regular output must not hit a total-time cap."""
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(read_fd, "rb", 0)
+        chunks = [
+            "chunk-{}\n".format(number).encode("ascii")
+            for number in range(4)
+        ]
+
+        def write_chunks():
+            try:
+                for index, chunk in enumerate(chunks):
+                    os.write(write_fd, chunk)
+                    if index + 1 < len(chunks):
+                        time.sleep(0.025)
+            finally:
+                os.close(write_fd)
+
+        writer = threading.Thread(target=write_chunks)
+        writer.start()
+        try:
+            reader = _DeadlinePipeReader(stream, 0.05)
+            started = time.monotonic()
+            self.assertEqual(
+                reader.read_exact(sum(len(chunk) for chunk in chunks)),
+                b"".join(chunks),
+            )
+            self.assertGreater(time.monotonic() - started, 0.05)
+        finally:
+            stream.close()
+            writer.join(timeout=1)
+            if writer.is_alive():
+                self.fail("batch writer did not terminate")
 
     def test_line_spliced_constant_candidate_cannot_hide_changed_dependency(self):
         """A changed constexpr on a logical line must block inheritance."""

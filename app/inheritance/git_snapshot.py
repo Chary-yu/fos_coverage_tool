@@ -40,12 +40,13 @@ class GitTechnicalFailure(RuntimeError):
 
 
 class _DeadlinePipeReader(object):
-    """Read a Git batch pipe without allowing a stalled child to hang us."""
+    """Read a Git batch pipe with an inactivity timeout."""
 
-    def __init__(self, stream, deadline):
+    def __init__(self, stream, idle_timeout):
         self.stream = stream
         self.file_descriptor = stream.fileno()
-        self.deadline = float(deadline)
+        self.idle_timeout = max(0.0, float(idle_timeout))
+        self.deadline = time.monotonic() + self.idle_timeout
         self.buffer = bytearray()
 
     def _fill(self):
@@ -71,6 +72,10 @@ class _DeadlinePipeReader(object):
         if not chunk:
             return False
         self.buffer.extend(chunk)
+        # A batch may legitimately take longer than one idle interval when it
+        # keeps making progress.  Only a period with no bytes from Git is a
+        # timeout; there is no fixed wall-clock cutoff for the whole batch.
+        self.deadline = time.monotonic() + self.idle_timeout
         return True
 
     def read_line(self):
@@ -221,7 +226,7 @@ class GitSnapshotProvider(object):
                 bufsize=0,
             )
             reader = _DeadlinePipeReader(
-                process.stdout, time.monotonic() + self.timeout
+                process.stdout, self.timeout
             )
             for path in paths:
                 request = "{}:{}\n".format(commit, path).encode("utf-8")

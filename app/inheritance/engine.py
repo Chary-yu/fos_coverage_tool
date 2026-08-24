@@ -77,9 +77,20 @@ class InheritanceEngine(object):
         count = len(self._source_index_cache)
         total = int(self._source_index_cache_bytes)
         evictions = int(self._source_index_cache_evictions)
+        candidate_bytes = 0
+        candidate_entries = 0
+        resolution_bytes = 0
+        for index in self._source_index_cache.values():
+            stats = index.cache_stats() or {}
+            candidate_bytes += int(stats.get("candidate_index_bytes") or 0)
+            candidate_entries += int(stats.get("candidate_index_entries") or 0)
+            resolution_bytes += int(stats.get("resolution_cache_bytes") or 0)
         self._metrics["source_index_count"] = count
         self._metrics["source_index_total_bytes"] = total
         self._metrics["source_index_evictions"] = evictions
+        self._metrics["candidate_index_entries"] = candidate_entries
+        self._metrics["candidate_index_bytes"] = candidate_bytes
+        self._metrics["resolution_cache_bytes"] = resolution_bytes
         # Keep the compact names as well; these are the stable cache evidence
         # fields consumed by operators without exposing source paths.
         self._metrics["index_count"] = count
@@ -90,10 +101,17 @@ class InheritanceEngine(object):
         self._metrics["ancestry_cache_count"] = len(self._ancestry_cache)
         self._metrics["ancestry_cache_evictions"] = int(self._ancestry_cache_evictions)
 
+    @staticmethod
+    def _source_index_bytes(index):
+        stats = index.cache_stats() or {}
+        # ``cache_bytes`` is retained as the parsed-analysis compatibility
+        # field.  The outer LRU must account for every index-owned structure.
+        return int(stats.get("total_index_bytes", stats.get("cache_bytes")) or 0)
+
     def _source_index_changed(self, key, index):
         if key not in self._source_index_cache:
             return
-        current = int((index.cache_stats() or {}).get("cache_bytes") or 0)
+        current = self._source_index_bytes(index)
         previous = int(self._source_index_cache_sizes.get(key) or 0)
         self._source_index_cache_sizes[key] = current
         self._source_index_cache_bytes += current - previous
@@ -801,9 +819,7 @@ class InheritanceEngine(object):
             ),
         )
         self._source_index_cache[key] = index
-        self._source_index_cache_sizes[key] = int(
-            (index.cache_stats() or {}).get("cache_bytes") or 0
-        )
+        self._source_index_cache_sizes[key] = self._source_index_bytes(index)
         self._source_index_cache_bytes += self._source_index_cache_sizes[key]
         self._source_index_changed(key, index)
         return index

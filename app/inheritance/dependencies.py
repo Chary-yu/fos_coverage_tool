@@ -11,6 +11,7 @@ from __future__ import absolute_import
 
 import hashlib
 import re
+import sys
 from collections import OrderedDict
 
 from app.inheritance.normalizer import normalize_cpp
@@ -97,11 +98,21 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
         self._candidate_index = self._normalize_candidate_index(candidate_index)
         self._candidate_index_loader = candidate_index_loader
         self._candidate_index_ready = candidate_index is not None
+        self._candidate_index_entries = (
+            self._count_candidate_index_entries(self._candidate_index)
+            if self._candidate_index_ready else 0
+        )
+        self._candidate_index_bytes = (
+            self._estimate_structure_size(self._candidate_index)
+            if self._candidate_index_ready else 0
+        )
         self.candidate_index_unavailable = False
         self._max_resolution_cache_entries = max(
             1, int(max_resolution_cache_entries)
         )
         self._resolution_cache = OrderedDict()
+        self._resolution_cache_sizes = {}
+        self._resolution_cache_bytes = 0
         self._resolution_cache_evictions = 0
         self.budget_exhausted = False
         super(LazySourceAnalysisIndex, self).__init__(analyses=analyses or {})
@@ -134,6 +145,61 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
                 )))
         return result
 
+    @staticmethod
+    def _count_candidate_index_entries(value):
+        return sum(
+            len(paths)
+            for source in (value or {}).values()
+            for paths in (source or {}).values()
+        )
+
+    @staticmethod
+    def _estimate_structure_size(value, seen=None):
+        """Estimate container/string memory, including Python object overhead."""
+        seen = seen if seen is not None else set()
+        identity = id(value)
+        if identity in seen:
+            return 0
+        seen.add(identity)
+        try:
+            size = sys.getsizeof(value)
+        except TypeError:
+            size = 0
+        if isinstance(value, dict):
+            size += sum(
+                LazySourceAnalysisIndex._estimate_structure_size(item, seen)
+                for pair in value.items() for item in pair
+            )
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            size += sum(
+                LazySourceAnalysisIndex._estimate_structure_size(item, seen)
+                for item in value
+            )
+        elif isinstance(value, (str, bytes)):
+            # ``getsizeof`` is authoritative for these leaf objects.  Keep a
+            # serialized lower bound for alternate Python implementations.
+            try:
+                size = max(size, len(value if isinstance(value, bytes)
+                                   else value.encode("utf-8")))
+            except (TypeError, UnicodeEncodeError):
+                pass
+        return max(1, int(size))
+
+    def _record_index_cache_metrics(self):
+        self._metrics["candidate_index_entries"] = int(
+            self._candidate_index_entries
+        )
+        self._metrics["candidate_index_bytes"] = int(
+            self._candidate_index_bytes
+        )
+        self._metrics["resolution_cache_bytes"] = int(
+            self._resolution_cache_bytes
+        )
+        self._metrics["total_index_bytes"] = int(
+            self._cached_bytes + self._candidate_index_bytes +
+            self._resolution_cache_bytes
+        )
+
     def _ensure_candidate_index(self):
         if self._candidate_index_ready:
             return
@@ -145,9 +211,17 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
             if not isinstance(loaded, dict):
                 raise ValueError("candidate index must be a mapping")
             self._candidate_index = self._normalize_candidate_index(loaded)
+            self._candidate_index_entries = self._count_candidate_index_entries(
+                self._candidate_index
+            )
+            self._candidate_index_bytes = self._estimate_structure_size(
+                self._candidate_index
+            )
             self._metrics["source_candidate_index_builds"] = (
                 int(self._metrics.get("source_candidate_index_builds") or 0) + 1
             )
+            self._record_index_cache_metrics()
+            self._notify_cache_change()
         except Exception:
             # A lightweight candidate index is an optimization, but an
             # unavailable index must never turn an unknown dependency into an
@@ -172,12 +246,20 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
         self._ensure_candidate_index()
         paths = tuple(self._candidate_index.get(str(kind), {}).get(str(name), ()))
         self._resolution_cache[key] = paths
+        entry_size = self._estimate_structure_size((key, paths))
+        self._resolution_cache_sizes[key] = entry_size
+        self._resolution_cache_bytes += entry_size
         while len(self._resolution_cache) > self._max_resolution_cache_entries:
-            self._resolution_cache.popitem(last=False)
+            evicted_key, _ = self._resolution_cache.popitem(last=False)
+            self._resolution_cache_bytes -= int(
+                self._resolution_cache_sizes.pop(evicted_key, 0)
+            )
             self._resolution_cache_evictions += 1
         self._metrics["dependency_candidate_paths"] = (
             int(self._metrics.get("dependency_candidate_paths") or 0) + len(paths)
         )
+        self._record_index_cache_metrics()
+        self._notify_cache_change()
         return paths
 
     @staticmethod
@@ -251,6 +333,7 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
             int(self._metrics.get("source_files_loaded") or 0) + 1
         )
         self._metrics["source_cache_bytes"] = self._cached_bytes
+        self._record_index_cache_metrics()
         self._notify_cache_change()
         return True
 
@@ -299,14 +382,23 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
         return [(local_analysis.get("path") or "", definitions)] if definitions else []
 
     def cache_stats(self):
+        self._record_index_cache_metrics()
         return {
             "cached_files": len(self._cache),
             "cache_bytes": int(self._cached_bytes),
+            "parsed_cache_bytes": int(self._cached_bytes),
             "max_cached_bytes": int(self._max_cached_bytes),
+            "candidate_index_entries": int(self._candidate_index_entries),
+            "candidate_index_bytes": int(self._candidate_index_bytes),
             "budget_exhausted": bool(self.budget_exhausted),
             "candidate_index_ready": bool(self._candidate_index_ready),
             "candidate_index_unavailable": bool(self.candidate_index_unavailable),
             "resolution_cache_entries": len(self._resolution_cache),
+            "resolution_cache_bytes": int(self._resolution_cache_bytes),
+            "total_index_bytes": int(
+                self._cached_bytes + self._candidate_index_bytes +
+                self._resolution_cache_bytes
+            ),
             "resolution_cache_evictions": int(self._resolution_cache_evictions),
         }
 
