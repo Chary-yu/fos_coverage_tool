@@ -6,6 +6,8 @@ import os
 import re
 import subprocess
 
+from app.inheritance.normalizer import CppLexer
+
 
 SOURCE_EXTENSIONS = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx")
 # This is intentionally a recall-only lexical hint.  The C++ analyzer remains
@@ -18,9 +20,11 @@ _FUNCTION_CANDIDATE = re.compile(r"\b([A-Za-z_]\w*)\s*\(", re.MULTILINE)
 _MACRO_CANDIDATE = re.compile(
     r"^\s*#\s*define\s+([A-Za-z_]\w*)", re.MULTILINE
 )
-_CONSTANT_CANDIDATE = re.compile(
-    r"\b(?:const|constexpr)\b[^;{}\n]{0,200}\b([A-Za-z_]\w*)\s*(?:=|;)",
-    re.MULTILINE,
+_CONSTANT_DECLARATION = re.compile(
+    r"\b(?:const|constexpr)\b[^;{}]*(?:;|$)", re.MULTILINE
+)
+_IDENTIFIER = re.compile(
+    r"\b([A-Za-z_]\w*)\b"
 )
 _NON_FUNCTION_SYMBOLS = frozenset((
     "if", "for", "while", "switch", "catch", "return", "sizeof",
@@ -110,9 +114,128 @@ class GitSnapshotProvider(object):
         return self._run(["show", "-s", "--format=%D", str(commit)], check=False)
 
     def read_file(self, commit, relative_path):
-        if os.path.isabs(str(relative_path)) or ".." in str(relative_path).replace("\\", "/").split("/"):
-            raise ValueError("source path must be repository-relative")
+        relative_path = self._validate_relative_path(relative_path)
         return self._run(["show", "{}:{}".format(commit, relative_path)])
+
+    @staticmethod
+    def _validate_relative_path(relative_path):
+        relative_path = str(relative_path)
+        if (os.path.isabs(relative_path) or
+                ".." in relative_path.replace("\\", "/").split("/")):
+            raise ValueError("source path must be repository-relative")
+        return relative_path
+
+    @staticmethod
+    def _read_exact(stream, size):
+        chunks = []
+        remaining = int(size)
+        while remaining > 0:
+            chunk = stream.read(remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+
+    def read_files(self, commit, relative_paths):
+        """Yield source blobs through one persistent ``git cat-file`` process.
+
+        ``git show COMMIT:path`` is convenient for one file but starts a
+        process for every path.  The batch protocol keeps one Git subprocess
+        alive while the caller still receives one decoded file at a time, so
+        lexical indexing does not trade parser amplification for process
+        amplification or unbounded source materialization.
+        """
+        paths = [self._validate_relative_path(path)
+                 for path in (relative_paths or ())]
+        if not paths:
+            return
+        process = None
+        total_bytes = 0
+        try:
+            process = subprocess.Popen(
+                ["git", "-C", self.repo_path, "cat-file", "--batch"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            for path in paths:
+                request = "{}:{}\n".format(commit, path).encode("utf-8")
+                process.stdin.write(request)
+                process.stdin.flush()
+                header = process.stdout.readline()
+                if not header:
+                    raise GitTechnicalFailure(
+                        "git cat-file batch ended before {}".format(path)
+                    )
+                fields = header.rstrip(b"\n").split()
+                if len(fields) >= 2 and fields[1] == b"missing":
+                    raise GitTechnicalFailure(
+                        "source blob is unavailable: {}".format(path)
+                    )
+                if len(fields) != 3 or fields[1] != b"blob":
+                    raise GitTechnicalFailure(
+                        "unexpected git object for source: {}".format(path)
+                    )
+                try:
+                    size = int(fields[2])
+                except (TypeError, ValueError):
+                    raise GitTechnicalFailure(
+                        "invalid git blob size for source: {}".format(path)
+                    )
+                data = self._read_exact(process.stdout, size)
+                if len(data) != size or process.stdout.read(1) != b"\n":
+                    raise GitTechnicalFailure(
+                        "truncated git source blob: {}".format(path)
+                    )
+                total_bytes += size
+                try:
+                    text = data.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise GitTechnicalFailure(
+                        "source blob is not UTF-8: {} ({})".format(path, exc)
+                    )
+                yield path, text.strip()
+            try:
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass
+            try:
+                return_code = process.wait(timeout=self.timeout)
+            except subprocess.TimeoutExpired as exc:
+                process.kill()
+                process.wait()
+                raise GitTechnicalFailure(
+                    "git cat-file batch timed out"
+                ) from exc
+            if return_code:
+                error = process.stderr.read().decode("utf-8", "replace").strip()
+                raise GitTechnicalFailure(
+                    "git cat-file batch failed: {}".format(error or return_code)
+                )
+        except BaseException:
+            if process is not None and process.poll() is None:
+                process.kill()
+            raise
+        finally:
+            if process is not None:
+                try:
+                    if process.stdin and not process.stdin.closed:
+                        process.stdin.close()
+                except (OSError, ValueError):
+                    pass
+                if process.poll() is None:
+                    process.kill()
+                try:
+                    process.wait(timeout=self.timeout)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+                for stream in (process.stdout, process.stderr):
+                    try:
+                        if stream and not stream.closed:
+                            stream.close()
+                    except (OSError, ValueError):
+                        pass
+            self._record_git(total_bytes)
 
     def list_source_files(self, commit):
         """List the repository C/C++ universe for dependency resolution."""
@@ -144,14 +267,23 @@ class GitSnapshotProvider(object):
                 return
             candidates[kind].setdefault(symbol, set()).add(str(path))
 
-        for path in source_paths:
-            text = self.read_file(commit, path)
+        for path, text in self.read_files(commit, source_paths):
             for match in _FUNCTION_CANDIDATE.finditer(text):
                 add("functions", match.group(1), path)
             for match in _MACRO_CANDIDATE.finditer(text):
                 add("macros", match.group(1), path)
-            for match in _CONSTANT_CANDIDATE.finditer(text):
-                add("constants", match.group(1), path)
+            logical_lines = CppLexer._logical_lines(
+                str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            )
+            for _, _, logical_line in logical_lines:
+                for declaration in _CONSTANT_DECLARATION.finditer(logical_line):
+                    # Recall every identifier in a const declaration.  The
+                    # canonical parser decides which one is the variable;
+                    # broad recall is deliberate because a lexical shortcut
+                    # must not invent a false negative for qualified types,
+                    # line splices, or long declarations.
+                    for identifier in _IDENTIFIER.finditer(declaration.group(0)):
+                        add("constants", identifier.group(1), path)
         return {
             kind: {name: sorted(paths) for name, paths in values.items()}
             for kind, values in candidates.items()

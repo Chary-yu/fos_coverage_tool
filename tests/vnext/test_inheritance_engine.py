@@ -472,8 +472,10 @@ class InheritanceEngineTest(unittest.TestCase):
         }
         provider = GitSnapshotProvider("/candidate-index-repo")
         with mock.patch.object(
-                provider, "read_file",
-                side_effect=lambda commit, path: sources[path]):
+                provider, "read_files",
+                side_effect=lambda commit, paths: (
+                    (path, sources[path]) for path in paths
+                )):
             candidates = provider.build_symbol_candidate_index(
                 "commit", sorted(sources)
             )
@@ -503,8 +505,11 @@ class InheritanceEngineTest(unittest.TestCase):
         )
         provider = GitSnapshotProvider("/candidate-index-repo")
         with mock.patch.object(
-                provider, "read_file",
-                return_value="auto helper() -> int {\n return 1;\n}\n"):
+                provider, "read_files",
+                return_value=[(
+                    "src/helper.cpp",
+                    "auto helper() -> int {\n return 1;\n}\n",
+                )]):
             candidates = provider.build_symbol_candidate_index(
                 "commit", ["src/helper.cpp"]
             )
@@ -528,6 +533,130 @@ class InheritanceEngineTest(unittest.TestCase):
         )
         self.assertFalse(result.ok)
         self.assertEqual(result.reason_code, "CALLEE_CHANGED")
+
+    def test_constant_candidate_index_is_sound_over_parser_corpus(self):
+        """Const candidates recall logical-line and long-type definitions."""
+        long_type = "::".join(["ns"] * 90 + ["Type"])
+        sources = {
+            "src/constants.hpp": (
+                "constexpr int " + "\\" + "\n"
+                "FEATURE_FLAG = 1;\n"
+                "const int ORDINARY_FLAG = 2;\n"
+                "const {} QUALIFIED_FLAG = 3;\n"
+                "#define MACRO_FLAG 1\n"
+            ).format(long_type),
+        }
+        provider = GitSnapshotProvider("/candidate-index-repo")
+        with mock.patch.object(
+                provider, "read_files",
+                side_effect=lambda commit, paths: (
+                    (path, sources[path]) for path in paths
+                )):
+            candidates = provider.build_symbol_candidate_index(
+                "commit", sorted(sources)
+            )
+
+        analysis = CppSourceAnalyzer().analyze(
+            sources["src/constants.hpp"], "src/constants.hpp"
+        )
+        self.assertEqual(
+            set(analysis["constants"]),
+            {"FEATURE_FLAG", "ORDINARY_FLAG", "QUALIFIED_FLAG"},
+        )
+        for name in analysis["constants"]:
+            self.assertIn(
+                "src/constants.hpp",
+                candidates["constants"].get(name, ()),
+                "{} was not recalled by constant candidate index".format(name),
+            )
+        self.assertIn(
+            "src/constants.hpp",
+            candidates["macros"].get("MACRO_FLAG", ()),
+        )
+
+    def test_line_spliced_constant_candidate_cannot_hide_changed_dependency(self):
+        """A changed constexpr on a logical line must block inheritance."""
+        analyzer = CppSourceAnalyzer()
+        caller = analyzer.analyze(
+            "int caller() {\n return FEATURE_FLAG;\n}\n",
+            "src/caller.cpp",
+        )
+        old_source = "constexpr int " + "\\" + "\nFEATURE_FLAG = 1;\n"
+        new_source = "constexpr int " + "\\" + "\nFEATURE_FLAG = 2;\n"
+        old_constant = analyzer.analyze(old_source, "src/constants.hpp")
+        new_constant = analyzer.analyze(new_source, "src/constants.hpp")
+
+        def candidate_for(source):
+            provider = GitSnapshotProvider("/candidate-index-repo")
+            with mock.patch.object(
+                    provider, "read_files",
+                    return_value=[("src/constants.hpp", source)]):
+                return provider.build_symbol_candidate_index(
+                    "commit", ["src/constants.hpp"]
+                )
+
+        old_index = LazySourceAnalysisIndex(
+            paths=["src/constants.hpp"],
+            loader=lambda path: (old_constant, 1024),
+            analyses={"src/caller.cpp": caller},
+            candidate_index=candidate_for(old_source),
+        )
+        new_index = LazySourceAnalysisIndex(
+            paths=["src/constants.hpp"],
+            loader=lambda path: (new_constant, 1024),
+            analyses={"src/caller.cpp": caller},
+            candidate_index=candidate_for(new_source),
+        )
+        result = InheritanceEngine().compare_line(
+            " return FEATURE_FLAG;", " return FEATURE_FLAG;",
+            caller, caller, 2, 2,
+            old_index=old_index, new_index=new_index,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "CONST_CHANGED")
+
+    def test_candidate_index_uses_one_git_batch_process_per_commit(self):
+        root = tempfile.TemporaryDirectory(prefix="candidate-batch-git-")
+        try:
+            paths = ["src/a.cpp", "src/b.hpp", "src/c.c"]
+            for index, path in enumerate(paths):
+                absolute = os.path.join(root.name, path)
+                os.makedirs(os.path.dirname(absolute), exist_ok=True)
+                with open(absolute, "w", encoding="utf-8") as stream:
+                    stream.write(
+                        "int helper_{}() {{ return {}; }}\n".format(index, index)
+                    )
+            subprocess.check_call(["git", "init", "-q", root.name])
+            subprocess.check_call([
+                "git", "-C", root.name, "config", "user.email",
+                "test@example.invalid",
+            ])
+            subprocess.check_call([
+                "git", "-C", root.name, "config", "user.name",
+                "candidate-batch-test",
+            ])
+            subprocess.check_call(["git", "-C", root.name, "add", "."])
+            subprocess.check_call([
+                "git", "-C", root.name, "commit", "-qm", "candidate batch",
+            ])
+            commit = subprocess.check_output(
+                ["git", "-C", root.name, "rev-parse", "HEAD"],
+                universal_newlines=True,
+            ).strip()
+            provider = GitSnapshotProvider(root.name)
+            with mock.patch(
+                    "app.inheritance.git_snapshot.subprocess.Popen",
+                    wraps=subprocess.Popen) as popen:
+                candidates = provider.build_symbol_candidate_index(
+                    commit, paths
+                )
+            self.assertEqual(popen.call_count, 1)
+            self.assertEqual(
+                sorted(candidates["functions"]),
+                ["helper_0", "helper_1", "helper_2"],
+            )
+        finally:
+            root.cleanup()
 
     def test_engine_wires_lightweight_candidate_index_before_parser_loading(self):
         class Provider(object):

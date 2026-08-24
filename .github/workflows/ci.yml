@@ -344,7 +344,8 @@ jobs:
             tests.vnext.test_jobs \
             tests.vnext.test_migration_runner \
             tests.vnext.test_runtime_config \
-            tests.vnext.test_vnext_runtime -v 2>&1 | tee .artifacts/py36-compat.log
+            tests.vnext.test_vnext_runtime \
+            tests.vnext.test_legacy_runtime_adapter -v 2>&1 | tee .artifacts/py36-compat.log
       - name: Isolate failing Python 3.6 compatibility module
         if: ${{ failure() }}
         run: |
@@ -358,7 +359,8 @@ jobs:
             tests.vnext.test_jobs \
             tests.vnext.test_migration_runner \
             tests.vnext.test_runtime_config \
-            tests.vnext.test_vnext_runtime; do
+            tests.vnext.test_vnext_runtime \
+            tests.vnext.test_legacy_runtime_adapter; do
             docker run --rm \
               -v "$PWD:/workspace" -w /workspace python@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc \
               python -m unittest "$test_module" -v
