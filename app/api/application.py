@@ -28,6 +28,7 @@ from app.code_detail.source_reader import compute_db_file_path_hash
 from app.db.repositories.base import fetchall, fetchone
 from app.scan_import import RepositoryBusyError
 from app.services.inheritance_review_service import InheritanceReviewService
+from app.observability.performance import bind_collector
 
 
 logger = logging.getLogger(__name__)
@@ -104,9 +105,10 @@ class VNextApplication(object):
         try:
             if method.upper() == "GET" and self._read_auth_required(path):
                 self._require_read(headers, remote_address)
-            return self.router.dispatch(
-                method, path, query, body, headers, remote_address
-            )
+            with bind_collector(getattr(self.runtime, "performance", None)):
+                return self.router.dispatch(
+                    method, path, query, body, headers, remote_address
+                )
         except KeyError:
             return 404, {"error": "not_found", "message": "resource not found"}
         except FileNotFoundError:

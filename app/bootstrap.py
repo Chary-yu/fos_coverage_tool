@@ -37,14 +37,16 @@ from app.inheritance.toolchain import parser_from_config
 from app.jobs.bounded_executor import BoundedJobExecutor
 from app.jobs.service import VNextBackgroundJobService
 from app.observability import PerformanceEvidenceCollector
+from app.observability.performance import bind_collector
 
 
 class _ConnectionLease(object):
     """DB-API proxy whose close returns a pooled connection or does nothing."""
 
-    def __init__(self, connection, close_callback=None):
+    def __init__(self, connection, close_callback=None, performance=None):
         self._connection = connection
         self._close_callback = close_callback
+        self._performance_collector = performance
         self._closed = False
 
     def __getattr__(self, name):
@@ -73,6 +75,9 @@ class VNextRuntime(object):
         # manifest must stop composition; generating a replacement here would
         # turn an exact-release failure into a silently accepted runtime.
         self.release_identity = get_current_release_identity(self.repo_root)
+        self.performance = PerformanceEvidenceCollector(
+            self.release_identity, workload_id="vnext-runtime"
+        )
         self.projects = ProjectRepository()
         self.lines = LineIndexRepository()
         self.analyses = AnalysisRepository()
@@ -100,6 +105,7 @@ class VNextRuntime(object):
         self.code_detail = VNextCodeDetailService(
             self.projects, self.analyses, self.report_registry,
             domain_repo=self.analysis_domain_repository,
+            performance=self.performance,
         )
         report_roots = []
         for root in self.config.get("report_roots") or []:
@@ -119,6 +125,7 @@ class VNextRuntime(object):
         self.scan_import_service = ScanImportService(
             self.project_service, report_registry=self.report_registry,
             allowed_info_roots=input_roots, allowed_report_roots=report_roots,
+            performance=self.performance,
         )
         self.analysis_service = AnalysisService(
             self.analyses, self.projects, self.states, self.lines,
@@ -143,10 +150,12 @@ class VNextRuntime(object):
             inheritance_engine=InheritanceEngine(
                 parser=self.inheritance_parser,
                 domain_repository=self.analysis_domain_repository,
+                performance=self.performance,
             ),
             file_state_repository=self.file_states,
             analysis_domain_service=self.analysis_domain_service,
             project_service=self.project_service,
+            performance=self.performance,
         )
         self.scan_import_staging_root = import_root
         self.scan_import_recovery = ScanImportRecoveryService(
@@ -165,9 +174,6 @@ class VNextRuntime(object):
         export_root = state_config.get("exports_dir") or os.path.join(state_root, "exports")
         if not os.path.isabs(export_root):
             export_root = os.path.join(self.repo_root, export_root)
-        self.performance = PerformanceEvidenceCollector(
-            self.release_identity, workload_id="vnext-runtime"
-        )
         self.export_service = ExportService(
             self.projects, export_root, release_identity=self.release_identity
         )
@@ -347,30 +353,32 @@ class VNextRuntime(object):
 
     @contextmanager
     def connection_context(self, read_only: bool = False):
-        if self._connection is not None:
-            yield self._connection
-            return
-        if self._connection_factory is not None:
-            connection = self._connection_factory()
-            try:
+        with bind_collector(self.performance):
+            if self._connection is not None:
+                yield self._connection
+                return
+            if self._connection_factory is not None:
+                connection = self._connection_factory()
+                try:
+                    yield connection
+                finally:
+                    close = getattr(connection, "close", None)
+                    if close:
+                        close()
+                return
+            if self.database_manager is None:
+                raise RuntimeError("VNext database manager is not configured")
+            with self.database_manager.connection(read_only=read_only) as connection:
                 yield connection
-            finally:
-                close = getattr(connection, "close", None)
-                if close:
-                    close()
-            return
-        if self.database_manager is None:
-            raise RuntimeError("VNext database manager is not configured")
-        with self.database_manager.connection(read_only=read_only) as connection:
-            yield connection
 
     def _job_connection(self):
         if self._connection is not None:
-            return _ConnectionLease(self._connection)
+            return _ConnectionLease(self._connection, performance=self.performance)
         if self._connection_factory is not None:
             connection = self._connection_factory()
             return _ConnectionLease(
-                connection, close_callback=getattr(connection, "close", None)
+                connection, close_callback=getattr(connection, "close", None),
+                performance=self.performance,
             )
         if self.database_manager is None:
             raise RuntimeError("VNext database manager is not configured")
@@ -379,6 +387,7 @@ class VNextRuntime(object):
         return _ConnectionLease(
             wrapper.raw_conn,
             close_callback=lambda: pool.return_connection(wrapper),
+            performance=self.performance,
         )
 
     def close(self):

@@ -17,6 +17,7 @@ from app.scan_import.publication import ScanPublicationService
 
 
 CONSTRUCTION_STATUSES = {"building", "importing", "constructing"}
+LINE_INGEST_BATCH_SIZE = 1000
 
 
 class ProjectService(object):
@@ -166,26 +167,34 @@ class ProjectService(object):
             self.states.advance(conn, project["id"])
         return self.get_scan(connection, scan["id"])
 
-    def _ingest_files(self, connection, scan_id, files):
+    def _ingest_files(self, connection, scan_id, files,
+                      line_batch_size=LINE_INGEST_BATCH_SIZE):
         self.projects._assert_scan_building(connection, scan_id)
-        normalized = []
-        for item in files or []:
+        for item in files or ():
             path = str(item.get("file_path") or "")
             repository_name = str(item.get("repository_name") or "")
             file_hash = str(item.get("file_path_hash") or "")
             if not file_hash:
                 file_hash = self._file_hash(path, repository_name)
-            normalized.append({
+            normalized = {
                 "repository_name": repository_name,
                 "file_path_hash": file_hash,
                 "file_path": path,
                 "source_file_name": item.get("source_file_name") or os.path.basename(path),
-                "lines": item.get("lines") or [],
-            })
-        file_rows = self.projects.ensure_files(connection, scan_id, normalized)
-        for item in normalized:
-            file_row = file_rows[(item["repository_name"], item["file_path_hash"])]
-            self.lines.upsert_lines(connection, file_row["id"], item.get("lines") or [])
+            }
+            file_rows = self.projects.ensure_files(
+                connection, scan_id, [normalized]
+            )
+            file_row = file_rows[(repository_name, file_hash)]
+            line_records = item.get("lines")
+            batch = []
+            for record in line_records or ():
+                batch.append(record)
+                if len(batch) >= max(1, int(line_batch_size)):
+                    self.lines.upsert_lines(connection, file_row["id"], batch)
+                    batch = []
+            if batch:
+                self.lines.upsert_lines(connection, file_row["id"], batch)
 
     def create_scan_and_ingest(self, connection, project_name, files,
                                info_file_name="", info_sha256="", review_scope="full",

@@ -33,7 +33,7 @@ class ArchitectureAuditTest(unittest.TestCase):
         }
         self.assertEqual(
             transitional,
-            {"app/compat/legacy_runtime_impl.py", "app/compat/incremental_impl.py"},
+            {"app/compat/legacy_runtime_previous_release.py", "app/compat/incremental_previous_release.py"},
         )
         self.assertEqual(result["classification"]["RETIRED"], [])
 
@@ -154,8 +154,8 @@ class ArchitectureAuditTest(unittest.TestCase):
                 "classification": {
                     "TRANSITIONAL_LEGACY": [],
                     "RETIRED": [
-                        {"path": "app/compat/legacy_runtime_impl.py"},
-                        {"path": "app/compat/incremental_impl.py"},
+                        {"path": "app/compat/legacy_runtime_previous_release.py"},
+                        {"path": "app/compat/incremental_previous_release.py"},
                     ],
                 },
             }

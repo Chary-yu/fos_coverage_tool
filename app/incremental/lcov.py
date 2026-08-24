@@ -92,42 +92,59 @@ def parse_function_records(lines):
     return legacy, False
 
 
-def parse_info(path):
-    files = {}
+def iter_info_records(path):
+    """Yield one LCOV file record at ``end_of_record``.
+
+    The compatibility ``parse_info`` API still aggregates these records for
+    callers that need a mapping.  Scan import uses this iterator directly so
+    the input file is never represented as one process-wide list/dictionary.
+    """
     current = None
     with open(path, "r", encoding="utf-8", errors="replace") as stream:
-        all_lines = [line.rstrip("\n") for line in stream]
-    function_lines = []
-    for line in all_lines:
-        if line == "end_of_record":
-            if current is not None:
-                ranges, fallback = parse_function_records(function_lines)
-                current["function_ranges"] = ranges
-                current["function_range_fallback"] = fallback or any(
-                    item.get("end_line") is None for item in ranges
-                )
-                files[current["file_path"]] = current
-            current = None
-            function_lines = []
-            continue
-        if line.startswith("SF:"):
-            current = {
-                "file_path": line[3:],
-                "lines": {},
-                "function_ranges": [],
-                "function_range_fallback": False,
-            }
-            function_lines = []
-            continue
-        if current is None:
-            continue
-        if line.startswith("DA:"):
-            fields = line[3:].split(",")
-            if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
-                current["lines"][int(fields[0])] = int(fields[1])
-        elif line.startswith(("FN:", "FNL:", "FNA:")):
-            function_lines.append(line)
-    return files
+        function_lines = []
+        for raw in stream:
+            line = raw.rstrip("\r\n")
+            if line == "end_of_record":
+                if current is not None:
+                    ranges, fallback = parse_function_records(function_lines)
+                    current["function_ranges"] = ranges
+                    current["function_range_fallback"] = fallback or any(
+                        item.get("end_line") is None for item in ranges
+                    )
+                    yield current
+                current = None
+                function_lines = []
+                continue
+            if line.startswith("SF:"):
+                # A malformed record without an end marker must not retain
+                # the previous file's facts or context.
+                if current is not None:
+                    ranges, fallback = parse_function_records(function_lines)
+                    current["function_ranges"] = ranges
+                    current["function_range_fallback"] = fallback or any(
+                        item.get("end_line") is None for item in ranges
+                    )
+                    yield current
+                current = {
+                    "file_path": line[3:],
+                    "lines": {},
+                    "function_ranges": [],
+                    "function_range_fallback": False,
+                }
+                function_lines = []
+                continue
+            if current is None:
+                continue
+            if line.startswith("DA:"):
+                fields = line[3:].split(",")
+                if len(fields) >= 2 and fields[0].isdigit() and fields[1].isdigit():
+                    current["lines"][int(fields[0])] = int(fields[1])
+            elif line.startswith(("FN:", "FNL:", "FNA:")):
+                function_lines.append(line)
+
+
+def parse_info(path):
+    return {item["file_path"]: item for item in iter_info_records(path)}
 
 
 def load_info(path):

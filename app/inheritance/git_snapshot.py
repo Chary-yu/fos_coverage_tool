@@ -14,22 +14,36 @@ class GitTechnicalFailure(RuntimeError):
 
 
 class GitSnapshotProvider(object):
-    def __init__(self, repo_path, timeout=30, fetch_remote=None):
+    def __init__(self, repo_path, timeout=30, fetch_remote=None,
+                 performance=None):
         self.repo_path = os.path.realpath(str(repo_path or ""))
         self.timeout = float(timeout)
         self.fetch_remote = fetch_remote
+        self.performance = performance
+
+    def _record_git(self, bytes_read=0):
+        if self.performance is not None:
+            self.performance.record_git_subprocess(bytes_read)
 
     def _run(self, args, check=True):
+        output = ""
         try:
-            return subprocess.check_output(
+            output = subprocess.check_output(
                 ["git", "-C", self.repo_path] + list(args),
                 stderr=subprocess.STDOUT, timeout=self.timeout,
                 universal_newlines=True,
             ).strip()
+            return output
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             if check:
                 raise GitTechnicalFailure(str(exc))
             return ""
+        finally:
+            if isinstance(output, bytes):
+                output_bytes = len(output)
+            else:
+                output_bytes = len(str(output).encode("utf-8")) if output else 0
+            self._record_git(output_bytes)
 
     def commit_available(self, commit):
         try:
@@ -41,6 +55,8 @@ class GitSnapshotProvider(object):
             return True
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return False
+        finally:
+            self._record_git()
 
     def ensure_commit(self, commit):
         if self.commit_available(commit):
@@ -67,6 +83,8 @@ class GitSnapshotProvider(object):
             return False
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise GitTechnicalFailure(str(exc))
+        finally:
+            self._record_git()
 
     def branch(self, commit):
         return self._run(["show", "-s", "--format=%D", str(commit)], check=False)

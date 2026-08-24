@@ -8,7 +8,7 @@ import os
 import uuid
 
 from app.db.repositories import JobRepository, ProjectRepository, ProjectStateRepository
-from app.db.repositories.base import adapt_sql, execute, fetchall, fetchone
+from app.db.repositories.base import execute, fetchall, fetchone
 from app.db.transaction import transaction
 from app.db.repositories.repository_repository import RepositoryRepository
 from app.db.repositories.file_state_repository import FileStateRepository
@@ -28,7 +28,7 @@ class ScanImportCoordinator(object):
                  publication_service=None, stager=None, repository_repository=None,
                  import_service=None, inheritance_engine=None,
                  file_state_repository=None, analysis_domain_service=None,
-                 project_service=None):
+                 project_service=None, performance=None):
         self.projects = project_repository or ProjectRepository()
         self.states = state_repository or ProjectStateRepository()
         self.jobs = job_repository or JobRepository()
@@ -42,6 +42,7 @@ class ScanImportCoordinator(object):
         self.file_states = file_state_repository or FileStateRepository()
         self.analysis_domain_service = analysis_domain_service
         self.project_service = project_service
+        self.performance = performance
         self._execution_contexts = {}
 
     def _stager(self, root):
@@ -186,6 +187,10 @@ class ScanImportCoordinator(object):
         scan_id = context["scan_id"]
         checkpoint = context["checkpoint"]
         artifact = context["artifact"]
+        if self.performance is not None:
+            self.performance.bind(
+                project_id=payload.get("project_id"), scan_id=scan_id,
+            )
 
         if checkpoint.get("phase") in ("PUBLISHED", "DONE"):
             return self.states.get(connection, int(payload.get("project_id") or 0))
@@ -199,16 +204,33 @@ class ScanImportCoordinator(object):
             "artifact_sha256": artifact.get("sha256"),
         })
         files = None
+        import_stats = None
         if self._phase_before(checkpoint, "COVERAGE_IMPORTED"):
             if self.import_service is None:
                 raise RuntimeError("IMPORT_SERVICE_NOT_CONFIGURED")
-            _, _, files = self.import_service.parse_info_file(
-                artifact["staged_path"], payload.get("repositories") or [],
-                expected_sha256=artifact.get("sha256"), verify=verify_artifact,
-            )
+            streaming_parser = getattr(self.import_service, "iter_info_file", None)
+            if streaming_parser is not None:
+                _, files, import_stats = streaming_parser(
+                    artifact["staged_path"], payload.get("repositories") or [],
+                    expected_sha256=artifact.get("sha256"), verify=verify_artifact,
+                )
+            else:
+                _, _, files = self.import_service.parse_info_file(
+                    artifact["staged_path"], payload.get("repositories") or [],
+                    expected_sha256=artifact.get("sha256"), verify=verify_artifact,
+                )
+                import_stats = {
+                    "files": len(files),
+                    "line_count": sum(len(item.get("lines") or []) for item in files),
+                    "function_range_fallback_files": sum(
+                        1 for item in files
+                        if item.get("function_range_fallback")
+                    ),
+                }
             phase_payload.update({
-                "file_count": len(files),
-                "line_count": sum(len(item.get("lines") or []) for item in files),
+                "file_count": 0,
+                "line_count": 0,
+                "function_range_fallback_files": 0,
             })
 
         self._advance_phase(connection, job_id, owner_token, fencing_token,
@@ -217,10 +239,23 @@ class ScanImportCoordinator(object):
                             "INFO_STAGED", phase_payload)
         if files is not None:
             project_service = self._project_service()
+            def ingest_coverage(conn):
+                if self.performance is not None:
+                    with self.performance.phase("scan_import.coverage_import"):
+                        project_service._ingest_files(conn, scan_id, files)
+                else:
+                    project_service._ingest_files(conn, scan_id, files)
+                phase_payload.update({
+                    "file_count": int((import_stats or {}).get("files") or 0),
+                    "line_count": int((import_stats or {}).get("line_count") or 0),
+                    "function_range_fallback_files": int(
+                        (import_stats or {}).get("function_range_fallback_files") or 0
+                    ),
+                })
             self._run_phase_operation(
                 connection, job_id, owner_token, fencing_token,
                 "COVERAGE_IMPORTED", phase_payload,
-                lambda conn: project_service._ingest_files(conn, scan_id, files),
+                ingest_coverage,
             )
 
         if self._phase_before(self._checkpoint(connection, job_id), "GIT_VERIFIED"):
@@ -428,6 +463,7 @@ class ScanImportCoordinator(object):
             provider = GitSnapshotProvider(
                 repo_path,
                 fetch_remote=remotes.get(name) or None,
+                performance=self.performance,
             )
             provider.ensure_commit(old_commit)
             provider.ensure_commit(new_commit)
@@ -553,16 +589,10 @@ class ScanImportCoordinator(object):
 
     @staticmethod
     def _locks_for_job(connection, job_id):
-        cursor = connection.cursor()
-        cursor.execute(adapt_sql(connection, """
+        return fetchall(connection, """
             SELECT * FROM coverage_repository_resource_locks
             WHERE job_id=? ORDER BY physical_resource_id
-        """), (str(job_id),))
-        try:
-            columns = [item[0] for item in (cursor.description or [])]
-            return [dict(zip(columns, row)) for row in cursor.fetchall()]
-        finally:
-            cursor.close()
+        """, (str(job_id),))
 
     def _assert_all_fences(self, connection, job_id, owner_token,
                            fencing_token, checkpoint=None):

@@ -8,7 +8,7 @@ from unittest import mock
 
 from app.inheritance.cpp_parser import CppSourceAnalyzer
 from app.inheritance.engine import InheritanceEngine
-from app.inheritance.dependencies import SourceAnalysisIndex
+from app.inheritance.dependencies import LazySourceAnalysisIndex, SourceAnalysisIndex
 from app.inheritance.git_snapshot import GitSnapshotProvider
 from app.inheritance.line_map import GitLineMapEngine
 from app.inheritance.normalizer import CppLexer, normalize_cpp
@@ -376,6 +376,107 @@ class InheritanceEngineTest(unittest.TestCase):
         )
         self.assertFalse(result.ok)
         self.assertEqual(result.reason_code, "CALLEE_CHANGED")
+
+    def test_dependency_budget_exhaustion_is_not_treated_as_external_library(self):
+        """A source index that cannot load a helper must fail closed."""
+        analyzer = CppSourceAnalyzer()
+        old_caller = analyzer.analyze(
+            "int caller() {\n return helper();\n}\n", "src/caller.cpp"
+        )
+        new_caller = analyzer.analyze(
+            "int caller() {\n return helper();\n}\n", "src/caller.cpp"
+        )
+        old_helper = analyzer.analyze(
+            "int helper() {\n return 1;\n}\n", "src/helper.cpp"
+        )
+        new_helper = analyzer.analyze(
+            "int helper() {\n return 1;\n}\n", "src/helper.cpp"
+        )
+
+        def load_old(path):
+            return old_helper, 1024
+
+        def load_new(path):
+            return new_helper, 1024
+
+        old_index = LazySourceAnalysisIndex(
+            paths=["src/helper.cpp"], loader=load_old,
+            analyses={"src/caller.cpp": old_caller}, max_cached_bytes=1,
+        )
+        new_index = LazySourceAnalysisIndex(
+            paths=["src/helper.cpp"], loader=load_new,
+            analyses={"src/caller.cpp": new_caller}, max_cached_bytes=1,
+        )
+        result = InheritanceEngine().compare_line(
+            " return helper();", " return helper();",
+            old_caller, new_caller, 2, 2,
+            old_index=old_index, new_index=new_index,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "DEPENDENCY_BUDGET_EXHAUSTED")
+
+    def test_single_side_dependency_budget_exhaustion_is_unknown(self):
+        analyzer = CppSourceAnalyzer()
+        caller = analyzer.analyze(
+            "int caller() {\n return helper();\n}\n", "src/caller.cpp"
+        )
+        helper = analyzer.analyze(
+            "int helper() { return 1; }\n", "src/helper.cpp"
+        )
+        exhausted = LazySourceAnalysisIndex(
+            paths=["src/helper.cpp"], loader=lambda path: (helper, 4096),
+            analyses={"src/caller.cpp": caller}, max_cached_bytes=1,
+        )
+        available = SourceAnalysisIndex(
+            {"src/caller.cpp": caller, "src/helper.cpp": helper}
+        )
+        result = InheritanceEngine().compare_line(
+            " return helper();", " return helper();",
+            caller, caller, 2, 2,
+            old_index=exhausted, new_index=available,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "DEPENDENCY_BUDGET_EXHAUSTED")
+
+    def test_pinned_initial_index_over_budget_is_explicitly_exhausted(self):
+        analyzer = CppSourceAnalyzer()
+        caller = analyzer.analyze("int caller() { return 0; }\n", "src/caller.cpp")
+        index = LazySourceAnalysisIndex(
+            analyses={"src/caller.cpp": caller}, max_cached_bytes=1,
+        )
+        result = InheritanceEngine().compare_line(
+            "return 0;", "return 0;", caller, caller, 1, 1,
+            old_index=index, new_index=None,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason_code, "DEPENDENCY_BUDGET_EXHAUSTED")
+
+    def test_engine_source_index_cache_has_a_total_budget_across_commits(self):
+        analyzer = CppSourceAnalyzer()
+
+        class Provider(object):
+            repo_path = "/repo"
+
+            def list_source_files(self, commit):
+                return ["src/helper.cpp"]
+
+            def read_file(self, commit, path):
+                return "int helper() { return 1; }\n"
+
+        provider = Provider()
+        engine = InheritanceEngine()
+        engine.max_source_cache_bytes = 1024 * 1024
+        engine._metrics = {
+            "parser_cache_hit": 0, "parser_cache_miss": 0,
+            "source_files_total": 0, "parser_file_total": 0,
+        }
+        first = engine._source_index(provider, "commit-one")
+        first.functions("helper")
+        engine.max_source_cache_total_bytes = first.cache_stats()["cache_bytes"] + 1
+        second = engine._source_index(provider, "commit-two")
+        second.functions("helper")
+        self.assertLessEqual(len(engine._source_index_cache), 1)
+        self.assertEqual(engine._metrics["source_index_evictions"], 1)
 
     def test_durable_run_requires_verified_git_snapshot_identity(self):
         result = InheritanceEngine()._snapshot_for_relation(

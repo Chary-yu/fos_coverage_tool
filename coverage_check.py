@@ -12,7 +12,7 @@ from app.incremental import legacy as _canonical
 
 
 if __name__ == "__main__":
-    _canonical.main()
+    _canonical.dispatch_cli()
 else:
     # Preserve patching/introspection semantics for legacy callers: importing
     # ``coverage_check`` returns the canonical module object itself.

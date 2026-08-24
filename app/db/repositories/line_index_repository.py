@@ -165,8 +165,19 @@ class LineIndexRepository(object):
             finally:
                 cursor.close()
         if return_rows:
-            return [self.get_line(connection, file_id, values[0])
-                    for values in normalized]
+            # The inserted identities are deterministic (file_id, line_number).
+            # Resolve them with the same bounded IN-query shape used for the
+            # preflight read, then restore the caller's input order.
+            missing_numbers = [values[0] for values in missing]
+            for number_chunk in _chunks(missing_numbers, lookup_size):
+                rows = fetchall(connection, """
+                    SELECT * FROM coverage_lines WHERE file_id = ?
+                      AND line_number IN ({})
+                """.format(", ".join("?" for _ in number_chunk)),
+                    (int(file_id),) + tuple(number_chunk))
+                for row in rows:
+                    by_line[int(row["line_number"])] = row
+            return [by_line.get(values[0]) for values in normalized]
         return len(normalized)
 
     def list_lines(self, connection, file_id: int):

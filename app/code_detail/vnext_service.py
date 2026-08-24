@@ -65,7 +65,8 @@ class VNextCodeDetailService(object):
                  max_cache_bytes=64 * 1024 * 1024,
                  max_cache_entry_bytes=4 * 1024 * 1024,
                  max_sidecar_cache_bytes=32 * 1024 * 1024,
-                 max_sidecar_entry_bytes=4 * 1024 * 1024):
+                 max_sidecar_entry_bytes=4 * 1024 * 1024,
+                 performance=None):
         self.projects = project_repo
         self.analyses = analysis_repo
         self.domain = domain_repo
@@ -82,6 +83,7 @@ class VNextCodeDetailService(object):
         self.max_cache_entry_bytes = max(0, int(max_cache_entry_bytes))
         self.max_sidecar_cache_bytes = max(0, int(max_sidecar_cache_bytes))
         self.max_sidecar_entry_bytes = max(0, int(max_sidecar_entry_bytes))
+        self.performance = performance
         self._sidecar_stores = OrderedDict()
         self._identity_cache = OrderedDict()
         self._overlay_cache = OrderedDict()
@@ -145,6 +147,8 @@ class VNextCodeDetailService(object):
             old_key = next(iter(cache))
             self._remove_service_entry_locked(cache, old_key, cache_name)
             self._metrics["cache_evictions"] += 1
+            if self.performance is not None:
+                self.performance.record_cache(evictions=1)
         if (self._identity_cache_bytes + self._overlay_cache_bytes + size >
                 self.max_cache_bytes or
                 not self._process_cache_budget.try_acquire(size)):
@@ -170,6 +174,7 @@ class VNextCodeDetailService(object):
             max_cache_bytes=self.max_sidecar_cache_bytes,
             max_entry_bytes=self.max_sidecar_entry_bytes,
             process_budget=self._process_cache_budget,
+            performance=self.performance,
         )
         with self._cache_lock:
             sidecar = self._sidecar_stores.get(store_key)
@@ -235,6 +240,8 @@ class VNextCodeDetailService(object):
                         if (current is not None and
                                 self._identity_index.get(base_key) == full_key):
                             self._identity_cache.move_to_end(full_key)
+                            if self.performance is not None:
+                                self.performance.record_cache(hit=True)
                             return current[0]
                 with self._cache_lock:
                     if self._identity_index.get(base_key) == full_key:
@@ -250,6 +257,8 @@ class VNextCodeDetailService(object):
                     self._identity_inflight[base_key] = event
                     owner = True
                     self._metrics["identity_loads"] += 1
+                    if self.performance is not None:
+                        self.performance.record_cache(miss=True)
                 else:
                     owner = False
                     self._metrics["identity_singleflight_shared"] += 1
@@ -378,6 +387,8 @@ class VNextCodeDetailService(object):
                 if cached is not None:
                     self._overlay_cache.move_to_end(cache_key)
                     self._metrics["overlay_cache_hits"] += 1
+                    if self.performance is not None:
+                        self.performance.record_cache(hit=True)
                     return cached[0]
                 event = self._overlay_inflight.get(cache_key)
                 if event is None:
@@ -385,6 +396,8 @@ class VNextCodeDetailService(object):
                     self._overlay_inflight[cache_key] = event
                     owner = True
                     self._metrics["overlay_cache_misses"] += 1
+                    if self.performance is not None:
+                        self.performance.record_cache(miss=True)
                 else:
                     owner = False
                     self._metrics["overlay_singleflight_shared"] += 1

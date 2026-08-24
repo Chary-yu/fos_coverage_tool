@@ -20,6 +20,25 @@ except ImportError:  # pragma: no cover
     resource = None
 
 
+_ACTIVE_COLLECTOR = threading.local()
+
+
+def current_collector():
+    """Return the collector bound to the current request/job context."""
+    return getattr(_ACTIVE_COLLECTOR, "value", None)
+
+
+@contextmanager
+def bind_collector(collector):
+    """Bind one bounded collector across repository calls in this context."""
+    previous = getattr(_ACTIVE_COLLECTOR, "value", None)
+    _ACTIVE_COLLECTOR.value = collector
+    try:
+        yield collector
+    finally:
+        _ACTIVE_COLLECTOR.value = previous
+
+
 def _peak_rss_bytes():
     if resource is None:
         return 0
@@ -119,6 +138,32 @@ class PerformanceEvidenceCollector(object):
         self.increment("request_bytes", int(request_bytes or 0))
         self.increment("response_bytes", int(response_bytes or 0))
         self.observe_duration("http_request", float(elapsed_ms or 0.0))
+
+    def record_db_query(self, elapsed_ms=0.0):
+        self.increment("db_query_count")
+        self.increment("db_time_ms", float(elapsed_ms or 0.0))
+
+    def record_db_rows(self, count):
+        self.increment("db_rows", int(count or 0))
+
+    def record_git_subprocess(self, bytes_read=0):
+        self.increment("git_subprocess_count")
+        self.increment("git_bytes_read", int(bytes_read or 0))
+
+    def record_cache(self, hit=False, miss=False, evictions=0,
+                     current_bytes=None):
+        """Record bounded cache evidence without exposing cache keys."""
+        if hit:
+            self.increment("cache_hits")
+        if miss:
+            self.increment("cache_misses")
+        if evictions:
+            self.increment("cache_evictions", int(evictions))
+        if current_bytes is not None:
+            self.observe("cache_bytes", max(0, int(current_bytes or 0)))
+
+    def record_bytes_read(self, count):
+        self.increment("bytes_read", max(0, int(count or 0)))
 
     def snapshot(self, operation="runtime"):
         with self._lock:

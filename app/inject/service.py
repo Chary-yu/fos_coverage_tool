@@ -5,7 +5,7 @@ import os
 from bisect import bisect_right
 
 from app.inject.parse_once import parse_gcov_source_once
-from app.incremental.lcov import load_info
+from app.incremental.lcov import iter_info_records, parse_info
 from app.services.project_service import ProjectService
 from app.config.path_policy import realpath_within, reject_relative_traversal
 
@@ -18,29 +18,41 @@ class ScanImportService(object):
     """Create one immutable Scan and populate its physical line identities."""
 
     def __init__(self, project_service=None, report_registry=None,
-                 allowed_info_roots=None, allowed_report_roots=None):
+                 allowed_info_roots=None, allowed_report_roots=None,
+                 performance=None):
         self.projects = project_service or ProjectService()
         self.report_registry = report_registry
         self.allowed_info_roots = [os.path.realpath(root) for root in (allowed_info_roots or [])]
         self.allowed_report_roots = [os.path.realpath(root) for root in
                                      (allowed_report_roots or [])]
+        self.performance = performance
 
     def import_info(self, connection, project_name, info_path, review_scope="full",
                     repositories=None, report=None, info_file_name=""):
         info_path = self._validate_info_path(info_path)
-        digest = hashlib.sha256()
-        with open(info_path, "rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        info_sha256 = digest.hexdigest()
-        parsed = load_info(info_path)
-        files = self.build_files(parsed, repositories or [])
-        scan = self.projects.create_scan_and_ingest(
-            connection, project_name, files,
-            info_file_name=info_file_name or os.path.basename(info_path),
-            info_sha256=info_sha256, review_scope=review_scope,
-            repositories=repositories or [], report=report,
+        info_sha256 = self._sha256_file(info_path)
+        stats = {"files": 0, "line_count": 0,
+                 "function_range_fallback_files": 0}
+        files = self.iter_files(
+            iter_info_records(info_path), repositories or [], stats=stats,
         )
+        def create_scan():
+            return self.projects.create_scan_and_ingest(
+                connection, project_name, files,
+                info_file_name=info_file_name or os.path.basename(info_path),
+                info_sha256=info_sha256, review_scope=review_scope,
+                repositories=repositories or [], report=report,
+            )
+        if self.performance is not None:
+            with self.performance.phase("scan_import.import_info"):
+                scan = create_scan()
+        else:
+            scan = create_scan()
+        if self.performance is not None:
+            self.performance.bind(
+                project_id=scan.get("project_id") if isinstance(scan, dict) else None,
+                scan_id=scan.get("id") if isinstance(scan, dict) else None,
+            )
         if report and self.report_registry:
             report_root = report.get("report_root") or ""
             directories = report.get("directories") or ([report_root] if report_root else [])
@@ -52,10 +64,10 @@ class ScanImportService(object):
                 source_signature=report.get("source_signature", ""),
             )
         return {
-            "scan": scan, "files": len(files),
-            "line_count": sum(len(item["lines"]) for item in files),
-            "function_range_fallback_files": sum(
-                1 for item in parsed.values() if item.get("function_range_fallback")
+            "scan": scan, "files": int(stats["files"]),
+            "line_count": int(stats["line_count"]),
+            "function_range_fallback_files": int(
+                stats["function_range_fallback_files"]
             ),
         }
 
@@ -76,21 +88,62 @@ class ScanImportService(object):
             raise FileNotFoundError(info_path)
         digest = None
         if verify:
-            digest = hashlib.sha256()
-            with open(info_path, "rb") as stream:
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            observed = digest.hexdigest()
+            digest = self._sha256_file(info_path)
+            observed = digest
             expected = str(expected_sha256 or "").strip().lower()
             if expected and observed.lower() != expected:
                 raise ValueError("STAGED_ARTIFACT_CHANGED")
-        parsed = load_info(info_path)
-        return (digest.hexdigest() if digest is not None else
+        parsed = parse_info(info_path)
+        return (digest if digest is not None else
                 str(expected_sha256 or "")), parsed, self.build_files(parsed, repositories or [])
 
+    def iter_info_file(self, info_path, repositories=None, expected_sha256="",
+                       verify=False):
+        """Return a bounded LCOV file iterator for durable scan import."""
+        info_path = os.path.realpath(str(info_path or ""))
+        if not os.path.isfile(info_path):
+            raise FileNotFoundError(info_path)
+        digest = None
+        if verify:
+            digest = self._sha256_file(info_path)
+            observed = digest
+            expected = str(expected_sha256 or "").strip().lower()
+            if expected and observed.lower() != expected:
+                raise ValueError("STAGED_ARTIFACT_CHANGED")
+        stats = {"files": 0, "line_count": 0,
+                 "function_range_fallback_files": 0}
+        records = self.iter_files(
+            iter_info_records(info_path), repositories or [], stats=stats,
+        )
+        return (digest if digest is not None else
+                str(expected_sha256 or "")), records, stats
+
+    def _sha256_file(self, path):
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+                if self.performance is not None:
+                    self.performance.record_bytes_read(len(chunk))
+        return digest.hexdigest()
+
     def build_files(self, parsed, repositories=None):
+        # Compatibility callers receive the historical materialized shape;
+        # durable Scan import uses ``iter_files`` below.
         files = []
-        for file_path, item in parsed.items():
+        for item in self.iter_files(
+                ({"file_path": path, **value} for path, value in parsed.items()),
+                repositories or []):
+            item = dict(item)
+            item["lines"] = list(item.get("lines") or [])
+            files.append(item)
+        return files
+
+    def iter_files(self, records, repositories=None, stats=None):
+        """Build one file at a time and yield fixed-size-ingest line iterators."""
+        for record in records or ():
+            file_path = record.get("file_path") if isinstance(record, dict) else ""
+            item = record if isinstance(record, dict) else {}
             normalized = str(file_path or "").replace("\\", "/")
             repository_name, normalized = self._repository_name(
                 normalized, repositories or []
@@ -101,34 +154,44 @@ class ScanImportService(object):
                 )
             ranges = item.get("function_ranges") or []
             fallback = bool(item.get("function_range_fallback"))
-            line_records = []
             sorted_lines = sorted(item.get("lines", {}).items())
             function_lookup = self._function_lookup(ranges) if not fallback else None
-            for line_number, execution_count in sorted_lines:
-                function = (function_lookup(line_number)
-                            if function_lookup is not None else None)
-                line_records.append({
-                    "line_number": line_number,
-                    "line_text": "",
-                    "coverage_state": "uncovered" if int(execution_count) == 0 else "covered",
-                    "block_start_line": function["start_line"] if function else line_number,
-                    "block_end_line": function["end_line"] if function else line_number,
-                    "block_type": "function" if function else "single",
-                    "function_name": function.get("name", "") if function else "",
-                    "function_hash": "",
-                    "code_line_hash": "",
-                    "code_occurrence": 1,
-                })
-            files.append({
+            if stats is not None:
+                stats["files"] = int(stats.get("files") or 0) + 1
+                stats["line_count"] = int(stats.get("line_count") or 0) + len(sorted_lines)
+                if fallback:
+                    stats["function_range_fallback_files"] = int(
+                        stats.get("function_range_fallback_files") or 0
+                    ) + 1
+            yield {
                 "repository_name": repository_name,
                 "file_path": normalized,
                 "file_path_hash": hashlib.md5(
                     "{}\0{}".format(repository_name, normalized).encode("utf-8")
                 ).hexdigest(),
                 "source_file_name": os.path.basename(normalized),
-                "lines": line_records,
-            })
-        return files
+                "lines": self._iter_line_records(
+                    sorted_lines, function_lookup,
+                ),
+            }
+
+    @staticmethod
+    def _iter_line_records(sorted_lines, function_lookup):
+        for line_number, execution_count in sorted_lines:
+            function = (function_lookup(line_number)
+                        if function_lookup is not None else None)
+            yield {
+                "line_number": line_number,
+                "line_text": "",
+                "coverage_state": "uncovered" if int(execution_count) == 0 else "covered",
+                "block_start_line": function["start_line"] if function else line_number,
+                "block_end_line": function["end_line"] if function else line_number,
+                "block_type": "function" if function else "single",
+                "function_name": function.get("name", "") if function else "",
+                "function_hash": "",
+                "code_line_hash": "",
+                "code_occurrence": 1,
+            }
 
     @staticmethod
     def _repository_name(path, repositories):

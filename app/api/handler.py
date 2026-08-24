@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import time
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlsplit
 
@@ -29,12 +30,12 @@ class VNextHTTPRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+        return len(data)
 
     def _send_download(self, status, payload):
         path = os.path.realpath(str(payload.get("__download__")))
         if not os.path.isfile(path):
-            self._send(404, {"error": "not_found", "message": "download is unavailable"})
-            return
+            return self._send(404, {"error": "not_found", "message": "download is unavailable"})
         filename = os.path.basename(str(payload.get("filename") or path))
         filename = "".join(
             char if ord(char) >= 32 and char not in '\\"\r\n' else "_"
@@ -54,6 +55,7 @@ class VNextHTTPRequestHandler(BaseHTTPRequestHandler):
                 if not chunk:
                     break
                 self.wfile.write(chunk)
+        return size
 
     def _request(self):
         parsed = urlsplit(self.path)
@@ -74,28 +76,41 @@ class VNextHTTPRequestHandler(BaseHTTPRequestHandler):
         return parsed.path, query, body
 
     def _dispatch(self, method):
-        if not self.application:
-            self._send(503, {"error": "runtime_unavailable"})
-            return
+        started = time.perf_counter()
         try:
-            path, query, body = self._request()
-            status, payload = self.application.dispatch(
-                method, path, query, body, self.headers, self.client_address[0]
+            request_bytes = max(0, int(self.headers.get("Content-Length", "0") or "0"))
+        except (AttributeError, TypeError, ValueError):
+            request_bytes = 0
+        response_bytes = 0
+        if not self.application:
+            response_bytes = self._send(503, {"error": "runtime_unavailable"}) or 0
+        else:
+            try:
+                path, query, body = self._request()
+                status, payload = self.application.dispatch(
+                    method, path, query, body, self.headers, self.client_address[0]
+                )
+            except RequestTooLarge:
+                status, payload = 413, {
+                    "error": "request_too_large",
+                    "message": "request body exceeds the configured limit",
+                }
+            except ValueError:
+                status, payload = 400, {
+                    "error": "invalid_request",
+                    "message": "invalid request",
+                }
+            except Exception as exc:
+                logger.exception("VNext HTTP request failed")
+                status, payload = 500, {"error": "internal_error", "message": "internal server error"}
+            response_bytes = self._send(status, payload) or 0
+        runtime = getattr(self.application, "runtime", None)
+        collector = getattr(runtime, "performance", None)
+        if collector is not None:
+            collector.record_request(
+                request_bytes=request_bytes, response_bytes=response_bytes,
+                elapsed_ms=(time.perf_counter() - started) * 1000.0,
             )
-        except RequestTooLarge:
-            status, payload = 413, {
-                "error": "request_too_large",
-                "message": "request body exceeds the configured limit",
-            }
-        except ValueError:
-            status, payload = 400, {
-                "error": "invalid_request",
-                "message": "invalid request",
-            }
-        except Exception as exc:
-            logger.exception("VNext HTTP request failed")
-            status, payload = 500, {"error": "internal_error", "message": "internal server error"}
-        self._send(status, payload)
 
     def do_GET(self):
         self._dispatch("GET")

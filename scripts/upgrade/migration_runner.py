@@ -920,9 +920,10 @@ def _legacy_file_contexts(connection, project_name, file_hash):
     for line in lines:
         path = line.get("file_path") or ""
         if not path:
-            context["missing_file_path_lines"].append(int(line["line_number"]))
             path = file_hash
         context = context_for(path)
+        if not line.get("file_path"):
+            context["missing_file_path_lines"].append(int(line["line_number"]))
         number = int(line["line_number"])
         context["source_lines"][number] = line
         context["lines"][number] = dict(

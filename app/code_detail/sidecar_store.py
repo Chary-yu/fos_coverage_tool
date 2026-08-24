@@ -58,6 +58,7 @@ class SidecarStore:
         max_metadata_entries: int = 128,
         max_legacy_entries: int = 32,
         process_budget: Optional[ByteBudget] = None,
+        performance=None,
     ):
         self.search_dirs = [os.path.abspath(d) for d in (search_dirs or []) if os.path.isdir(d)]
         self.chunk_size = chunk_size
@@ -68,6 +69,7 @@ class SidecarStore:
         self.max_metadata_entries = max(1, int(max_metadata_entries))
         self.max_legacy_entries = max(1, int(max_legacy_entries))
         self._process_cache_budget = process_budget or ByteBudget(self.max_cache_bytes)
+        self.performance = performance
         self._cache_lock = threading.RLock()
         self._metadata_cache = OrderedDict()
         self._legacy_cache = OrderedDict()
@@ -102,6 +104,15 @@ class SidecarStore:
     def _inc_metric(self, name: str) -> None:
         with self._cache_lock:
             self._metrics[name] = self._metrics.get(name, 0) + 1
+        if self.performance is not None:
+            if name in ("metadata_cache_hits", "legacy_cache_hits", "chunk_cache_hits"):
+                self.performance.record_cache(hit=True)
+            elif name in ("metadata_cache_misses", "legacy_cache_misses"):
+                self.performance.record_cache(miss=True)
+            elif name == "chunk_reads":
+                self.performance.increment("sidecar_decode_count")
+            elif name == "cache_evictions":
+                self.performance.record_cache(evictions=1)
 
     def cache_stats(self) -> Dict[str, Any]:
         with self._cache_lock:
@@ -147,7 +158,7 @@ class SidecarStore:
             if cache:
                 key = next(iter(cache))
                 self._cache_remove_locked(cache, key, cache_name)
-                self._metrics["cache_evictions"] += 1
+                self._inc_metric("cache_evictions")
                 return True
         return False
 
@@ -239,10 +250,10 @@ class SidecarStore:
         with self._cache_lock:
             cached = self._metadata_cache.get(cache_key)
             if cached and cached[0] == signature:
-                self._metrics["metadata_cache_hits"] += 1
+                self._inc_metric("metadata_cache_hits")
                 self._metadata_cache.move_to_end(cache_key)
                 return cached[1]
-            self._metrics["metadata_cache_misses"] += 1
+            self._inc_metric("metadata_cache_misses")
             self._metrics["metadata_reads"] += 1
         try:
             with open(meta_path, "r", encoding="utf-8") as stream:
@@ -281,10 +292,10 @@ class SidecarStore:
         with self._cache_lock:
             cached = self._legacy_cache.get(cache_key)
             if cached and cached[0] == signature:
-                self._metrics["legacy_cache_hits"] += 1
+                self._inc_metric("legacy_cache_hits")
                 self._legacy_cache.move_to_end(cache_key)
                 return cached[1]
-            self._metrics["legacy_cache_misses"] += 1
+            self._inc_metric("legacy_cache_misses")
             self._metrics["legacy_reads"] += 1
         try:
             with open(legacy_path, "r", encoding="utf-8") as stream:
@@ -333,14 +344,14 @@ class SidecarStore:
             with self._cache_lock:
                 cached = self._decoded_chunk_cache.get(cache_key)
                 if cached is not None:
-                    self._metrics["chunk_cache_hits"] += 1
+                    self._inc_metric("chunk_cache_hits")
                     self._decoded_chunk_cache.move_to_end(cache_key)
                     return cached[0]
                 event = self._decoded_chunk_inflight.get(cache_key)
                 if event is None:
                     event = threading.Event()
                     self._decoded_chunk_inflight[cache_key] = event
-                    self._metrics["chunk_reads"] += 1
+                    self._inc_metric("chunk_reads")
                     owner = True
                 else:
                     self._metrics["chunk_inflight_waits"] += 1

@@ -12,6 +12,7 @@ from app.release_identity import (
     DEFAULT_RELEASE_ASSET_RELATIVE_PATHS,
     get_current_release_identity, generate_release_identity, save_release_manifest,
 )
+from scripts.release.build_release import main as build_release_main
 from scripts.upgrade.evidence_manifest import EvidenceManifestV2, ProductionEvidenceManifest
 
 
@@ -75,6 +76,29 @@ class TestEvidenceAuthenticity(unittest.TestCase):
             save_release_manifest(os.path.join(root, "release_manifest.json"), identity)
             with self.assertRaisesRegex(RuntimeError, "exact commit SHA"):
                 get_current_release_identity(root)
+
+    def test_no_git_release_artifact_rejects_all_zero_manifest_sha(self):
+        with tempfile.TemporaryDirectory() as root:
+            identity = generate_release_identity(
+                root, commit_sha="0" * 40, asset_files=[],
+                build_provenance="release-build",
+            )
+            save_release_manifest(os.path.join(root, "release_manifest.json"), identity)
+            with self.assertRaisesRegex(RuntimeError, "concrete commit SHA"):
+                get_current_release_identity(root)
+
+    def test_build_release_requires_concrete_sha_without_git_metadata(self):
+        with tempfile.TemporaryDirectory() as root:
+            output = os.path.join(root, "release_manifest.json")
+            with self.assertRaises(SystemExit) as missing:
+                build_release_main(["--repo-root", root, "--output", output])
+            self.assertEqual(missing.exception.code, 2)
+            with self.assertRaises(SystemExit) as zero:
+                build_release_main([
+                    "--repo-root", root, "--output", output,
+                    "--commit-sha", "0" * 40,
+                ])
+            self.assertEqual(zero.exception.code, 2)
 
     def test_mock_backup_and_browser_cannot_pass_final_gate(self):
         with tempfile.TemporaryDirectory() as root:

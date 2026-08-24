@@ -779,7 +779,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         duration = timer.mark("phase_test")
         self.assertGreaterEqual(duration, 0.0)
 
-        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_impl.py")
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_previous_release.py")
         with open(py_path, "r", encoding="utf-8") as f:
             py_content = f.read()
 
@@ -793,7 +793,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("latest_mtime", sig)
         self.assertIn("total_size", sig)
 
-        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_impl.py")
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_previous_release.py")
         with open(py_path, "r", encoding="utf-8") as f:
             py_content = f.read()
 
@@ -828,7 +828,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertTrue(mock_conn.close.called)
 
     def test_ios_ui_template_integrity(self):
-        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_impl.py")
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_previous_release.py")
         with open(py_path, "r", encoding="utf-8") as f:
             py_content = f.read()
 
@@ -867,7 +867,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertEqual(enhance_coverage.get_project_data_version("test_persisted_project"), v2)
 
     def test_persistent_background_jobs_schema_and_methods(self):
-        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_impl.py")
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_previous_release.py")
         with open(py_path, "r", encoding="utf-8") as f:
             py_content = f.read()
 
@@ -992,7 +992,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
             self.assertIsNone(res, "Expired job query from DB should return None and expire DB row")
 
     def test_cli_ops_paths_invalidate_data_version(self):
-        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_impl.py")
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_previous_release.py")
         with open(py_path, "r", encoding="utf-8") as f:
             py_content = f.read()
 
@@ -1010,7 +1010,7 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("coverage_project_state", clear_content)
 
     def test_server_port_bind_order(self):
-        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_impl.py")
+        py_path = os.path.join(enhance_coverage.SCRIPT_DIR, "app", "compat", "legacy_runtime_previous_release.py")
         with open(py_path, "r", encoding="utf-8") as f:
             py_content = f.read()
 

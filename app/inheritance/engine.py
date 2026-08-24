@@ -10,6 +10,7 @@ from __future__ import absolute_import
 import hashlib
 import json
 import os
+from collections import OrderedDict
 
 from app.db.repositories.analysis_domain_repository import (
     AnalysisDomainRepository, CARRIED_COVERED, INHERITED_PENDING,
@@ -39,16 +40,94 @@ class InheritanceTechnicalFailure(RuntimeError):
 
 class InheritanceEngine(object):
     def __init__(self, predecessor=None, line_mapper=None, parser=None,
-                 dependency_resolver=None, domain_repository=None):
+                 dependency_resolver=None, domain_repository=None,
+                 performance=None, max_source_cache_bytes=32 * 1024 * 1024,
+                 max_source_cache_total_bytes=None,
+                 max_ancestry_cache_entries=2048):
         self.predecessor = predecessor or PredecessorResolver()
         self.line_mapper = line_mapper or GitLineMapEngine()
         self.parser = parser or CppSourceAnalyzer()
         self.dependencies = dependency_resolver or DependencyResolver()
         self.domain = domain_repository or AnalysisDomainRepository()
-        self._source_index_cache = {}
-        self._ancestry_cache = {}
+        self._source_index_cache = OrderedDict()
+        self._source_index_cache_sizes = {}
+        self._source_index_cache_bytes = 0
+        self._source_index_cache_evictions = 0
+        self._ancestry_cache = OrderedDict()
+        self._ancestry_cache_evictions = 0
         self._metrics = {}
-        self.max_source_cache_bytes = 32 * 1024 * 1024
+        self.max_source_cache_bytes = max(1, int(max_source_cache_bytes))
+        self.max_source_cache_total_bytes = max(
+            self.max_source_cache_bytes,
+            int(max_source_cache_total_bytes or self.max_source_cache_bytes * 4),
+        )
+        self.max_ancestry_cache_entries = max(1, int(max_ancestry_cache_entries))
+        self.performance = performance
+
+    def clear_caches(self):
+        """Release commit-scoped source and ancestry cache ownership."""
+        self._source_index_cache.clear()
+        self._source_index_cache_sizes.clear()
+        self._source_index_cache_bytes = 0
+        self._ancestry_cache.clear()
+        self._record_source_cache_metrics()
+        self._record_ancestry_cache_metrics()
+
+    def _record_source_cache_metrics(self):
+        count = len(self._source_index_cache)
+        total = int(self._source_index_cache_bytes)
+        evictions = int(self._source_index_cache_evictions)
+        self._metrics["source_index_count"] = count
+        self._metrics["source_index_total_bytes"] = total
+        self._metrics["source_index_evictions"] = evictions
+        # Keep the compact names as well; these are the stable cache evidence
+        # fields consumed by operators without exposing source paths.
+        self._metrics["index_count"] = count
+        self._metrics["total_bytes"] = total
+        self._metrics["evictions"] = evictions
+
+    def _record_ancestry_cache_metrics(self):
+        self._metrics["ancestry_cache_count"] = len(self._ancestry_cache)
+        self._metrics["ancestry_cache_evictions"] = int(self._ancestry_cache_evictions)
+
+    def _source_index_changed(self, key, index):
+        if key not in self._source_index_cache:
+            return
+        current = int((index.cache_stats() or {}).get("cache_bytes") or 0)
+        previous = int(self._source_index_cache_sizes.get(key) or 0)
+        self._source_index_cache_sizes[key] = current
+        self._source_index_cache_bytes += current - previous
+        self._source_index_cache.move_to_end(key)
+        while self._source_index_cache_bytes > self.max_source_cache_total_bytes:
+            evicted_key = next(
+                (item for item in self._source_index_cache if item != key), None
+            )
+            if evicted_key is None:
+                # A single active index is allowed to consume its configured
+                # per-index budget; the total budget is always at least that
+                # large.  Keep the guard for callers that mutate limits at
+                # runtime rather than corrupting the byte accounting.
+                break
+            self._source_index_cache.pop(evicted_key, None)
+            self._source_index_cache_bytes -= int(
+                self._source_index_cache_sizes.pop(evicted_key, 0)
+            )
+            self._source_index_cache_evictions += 1
+            if self.performance is not None:
+                self.performance.record_cache(evictions=1)
+        self._record_source_cache_metrics()
+        if self.performance is not None:
+            self.performance.record_cache(current_bytes=self._source_index_cache_bytes)
+
+    def _ancestry_cache_put(self, key, value):
+        self._ancestry_cache[key] = bool(value)
+        self._ancestry_cache.move_to_end(key)
+        while len(self._ancestry_cache) > self.max_ancestry_cache_entries:
+            self._ancestry_cache.popitem(last=False)
+            self._ancestry_cache_evictions += 1
+            if self.performance is not None:
+                self.performance.record_cache(evictions=1)
+        self._record_ancestry_cache_metrics()
 
     def compare_line(self, old_line, new_line, old_analysis=None, new_analysis=None,
                      old_line_number=None, new_line_number=None,
@@ -106,6 +185,9 @@ class InheritanceEngine(object):
     def run(self, connection, candidate_scan_id, repository_paths=None,
             decision_run_id=None, algorithm_version=ALGORITHM_VERSION,
             collect_decisions=False, batch_size=500):
+        # Source indexes are useful within one scan only. Drop historical
+        # commit ownership before a long-lived runtime starts the next scan.
+        self.clear_caches()
         self._metrics = {
             "parser_candidate_total": 0,
             "parser_unresolved_total": 0,
@@ -116,6 +198,7 @@ class InheritanceEngine(object):
             "parser_cache_miss": 0,
             "parser_unresolved_by_reason": {},
             "callee_unresolved_by_reason": {},
+            "dependency_budget_exhausted_by_reason": {},
             "macro_unresolved_by_reason": {},
             "const_unresolved_by_reason": {},
             "relation_total": 0,
@@ -128,11 +211,14 @@ class InheritanceEngine(object):
             "source_files_loaded": 0,
             "source_cache_bytes": 0,
             "source_budget_exhausted": 0,
+            "dependency_budget_exhausted_total": 0,
             "source_relation_page_peak": 0,
             "target_line_page_peak": 0,
             "read_set_relation_total": 0,
             "read_set_record_observation_total": 0,
         }
+        self._record_source_cache_metrics()
+        self._record_ancestry_cache_metrics()
         candidate = fetchone(connection, "SELECT * FROM coverage_scans WHERE id=?",
                              (int(candidate_scan_id),))
         if not candidate:
@@ -413,12 +499,14 @@ class InheritanceEngine(object):
         reason = result.reason_code
         if reason in (
                 "FUNCTION_ID_UNRESOLVED", "PARSER_UNRELIABLE",
-                "CALLEE_UNRESOLVED", "MACRO_CHANGED", "CONST_CHANGED"):
+                "CALLEE_UNRESOLVED", "DEPENDENCY_BUDGET_EXHAUSTED",
+                "MACRO_CHANGED", "CONST_CHANGED"):
             self._metrics["parser_unresolved_total"] += 1
             values = self._metrics["parser_unresolved_by_reason"]
             values[reason] = int(values.get(reason) or 0) + 1
         counter = {
             "CALLEE_UNRESOLVED": "callee_unresolved_total",
+            "DEPENDENCY_BUDGET_EXHAUSTED": "dependency_budget_exhausted_total",
             "MACRO_CHANGED": "macro_unresolved_total",
             "CONST_CHANGED": "const_unresolved_total",
         }.get(reason)
@@ -637,13 +725,17 @@ class InheritanceEngine(object):
                     repo_path,
                     fetch_remote=(old_snapshot.get("canonical_remote") or
                                   new_snapshot.get("canonical_remote") or None),
+                    performance=self.performance,
                 )
                 provider.ensure_commit(old_commit)
                 provider.ensure_commit(new_commit)
                 ancestry_key = (provider.repo_path, str(old_commit), str(new_commit))
-                if ancestry_key not in self._ancestry_cache:
-                    self._ancestry_cache[ancestry_key] = provider.is_ancestor(
-                        old_commit, new_commit
+                if ancestry_key in self._ancestry_cache:
+                    self._ancestry_cache.move_to_end(ancestry_key)
+                    self._record_ancestry_cache_metrics()
+                else:
+                    self._ancestry_cache_put(
+                        ancestry_key, provider.is_ancestor(old_commit, new_commit)
                     )
                 if not self._ancestry_cache[ancestry_key]:
                     return {"reason_code": "NON_ANCESTOR"}
@@ -674,8 +766,14 @@ class InheritanceEngine(object):
         key = (provider.repo_path, str(commit), str(parser_version))
         if key in self._source_index_cache:
             self._metrics["parser_cache_hit"] += 1
+            if self.performance is not None:
+                self.performance.record_cache(hit=True)
+            self._source_index_cache.move_to_end(key)
+            self._source_index_changed(key, self._source_index_cache[key])
             return self._source_index_cache[key]
         self._metrics["parser_cache_miss"] += 1
+        if self.performance is not None:
+            self.performance.record_cache(miss=True)
         paths = provider.list_source_files(commit)
         self._metrics["source_files_total"] += len(paths)
 
@@ -687,8 +785,16 @@ class InheritanceEngine(object):
         index = LazySourceAnalysisIndex(
             paths=paths, loader=load, max_cached_bytes=self.max_source_cache_bytes,
             metrics=self._metrics,
+            on_cache_change=lambda value, cache_key=key: self._source_index_changed(
+                cache_key, value
+            ),
         )
         self._source_index_cache[key] = index
+        self._source_index_cache_sizes[key] = int(
+            (index.cache_stats() or {}).get("cache_bytes") or 0
+        )
+        self._source_index_cache_bytes += self._source_index_cache_sizes[key]
+        self._source_index_changed(key, index)
         return index
 
     @staticmethod

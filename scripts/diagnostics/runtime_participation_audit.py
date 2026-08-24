@@ -166,7 +166,7 @@ def audit():
         "provider_only": [item["name"] for item in checks if item["status"] != "RUNTIME_WIRED"],
         "compatibility_only": [{
             "name": "directory_signature",
-            "paths": ["app/compat/legacy_runtime_impl.py", "app/inject/directory_signature.py"],
+            "paths": ["app/compat/legacy_runtime_previous_release.py", "app/inject/directory_signature.py"],
             "reason": "retained for the legacy HTML-injection compatibility surface; not a VNext runtime dependency",
         }],
         "checks": checks,

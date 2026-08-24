@@ -281,6 +281,41 @@ class MigrationRunnerTest(unittest.TestCase):
             "src/migrated.c",
         )
 
+    def test_missing_file_path_on_first_legacy_line_uses_hash_context(self):
+        source = legacy_connection()
+        self.addCleanup(source.close)
+        file_hash = "m" * 32
+        source.execute(
+            "INSERT INTO coverage_line_index VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (9, "project-a", "", file_hash, "missing.c", 9, "return 9;",
+             9, 9, "single", "main", "fn", "line-9", 1),
+        )
+        source.commit()
+        contexts = _legacy_file_contexts(source, "project-a", file_hash)
+        self.assertEqual(len(contexts), 1)
+        self.assertEqual(contexts[0]["file_path"], file_hash)
+        self.assertEqual(contexts[0]["missing_file_path_lines"], [9])
+
+    def test_missing_file_path_in_middle_is_recorded_on_fallback_context(self):
+        source = legacy_connection()
+        self.addCleanup(source.close)
+        file_hash = "n" * 32
+        for row in (
+            (10, "src/known.c", 10, "known"),
+            (11, "", 11, "missing"),
+        ):
+            source.execute(
+                "INSERT INTO coverage_line_index VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (row[0], "project-a", row[1], file_hash, "known.c", row[2],
+                 row[3], row[2], row[2], "single", "main", "fn",
+                 "line-{}".format(row[2]), 1),
+            )
+        source.commit()
+        contexts = _legacy_file_contexts(source, "project-a", file_hash)
+        by_path = {item["file_path"]: item for item in contexts}
+        self.assertEqual(by_path["src/known.c"]["missing_file_path_lines"], [])
+        self.assertEqual(by_path[file_hash]["missing_file_path_lines"], [11])
+
     def test_active_jobs_and_analysis_only_lines_are_explicitly_mapped(self):
         source = legacy_connection()
         self.addCleanup(source.close)

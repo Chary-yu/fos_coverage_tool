@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import hashlib
+import re
 import subprocess
 from typing import Dict, Any, Optional
 
@@ -15,6 +16,7 @@ from app.time_utils import utc_iso
 DEFAULT_VERSION = "v11.7 2026-08-19"
 DEFAULT_SCHEMA_VERSION = 2
 RELEASE_MANIFEST_NAME = "release_manifest.json"
+_FULL_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 
 # Keep this list in one place for both build-time generation and any release
 # governance checker.  The root-level files are retained compatibility assets;
@@ -35,18 +37,24 @@ DEFAULT_RELEASE_ASSET_RELATIVE_PATHS = (
 )
 
 def _get_git_commit_sha(repo_root: str) -> str:
-    """Safely get git commit SHA or return fallback."""
+    """Safely get the exact checkout SHA, or an empty value on failure."""
     try:
         res = subprocess.check_output(
             ["git", "rev-parse", "HEAD"],
             cwd=repo_root,
             stderr=subprocess.DEVNULL
         ).decode("utf-8").strip()
-        if res:
+        if is_valid_commit_sha(res):
             return res
     except Exception:
         pass
-    return "0000000000000000000000000000000000000000"
+    return ""
+
+
+def is_valid_commit_sha(value: str) -> bool:
+    """Return true only for a concrete, non-placeholder full Git SHA."""
+    value = str(value or "").strip()
+    return bool(_FULL_COMMIT_SHA.fullmatch(value)) and set(value.lower()) != {"0"}
 
 
 def _has_git_metadata(repo_root: str) -> bool:
@@ -96,7 +104,12 @@ def generate_release_identity(
     if repo_root is None:
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     
-    commit_sha = str(commit_sha or _get_git_commit_sha(repo_root))
+    resolved_from_checkout = commit_sha is None
+    commit_sha = str(
+        _get_git_commit_sha(repo_root) if resolved_from_checkout else commit_sha
+    ).strip()
+    if resolved_from_checkout and not is_valid_commit_sha(commit_sha):
+        raise RuntimeError("release build has no concrete commit SHA")
     
     if asset_files is None:
         asset_files = _default_asset_files(repo_root)
@@ -149,6 +162,10 @@ def get_current_release_identity(repo_root: Optional[str] = None) -> Dict[str, A
     missing = [key for key in required if manifest.get(key) in (None, "")]
     if missing:
         raise RuntimeError("release identity manifest is incomplete: " + ", ".join(missing))
+    if not is_valid_commit_sha(manifest.get("commit_sha")):
+        raise RuntimeError(
+            "release identity manifest has no concrete commit SHA; exact commit SHA required"
+        )
 
     actual_asset_hash = compute_asset_hash(_default_asset_files(repo_root))
     mismatches = []
@@ -166,7 +183,7 @@ def get_current_release_identity(repo_root: Optional[str] = None) -> Dict[str, A
         # value; a build system must never turn a missing Git checkout into a
         # silently accepted all-zero release.
         commit = str(manifest.get("commit_sha") or "")
-        if len(commit) != 40 or any(char not in "0123456789abcdefABCDEF" for char in commit):
+        if not is_valid_commit_sha(commit):
             raise RuntimeError("release artifact manifest has no exact commit SHA")
     if manifest.get("version") in (None, ""):
         mismatches.append("version")

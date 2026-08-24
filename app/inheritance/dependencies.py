@@ -65,7 +65,8 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
     """
 
     def __init__(self, paths=None, loader=None, analyses=None,
-                 max_cached_bytes=32 * 1024 * 1024, metrics=None):
+                 max_cached_bytes=32 * 1024 * 1024, metrics=None,
+                 on_cache_change=None):
         self._lazy_paths = [str(path) for path in (paths or [])]
         self._lazy_loader = loader
         self._max_cached_bytes = max(1, int(max_cached_bytes))
@@ -73,11 +74,20 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
         self._cache = OrderedDict()
         self._pinned = set((analyses or {}).keys())
         self._metrics = metrics if isinstance(metrics, dict) else {}
+        self._on_cache_change = on_cache_change
         self.budget_exhausted = False
         super(LazySourceAnalysisIndex, self).__init__(analyses=analyses or {})
         for path in sorted(self.analyses):
             self._cache[path] = self._estimate_size(self.analyses[path])
             self._cached_bytes += self._cache[path]
+        if self._cached_bytes > self._max_cached_bytes:
+            # Pinned analysis entries cannot be evicted. Treat an over-budget
+            # initial universe exactly like a failed lazy admission instead of
+            # exposing a partial/empty dependency universe as external code.
+            self.budget_exhausted = True
+            self._metrics["source_budget_exhausted"] = (
+                int(self._metrics.get("source_budget_exhausted") or 0) + 1
+            )
 
     @staticmethod
     def _estimate_size(analysis):
@@ -98,10 +108,15 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
             for name, definition in (analysis.get("constants") or {}).items():
                 self._constants.setdefault(str(name), []).append((path, definition))
 
+    def _notify_cache_change(self):
+        if self._on_cache_change is not None:
+            self._on_cache_change(self)
+
     def _load_path(self, path):
         path = str(path)
         if path in self.analyses:
             self._cache.move_to_end(path)
+            self._notify_cache_change()
             return True
         if self._lazy_loader is None:
             return False
@@ -121,6 +136,7 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
             self._metrics["source_budget_exhausted"] = (
                 int(self._metrics.get("source_budget_exhausted") or 0) + 1
             )
+            self._notify_cache_change()
             return False
         while self._cached_bytes + size > self._max_cached_bytes:
             evicted = next(
@@ -131,6 +147,7 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
                 self._metrics["source_budget_exhausted"] = (
                     int(self._metrics.get("source_budget_exhausted") or 0) + 1
                 )
+                self._notify_cache_change()
                 return False
             evicted_size = self._cache.pop(evicted)
             self.analyses.pop(evicted, None)
@@ -143,6 +160,7 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
             int(self._metrics.get("source_files_loaded") or 0) + 1
         )
         self._metrics["source_cache_bytes"] = self._cached_bytes
+        self._notify_cache_change()
         return True
 
     def _ensure_symbol(self, kind, name):
@@ -197,6 +215,12 @@ class DependencyResolver(object):
     def compare(self, old_analysis, new_analysis, old_line, new_line,
                 old_context=None, new_context=None, old_index=None,
                 new_index=None):
+        if (self._budget_exhausted(old_index) or
+                self._budget_exhausted(new_index)):
+            return DependencyResult(
+                False, "DEPENDENCY_BUDGET_EXHAUSTED",
+                self._fingerprint("budget", old_line, new_line),
+            )
         names = set()
         for value in (old_line, new_line) + tuple(old_context or ()) + tuple(new_context or ()):
             if isinstance(value, (tuple, list)):
@@ -210,6 +234,12 @@ class DependencyResolver(object):
         for name in sorted(names):
             old_definitions = self._definitions(old_index, "macros", name, old_analysis)
             new_definitions = self._definitions(new_index, "macros", name, new_analysis)
+            if (self._budget_exhausted(old_index) or
+                    self._budget_exhausted(new_index)):
+                return DependencyResult(
+                    False, "DEPENDENCY_BUDGET_EXHAUSTED",
+                    self._fingerprint(name, old_definitions, new_definitions),
+                )
             if old_definitions or new_definitions:
                 if (len(old_definitions) != 1 or len(new_definitions) != 1 or
                         old_definitions[0][1] != new_definitions[0][1]):
@@ -220,6 +250,12 @@ class DependencyResolver(object):
 
             old_constants = self._definitions(old_index, "constants", name, old_analysis)
             new_constants = self._definitions(new_index, "constants", name, new_analysis)
+            if (self._budget_exhausted(old_index) or
+                    self._budget_exhausted(new_index)):
+                return DependencyResult(
+                    False, "DEPENDENCY_BUDGET_EXHAUSTED",
+                    self._fingerprint(name, old_constants, new_constants),
+                )
             if old_constants or new_constants:
                 if (len(old_constants) != 1 or len(new_constants) != 1 or
                         old_constants[0][1] != new_constants[0][1]):
@@ -235,6 +271,12 @@ class DependencyResolver(object):
         for name in sorted(old_calls | new_calls):
             old_functions = self._functions(old_index, name, old_analysis)
             new_functions = self._functions(new_index, name, new_analysis)
+            if (self._budget_exhausted(old_index) or
+                    self._budget_exhausted(new_index)):
+                return DependencyResult(
+                    False, "DEPENDENCY_BUDGET_EXHAUSTED",
+                    self._fingerprint(name, old_functions, new_functions),
+                )
             # A name absent from both repository universes is a library/API
             # call, not a same-repository dependency.  A present-but-ambiguous
             # name is different: without overload/include resolution it must
@@ -264,6 +306,10 @@ class DependencyResolver(object):
                                                           new_function.body_fingerprint()))
             fingerprints.append(("callee", name, old_function.body_fingerprint()))
         return DependencyResult(True, "", self._fingerprint(fingerprints))
+
+    @staticmethod
+    def _budget_exhausted(index):
+        return bool(index is not None and getattr(index, "budget_exhausted", False))
 
     @staticmethod
     def _definitions(index, kind, name, analysis):

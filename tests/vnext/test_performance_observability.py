@@ -1,0 +1,141 @@
+import io
+import os
+import sqlite3
+import tempfile
+import unittest
+from unittest import mock
+
+from app.api.handler import VNextHTTPRequestHandler
+from app.code_detail.sidecar_store import SidecarStore
+from app.code_detail.source_reader import SourceContext, SourceLineDTO
+from app.db.repositories.base import fetchall
+from app.inject.service import ScanImportService
+from app.inheritance.git_snapshot import GitSnapshotProvider
+from app.observability.performance import (
+    PerformanceEvidenceCollector, bind_collector,
+)
+
+
+class PerformanceObservabilityTest(unittest.TestCase):
+    def test_http_handler_records_request_bytes_response_bytes_and_time(self):
+        collector = PerformanceEvidenceCollector(
+            {"commit_sha": "a" * 40, "build_id": "build"},
+            workload_id="fixed-http-fixture",
+        )
+
+        class Runtime(object):
+            performance = collector
+
+        class Application(object):
+            runtime = Runtime()
+
+            def dispatch(self, method, path, query, body, headers, remote):
+                return 200, {"ok": True}
+
+        handler = object.__new__(VNextHTTPRequestHandler)
+        handler.application = Application()
+        handler.path = "/api/coverage/health"
+        handler.headers = {"Content-Length": "3"}
+        handler.client_address = ("127.0.0.1", 1)
+        handler.rfile = io.BytesIO(b"{}")
+        handler.wfile = io.BytesIO()
+        handler.send_response = lambda status: None
+        handler.send_header = lambda name, value: None
+        handler.end_headers = lambda: None
+        handler._dispatch("GET")
+        snapshot = collector.snapshot("fixed-http-fixture")
+        self.assertEqual(snapshot["counters"]["request_count"], 1)
+        self.assertEqual(snapshot["counters"]["request_bytes"], 3)
+        self.assertGreater(snapshot["counters"]["response_bytes"], 0)
+        self.assertGreater(snapshot["durations"]["http_request"]["count"], 0)
+
+    def test_database_and_git_layers_record_real_operations(self):
+        collector = PerformanceEvidenceCollector(
+            {"commit_sha": "b" * 40, "build_id": "build"},
+            workload_id="fixed-cross-layer-fixture",
+        )
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE fixture (value INTEGER)")
+        connection.execute("INSERT INTO fixture VALUES (1)")
+        connection.commit()
+        with bind_collector(collector):
+            rows = fetchall(connection, "SELECT * FROM fixture")
+        self.assertEqual(len(rows), 1)
+
+        provider = GitSnapshotProvider("/repo", performance=collector)
+        with mock.patch(
+                "app.inheritance.git_snapshot.subprocess.check_output",
+                return_value="fixture-output\n"):
+            self.assertEqual(provider._run(["show", "HEAD:file.c"]), "fixture-output")
+        snapshot = collector.snapshot("fixed-cross-layer-fixture")
+        self.assertGreater(snapshot["counters"]["db_query_count"], 0)
+        self.assertEqual(snapshot["counters"]["db_rows"], 1)
+        self.assertGreater(snapshot["counters"]["db_time_ms"], 0)
+        self.assertGreater(snapshot["counters"]["git_subprocess_count"], 0)
+        self.assertGreater(snapshot["counters"]["git_bytes_read"], 0)
+
+    def test_scan_import_phase_is_bound_to_the_collector(self):
+        class ProjectService(object):
+            def create_scan_and_ingest(self, connection, project_name, files, **kwargs):
+                for item in files:
+                    list(item["lines"])
+                return {"id": 1}
+
+        collector = PerformanceEvidenceCollector(
+            {"commit_sha": "c" * 40, "build_id": "build"},
+            workload_id="fixed-scan-fixture",
+        )
+        service = ScanImportService(ProjectService(), performance=collector)
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".info", delete=False) as stream:
+            stream.write("TN:\nSF:src/a.c\nDA:1,0\nend_of_record\n")
+            info_path = stream.name
+        try:
+            with bind_collector(collector):
+                result = service.import_info(None, "scan", info_path)
+        finally:
+            os.remove(info_path)
+        evidence = collector.snapshot("fixed-scan-fixture")
+        phases = evidence["scan_phases"]
+        counters = evidence["counters"]
+        self.assertEqual(result["files"], 1)
+        self.assertEqual(evidence["identity"]["scan_id"], 1)
+        self.assertGreater(phases["scan_import.import_info"]["count"], 0)
+        self.assertGreater(phases["scan_import.import_info"]["total_ms"], 0)
+        self.assertGreater(counters["bytes_read"], 0)
+
+    def test_sidecar_cache_events_are_bound_to_the_collector(self):
+        collector = PerformanceEvidenceCollector(
+            {"commit_sha": "d" * 40, "build_id": "build"},
+            workload_id="fixed-sidecar-fixture",
+        )
+        with tempfile.TemporaryDirectory(prefix="performance-sidecar-") as root:
+            store = SidecarStore(
+                [root], chunk_size=2, performance=collector,
+            )
+            context = SourceContext(
+                "sidecar", "src/a.c", [
+                    SourceLineDTO(1, "return 0;", coverage_state="uncovered"),
+                    SourceLineDTO(2, "return 1;", coverage_state="covered"),
+                ], report_id="report-sidecar",
+            )
+            key = "a" * 32
+            store.save_chunked_sidecar(root, "report-sidecar", key, context)
+            self.assertIsNotNone(store.load_metadata("report-sidecar", key))
+            self.assertIsNotNone(store.load_metadata("report-sidecar", key))
+            self.assertEqual(
+                len(store.load_lines_ranges("report-sidecar", key, [(1, 2)])[0]),
+                2,
+            )
+            self.assertEqual(
+                len(store.load_lines_ranges("report-sidecar", key, [(1, 2)])[0]),
+                2,
+            )
+        counters = collector.snapshot("fixed-sidecar-fixture")["counters"]
+        self.assertGreater(counters["cache_hits"], 0)
+        self.assertGreater(counters["cache_misses"], 0)
+        self.assertGreater(counters["sidecar_decode_count"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

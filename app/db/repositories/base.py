@@ -5,7 +5,10 @@ mark placeholders. Keeping this adaptation in one module prevents SQL dialect
 details leaking into services and makes migration tests deterministic.
 """
 
+import time
 from typing import Any, Dict, Iterable, Optional
+
+from app.observability.performance import current_collector
 
 
 def is_sqlite(connection) -> bool:
@@ -50,7 +53,13 @@ def bind_chunk_size(connection, parameter_width=1, reserved=0, maximum=None):
 
 def execute(connection, sql: str, params: Iterable[Any] = ()):
     cursor = connection.cursor()
-    cursor.execute(adapt_sql(connection, sql), tuple(params or ()))
+    started = time.perf_counter()
+    try:
+        cursor.execute(adapt_sql(connection, sql), tuple(params or ()))
+    finally:
+        collector = _collector_for(connection)
+        if collector is not None:
+            collector.record_db_query((time.perf_counter() - started) * 1000.0)
     return cursor
 
 
@@ -69,7 +78,11 @@ def row_to_dict(cursor, row) -> Optional[Dict[str, Any]]:
 def fetchone(connection, sql: str, params: Iterable[Any] = ()) -> Optional[Dict[str, Any]]:
     cursor = execute(connection, sql, params)
     try:
-        return row_to_dict(cursor, cursor.fetchone())
+        row = cursor.fetchone()
+        collector = _collector_for(connection)
+        if collector is not None:
+            collector.record_db_rows(1 if row is not None else 0)
+        return row_to_dict(cursor, row)
     finally:
         cursor.close()
 
@@ -77,7 +90,11 @@ def fetchone(connection, sql: str, params: Iterable[Any] = ()) -> Optional[Dict[
 def fetchall(connection, sql: str, params: Iterable[Any] = ()):
     cursor = execute(connection, sql, params)
     try:
-        return [row_to_dict(cursor, row) for row in cursor.fetchall()]
+        rows = cursor.fetchall()
+        collector = _collector_for(connection)
+        if collector is not None:
+            collector.record_db_rows(len(rows))
+        return [row_to_dict(cursor, row) for row in rows]
     finally:
         cursor.close()
 
@@ -92,6 +109,9 @@ def iter_rows(connection, sql: str, params: Iterable[Any] = (), batch_size=500):
             rows = cursor.fetchmany(size)
             if not rows:
                 break
+            collector = _collector_for(connection)
+            if collector is not None:
+                collector.record_db_rows(len(rows))
             for row in rows:
                 yield row_to_dict(cursor, row) if not isinstance(row, dict) else dict(row)
     finally:
@@ -104,3 +124,7 @@ def insert_id(cursor, fallback: int = 0) -> int:
         return int(value or fallback)
     except (TypeError, ValueError):
         return int(fallback)
+
+
+def _collector_for(connection):
+    return current_collector() or getattr(connection, "_performance_collector", None)
