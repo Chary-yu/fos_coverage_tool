@@ -57,6 +57,7 @@ class InheritanceEngine(object):
         self._source_index_cache_bytes = 0
         self._source_index_cache_evictions = 0
         self._active_index_pairs = set()
+        self._active_pairs_by_scope = {}
         self._active_source_index_keys = set()
         self._failed_index_pairs = set()
         self._ancestry_cache = OrderedDict()
@@ -76,6 +77,7 @@ class InheritanceEngine(object):
         self._source_index_cache_sizes.clear()
         self._source_index_cache_bytes = 0
         self._active_index_pairs.clear()
+        self._active_pairs_by_scope.clear()
         self._active_source_index_keys.clear()
         self._failed_index_pairs.clear()
         self._ancestry_cache.clear()
@@ -98,6 +100,9 @@ class InheritanceEngine(object):
         self._metrics["source_index_total_bytes"] = total
         self._metrics["source_index_evictions"] = evictions
         self._metrics["active_index_pair_count"] = len(self._active_index_pairs)
+        self._metrics["active_index_scope_count"] = len(
+            self._active_pairs_by_scope
+        )
         self._metrics["active_source_index_count"] = len(
             self._active_source_index_keys
         )
@@ -142,6 +147,10 @@ class InheritanceEngine(object):
             self._record_source_cache_metrics()
             return
         self._active_index_pairs.discard(pair_key)
+        for scope_key, pairs in list(self._active_pairs_by_scope.items()):
+            pairs.discard(pair_key)
+            if not pairs:
+                self._active_pairs_by_scope.pop(scope_key, None)
         self._active_source_index_keys = set(
             key for pair in self._active_index_pairs for key in pair
         )
@@ -159,7 +168,37 @@ class InheritanceEngine(object):
         if self._source_index_cache_bytes <= self.max_source_cache_total_bytes:
             return
         for pair_key in self._active_pair_for_key(key):
-            self._mark_index_pair_budget_exhausted(pair_key)
+            # The current source snapshot still owns these objects, so the
+            # attribute marks that live pair fail-closed for this comparison;
+            # removing cache ownership prevents the failed pair from
+            # surviving after the snapshot is released.
+            self._mark_index_pair_budget_exhausted(pair_key, drop=True)
+
+    def _release_index_pairs_for_scope(self, scope_key):
+        """Release pairs after a repository has no remaining source files."""
+        scope_key = str(scope_key or "")
+        pair_keys = self._active_pairs_by_scope.pop(scope_key, set())
+        if not pair_keys:
+            return
+        for pair_key in pair_keys:
+            self._active_index_pairs.discard(pair_key)
+        self._active_source_index_keys = set(
+            key for pair in self._active_index_pairs for key in pair
+        )
+        for pair_key in pair_keys:
+            for key in pair_key:
+                if key in self._active_source_index_keys:
+                    continue
+                self._source_index_cache.pop(key, None)
+                self._source_index_cache_bytes -= int(
+                    self._source_index_cache_sizes.pop(key, 0)
+                )
+        self._source_index_cache_bytes = max(0, self._source_index_cache_bytes)
+        self._record_source_cache_metrics()
+        if self.performance is not None:
+            self.performance.record_cache(
+                current_bytes=self._source_index_cache_bytes
+            )
 
     def _source_index_changed(self, key, index):
         if key not in self._source_index_cache:
@@ -351,6 +390,15 @@ class InheritanceEngine(object):
         # Read the source side a file work-unit at a time.  Relation pages and
         # target-line pages are bounded; no full source or candidate file is
         # retained in Python.
+        source_file_last_ids = self._source_file_last_ids(
+            connection, predecessor_id
+        )
+
+        def release_scope_if_complete(source_file, scope_key):
+            file_id = int(source_file.get("file_id") or 0)
+            if file_id >= source_file_last_ids.get(scope_key, file_id):
+                self._release_index_pairs_for_scope(scope_key)
+
         for source_file in self._iter_relation_files(
                 connection, predecessor_id, batch_size=batch_size):
             repository_name = str(source_file.get("repository_name") or "")
@@ -364,6 +412,7 @@ class InheritanceEngine(object):
                     str(repository_status.get("reason_code") or "NO_PREDECESSOR") != "READY"):
                 for relation_page in source_relation_pages:
                     self._record_read_set_page(relation_page, read_set)
+                release_scope_if_complete(source_file, repository_name)
                 continue
             key = (repository_name, str(source_file.get("file_path") or ""))
             target_file = self._candidate_file(
@@ -372,6 +421,7 @@ class InheritanceEngine(object):
             if not target_file:
                 for relation_page in source_relation_pages:
                     self._record_read_set_page(relation_page, read_set)
+                release_scope_if_complete(source_file, repository_name)
                 continue
 
             source_snapshot = None
@@ -454,6 +504,8 @@ class InheritanceEngine(object):
                         connection, run_id, candidate_scan_id, predecessor_id,
                         relation, target_line, mapping, source_snapshot, persist,
                     )
+            release_scope_if_complete(source_file, repository_name)
+            source_snapshot = None
 
         # A source relation is not a license to omit a new candidate line.
         # The anti-join makes retries idempotent without a resident line-id set.
@@ -645,6 +697,24 @@ class InheritanceEngine(object):
             for row in rows:
                 yield row
             last_id = int(rows[-1].get("file_id") or 0)
+
+    def _source_file_last_ids(self, connection, scan_id):
+        rows = fetchall(connection, """
+            SELECT f.repository_name, MAX(f.id) AS last_file_id
+            FROM coverage_files f
+            WHERE f.scan_id=? AND EXISTS (
+                SELECT 1 FROM coverage_lines l
+                JOIN coverage_analysis_line_links q ON q.line_id=l.id
+                WHERE l.file_id=f.id AND q.scan_id=? AND q.is_active=1
+            )
+            GROUP BY f.repository_name
+        """, (int(scan_id), int(scan_id)))
+        return {
+            str(row.get("repository_name") or ""): int(
+                row.get("last_file_id") or 0
+            )
+            for row in rows
+        }
 
     def _iter_source_relation_pages(self, connection, scan_id, file_id,
                                     batch_size=500):
@@ -848,7 +918,8 @@ class InheritanceEngine(object):
                     repo_path, old_commit, new_commit, relation["file_path"],
                 ))
                 old_index, new_index, pair_reason = self._source_index_pair(
-                    provider, old_commit, new_commit
+                    provider, old_commit, new_commit,
+                    scope_key=relation.get("repository_name"),
                 )
                 if pair_reason:
                     return {"reason_code": pair_reason}
@@ -901,7 +972,8 @@ class InheritanceEngine(object):
         self._source_index_changed(key, index)
         return index
 
-    def _source_index_pair(self, provider, old_commit, new_commit):
+    def _source_index_pair(self, provider, old_commit, new_commit,
+                           scope_key=None):
         """Return a jointly pinned old/new dependency index pair.
 
         A generic LRU may evict an inactive commit, but it must never evict
@@ -914,9 +986,14 @@ class InheritanceEngine(object):
         new_key = self._source_index_key(provider, new_commit)
         pair_key = (old_key, new_key)
         if pair_key in self._failed_index_pairs:
+            self._mark_index_pair_budget_exhausted(pair_key, drop=True)
             return None, None, DEPENDENCY_INDEX_MEMORY_BUDGET_EXHAUSTED
         self._active_index_pairs.add(pair_key)
         self._active_source_index_keys.update((old_key, new_key))
+        if scope_key is not None:
+            self._active_pairs_by_scope.setdefault(
+                str(scope_key or ""), set()
+            ).add(pair_key)
         self._record_source_cache_metrics()
         old_index = self._source_index(provider, old_commit)
         new_index = self._source_index(provider, new_commit)

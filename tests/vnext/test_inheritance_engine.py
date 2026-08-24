@@ -581,7 +581,8 @@ class InheritanceEngineTest(unittest.TestCase):
         self.assertTrue(
             new_index.dependency_index_memory_budget_exhausted
         )
-        self.assertEqual(len(engine._source_index_cache), 2)
+        self.assertEqual(len(engine._source_index_cache), 0)
+        self.assertEqual(len(engine._active_index_pairs), 0)
         analyzer = CppSourceAnalyzer()
         caller = analyzer.analyze(
             "int caller() {\n return missing();\n}\n", "src/caller.cpp"
@@ -593,6 +594,60 @@ class InheritanceEngineTest(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(
             result.reason_code, "DEPENDENCY_INDEX_MEMORY_BUDGET_EXHAUSTED"
+        )
+
+    def test_repository_pair_is_released_before_next_repository(self):
+        class Provider(object):
+            repo_path = "/repository-scope-repo"
+
+            def __init__(self):
+                self.candidate_builds = []
+
+            def list_source_files(self, commit):
+                return ["src/helper.cpp"]
+
+            def build_symbol_candidate_index(self, commit, paths):
+                self.candidate_builds.append(str(commit))
+                return {
+                    "functions": {"helper": ["src/helper.cpp"]},
+                    "macros": {}, "constants": {},
+                }
+
+            def read_file(self, commit, path):
+                return "int helper() { return 1; }\n"
+
+        provider = Provider()
+        engine = InheritanceEngine(
+            max_source_cache_bytes=1024 * 1024,
+            max_source_cache_total_bytes=1024 * 1024,
+        )
+        engine._metrics = {
+            "parser_cache_hit": 0,
+            "parser_cache_miss": 0,
+            "source_files_total": 0,
+            "parser_file_total": 0,
+        }
+        old_a, new_a, reason = engine._source_index_pair(
+            provider, "a-old", "a-new", scope_key="repo-a"
+        )
+        self.assertEqual(reason, "")
+        old_a.functions("missing")
+        new_a.functions("missing")
+        self.assertEqual(len(engine._active_index_pairs), 1)
+        engine._release_index_pairs_for_scope("repo-a")
+        self.assertEqual(len(engine._active_index_pairs), 0)
+        self.assertEqual(len(engine._source_index_cache), 0)
+
+        old_b, new_b, reason = engine._source_index_pair(
+            provider, "b-old", "b-new", scope_key="repo-b"
+        )
+        self.assertEqual(reason, "")
+        old_b.functions("missing")
+        new_b.functions("missing")
+        self.assertEqual(len(engine._active_index_pairs), 1)
+        self.assertEqual(
+            sorted(provider.candidate_builds),
+            ["a-new", "a-old", "b-new", "b-old"],
         )
 
     def test_candidate_index_is_sound_over_parser_function_corpus(self):
