@@ -32,6 +32,9 @@ from app.time_utils import utc_sql
 
 ALGORITHM_VERSION = "inheritance-v1"
 NO_INHERIT = "NO_INHERIT"
+DEPENDENCY_INDEX_MEMORY_BUDGET_EXHAUSTED = (
+    "DEPENDENCY_INDEX_MEMORY_BUDGET_EXHAUSTED"
+)
 
 
 class InheritanceTechnicalFailure(RuntimeError):
@@ -53,6 +56,9 @@ class InheritanceEngine(object):
         self._source_index_cache_sizes = {}
         self._source_index_cache_bytes = 0
         self._source_index_cache_evictions = 0
+        self._active_index_pairs = set()
+        self._active_source_index_keys = set()
+        self._failed_index_pairs = set()
         self._ancestry_cache = OrderedDict()
         self._ancestry_cache_evictions = 0
         self._metrics = {}
@@ -69,6 +75,9 @@ class InheritanceEngine(object):
         self._source_index_cache.clear()
         self._source_index_cache_sizes.clear()
         self._source_index_cache_bytes = 0
+        self._active_index_pairs.clear()
+        self._active_source_index_keys.clear()
+        self._failed_index_pairs.clear()
         self._ancestry_cache.clear()
         self._record_source_cache_metrics()
         self._record_ancestry_cache_metrics()
@@ -88,6 +97,13 @@ class InheritanceEngine(object):
         self._metrics["source_index_count"] = count
         self._metrics["source_index_total_bytes"] = total
         self._metrics["source_index_evictions"] = evictions
+        self._metrics["active_index_pair_count"] = len(self._active_index_pairs)
+        self._metrics["active_source_index_count"] = len(
+            self._active_source_index_keys
+        )
+        self._metrics["source_index_pair_budget_failures"] = len(
+            self._failed_index_pairs
+        )
         self._metrics["candidate_index_entries"] = candidate_entries
         self._metrics["candidate_index_bytes"] = candidate_bytes
         self._metrics["resolution_cache_bytes"] = resolution_bytes
@@ -108,6 +124,43 @@ class InheritanceEngine(object):
         # field.  The outer LRU must account for every index-owned structure.
         return int(stats.get("total_index_bytes", stats.get("cache_bytes")) or 0)
 
+    def _source_index_key(self, provider, commit):
+        parser_version = getattr(self.parser, "version", self.parser.__class__.__name__)
+        return (provider.repo_path, str(commit), str(parser_version))
+
+    def _active_pair_for_key(self, key):
+        return [pair for pair in self._active_index_pairs if key in pair]
+
+    def _mark_index_pair_budget_exhausted(self, pair_key, drop=False):
+        if pair_key not in self._failed_index_pairs:
+            self._failed_index_pairs.add(pair_key)
+        for key in pair_key:
+            index = self._source_index_cache.get(key)
+            if index is not None:
+                index.dependency_index_memory_budget_exhausted = True
+        if not drop:
+            self._record_source_cache_metrics()
+            return
+        self._active_index_pairs.discard(pair_key)
+        self._active_source_index_keys = set(
+            key for pair in self._active_index_pairs for key in pair
+        )
+        for key in pair_key:
+            if key in self._active_source_index_keys:
+                continue
+            self._source_index_cache.pop(key, None)
+            self._source_index_cache_bytes -= int(
+                self._source_index_cache_sizes.pop(key, 0)
+            )
+        self._source_index_cache_bytes = max(0, self._source_index_cache_bytes)
+        self._record_source_cache_metrics()
+
+    def _mark_active_pairs_over_budget(self, key):
+        if self._source_index_cache_bytes <= self.max_source_cache_total_bytes:
+            return
+        for pair_key in self._active_pair_for_key(key):
+            self._mark_index_pair_budget_exhausted(pair_key)
+
     def _source_index_changed(self, key, index):
         if key not in self._source_index_cache:
             return
@@ -118,7 +171,9 @@ class InheritanceEngine(object):
         self._source_index_cache.move_to_end(key)
         while self._source_index_cache_bytes > self.max_source_cache_total_bytes:
             evicted_key = next(
-                (item for item in self._source_index_cache if item != key), None
+                (item for item in self._source_index_cache
+                 if item != key and item not in self._active_source_index_keys),
+                None,
             )
             if evicted_key is None:
                 # A single active index is allowed to consume its configured
@@ -133,6 +188,7 @@ class InheritanceEngine(object):
             self._source_index_cache_evictions += 1
             if self.performance is not None:
                 self.performance.record_cache(evictions=1)
+        self._mark_active_pairs_over_budget(key)
         self._record_source_cache_metrics()
         if self.performance is not None:
             self.performance.record_cache(current_bytes=self._source_index_cache_bytes)
@@ -154,6 +210,11 @@ class InheritanceEngine(object):
         new_analysis = new_analysis or {}
         old_line_number = int(old_line_number or old_analysis.get("line_number") or 0)
         new_line_number = int(new_line_number or new_analysis.get("line_number") or 0)
+        if any(getattr(index, "dependency_index_memory_budget_exhausted", False)
+               for index in (old_index, new_index) if index is not None):
+            return self._result(
+                False, DEPENDENCY_INDEX_MEMORY_BUDGET_EXHAUSTED
+            )
         if normalize_cpp(old_line) != normalize_cpp(new_line):
             return self._result(False, "LINE_CODE_CHANGED")
         old_function = self.parser.function_for_line(old_analysis, old_line_number)
@@ -183,6 +244,11 @@ class InheritanceEngine(object):
             old_context=old_context, new_context=new_context,
             old_index=old_index, new_index=new_index,
         )
+        if any(getattr(index, "dependency_index_memory_budget_exhausted", False)
+               for index in (old_index, new_index) if index is not None):
+            return self._result(
+                False, DEPENDENCY_INDEX_MEMORY_BUDGET_EXHAUSTED
+            )
         if not dependency.ok:
             return self._result(False, dependency.reason_code,
                                 dependency_fingerprint=dependency.fingerprint)
@@ -230,6 +296,7 @@ class InheritanceEngine(object):
             "source_cache_bytes": 0,
             "source_budget_exhausted": 0,
             "dependency_budget_exhausted_total": 0,
+            "dependency_index_memory_budget_exhausted_total": 0,
             "source_candidate_index_builds": 0,
             "source_candidate_index_failures": 0,
             "dependency_resolution_cache_hits": 0,
@@ -339,6 +406,11 @@ class InheritanceEngine(object):
                         self._metrics["parser_file_total"] += 2
 
                 if source_snapshot.get("reason_code"):
+                    if (source_snapshot.get("reason_code") ==
+                            DEPENDENCY_INDEX_MEMORY_BUDGET_EXHAUSTED):
+                        self._metrics[
+                            "dependency_index_memory_budget_exhausted_total"
+                        ] += len(relation_page)
                     for relation in relation_page:
                         persist(None, relation, source_snapshot["reason_code"])
                     continue
@@ -523,6 +595,7 @@ class InheritanceEngine(object):
         if reason in (
                 "FUNCTION_ID_UNRESOLVED", "PARSER_UNRELIABLE",
                 "CALLEE_UNRESOLVED", "DEPENDENCY_BUDGET_EXHAUSTED",
+                "DEPENDENCY_INDEX_MEMORY_BUDGET_EXHAUSTED",
                 "DEPENDENCY_CANDIDATE_INDEX_UNAVAILABLE",
                 "MACRO_CHANGED", "CONST_CHANGED"):
             self._metrics["parser_unresolved_total"] += 1
@@ -531,6 +604,8 @@ class InheritanceEngine(object):
         counter = {
             "CALLEE_UNRESOLVED": "callee_unresolved_total",
             "DEPENDENCY_BUDGET_EXHAUSTED": "dependency_budget_exhausted_total",
+            "DEPENDENCY_INDEX_MEMORY_BUDGET_EXHAUSTED":
+                "dependency_index_memory_budget_exhausted_total",
             "MACRO_CHANGED": "macro_unresolved_total",
             "CONST_CHANGED": "const_unresolved_total",
         }.get(reason)
@@ -772,8 +847,11 @@ class InheritanceEngine(object):
                 ) if map_git_text else self.line_mapper.map_git_file(
                     repo_path, old_commit, new_commit, relation["file_path"],
                 ))
-                old_index = self._source_index(provider, old_commit)
-                new_index = self._source_index(provider, new_commit)
+                old_index, new_index, pair_reason = self._source_index_pair(
+                    provider, old_commit, new_commit
+                )
+                if pair_reason:
+                    return {"reason_code": pair_reason}
                 return {"old_text": old_text, "new_text": new_text, "mapping": mapping,
                         "old_index": old_index, "new_index": new_index}
             except GitTechnicalFailure as exc:
@@ -786,8 +864,7 @@ class InheritanceEngine(object):
         return {"reason_code": "REPOSITORY_PATH_UNAVAILABLE"}
 
     def _source_index(self, provider, commit):
-        parser_version = getattr(self.parser, "version", self.parser.__class__.__name__)
-        key = (provider.repo_path, str(commit), str(parser_version))
+        key = self._source_index_key(provider, commit)
         if key in self._source_index_cache:
             self._metrics["parser_cache_hit"] += 1
             if self.performance is not None:
@@ -823,6 +900,36 @@ class InheritanceEngine(object):
         self._source_index_cache_bytes += self._source_index_cache_sizes[key]
         self._source_index_changed(key, index)
         return index
+
+    def _source_index_pair(self, provider, old_commit, new_commit):
+        """Return a jointly pinned old/new dependency index pair.
+
+        A generic LRU may evict an inactive commit, but it must never evict
+        one side of the pair needed by the same inheritance comparison.  If
+        the pair (or the already active pairs for this run) cannot fit, mark
+        the pair failed closed and remember that result so subsequent source
+        files do not rebuild the same candidate indexes.
+        """
+        old_key = self._source_index_key(provider, old_commit)
+        new_key = self._source_index_key(provider, new_commit)
+        pair_key = (old_key, new_key)
+        if pair_key in self._failed_index_pairs:
+            return None, None, DEPENDENCY_INDEX_MEMORY_BUDGET_EXHAUSTED
+        self._active_index_pairs.add(pair_key)
+        self._active_source_index_keys.update((old_key, new_key))
+        self._record_source_cache_metrics()
+        old_index = self._source_index(provider, old_commit)
+        new_index = self._source_index(provider, new_commit)
+        pair_bytes = sum(
+            int(self._source_index_cache_sizes.get(key) or 0)
+            for key in set((old_key, new_key))
+        )
+        if (pair_key in self._failed_index_pairs or
+                pair_bytes > self.max_source_cache_total_bytes or
+                self._source_index_cache_bytes > self.max_source_cache_total_bytes):
+            self._mark_index_pair_budget_exhausted(pair_key, drop=True)
+            return None, None, DEPENDENCY_INDEX_MEMORY_BUDGET_EXHAUSTED
+        return old_index, new_index, ""
 
     @staticmethod
     def _dependency_context(analysis, line_number):

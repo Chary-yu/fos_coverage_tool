@@ -524,6 +524,77 @@ class InheritanceEngineTest(unittest.TestCase):
                          second.cache_stats()["total_index_bytes"])
         self.assertEqual(engine._metrics["source_index_evictions"], 1)
 
+    def test_active_index_pair_fails_closed_without_rebuilding(self):
+        class Provider(object):
+            repo_path = "/active-pair-budget-repo"
+
+            def __init__(self):
+                self.candidate_builds = []
+
+            def list_source_files(self, commit):
+                return ["src/helper.cpp"]
+
+            def build_symbol_candidate_index(self, commit, paths):
+                self.candidate_builds.append(str(commit))
+                return {
+                    "functions": {
+                        "symbol_{}".format(number): ["src/helper.cpp"]
+                        for number in range(64)
+                    },
+                    "macros": {}, "constants": {},
+                }
+
+            def read_file(self, commit, path):
+                return "int helper() { return 1; }\n"
+
+        provider = Provider()
+        engine = InheritanceEngine(
+            max_source_cache_bytes=1,
+            max_source_cache_total_bytes=1,
+        )
+        engine._metrics = {
+            "parser_cache_hit": 0,
+            "parser_cache_miss": 0,
+            "source_files_total": 0,
+            "parser_file_total": 0,
+        }
+        old_index, new_index, reason = engine._source_index_pair(
+            provider, "old", "new"
+        )
+        self.assertEqual(reason, "")
+        old_index.functions("missing")
+        new_index.functions("missing")
+        self.assertEqual(sorted(provider.candidate_builds), ["new", "old"])
+        self.assertGreater(
+            old_index.cache_stats()["candidate_index_bytes"],
+            engine.max_source_cache_total_bytes,
+        )
+
+        _, _, reason = engine._source_index_pair(provider, "old", "new")
+        self.assertEqual(
+            reason, "DEPENDENCY_INDEX_MEMORY_BUDGET_EXHAUSTED"
+        )
+        self.assertEqual(len(provider.candidate_builds), 2)
+        self.assertTrue(
+            old_index.dependency_index_memory_budget_exhausted
+        )
+        self.assertTrue(
+            new_index.dependency_index_memory_budget_exhausted
+        )
+        self.assertEqual(len(engine._source_index_cache), 2)
+        analyzer = CppSourceAnalyzer()
+        caller = analyzer.analyze(
+            "int caller() {\n return missing();\n}\n", "src/caller.cpp"
+        )
+        result = engine.compare_line(
+            " return missing();", " return missing();",
+            caller, caller, 2, 2, old_index=old_index, new_index=new_index,
+        )
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            result.reason_code, "DEPENDENCY_INDEX_MEMORY_BUDGET_EXHAUSTED"
+        )
+
     def test_candidate_index_is_sound_over_parser_function_corpus(self):
         """Lexical candidates must recall every function accepted by parser."""
         sources = {
@@ -758,6 +829,20 @@ class InheritanceEngineTest(unittest.TestCase):
             writer.join(timeout=1)
             if writer.is_alive():
                 self.fail("batch writer did not terminate")
+
+    def test_batch_reader_can_rearm_after_caller_processing(self):
+        """Caller CPU time before a new request is outside Git idle time."""
+        read_fd, write_fd = os.pipe()
+        stream = os.fdopen(read_fd, "rb", 0)
+        try:
+            reader = _DeadlinePipeReader(stream, 0.02)
+            time.sleep(0.03)
+            reader.arm()
+            os.write(write_fd, b"response\n")
+            self.assertEqual(reader.read_line(), b"response\n")
+        finally:
+            os.close(write_fd)
+            stream.close()
 
     def test_line_spliced_constant_candidate_cannot_hide_changed_dependency(self):
         """A changed constexpr on a logical line must block inheritance."""

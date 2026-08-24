@@ -46,8 +46,13 @@ class _DeadlinePipeReader(object):
         self.stream = stream
         self.file_descriptor = stream.fileno()
         self.idle_timeout = max(0.0, float(idle_timeout))
-        self.deadline = time.monotonic() + self.idle_timeout
+        self.deadline = 0.0
         self.buffer = bytearray()
+        self.arm()
+
+    def arm(self):
+        """Start a fresh idle interval for the response to a new request."""
+        self.deadline = time.monotonic() + self.idle_timeout
 
     def _fill(self):
         remaining = self.deadline - time.monotonic()
@@ -232,6 +237,7 @@ class GitSnapshotProvider(object):
                 request = "{}:{}\n".format(commit, path).encode("utf-8")
                 process.stdin.write(request)
                 process.stdin.flush()
+                reader.arm()
                 header = reader.read_line()
                 if not header:
                     raise GitTechnicalFailure(

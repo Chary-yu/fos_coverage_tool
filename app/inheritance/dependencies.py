@@ -114,6 +114,7 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
         self._resolution_cache_sizes = {}
         self._resolution_cache_bytes = 0
         self._resolution_cache_evictions = 0
+        self.dependency_index_memory_budget_exhausted = False
         self.budget_exhausted = False
         super(LazySourceAnalysisIndex, self).__init__(analyses=analyses or {})
         for path in sorted(self.analyses):
@@ -391,6 +392,9 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
             "candidate_index_entries": int(self._candidate_index_entries),
             "candidate_index_bytes": int(self._candidate_index_bytes),
             "budget_exhausted": bool(self.budget_exhausted),
+            "dependency_index_memory_budget_exhausted": bool(
+                self.dependency_index_memory_budget_exhausted
+            ),
             "candidate_index_ready": bool(self._candidate_index_ready),
             "candidate_index_unavailable": bool(self.candidate_index_unavailable),
             "resolution_cache_entries": len(self._resolution_cache),
@@ -509,6 +513,9 @@ class DependencyResolver(object):
 
     @classmethod
     def _unresolved_reason(cls, *indexes):
+        if any(getattr(index, "dependency_index_memory_budget_exhausted", False)
+               for index in indexes if index is not None):
+            return "DEPENDENCY_INDEX_MEMORY_BUDGET_EXHAUSTED"
         if any(getattr(index, "candidate_index_unavailable", False)
                for index in indexes if index is not None):
             return "DEPENDENCY_CANDIDATE_INDEX_UNAVAILABLE"
