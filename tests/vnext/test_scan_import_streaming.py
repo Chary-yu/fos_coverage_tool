@@ -1,10 +1,14 @@
 import os
 import hashlib
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
 
+from app.db.repositories import LineIndexRepository, ProjectRepository, ProjectStateRepository
 from app.inject.service import ScanImportService
+from app.services.project_service import ProjectService
+from scripts.upgrade.migration_runner import create_sqlite_schema
 
 
 class ScanImportStreamingTest(unittest.TestCase):
@@ -52,3 +56,38 @@ class ScanImportStreamingTest(unittest.TestCase):
             self.assertEqual(stats["files"], 1)
         finally:
             os.remove(info_path)
+
+    def test_streaming_ingest_batches_file_identity_sql(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        create_sqlite_schema(connection)
+        service = ProjectService(
+            ProjectRepository(), ProjectStateRepository(), LineIndexRepository(),
+        )
+        scan = service.create_scan(
+            connection, "file-batch", info_sha256="file-batch", status="building",
+        )
+        trace = []
+        connection.set_trace_callback(
+            lambda statement: trace.append(statement)
+            if statement.lstrip().upper().startswith("SELECT")
+            and "SELECT * FROM coverage_files" in statement else None
+        )
+
+        def files():
+            for number in range(300):
+                yield {
+                    "repository_name": "repo-a",
+                    "file_path": "src/file-{}.c".format(number),
+                    "file_path_hash": "{:032x}".format(number),
+                    "source_file_name": "file-{}.c".format(number),
+                    "lines": ({
+                        "line_number": 1, "line_text": "return 0;",
+                        "coverage_state": "uncovered",
+                    } for _ in [0]),
+                }
+
+        service._ingest_files(connection, scan["id"], files(), file_batch_size=128)
+        connection.set_trace_callback(None)
+        self.assertLessEqual(len(trace), 8)

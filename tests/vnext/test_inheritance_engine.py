@@ -415,6 +415,69 @@ class InheritanceEngineTest(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.reason_code, "DEPENDENCY_BUDGET_EXHAUSTED")
 
+    def test_lazy_dependency_resolution_uses_candidate_paths_and_negative_cache(self):
+        """Ordinary/absent tokens must not trigger a repository-wide parser scan."""
+        analyzer = CppSourceAnalyzer()
+        helper = analyzer.analyze(
+            "int helper() { return 1; }\n", "src/helper.cpp"
+        )
+        loaded = []
+
+        def load(path):
+            loaded.append(path)
+            return helper, 1024
+
+        index = LazySourceAnalysisIndex(
+            paths=["src/a.cpp", "src/b.cpp", "src/helper.cpp"],
+            loader=load,
+            candidate_index={
+                "functions": {"helper": ["src/helper.cpp"]},
+                "macros": {}, "constants": {},
+            },
+            max_cached_bytes=4096,
+        )
+        self.assertEqual(index.functions("return"), [])
+        self.assertEqual(index.functions("return"), [])
+        self.assertEqual(index.functions("missing_symbol"), [])
+        self.assertEqual(index.functions("missing_symbol"), [])
+        self.assertEqual(loaded, [])
+        self.assertEqual(len(index.functions("helper")), 1)
+        self.assertEqual(loaded, ["src/helper.cpp"])
+        self.assertGreaterEqual(index.cache_stats()["resolution_cache_entries"], 2)
+
+    def test_engine_wires_lightweight_candidate_index_before_parser_loading(self):
+        class Provider(object):
+            repo_path = "/candidate-index-repo"
+
+            def __init__(self):
+                self.reads = []
+
+            def list_source_files(self, commit):
+                return ["src/file-{}.cpp".format(number) for number in range(1000)]
+
+            def build_symbol_candidate_index(self, commit, paths):
+                return {
+                    "functions": {"helper": ["src/helper.cpp"]},
+                    "macros": {}, "constants": {},
+                }
+
+            def read_file(self, commit, path):
+                self.reads.append(path)
+                return "int helper() { return 1; }\n"
+
+        provider = Provider()
+        engine = InheritanceEngine()
+        engine._metrics = {
+            "parser_cache_hit": 0, "parser_cache_miss": 0,
+            "source_files_total": 0, "parser_file_total": 0,
+        }
+        index = engine._source_index(provider, "commit")
+        self.assertEqual(index.functions("ordinary_token"), [])
+        self.assertEqual(index.functions("ordinary_token"), [])
+        self.assertEqual(provider.reads, [])
+        self.assertEqual(len(index.functions("helper")), 1)
+        self.assertEqual(provider.reads, ["src/helper.cpp"])
+
     def test_single_side_dependency_budget_exhaustion_is_unknown(self):
         analyzer = CppSourceAnalyzer()
         caller = analyzer.analyze(

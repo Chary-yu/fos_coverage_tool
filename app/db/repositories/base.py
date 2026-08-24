@@ -58,7 +58,8 @@ def execute(connection, sql: str, params: Iterable[Any] = ()):
         cursor.execute(adapt_sql(connection, sql), tuple(params or ()))
     finally:
         collector = _collector_for(connection)
-        if collector is not None:
+        if collector is not None and not getattr(
+                cursor, "_performance_instrumented", False):
             collector.record_db_query((time.perf_counter() - started) * 1000.0)
     return cursor
 
@@ -80,7 +81,8 @@ def fetchone(connection, sql: str, params: Iterable[Any] = ()) -> Optional[Dict[
     try:
         row = cursor.fetchone()
         collector = _collector_for(connection)
-        if collector is not None:
+        if collector is not None and not getattr(
+                cursor, "_performance_instrumented", False):
             collector.record_db_rows(1 if row is not None else 0)
         return row_to_dict(cursor, row)
     finally:
@@ -92,7 +94,8 @@ def fetchall(connection, sql: str, params: Iterable[Any] = ()):
     try:
         rows = cursor.fetchall()
         collector = _collector_for(connection)
-        if collector is not None:
+        if collector is not None and not getattr(
+                cursor, "_performance_instrumented", False):
             collector.record_db_rows(len(rows))
         return [row_to_dict(cursor, row) for row in rows]
     finally:
@@ -110,7 +113,8 @@ def iter_rows(connection, sql: str, params: Iterable[Any] = (), batch_size=500):
             if not rows:
                 break
             collector = _collector_for(connection)
-            if collector is not None:
+            if collector is not None and not getattr(
+                    cursor, "_performance_instrumented", False):
                 collector.record_db_rows(len(rows))
             for row in rows:
                 yield row_to_dict(cursor, row) if not isinstance(row, dict) else dict(row)

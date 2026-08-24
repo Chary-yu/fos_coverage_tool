@@ -18,6 +18,7 @@ from app.scan_import.locks import RepositoryResourceLockService
 from app.scan_import.publication import ScanPublicationService
 from app.time_utils import utc_sql
 from app.inheritance.git_snapshot import GitSnapshotProvider, GitTechnicalFailure
+from app.observability.performance import instrument_connection
 
 
 class ScanImportCoordinator(object):
@@ -177,20 +178,32 @@ class ScanImportCoordinator(object):
         Normal execution consumes the immutable artifact descriptor without a
         second hash pass; recovery explicitly requests one verification pass.
         """
+        connection = instrument_connection(connection, self.performance)
         context = self._load_execution_context(
             connection, job_id, owner_token, fencing_token,
             verify_artifact=verify_artifact,
         )
+        payload = context["payload"]
+        if self.performance is not None:
+            with self.performance.child_context(
+                    payload.get("project_id"), context["scan_id"],
+                    workload_id="scan-import:{}".format(context["scan_id"])):
+                return self._execute_bound(
+                    connection, job_id, context, repository_paths,
+                    verify_artifact,
+                )
+        return self._execute_bound(
+            connection, job_id, context, repository_paths, verify_artifact,
+        )
+
+    def _execute_bound(self, connection, job_id, context,
+                       repository_paths=None, verify_artifact=False):
         payload = context["payload"]
         owner_token = context["owner_token"]
         fencing_token = context["fencing_token"]
         scan_id = context["scan_id"]
         checkpoint = context["checkpoint"]
         artifact = context["artifact"]
-        if self.performance is not None:
-            self.performance.bind(
-                project_id=payload.get("project_id"), scan_id=scan_id,
-            )
 
         if checkpoint.get("phase") in ("PUBLISHED", "DONE"):
             return self.states.get(connection, int(payload.get("project_id") or 0))

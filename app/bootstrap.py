@@ -37,7 +37,7 @@ from app.inheritance.toolchain import parser_from_config
 from app.jobs.bounded_executor import BoundedJobExecutor
 from app.jobs.service import VNextBackgroundJobService
 from app.observability import PerformanceEvidenceCollector
-from app.observability.performance import bind_collector
+from app.observability.performance import bind_collector, instrument_connection
 
 
 class _ConnectionLease(object):
@@ -45,12 +45,15 @@ class _ConnectionLease(object):
 
     def __init__(self, connection, close_callback=None, performance=None):
         self._connection = connection
+        self._instrumented_connection = instrument_connection(
+            connection, performance
+        )
         self._close_callback = close_callback
         self._performance_collector = performance
         self._closed = False
 
     def __getattr__(self, name):
-        return getattr(self._connection, name)
+        return getattr(self._instrumented_connection, name)
 
     def close(self):
         if self._closed:
@@ -355,10 +358,12 @@ class VNextRuntime(object):
     def connection_context(self, read_only: bool = False):
         with bind_collector(self.performance):
             if self._connection is not None:
-                yield self._connection
+                yield instrument_connection(self._connection, self.performance)
                 return
             if self._connection_factory is not None:
-                connection = self._connection_factory()
+                connection = instrument_connection(
+                    self._connection_factory(), self.performance
+                )
                 try:
                     yield connection
                 finally:
@@ -369,7 +374,7 @@ class VNextRuntime(object):
             if self.database_manager is None:
                 raise RuntimeError("VNext database manager is not configured")
             with self.database_manager.connection(read_only=read_only) as connection:
-                yield connection
+                yield instrument_connection(connection, self.performance)
 
     def _job_connection(self):
         if self._connection is not None:

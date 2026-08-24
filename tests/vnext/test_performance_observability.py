@@ -12,7 +12,7 @@ from app.db.repositories.base import fetchall
 from app.inject.service import ScanImportService
 from app.inheritance.git_snapshot import GitSnapshotProvider
 from app.observability.performance import (
-    PerformanceEvidenceCollector, bind_collector,
+    PerformanceEvidenceCollector, bind_collector, instrument_connection,
 )
 
 
@@ -99,7 +99,11 @@ class PerformanceObservabilityTest(unittest.TestCase):
         phases = evidence["scan_phases"]
         counters = evidence["counters"]
         self.assertEqual(result["files"], 1)
-        self.assertEqual(evidence["identity"]["scan_id"], 1)
+        self.assertEqual(
+            [item["identity"]["scan_id"]
+             for item in evidence["completed_scan_evidence"]],
+            [1],
+        )
         self.assertGreater(phases["scan_import.import_info"]["count"], 0)
         self.assertGreater(phases["scan_import.import_info"]["total_ms"], 0)
         self.assertGreater(counters["bytes_read"], 0)
@@ -135,6 +139,44 @@ class PerformanceObservabilityTest(unittest.TestCase):
         self.assertGreater(counters["cache_hits"], 0)
         self.assertGreater(counters["cache_misses"], 0)
         self.assertGreater(counters["sidecar_decode_count"], 0)
+
+    def test_child_scan_collectors_preserve_identity_and_merge_to_runtime(self):
+        collector = PerformanceEvidenceCollector(
+            {"commit_sha": "e" * 40, "build_id": "build"},
+            workload_id="runtime",
+        )
+        with collector.child_context(7, 101, workload_id="scan-101") as first:
+            collector.record_db_query(1.0)
+            first.increment("db_query_count", 1)
+        with collector.child_context(8, 202, workload_id="scan-202") as second:
+            collector.record_db_query(1.0)
+            second.increment("db_query_count", 2)
+        evidence = collector.snapshot("runtime")
+        self.assertEqual(evidence["counters"]["db_query_count"], 5)
+        identities = {
+            (item["identity"]["project_id"], item["identity"]["scan_id"])
+            for item in evidence["completed_scan_evidence"]
+        }
+        self.assertEqual(identities, {(7, 101), (8, 202)})
+
+    def test_instrumented_connection_captures_direct_cursor_writes(self):
+        collector = PerformanceEvidenceCollector(
+            {"commit_sha": "f" * 40, "build_id": "build"},
+            workload_id="cursor-fixture",
+        )
+        raw = sqlite3.connect(":memory:")
+        self.addCleanup(raw.close)
+        connection = instrument_connection(raw, collector)
+        with bind_collector(collector):
+            cursor = connection.cursor()
+            cursor.execute("CREATE TABLE fixture (value INTEGER)")
+            cursor.executemany("INSERT INTO fixture VALUES (?)", [(1,), (2,)])
+            cursor.execute("SELECT * FROM fixture")
+            self.assertEqual(len(cursor.fetchall()), 2)
+            cursor.close()
+        counters = collector.snapshot("cursor-fixture")["counters"]
+        self.assertGreaterEqual(counters["db_query_count"], 3)
+        self.assertGreaterEqual(counters["db_rows"], 2)
 
 
 if __name__ == "__main__":

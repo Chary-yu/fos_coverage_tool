@@ -2,6 +2,9 @@
 
 from __future__ import absolute_import
 
+import sys
+from types import ModuleType
+
 from app.compat import legacy_runtime_adapter as _adapter
 from app.compat.telemetry import record as _record_legacy_usage
 
@@ -17,8 +20,27 @@ print_help = _adapter.print_help
 dispatch_cli = _adapter.dispatch_cli
 
 
+class _LegacyRuntimeModule(ModuleType):
+    """Module proxy retaining old monkey-patch assignment behavior."""
+
+    _OWNED_NAMES = frozenset((
+        "SCRIPT_DIR", "CONFIG_PATH", "DEFAULT_PROJECT_NAME", "load_config",
+        "get_arg_value", "has_arg", "run_server", "print_help", "dispatch_cli",
+    ))
+
+    def __setattr__(self, name, value):
+        if name.startswith("_") or name in self._OWNED_NAMES:
+            return ModuleType.__setattr__(self, name, value)
+        return _adapter.set_legacy_attribute(name, value)
+
+
 def __getattr__(name):
     return getattr(_adapter, name)
+
+
+_module = sys.modules.get(__name__)
+if _module is not None:
+    _module.__class__ = _LegacyRuntimeModule
 
 
 if __name__ == "__main__":

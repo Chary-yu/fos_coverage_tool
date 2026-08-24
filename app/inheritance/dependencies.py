@@ -16,6 +16,24 @@ from collections import OrderedDict
 from app.inheritance.normalizer import normalize_cpp
 
 
+_NON_DEPENDENCY_TOKENS = frozenset((
+    "alignas", "alignof", "and", "and_eq", "asm", "auto", "bitand",
+    "bitor", "bool", "break", "case", "catch", "char", "char8_t",
+    "char16_t", "char32_t", "class", "compl", "concept", "const",
+    "consteval", "constexpr", "constinit", "const_cast", "continue",
+    "co_await", "co_return", "co_yield", "decltype", "default", "delete",
+    "do", "double", "dynamic_cast", "else", "enum", "explicit", "export",
+    "extern", "false", "float", "for", "friend", "goto", "if", "inline",
+    "int", "long", "mutable", "namespace", "new", "noexcept", "not",
+    "not_eq", "nullptr", "operator", "or", "or_eq", "private", "protected",
+    "public", "register", "reinterpret_cast", "requires", "return", "short",
+    "signed", "sizeof", "static", "static_assert", "static_cast", "struct",
+    "switch", "template", "this", "thread_local", "throw", "true", "try",
+    "typedef", "typeid", "typename", "union", "unsigned", "using", "virtual",
+    "void", "volatile", "wchar_t", "while", "xor", "xor_eq",
+))
+
+
 class DependencyResult(object):
     def __init__(self, ok=True, reason_code="", fingerprint=""):
         self.ok = bool(ok)
@@ -66,7 +84,8 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
 
     def __init__(self, paths=None, loader=None, analyses=None,
                  max_cached_bytes=32 * 1024 * 1024, metrics=None,
-                 on_cache_change=None):
+                 on_cache_change=None, candidate_index=None,
+                 candidate_index_loader=None, max_resolution_cache_entries=4096):
         self._lazy_paths = [str(path) for path in (paths or [])]
         self._lazy_loader = loader
         self._max_cached_bytes = max(1, int(max_cached_bytes))
@@ -75,6 +94,15 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
         self._pinned = set((analyses or {}).keys())
         self._metrics = metrics if isinstance(metrics, dict) else {}
         self._on_cache_change = on_cache_change
+        self._candidate_index = self._normalize_candidate_index(candidate_index)
+        self._candidate_index_loader = candidate_index_loader
+        self._candidate_index_ready = candidate_index is not None
+        self.candidate_index_unavailable = False
+        self._max_resolution_cache_entries = max(
+            1, int(max_resolution_cache_entries)
+        )
+        self._resolution_cache = OrderedDict()
+        self._resolution_cache_evictions = 0
         self.budget_exhausted = False
         super(LazySourceAnalysisIndex, self).__init__(analyses=analyses or {})
         for path in sorted(self.analyses):
@@ -88,6 +116,69 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
             self._metrics["source_budget_exhausted"] = (
                 int(self._metrics.get("source_budget_exhausted") or 0) + 1
             )
+
+    @staticmethod
+    def _normalize_candidate_index(value):
+        result = {"functions": {}, "macros": {}, "constants": {}}
+        if not isinstance(value, dict):
+            return result
+        for kind in result:
+            source = value.get(kind) or {}
+            if not isinstance(source, dict):
+                continue
+            for name, paths in source.items():
+                if isinstance(paths, str):
+                    paths = (paths,)
+                result[kind][str(name)] = tuple(sorted(set(
+                    str(path) for path in (paths or ()) if str(path)
+                )))
+        return result
+
+    def _ensure_candidate_index(self):
+        if self._candidate_index_ready:
+            return
+        self._candidate_index_ready = True
+        if self._candidate_index_loader is None:
+            return
+        try:
+            loaded = self._candidate_index_loader()
+            if not isinstance(loaded, dict):
+                raise ValueError("candidate index must be a mapping")
+            self._candidate_index = self._normalize_candidate_index(loaded)
+            self._metrics["source_candidate_index_builds"] = (
+                int(self._metrics.get("source_candidate_index_builds") or 0) + 1
+            )
+        except Exception:
+            # A lightweight candidate index is an optimization, but an
+            # unavailable index must never turn an unknown dependency into an
+            # external/library dependency.  The resolver will fail closed.
+            self.candidate_index_unavailable = True
+            self._metrics["source_candidate_index_failures"] = (
+                int(self._metrics.get("source_candidate_index_failures") or 0) + 1
+            )
+
+    def _candidate_paths(self, kind, name):
+        key = (str(kind), str(name))
+        cached = self._resolution_cache.get(key)
+        if cached is not None:
+            self._resolution_cache.move_to_end(key)
+            self._metrics["dependency_resolution_cache_hits"] = (
+                int(self._metrics.get("dependency_resolution_cache_hits") or 0) + 1
+            )
+            return cached
+        self._metrics["dependency_resolution_cache_misses"] = (
+            int(self._metrics.get("dependency_resolution_cache_misses") or 0) + 1
+        )
+        self._ensure_candidate_index()
+        paths = tuple(self._candidate_index.get(str(kind), {}).get(str(name), ()))
+        self._resolution_cache[key] = paths
+        while len(self._resolution_cache) > self._max_resolution_cache_entries:
+            self._resolution_cache.popitem(last=False)
+            self._resolution_cache_evictions += 1
+        self._metrics["dependency_candidate_paths"] = (
+            int(self._metrics.get("dependency_candidate_paths") or 0) + len(paths)
+        )
+        return paths
 
     @staticmethod
     def _estimate_size(analysis):
@@ -168,7 +259,12 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
             self._macros if kind == "macros" else self._constants
         )
         symbol = str(name)
-        for path in self._lazy_paths:
+        paths = (self._lazy_paths if self._candidate_index_loader is None and
+                 not self._candidate_index_ready else
+                 self._candidate_paths(kind, symbol))
+        if self.candidate_index_unavailable:
+            return
+        for path in paths:
             values = source.get(symbol, ())
             if len(values) > 1:
                 break
@@ -208,6 +304,10 @@ class LazySourceAnalysisIndex(SourceAnalysisIndex):
             "cache_bytes": int(self._cached_bytes),
             "max_cached_bytes": int(self._max_cached_bytes),
             "budget_exhausted": bool(self.budget_exhausted),
+            "candidate_index_ready": bool(self._candidate_index_ready),
+            "candidate_index_unavailable": bool(self.candidate_index_unavailable),
+            "resolution_cache_entries": len(self._resolution_cache),
+            "resolution_cache_evictions": int(self._resolution_cache_evictions),
         }
 
 
@@ -215,10 +315,10 @@ class DependencyResolver(object):
     def compare(self, old_analysis, new_analysis, old_line, new_line,
                 old_context=None, new_context=None, old_index=None,
                 new_index=None):
-        if (self._budget_exhausted(old_index) or
-                self._budget_exhausted(new_index)):
+        unresolved_reason = self._unresolved_reason(old_index, new_index)
+        if unresolved_reason:
             return DependencyResult(
-                False, "DEPENDENCY_BUDGET_EXHAUSTED",
+                False, unresolved_reason,
                 self._fingerprint("budget", old_line, new_line),
             )
         names = set()
@@ -229,15 +329,16 @@ class DependencyResolver(object):
             else:
                 names.update(token for token in normalize_cpp(value)
                              if re.match(r"^[A-Za-z_]\w*$", token))
+        names.difference_update(_NON_DEPENDENCY_TOKENS)
 
         fingerprints = []
         for name in sorted(names):
             old_definitions = self._definitions(old_index, "macros", name, old_analysis)
             new_definitions = self._definitions(new_index, "macros", name, new_analysis)
-            if (self._budget_exhausted(old_index) or
-                    self._budget_exhausted(new_index)):
+            unresolved_reason = self._unresolved_reason(old_index, new_index)
+            if unresolved_reason:
                 return DependencyResult(
-                    False, "DEPENDENCY_BUDGET_EXHAUSTED",
+                    False, unresolved_reason,
                     self._fingerprint(name, old_definitions, new_definitions),
                 )
             if old_definitions or new_definitions:
@@ -250,10 +351,10 @@ class DependencyResolver(object):
 
             old_constants = self._definitions(old_index, "constants", name, old_analysis)
             new_constants = self._definitions(new_index, "constants", name, new_analysis)
-            if (self._budget_exhausted(old_index) or
-                    self._budget_exhausted(new_index)):
+            unresolved_reason = self._unresolved_reason(old_index, new_index)
+            if unresolved_reason:
                 return DependencyResult(
-                    False, "DEPENDENCY_BUDGET_EXHAUSTED",
+                    False, unresolved_reason,
                     self._fingerprint(name, old_constants, new_constants),
                 )
             if old_constants or new_constants:
@@ -271,10 +372,10 @@ class DependencyResolver(object):
         for name in sorted(old_calls | new_calls):
             old_functions = self._functions(old_index, name, old_analysis)
             new_functions = self._functions(new_index, name, new_analysis)
-            if (self._budget_exhausted(old_index) or
-                    self._budget_exhausted(new_index)):
+            unresolved_reason = self._unresolved_reason(old_index, new_index)
+            if unresolved_reason:
                 return DependencyResult(
-                    False, "DEPENDENCY_BUDGET_EXHAUSTED",
+                    False, unresolved_reason,
                     self._fingerprint(name, old_functions, new_functions),
                 )
             # A name absent from both repository universes is a library/API
@@ -309,7 +410,19 @@ class DependencyResolver(object):
 
     @staticmethod
     def _budget_exhausted(index):
-        return bool(index is not None and getattr(index, "budget_exhausted", False))
+        return bool(index is not None and (
+            getattr(index, "budget_exhausted", False) or
+            getattr(index, "candidate_index_unavailable", False)
+        ))
+
+    @classmethod
+    def _unresolved_reason(cls, *indexes):
+        if any(getattr(index, "candidate_index_unavailable", False)
+               for index in indexes if index is not None):
+            return "DEPENDENCY_CANDIDATE_INDEX_UNAVAILABLE"
+        if any(cls._budget_exhausted(index) for index in indexes):
+            return "DEPENDENCY_BUDGET_EXHAUSTED"
+        return ""
 
     @staticmethod
     def _definitions(index, kind, name, analysis):

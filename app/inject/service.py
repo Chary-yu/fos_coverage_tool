@@ -8,6 +8,7 @@ from app.inject.parse_once import parse_gcov_source_once
 from app.incremental.lcov import iter_info_records, parse_info
 from app.services.project_service import ProjectService
 from app.config.path_policy import realpath_within, reject_relative_traversal
+from app.observability.performance import current_collector, instrument_connection
 
 
 class InjectService:
@@ -29,6 +30,27 @@ class ScanImportService(object):
 
     def import_info(self, connection, project_name, info_path, review_scope="full",
                     repositories=None, report=None, info_file_name=""):
+        connection = instrument_connection(connection, self.performance)
+        if self.performance is not None:
+            with self.performance.child_context(
+                    workload_id="scan-import:{}".format(project_name)) as collector:
+                result = self._import_info_bound(
+                    connection, project_name, info_path, review_scope,
+                    repositories, report, info_file_name,
+                )
+                scan = result.get("scan") or {}
+                collector.bind(
+                    project_id=scan.get("project_id"), scan_id=scan.get("id")
+                )
+                return result
+        return self._import_info_bound(
+            connection, project_name, info_path, review_scope,
+            repositories, report, info_file_name,
+        )
+
+    def _import_info_bound(self, connection, project_name, info_path,
+                           review_scope="full", repositories=None,
+                           report=None, info_file_name=""):
         info_path = self._validate_info_path(info_path)
         info_sha256 = self._sha256_file(info_path)
         stats = {"files": 0, "line_count": 0,
@@ -43,16 +65,12 @@ class ScanImportService(object):
                 info_sha256=info_sha256, review_scope=review_scope,
                 repositories=repositories or [], report=report,
             )
-        if self.performance is not None:
-            with self.performance.phase("scan_import.import_info"):
+        collector = current_collector() if self.performance is not None else None
+        if collector is not None:
+            with collector.phase("scan_import.import_info"):
                 scan = create_scan()
         else:
             scan = create_scan()
-        if self.performance is not None:
-            self.performance.bind(
-                project_id=scan.get("project_id") if isinstance(scan, dict) else None,
-                scan_id=scan.get("id") if isinstance(scan, dict) else None,
-            )
         if report and self.report_registry:
             report_root = report.get("report_root") or ""
             directories = report.get("directories") or ([report_root] if report_root else [])

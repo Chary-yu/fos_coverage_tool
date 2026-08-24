@@ -3,10 +3,28 @@
 from __future__ import absolute_import
 
 import os
+import re
 import subprocess
 
 
 SOURCE_EXTENSIONS = (".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx")
+_FUNCTION_CANDIDATE = re.compile(
+    r"\b([A-Za-z_]\w*)\s*\([^;{}]{0,400}\)\s*"
+    r"(?:const\b|noexcept\b|override\b|final\b|[\s&*])*\s*\{",
+    re.MULTILINE,
+)
+_MACRO_CANDIDATE = re.compile(
+    r"^\s*#\s*define\s+([A-Za-z_]\w*)", re.MULTILINE
+)
+_CONSTANT_CANDIDATE = re.compile(
+    r"\b(?:const|constexpr)\b[^;{}\n]{0,200}\b([A-Za-z_]\w*)\s*(?:=|;)",
+    re.MULTILINE,
+)
+_NON_FUNCTION_SYMBOLS = frozenset((
+    "if", "for", "while", "switch", "catch", "return", "sizeof",
+    "decltype", "static_cast", "dynamic_cast", "reinterpret_cast",
+    "const_cast", "new", "delete",
+))
 
 
 class GitTechnicalFailure(RuntimeError):
@@ -106,3 +124,33 @@ class GitSnapshotProvider(object):
                 continue
             paths.append(path)
         return sorted(set(paths))
+
+    def build_symbol_candidate_index(self, commit, paths=None):
+        """Build one lightweight symbol-to-path index for a commit.
+
+        This deliberately does not invoke the C++ parser.  It performs one
+        bounded lexical pass over the source universe, so a missing ordinary
+        token is answered from a negative cache instead of reparsing every
+        source file for every token.
+        """
+        candidates = {"functions": {}, "macros": {}, "constants": {}}
+        source_paths = list(paths or self.list_source_files(commit))
+
+        def add(kind, symbol, path):
+            symbol = str(symbol or "")
+            if not symbol or symbol in _NON_FUNCTION_SYMBOLS:
+                return
+            candidates[kind].setdefault(symbol, set()).add(str(path))
+
+        for path in source_paths:
+            text = self.read_file(commit, path)
+            for match in _FUNCTION_CANDIDATE.finditer(text):
+                add("functions", match.group(1), path)
+            for match in _MACRO_CANDIDATE.finditer(text):
+                add("macros", match.group(1), path)
+            for match in _CONSTANT_CANDIDATE.finditer(text):
+                add("constants", match.group(1), path)
+        return {
+            kind: {name: sorted(paths) for name, paths in values.items()}
+            for kind, values in candidates.items()
+        }

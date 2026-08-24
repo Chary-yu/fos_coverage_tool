@@ -12,6 +12,7 @@ import hashlib
 import json
 import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 
 try:
@@ -58,6 +59,147 @@ def stable_identity(value):
     return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[:16]
 
 
+class InstrumentedCursor(object):
+    """DB-API cursor proxy covering direct execute/executemany paths."""
+
+    _performance_instrumented = True
+
+    def __init__(self, cursor, collector=None):
+        self._cursor = cursor
+        self._collector = collector
+
+    def _active_collector(self):
+        return current_collector() or self._collector
+
+    def _query(self, method, *args, **kwargs):
+        started = time.perf_counter()
+        try:
+            result = getattr(self._cursor, method)(*args, **kwargs)
+            collector = self._active_collector()
+            rowcount = getattr(self._cursor, "rowcount", -1)
+            if collector is not None and int(rowcount or -1) >= 0:
+                collector.record_db_rows(int(rowcount))
+            return result
+        finally:
+            collector = self._active_collector()
+            if collector is not None:
+                collector.record_db_query(
+                    (time.perf_counter() - started) * 1000.0
+                )
+
+    def execute(self, *args, **kwargs):
+        return self._query("execute", *args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self._query("executemany", *args, **kwargs)
+
+    def _rows(self, method, *args, **kwargs):
+        rows = getattr(self._cursor, method)(*args, **kwargs)
+        collector = self._active_collector()
+        if collector is not None:
+            collector.record_db_rows(
+                len(rows) if method != "fetchone" else int(rows is not None)
+            )
+        return rows
+
+    def fetchone(self):
+        return self._rows("fetchone")
+
+    def fetchmany(self, *args, **kwargs):
+        return self._rows("fetchmany", *args, **kwargs)
+
+    def fetchall(self):
+        return self._rows("fetchall")
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            row = next(self._cursor)
+        except StopIteration:
+            raise
+        collector = self._active_collector()
+        if collector is not None:
+            collector.record_db_rows(1)
+        return row
+
+    next = __next__
+
+    def close(self):
+        return self._cursor.close()
+
+    def __enter__(self):
+        self._cursor.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self._cursor.__exit__(exc_type, exc_value, traceback)
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class InstrumentedConnection(object):
+    """DB-API connection proxy that instruments every cursor it creates."""
+
+    _performance_instrumented = True
+
+    def __init__(self, connection, collector=None):
+        self._connection = connection
+        self._performance_collector = collector
+
+    def _active_collector(self):
+        return current_collector() or self._performance_collector
+
+    def cursor(self, *args, **kwargs):
+        cursor = self._connection.cursor(*args, **kwargs)
+        if getattr(cursor, "_performance_instrumented", False):
+            return cursor
+        return InstrumentedCursor(cursor, self._active_collector())
+
+    def execute(self, *args, **kwargs):
+        cursor = self.cursor()
+        cursor.execute(*args, **kwargs)
+        return cursor
+
+    def executemany(self, *args, **kwargs):
+        cursor = self.cursor()
+        cursor.executemany(*args, **kwargs)
+        return cursor
+
+    def executescript(self, *args, **kwargs):
+        started = time.perf_counter()
+        try:
+            result = self._connection.executescript(*args, **kwargs)
+        finally:
+            collector = self._active_collector()
+            if collector is not None:
+                collector.record_db_query(
+                    (time.perf_counter() - started) * 1000.0
+                )
+        if getattr(result, "_performance_instrumented", False):
+            return result
+        return InstrumentedCursor(result, self._active_collector())
+
+    def __enter__(self):
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self._connection.__exit__(exc_type, exc_value, traceback)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+def instrument_connection(connection, collector=None):
+    """Return an idempotent DB-API proxy with dynamic collector binding."""
+    if connection is None or getattr(connection, "_performance_instrumented", False):
+        return connection
+    return InstrumentedConnection(connection, collector or current_collector())
+
+
 class PerformanceEvidenceCollector(object):
     SCHEMA_VERSION = 1
 
@@ -82,8 +224,14 @@ class PerformanceEvidenceCollector(object):
         }
         self._durations = {}
         self._phase_durations = {}
+        self._completed_scan_evidence = OrderedDict()
+        self._max_completed_scan_evidence = 64
 
     def bind(self, project_id=None, scan_id=None, workload_id=None):
+        active = current_collector()
+        if active is not None and active is not self:
+            active.bind(project_id, scan_id, workload_id)
+            return
         with self._lock:
             if project_id is not None:
                 self.project_id = int(project_id)
@@ -92,15 +240,84 @@ class PerformanceEvidenceCollector(object):
             if workload_id is not None:
                 self.workload_id = str(workload_id)
 
+    def child(self, project_id=None, scan_id=None, workload_id=None):
+        """Create an isolated collector for one request/job/scan identity."""
+        return PerformanceEvidenceCollector(
+            {"commit_sha": self.release_sha, "build_id": self.build_id},
+            project_id=project_id, scan_id=scan_id,
+            workload_id=workload_id or self.workload_id,
+        )
+
+    @contextmanager
+    def child_context(self, project_id=None, scan_id=None, workload_id=None):
+        child = self.child(project_id, scan_id, workload_id)
+        with bind_collector(child):
+            try:
+                yield child
+            finally:
+                self._merge_child(child)
+
+    def _merge_child(self, child):
+        child_snapshot = child.snapshot("scan")
+        identity = child_snapshot.get("identity") or {}
+        key = (
+            identity.get("project_id"), identity.get("scan_id"),
+            identity.get("workload_id"),
+        )
+        with child._lock:
+            child_counters = dict(child._counters)
+            child_durations = json.loads(json.dumps(child._durations))
+            child_phases = json.loads(json.dumps(child._phase_durations))
+        with self._lock:
+            for field, value in child_counters.items():
+                if field == "cache_bytes":
+                    self._counters[field] = max(
+                        int(self._counters.get(field) or 0), int(value or 0)
+                    )
+                else:
+                    self._counters[field] = (
+                        self._counters.get(field, 0) + value
+                    )
+            self._merge_timed_values(self._durations, child_durations)
+            self._merge_timed_values(self._phase_durations, child_phases)
+            self._completed_scan_evidence[key] = child_snapshot
+            self._completed_scan_evidence.move_to_end(key)
+            while len(self._completed_scan_evidence) > self._max_completed_scan_evidence:
+                self._completed_scan_evidence.popitem(last=False)
+
+    @staticmethod
+    def _merge_timed_values(target, source):
+        for operation, item in source.items():
+            current = target.setdefault(operation, {
+                "count": 0, "total_ms": 0.0, "max_ms": 0.0,
+            })
+            current["count"] += int(item.get("count") or 0)
+            current["total_ms"] += float(item.get("total_ms") or 0.0)
+            current["max_ms"] = max(
+                current["max_ms"], float(item.get("max_ms") or 0.0)
+            )
+
     def increment(self, field, amount=1):
+        active = current_collector()
+        if active is not None and active is not self:
+            active.increment(field, amount)
+            return
         with self._lock:
             self._counters[field] = self._counters.get(field, 0) + amount
 
     def observe(self, field, value):
+        active = current_collector()
+        if active is not None and active is not self:
+            active.observe(field, value)
+            return
         with self._lock:
             self._counters[field] = value
 
     def observe_duration(self, operation, elapsed_ms):
+        active = current_collector()
+        if active is not None and active is not self:
+            active.observe_duration(operation, elapsed_ms)
+            return
         key = str(operation or "unknown")
         with self._lock:
             value = self._durations.setdefault(key, {
@@ -112,6 +329,11 @@ class PerformanceEvidenceCollector(object):
 
     @contextmanager
     def timed(self, operation):
+        active = current_collector()
+        if active is not None and active is not self:
+            with active.timed(operation):
+                yield active
+            return
         started = time.perf_counter()
         try:
             yield self
@@ -120,6 +342,11 @@ class PerformanceEvidenceCollector(object):
 
     @contextmanager
     def phase(self, phase):
+        active = current_collector()
+        if active is not None and active is not self:
+            with active.phase(phase):
+                yield active
+            return
         started = time.perf_counter()
         try:
             yield self
@@ -173,6 +400,7 @@ class PerformanceEvidenceCollector(object):
             project_id = self.project_id
             scan_id = self.scan_id
             workload_id = self.workload_id
+            completed_scans = list(self._completed_scan_evidence.values())
         elapsed_ms = (time.perf_counter() - self._started) * 1000.0
         return {
             "evidence_schema_version": self.SCHEMA_VERSION,
@@ -190,4 +418,5 @@ class PerformanceEvidenceCollector(object):
             "counters": counters,
             "durations": durations,
             "scan_phases": phases,
+            "completed_scan_evidence": completed_scans,
         }

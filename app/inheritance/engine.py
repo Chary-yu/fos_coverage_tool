@@ -212,6 +212,11 @@ class InheritanceEngine(object):
             "source_cache_bytes": 0,
             "source_budget_exhausted": 0,
             "dependency_budget_exhausted_total": 0,
+            "source_candidate_index_builds": 0,
+            "source_candidate_index_failures": 0,
+            "dependency_resolution_cache_hits": 0,
+            "dependency_resolution_cache_misses": 0,
+            "dependency_candidate_paths": 0,
             "source_relation_page_peak": 0,
             "target_line_page_peak": 0,
             "read_set_relation_total": 0,
@@ -500,6 +505,7 @@ class InheritanceEngine(object):
         if reason in (
                 "FUNCTION_ID_UNRESOLVED", "PARSER_UNRELIABLE",
                 "CALLEE_UNRESOLVED", "DEPENDENCY_BUDGET_EXHAUSTED",
+                "DEPENDENCY_CANDIDATE_INDEX_UNAVAILABLE",
                 "MACRO_CHANGED", "CONST_CHANGED"):
             self._metrics["parser_unresolved_total"] += 1
             values = self._metrics["parser_unresolved_by_reason"]
@@ -785,6 +791,11 @@ class InheritanceEngine(object):
         index = LazySourceAnalysisIndex(
             paths=paths, loader=load, max_cached_bytes=self.max_source_cache_bytes,
             metrics=self._metrics,
+            candidate_index_loader=(
+                (lambda source_paths=tuple(paths), source_commit=str(commit):
+                 provider.build_symbol_candidate_index(source_commit, source_paths))
+                if hasattr(provider, "build_symbol_candidate_index") else None
+            ),
             on_cache_change=lambda value, cache_key=key: self._source_index_changed(
                 cache_key, value
             ),

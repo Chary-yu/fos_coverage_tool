@@ -65,6 +65,14 @@ def has_arg(args, name):
     return name in (args or ())
 
 
+def set_legacy_attribute(name, value):
+    """Preserve assignment semantics for the historical module surface."""
+    implementation = _legacy_impl()
+    target_factory = getattr(implementation, "_implementation", None)
+    target = target_factory() if callable(target_factory) else implementation
+    setattr(target, str(name), value)
+
+
 def _run_vnext_server(config):
     from app.bootstrap import create_vnext_server
 
