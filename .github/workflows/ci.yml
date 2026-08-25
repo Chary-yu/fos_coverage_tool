@@ -374,10 +374,12 @@ jobs:
           assert evidence['required_version_prefix'] == '5.5'
           assert evidence['database_version'].startswith('5.5')
           assert evidence['candidate_revision']
-          assert evidence['collations']['source']['collation'] == 'utf8mb4_unicode_ci'
-          assert evidence['collations']['target']['collation'] == 'utf8mb4_general_ci'
-          assert evidence['checks']['collation_independent_semantic_hash'] is True
-          assert evidence['checks']['data_version_mutation_changes_semantic_hash'] is True
+          migration = evidence['checks']['legacy_to_vnext_migration_rehearsal']
+          assert migration['status'] == 'PASSED'
+          assert migration['collations']['source']['collation'] == 'utf8mb4_unicode_ci'
+          assert migration['collations']['target']['collation'] == 'utf8mb4_general_ci'
+          assert migration['checks']['collation_independent_semantic_hash'] is True
+          assert migration['checks']['data_version_mutation_changes_semantic_hash'] is True
           PY
       - name: Upload MariaDB 5.5 compatibility evidence
         if: ${{ always() }}
