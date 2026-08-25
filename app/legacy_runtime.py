@@ -20,6 +20,13 @@ print_help = _adapter.print_help
 dispatch_cli = _adapter.dispatch_cli
 
 
+_FACADE_NAMES = frozenset((
+    "SCRIPT_DIR", "CONFIG_PATH", "DEFAULT_PROJECT_NAME", "load_config",
+    "get_arg_value", "has_arg", "run_server", "print_help", "dispatch_cli",
+))
+_facade_patch_state = {}
+
+
 class _LegacyRuntimeModule(ModuleType):
     """Module proxy retaining old monkey-patch assignment behavior."""
 
@@ -30,11 +37,34 @@ class _LegacyRuntimeModule(ModuleType):
     ))
 
     def __setattr__(self, name, value):
+        if name in _FACADE_NAMES:
+            state = _facade_patch_state.get(name)
+            if state is None:
+                state = (
+                    ModuleType.__getattribute__(self, name),
+                    _adapter.get_legacy_attribute(name),
+                )
+                _facade_patch_state[name] = state
+            elif value is state[0]:
+                # unittest.mock.patch restores the wrapper's original facade
+                # value. Restore the historical global captured at patch
+                # entry as well, rather than leaking the adapter function
+                # into the previous-release module.
+                _adapter.set_legacy_attribute(name, state[1])
+                del _facade_patch_state[name]
+                return ModuleType.__setattr__(self, name, value)
+            _adapter.set_legacy_attribute(name, value)
+            return ModuleType.__setattr__(self, name, value)
         if name.startswith("__") or name in self._OWNED_NAMES:
             return ModuleType.__setattr__(self, name, value)
         return _adapter.set_legacy_attribute(name, value)
 
     def __delattr__(self, name):
+        if name in _FACADE_NAMES:
+            state = _facade_patch_state.pop(name, None)
+            if state is not None:
+                _adapter.set_legacy_attribute(name, state[1])
+            return ModuleType.__delattr__(self, name)
         if name.startswith("__") or name in self._OWNED_NAMES:
             return ModuleType.__delattr__(self, name)
         return _adapter.delete_legacy_attribute(name)
