@@ -469,7 +469,11 @@ jobs:
           set -o pipefail
           docker run --rm \
             -v "$PWD:/workspace" -w /workspace python@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc \
-            python -m unittest \
+            bash -s <<'PY' 2>&1 | tee .artifacts/py36-compat.log
+          set -e
+          python -m pip install --no-cache-dir -r requirements-py36.txt
+          python -c "import pymysql; assert pymysql.__version__ == '0.10.1', pymysql.__version__"
+          python -m unittest \
             tests.code_detail.test_phase2_core \
             tests.incremental.test_phase5_inject_path \
             tests.vnext.test_api_export_security \
@@ -478,10 +482,17 @@ jobs:
             tests.vnext.test_migration_runner \
             tests.vnext.test_runtime_config \
             tests.vnext.test_vnext_runtime \
-            tests.vnext.test_legacy_runtime_adapter -v 2>&1 | tee .artifacts/py36-compat.log
+            tests.vnext.test_legacy_runtime_adapter -v
+          PY
       - name: Isolate failing Python 3.6 compatibility module
         if: ${{ failure() }}
         run: |
+          docker run --rm \
+            -v "$PWD:/workspace" -w /workspace python@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc \
+            bash -s <<'PY'
+          set -e
+          python -m pip install --no-cache-dir -r requirements-py36.txt
+          python -c "import pymysql; assert pymysql.__version__ == '0.10.1', pymysql.__version__"
           set +e
           failed=0
           for test_module in \
@@ -494,9 +505,7 @@ jobs:
             tests.vnext.test_runtime_config \
             tests.vnext.test_vnext_runtime \
             tests.vnext.test_legacy_runtime_adapter; do
-            docker run --rm \
-              -v "$PWD:/workspace" -w /workspace python@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc \
-              python -m unittest "$test_module" -v
+            python -m unittest "$test_module" -v
             status=$?
             if [ "$status" -ne 0 ]; then
               echo "::error title=Python 3.6 module failure::$test_module exited with status $status"
@@ -507,6 +516,7 @@ jobs:
             echo "Python 3.6 compatibility module isolation found one or more failures" >> "$GITHUB_STEP_SUMMARY"
           fi
           exit 0
+          PY
       - name: Upload Python 3.6 compatibility log
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
@@ -514,6 +524,36 @@ jobs:
           name: py36-compatibility-log
           path: .artifacts/py36-compat.log
           if-no-files-found: error
+
+  candidate-release-gate:
+    name: Candidate release gate (required lanes)
+    if: ${{ always() }}
+    needs:
+      - semantic-migration-regression
+      - mysql55-compatibility
+      - py36-compat
+      - specialist-regression
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all Candidate release lanes to pass
+        env:
+          SEMANTIC_MIGRATION_RESULT: ${{ needs.semantic-migration-regression.result }}
+          MYSQL55_RESULT: ${{ needs.mysql55-compatibility.result }}
+          PY36_RESULT: ${{ needs.py36-compat.result }}
+          SPECIALIST_RESULT: ${{ needs.specialist-regression.result }}
+        run: |
+          set -eu
+          for result in \
+            "semantic-migration-regression=$SEMANTIC_MIGRATION_RESULT" \
+            "mysql55-compatibility=$MYSQL55_RESULT" \
+            "py36-compat=$PY36_RESULT" \
+            "specialist-regression=$SPECIALIST_RESULT"; do
+            lane="${result%%=*}"
+            status="${result#*=}"
+            echo "$lane: $status"
+            test "$status" = success
+          done
+          echo "Candidate release gate: PASS"
 
   mock-dom-regression:
     name: Mock DOM regression (not browser evidence)

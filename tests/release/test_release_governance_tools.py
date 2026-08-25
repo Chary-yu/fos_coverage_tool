@@ -39,6 +39,29 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808", workflow)
         self.assertIn("fetch-depth: 0", workflow)
 
+    def test_ci_has_required_candidate_release_lanes(self):
+        with open(
+                os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
+                encoding="utf-8") as stream:
+            workflow = stream.read()
+        self.assertIn("candidate-release-gate:", workflow)
+        for lane in (
+                "semantic-migration-regression",
+                "mysql55-compatibility",
+                "py36-compat",
+                "specialist-regression"):
+            self.assertIn("- {}".format(lane), workflow)
+        with open("requirements-py36.txt", encoding="utf-8") as stream:
+            requirements = stream.read()
+        self.assertIn("PyMySQL==0.10.1", requirements)
+        self.assertIn(
+            "python -m pip install --no-cache-dir -r requirements-py36.txt",
+            workflow,
+        )
+        self.assertIn(
+            "pymysql.__version__ == '0.10.1'", workflow,
+        )
+
     def test_perf_benchmark_help_is_side_effect_free(self):
         with tempfile.TemporaryDirectory() as directory:
             output = os.path.join(directory, "benchmark.json")

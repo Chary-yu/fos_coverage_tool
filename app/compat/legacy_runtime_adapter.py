@@ -65,12 +65,37 @@ def has_arg(args, name):
     return name in (args or ())
 
 
+def get_legacy_attribute(name):
+    """Read a previous-release symbol through an explicit Python 3.6 API."""
+    if str(name).startswith("__"):
+        raise AttributeError(name)
+    implementation = _legacy_impl()
+    getter = getattr(implementation, "get_legacy_attribute", None)
+    if callable(getter):
+        return getter(name)
+    return getattr(implementation, str(name))
+
+
 def set_legacy_attribute(name, value):
     """Preserve assignment semantics for the historical module surface."""
     implementation = _legacy_impl()
+    setter = getattr(implementation, "set_legacy_attribute", None)
+    if callable(setter):
+        return setter(name, value)
     target_factory = getattr(implementation, "_implementation", None)
     target = target_factory() if callable(target_factory) else implementation
     setattr(target, str(name), value)
+
+
+def delete_legacy_attribute(name):
+    """Delete a previous-release symbol for mock.patch cleanup semantics."""
+    implementation = _legacy_impl()
+    deleter = getattr(implementation, "delete_legacy_attribute", None)
+    if callable(deleter):
+        return deleter(name)
+    target_factory = getattr(implementation, "_implementation", None)
+    target = target_factory() if callable(target_factory) else implementation
+    delattr(target, str(name))
 
 
 def _run_vnext_server(config):
@@ -134,9 +159,9 @@ def dispatch_cli(argv=None):
 
 
 def __getattr__(name):
-    if name.startswith("__"):
-        raise AttributeError(name)
-    return getattr(_legacy_impl(), name)
+    # Kept for Python 3.7+ direct imports; compatibility callers use the
+    # explicit get_legacy_attribute helper through a ModuleType subclass.
+    return get_legacy_attribute(name)
 
 
 __all__ = ("SCRIPT_DIR", "CONFIG_PATH", "DEFAULT_PROJECT_NAME",

@@ -53,6 +53,20 @@ class LegacyRuntimeAdapterTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "False")
 
+    def test_incremental_module_proxy_reads_and_assigns_old_symbols(self):
+        legacy = importlib.import_module("app.incremental.legacy")
+        previous = importlib.import_module(
+            "app.compat.incremental_previous_release"
+        )
+        old_blame = previous._run_git_blame
+        fake_blame = lambda *args, **kwargs: ""
+        try:
+            self.assertIs(legacy._run_git_blame, old_blame)
+            legacy._run_git_blame = fake_blame
+            self.assertIs(previous._run_git_blame, fake_blame)
+        finally:
+            legacy._run_git_blame = old_blame
+
     def test_vnext_server_surface_delegates_to_bootstrap(self):
         config = {"runtime_mode": "vnext", "server": {"host": "127.0.0.1", "port": 1}}
         with mock.patch.object(legacy_runtime_adapter, "load_config", return_value=config), \

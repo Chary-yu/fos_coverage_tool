@@ -26,12 +26,18 @@ class _LegacyRuntimeModule(ModuleType):
     _OWNED_NAMES = frozenset((
         "SCRIPT_DIR", "CONFIG_PATH", "DEFAULT_PROJECT_NAME", "load_config",
         "get_arg_value", "has_arg", "run_server", "print_help", "dispatch_cli",
+        "_adapter", "_record_legacy_usage", "_LegacyRuntimeModule", "_module",
     ))
 
     def __setattr__(self, name, value):
-        if name.startswith("_") or name in self._OWNED_NAMES:
+        if name.startswith("__") or name in self._OWNED_NAMES:
             return ModuleType.__setattr__(self, name, value)
         return _adapter.set_legacy_attribute(name, value)
+
+    def __delattr__(self, name):
+        if name.startswith("__") or name in self._OWNED_NAMES:
+            return ModuleType.__delattr__(self, name)
+        return _adapter.delete_legacy_attribute(name)
 
     def __getattr__(self, name):
         """Resolve old-only symbols without relying on PEP 562.
@@ -43,7 +49,7 @@ class _LegacyRuntimeModule(ModuleType):
         """
         if name.startswith("__"):
             raise AttributeError(name)
-        return getattr(_adapter, name)
+        return _adapter.get_legacy_attribute(name)
 
 
 _module = sys.modules.get(__name__)
