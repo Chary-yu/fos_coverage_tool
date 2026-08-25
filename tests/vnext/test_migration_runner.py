@@ -20,12 +20,14 @@ from scripts.upgrade.migration_runner import (
     canonical_semantic_contract_hash,
     _stream_legacy_semantic_hash,
     _stream_vnext_semantic_hash,
+    _migration_stream_cursor_class,
     _legacy_file_contexts,
     _migration_checkpoint_done,
     _migration_checkpoint_key_hash,
     _upsert_migration_checkpoint,
     _split_sql,
 )
+from app.db.repositories.base import iter_rows
 from scripts.upgrade.schema_preflight import (
     PROTECTED_TABLES, analyze_sql_script, validate_ddl_file,
 )
@@ -97,6 +99,54 @@ def semantic_fixture():
 
 
 class MigrationRunnerTest(unittest.TestCase):
+    def test_migration_stream_uses_pymysql_server_side_dict_cursor(self):
+        class PymysqlConnection(object):
+            pass
+
+        PymysqlConnection.__module__ = "pymysql.connections"
+        cursor_class = _migration_stream_cursor_class(PymysqlConnection())
+        self.assertIsNotNone(cursor_class)
+        self.assertEqual(cursor_class.__name__, "SSDictCursor")
+
+        sqlite_connection = sqlite3.connect(":memory:")
+        self.addCleanup(sqlite_connection.close)
+        self.assertIsNone(_migration_stream_cursor_class(sqlite_connection))
+
+    def test_iter_rows_passes_explicit_cursor_class_to_driver(self):
+        sentinel_cursor_class = object()
+
+        class Cursor(object):
+            description = (("value",),)
+
+            def __init__(self):
+                self.batches = [[(1,)], []]
+
+            def execute(self, sql, params):
+                self.sql = sql
+                self.params = params
+
+            def fetchmany(self, size):
+                return self.batches.pop(0)
+
+            def close(self):
+                self.closed = True
+
+        class Connection(object):
+            def cursor(self, cursor_class=None):
+                self.cursor_class = cursor_class
+                self.active_cursor = Cursor()
+                return self.active_cursor
+
+        connection = Connection()
+        self.assertEqual(
+            list(iter_rows(
+                connection, "SELECT 1", batch_size=1,
+                cursor_class=sentinel_cursor_class,
+            )),
+            [{"value": 1}],
+        )
+        self.assertIs(connection.cursor_class, sentinel_cursor_class)
+
     def test_checkpoint_identity_hash_handles_long_unicode_keys(self):
         target = sqlite3.connect(":memory:")
         target.row_factory = sqlite3.Row

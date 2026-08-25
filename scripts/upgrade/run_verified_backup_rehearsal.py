@@ -57,8 +57,8 @@ from scripts.upgrade.migration_runner import (
     apply_schema,
     capture_legacy_semantic_snapshot,
     capture_vnext_semantic_snapshot,
+    canonical_semantic_contract_hash,
     migrate_legacy,
-    semantic_hash,
 )
 
 
@@ -133,10 +133,13 @@ def _database_exists(client, common, env, name):
     return bool(result.stdout.decode("utf-8", errors="replace").strip())
 
 
-def _create_database(client, common, env, name):
+def _create_database(client, common, env, name,
+                     collation="utf8mb4_unicode_ci"):
     result = _run_client(
         client, common, env,
-        "CREATE DATABASE `{}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci".format(name),
+        "CREATE DATABASE `{}` CHARACTER SET utf8mb4 COLLATE {}".format(
+            name, collation,
+        ),
     )
     if result.returncode != 0:
         raise RuntimeError(
@@ -144,6 +147,21 @@ def _create_database(client, common, env, name):
                 name, result.stderr.decode("utf-8", errors="replace")
             )
         )
+
+
+def _database_collation(connection):
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT @@character_set_database AS character_set_database, "
+            "@@collation_database AS collation_database"
+        )
+        row = cursor.fetchone()
+    if isinstance(row, dict):
+        return {
+            "character_set": str(row.get("character_set_database", "")),
+            "collation": str(row.get("collation_database", "")),
+        }
+    return {"character_set": str(row[0]), "collation": str(row[1])}
 
 
 def _drop_database(client, common, env, name):
@@ -201,7 +219,7 @@ def _connect(config, database):
         charset=cfg.get("charset", "utf8mb4"),
         autocommit=False,
         connect_timeout=float(cfg.get("connect_timeout", 5)),
-        cursorclass=pymysql.cursors.DictCursor,
+        cursorclass=pymysql.cursors.SSDictCursor,
     )
 
 
@@ -468,14 +486,28 @@ def run(args):
             raise RuntimeError("disposable source database already exists")
         if _database_exists(client, common, env, target_database):
             raise RuntimeError("disposable target database already exists")
-        _create_database(client, common, env, source_database)
+        _create_database(
+            client, common, env, source_database, "utf8mb4_unicode_ci"
+        )
         source_created = True
-        _create_database(client, common, env, target_database)
+        _create_database(
+            client, common, env, target_database, "utf8mb4_general_ci"
+        )
         target_created = True
         _restore_dump(client, common, env, dump_path, source_database)
 
         source_connection = _connect(mysql_config, source_database)
         target_connection = _connect(mysql_config, target_database)
+        source_collation = _database_collation(source_connection)
+        target_collation = _database_collation(target_connection)
+        if source_collation["collation"] != "utf8mb4_unicode_ci":
+            raise RuntimeError(
+                "disposable source collation is not utf8mb4_unicode_ci"
+            )
+        if target_collation["collation"] != "utf8mb4_general_ci":
+            raise RuntimeError(
+                "disposable target collation is not utf8mb4_general_ci"
+            )
         source_identity_ok, source_identity, source_identity_error = _runtime_identity(
             client, common, env, source_database,
         )
@@ -512,6 +544,9 @@ def run(args):
             "backup_gzip_verified": True,
             "restore_into_empty_source": True,
             "source_target_database_separation": True,
+            "collation_independent_semantic_hash": True,
+            "source_collation": source_collation,
+            "target_collation": target_collation,
             "core_schema_first_apply": first_schema,
             "core_schema_second_apply": second_schema,
             "analysis_domain_first_apply": first_domain,
@@ -523,9 +558,29 @@ def run(args):
         }
         result["source_database"] = source_database
         result["target_database"] = target_database
-        result["source_semantic_hash"] = semantic_hash(source_semantic)
-        result["target_semantic_hash"] = semantic_hash(target_semantic)
-        result["target_semantic_hash_second"] = semantic_hash(target_semantic_second)
+        result["semantic_hash_version"] = first_migration.get(
+            "semantic_hash_version", ""
+        )
+        result["source_component_hashes"] = first_migration.get(
+            "source_component_hashes", {}
+        )
+        result["target_component_hashes"] = first_migration.get(
+            "target_component_hashes", {}
+        )
+        result["semantic_mismatch_components"] = first_migration.get(
+            "semantic_mismatch_components", []
+        )
+        result["source_semantic_hash"] = first_migration.get(
+            "source_semantic_hash", canonical_semantic_contract_hash(source_semantic)
+        )
+        result["target_semantic_hash"] = first_migration.get(
+            "target_semantic_hash", canonical_semantic_contract_hash(target_semantic)
+        )
+        result["target_semantic_hash_second"] = second_migration.get(
+            "target_semantic_hash", canonical_semantic_contract_hash(
+                target_semantic_second
+            )
+        )
         result["semantic_differences"] = _semantic_diff(
             source_semantic, target_semantic,
         )

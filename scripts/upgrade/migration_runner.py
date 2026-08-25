@@ -1852,6 +1852,25 @@ def capture_vnext_semantic_snapshot(connection):
     }
 
 
+def _migration_stream_cursor_class(connection):
+    """Return PyMySQL's unbuffered dict cursor for target fact scans.
+
+    ``fetchmany`` on a regular PyMySQL cursor only limits the rows handed to
+    Python; the driver may already have buffered the complete result.  Keep
+    the opt-in local to the migration's unbounded semantic scans so normal
+    repository queries retain their existing cursor behavior.
+    """
+    connection = getattr(connection, "_connection", connection)
+    module = str(getattr(connection.__class__, "__module__", ""))
+    if not module.startswith("pymysql"):
+        return None
+    try:
+        import pymysql
+    except ImportError:
+        return None
+    return pymysql.cursors.SSDictCursor
+
+
 def _stream_vnext_semantic_contract(
         connection, batch_size=LEGACY_STREAM_BATCH_SIZE,
         chunk_size=SEMANTIC_HASH_CHUNK_SIZE):
@@ -1860,8 +1879,16 @@ def _stream_vnext_semantic_contract(
         component: _CanonicalMultisetSpool(chunk_size=chunk_size)
         for component in SEMANTIC_COMPONENTS
     }
+    stream_cursor_class = _migration_stream_cursor_class(connection)
+
+    def stream_rows(sql):
+        return iter_rows(
+            connection, sql, batch_size=batch_size,
+            cursor_class=stream_cursor_class,
+        )
+
     try:
-        for row in iter_rows(connection, """
+        for row in stream_rows("""
                 SELECT p.project_name, f.file_path_hash, f.file_path,
                        l.line_number, a.status, a.is_draft, a.reviewer,
                        a.coverage_method, a.uncovered_reason, a.comment
@@ -1870,26 +1897,26 @@ def _stream_vnext_semantic_contract(
                 JOIN coverage_files f ON f.id = l.file_id
                 JOIN coverage_scans s ON s.id = f.scan_id
                 JOIN coverage_projects p ON p.id = s.project_id
-            """, batch_size=batch_size):
+            """):
             component_spools["analyses"].append(_semantic_analysis_item(row))
 
-        for row in iter_rows(connection, """
+        for row in stream_rows("""
                 SELECT j.job_id, p.project_name, j.kind, j.state,
                        COALESCE(j.data_version, 0) AS data_version,
                        COALESCE(j.error_message, '') AS error_message
                 FROM coverage_background_jobs j
                 LEFT JOIN coverage_projects p ON p.id = j.project_id
-            """, batch_size=batch_size):
+            """):
             component_spools["jobs"].append(_semantic_job_item(row))
 
         if _table_exists(connection, "coverage_legacy_provenance"):
-            provenance_rows = iter_rows(connection, """
+            provenance_rows = stream_rows("""
                     SELECT target_entity_type, source_table, source_identity,
                            legacy_created_at, legacy_updated_at,
                            legacy_raw_status, legacy_raw_is_draft,
                            raw_payload_sha256
                     FROM coverage_legacy_provenance
-                """, batch_size=batch_size)
+                """)
         else:
             provenance_rows = ()
         for row in provenance_rows:
@@ -1897,7 +1924,7 @@ def _stream_vnext_semantic_contract(
                 _semantic_provenance_item(row)
             )
 
-        for row in iter_rows(connection, """
+        for row in stream_rows("""
                 SELECT p.project_name, f.file_path_hash, f.file_path,
                        l.line_number, l.line_text, l.block_start_line,
                        l.block_end_line, l.block_type, l.function_name,
@@ -1906,23 +1933,23 @@ def _stream_vnext_semantic_contract(
                 JOIN coverage_files f ON f.id = l.file_id
                 JOIN coverage_scans s ON s.id = f.scan_id
                 JOIN coverage_projects p ON p.id = s.project_id
-            """, batch_size=batch_size):
+            """):
             component_spools["lines"].append(_semantic_line_item(row))
 
-        for row in iter_rows(connection, """
+        for row in stream_rows("""
                 SELECT p.project_name, s.data_version
                 FROM coverage_project_state s
                 JOIN coverage_projects p ON p.id = s.project_id
-            """, batch_size=batch_size):
+            """):
             component_spools["project_data_versions"].append(
                 _semantic_project_data_version_item(
                     row.get("project_name"), row.get("data_version")
                 )
             )
 
-        for row in iter_rows(connection, """
+        for row in stream_rows("""
                 SELECT project_name FROM coverage_projects
-            """, batch_size=batch_size):
+            """):
             component_spools["projects"].append(
                 _semantic_project_item(row.get("project_name"))
             )
@@ -3475,7 +3502,7 @@ def main(argv=None):
                 charset="utf8mb4",
                 autocommit=False,
                 connect_timeout=float(config.get("connect_timeout", 5)),
-                cursorclass=pymysql.cursors.DictCursor,
+                cursorclass=pymysql.cursors.SSDictCursor,
             )
 
         source_config = load_mysql_config(args.source_config)

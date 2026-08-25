@@ -51,8 +51,16 @@ def bind_chunk_size(connection, parameter_width=1, reserved=0, maximum=None):
     return size
 
 
-def execute(connection, sql: str, params: Iterable[Any] = ()):
-    cursor = connection.cursor()
+def execute(connection, sql: str, params: Iterable[Any] = (), cursor_class=None):
+    """Execute a statement, optionally selecting a driver cursor class.
+
+    Most repository queries use the driver's default buffered cursor.  A
+    caller that has an explicit bounded/streaming contract can opt into a
+    driver-specific cursor without changing that default for the rest of the
+    application.
+    """
+    cursor = (connection.cursor(cursor_class)
+              if cursor_class is not None else connection.cursor())
     started = time.perf_counter()
     try:
         cursor.execute(adapt_sql(connection, sql), tuple(params or ()))
@@ -102,9 +110,15 @@ def fetchall(connection, sql: str, params: Iterable[Any] = ()):
         cursor.close()
 
 
-def iter_rows(connection, sql: str, params: Iterable[Any] = (), batch_size=500):
-    """Yield DB rows in bounded batches without materializing a result set."""
-    cursor = execute(connection, sql, params)
+def iter_rows(connection, sql: str, params: Iterable[Any] = (), batch_size=500,
+              cursor_class=None):
+    """Yield DB rows in bounded batches without materializing a result set.
+
+    ``fetchmany`` alone does not guarantee driver-level streaming.  Callers
+    that need that guarantee must pass the appropriate server-side cursor
+    class through ``cursor_class``.
+    """
+    cursor = execute(connection, sql, params, cursor_class=cursor_class)
     columns = _description(cursor)
     size = max(1, int(batch_size or 500))
     try:

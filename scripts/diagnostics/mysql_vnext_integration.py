@@ -52,6 +52,7 @@ from scripts.upgrade.migration_runner import apply_schema
 from scripts.upgrade.migration_runner import (
     capture_vnext_semantic_snapshot,
     migrate_legacy,
+    _stream_vnext_semantic_hash,
     validate_migration_database_separation,
 )
 from scripts.upgrade.domain_migration import apply_analysis_domain
@@ -170,12 +171,24 @@ def _assert(condition, message):
         raise AssertionError(message)
 
 
-def _create_database(connection, database):
+def _create_database(connection, database, collation="utf8mb4_unicode_ci"):
     with connection.cursor() as cursor:
         cursor.execute(
             "CREATE DATABASE `{}` CHARACTER SET utf8mb4 "
-            "COLLATE utf8mb4_unicode_ci".format(database)
+            "COLLATE {}".format(database, collation)
         )
+
+
+def _database_collation(connection):
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT @@character_set_database, @@collation_database"
+        )
+        row = cursor.fetchone()
+    return {
+        "character_set": str(row[0]),
+        "collation": str(row[1]),
+    }
 
 
 def _drop_database(host, port, user, password, database):
@@ -203,8 +216,8 @@ def _run_legacy_migration_rehearsal(args):
     started = time.time()
     try:
         admin = _connect(args.host, args.port, args.user, args.password)
-        _create_database(admin, source_database)
-        _create_database(admin, target_database)
+        _create_database(admin, source_database, "utf8mb4_unicode_ci")
+        _create_database(admin, target_database, "utf8mb4_general_ci")
         admin.close()
         admin = None
 
@@ -220,6 +233,16 @@ def _run_legacy_migration_rehearsal(args):
         target = _connect(
             args.host, args.port, args.user, args.password,
             database=target_database, autocommit=False,
+        )
+        source_collation = _database_collation(source)
+        target_collation = _database_collation(target)
+        _assert(
+            source_collation["collation"] == "utf8mb4_unicode_ci",
+            "MariaDB source rehearsal collation was not utf8mb4_unicode_ci",
+        )
+        _assert(
+            target_collation["collation"] == "utf8mb4_general_ci",
+            "MariaDB target rehearsal collation was not utf8mb4_general_ci",
         )
         separation = validate_migration_database_separation(
             source_config, target_config,
@@ -249,6 +272,22 @@ def _run_legacy_migration_rehearsal(args):
         domain = apply_analysis_domain(target, release_sha=release_sha)
         source.rollback()
         first_snapshot = capture_vnext_semantic_snapshot(target)
+
+        with target.cursor() as cursor:
+            cursor.execute(
+                "UPDATE coverage_project_state "
+                "SET data_version = data_version + 1"
+            )
+        mutated_target_hash = _stream_vnext_semantic_hash(target)
+        semantic_mutation_rejected = (
+            mutated_target_hash != first["target_semantic_hash"]
+        )
+        target.rollback()
+        _assert(
+            semantic_mutation_rejected,
+            "MariaDB data_version mutation did not change the semantic hash",
+        )
+
         second = migrate_legacy(source, target, release_sha=release_sha)
         second_snapshot = capture_vnext_semantic_snapshot(target)
         domain_again = apply_analysis_domain(target, release_sha=release_sha)
@@ -282,8 +321,14 @@ def _run_legacy_migration_rehearsal(args):
             "source_database": source_database,
             "target_database": target_database,
             "database_runtime_identity": separation.get("runtime_fingerprint", {}),
+            "collations": {
+                "source": source_collation,
+                "target": target_collation,
+            },
             "checks": {
                 "source_target_separation": separation,
+                "collation_independent_semantic_hash": True,
+                "data_version_mutation_changes_semantic_hash": True,
                 "core_schema_first_apply": first_schema,
                 "core_schema_second_apply": second_schema,
                 "legacy_migration_first_run": first,
