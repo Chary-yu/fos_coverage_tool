@@ -3,6 +3,7 @@
 from __future__ import print_function
 
 import hashlib
+import heapq
 import json
 import os
 import pickle
@@ -730,6 +731,12 @@ def _nullable_int(value):
 
 
 LEGACY_STREAM_BATCH_SIZE = 500
+SEMANTIC_HASH_VERSION = "canonical-multiset-v2"
+SEMANTIC_HASH_CHUNK_SIZE = 50000
+SEMANTIC_COMPONENTS = (
+    "projects", "project_data_versions", "lines", "analyses", "jobs",
+    "legacy_provenance",
+)
 
 
 def _iter_legacy_rows(connection, table_name, where="", params=(),
@@ -978,17 +985,6 @@ def _json_compact(value):
     ).encode("utf-8")
 
 
-def _stream_json_array(hasher, items):
-    hasher.update(b"[")
-    first = True
-    for item in items:
-        if not first:
-            hasher.update(b",")
-        hasher.update(_json_compact(item))
-        first = False
-    hasher.update(b"]")
-
-
 def _semantic_line_item(line):
     return {key: line.get(key) for key in (
         "project_name", "file_path_hash", "file_path", "line_number", "line_text",
@@ -1004,6 +1000,110 @@ def _semantic_analysis_item(row):
     )}
 
 
+def _semantic_job_item(row):
+    state = row.get("state")
+    error_message = row.get("error_message") or ""
+    if state in ("queued", "running", "interrupted"):
+        state = "interrupted"
+        error_message = error_message or (
+            "legacy active job requires manual migration decision"
+        )
+    return {
+        "job_id": row.get("job_id"),
+        "project_name": row.get("project_name"),
+        "kind": row.get("kind"),
+        "state": state,
+        "data_version": int(row.get("data_version") or 0),
+        "error_message": error_message,
+    }
+
+
+def _semantic_project_item(value):
+    if isinstance(value, dict):
+        value = value.get("project_name")
+    return {"project_name": str(value or "")}
+
+
+def _semantic_project_data_version_item(project_name, data_version=None):
+    if isinstance(project_name, dict):
+        data_version = project_name.get("data_version")
+        project_name = project_name.get("project_name")
+    return {
+        "project_name": str(project_name or ""),
+        "data_version": int(data_version or 0),
+    }
+
+
+def _semantic_provenance_item(row):
+    item = {key: row.get(key) for key in (
+        "target_entity_type", "source_table", "source_identity",
+        "legacy_created_at", "legacy_updated_at", "legacy_raw_status",
+        "legacy_raw_is_draft", "raw_payload_sha256",
+    )}
+    if item.get("legacy_raw_status") == "":
+        item["legacy_raw_status"] = None
+    return item
+
+
+def _canonical_semantic_record_digest(record):
+    """Return the fixed-width digest used by canonical semantic multisets."""
+    return hashlib.sha256(_json_compact(record)).digest()
+
+
+class _CanonicalMultisetSpool(object):
+    """External sorter for fixed-width semantic record digests.
+
+    Only 32-byte record digests are kept in the in-memory chunk.  Sorted
+    chunks are merged directly into the component SHA-256, so the original
+    records and database return order never participate in the result.
+    """
+
+    def __init__(self, chunk_size=SEMANTIC_HASH_CHUNK_SIZE):
+        self.chunk_size = max(1, int(chunk_size or SEMANTIC_HASH_CHUNK_SIZE))
+        self.pending = []
+        self.chunks = []
+
+    def append(self, record):
+        self.pending.append(_canonical_semantic_record_digest(record))
+        if len(self.pending) >= self.chunk_size:
+            self._flush()
+
+    def _flush(self):
+        if not self.pending:
+            return
+        self.pending.sort()
+        stream = tempfile.TemporaryFile(mode="w+b")
+        stream.write(b"".join(self.pending))
+        stream.flush()
+        stream.seek(0)
+        self.chunks.append(stream)
+        self.pending = []
+
+    @staticmethod
+    def _iter_chunk(stream):
+        while True:
+            digest = stream.read(32)
+            if not digest:
+                return
+            if len(digest) != 32:
+                raise RuntimeError("semantic digest chunk ended mid-record")
+            yield digest
+
+    def hexdigest(self):
+        self._flush()
+        result = hashlib.sha256()
+        iterators = [self._iter_chunk(stream) for stream in self.chunks]
+        for digest in heapq.merge(*iterators):
+            result.update(digest)
+        return result.hexdigest()
+
+    def close(self):
+        for stream in self.chunks:
+            stream.close()
+        self.chunks = []
+        self.pending = []
+
+
 def _source_provenance_item(entity_type, source_table, identity, row,
                             raw_status=None, raw_is_draft=None):
     return {
@@ -1014,34 +1114,6 @@ def _source_provenance_item(entity_type, source_table, identity, row,
         "legacy_raw_status": raw_status, "legacy_raw_is_draft": raw_is_draft,
         "raw_payload_sha256": row.get("raw_payload_sha256") or "",
     }
-
-
-class _JsonArraySpool(object):
-    """Disk-backed JSON-array body used to keep migration hashing bounded."""
-
-    def __init__(self):
-        self.stream = tempfile.TemporaryFile(mode="w+b")
-        self.has_items = False
-
-    def append(self, item):
-        self.append_encoded(_json_compact(item))
-
-    def append_encoded(self, encoded):
-        if self.has_items:
-            self.stream.write(b",")
-        self.stream.write(encoded)
-        self.has_items = True
-
-    def copy_to(self, target):
-        self.stream.seek(0)
-        while True:
-            chunk = self.stream.read(1024 * 1024)
-            if not chunk:
-                return
-            target.update(chunk)
-
-    def close(self):
-        self.stream.close()
 
 
 class _LegacySourceSpool(object):
@@ -1110,96 +1182,93 @@ class _LegacySourceSpool(object):
         self.stream.close()
 
 
-def _stream_legacy_semantic_hash(connection, projects, data_versions,
-                                 source_spool=None):
+def _stream_legacy_semantic_hash(
+        connection, projects, data_versions, source_spool=None,
+        chunk_size=SEMANTIC_HASH_CHUNK_SIZE):
     """Hash normalized legacy facts with one bounded source traversal.
 
-    The semantic contract keeps its historical field order, even though the
-    source facts are naturally encountered file-by-file.  Disk-backed spools
-    let one traversal feed the analyses, lines, and provenance fields without
-    retaining the complete source snapshot or querying each file context again.
+    Every semantic component receives record digests in encounter order and
+    performs its own external multiset sort.  The source DB's collation and
+    the order of its result sets therefore cannot affect the contract hash.
     """
     project_names = sorted(projects)
     counts = {"lines": 0, "analyses": 0, "jobs": 0}
-    array_spools = {
-        "analyses": _JsonArraySpool(),
-        "jobs": _JsonArraySpool(),
-        "lines": _JsonArraySpool(),
-        "projects": _JsonArraySpool(),
+    component_spools = {
+        component: _CanonicalMultisetSpool(chunk_size=chunk_size)
+        for component in SEMANTIC_COMPONENTS
     }
-    provenance_spools = {
-        "coverage_analysis": _JsonArraySpool(),
-        "coverage_background_jobs": _JsonArraySpool(),
-        "coverage_line_index": _JsonArraySpool(),
-        "coverage_project_state": _JsonArraySpool(),
-    }
-    line_fragment_spool = tempfile.TemporaryFile(mode="w+b")
-    analysis_fragment_spool = tempfile.TemporaryFile(mode="w+b")
-    fragment_offsets = {}
+    project_fragments = {}
 
     try:
         for project_name in project_names:
-            line_start = line_fragment_spool.tell()
-            analysis_start = analysis_fragment_spool.tell()
-            for context in _iter_legacy_file_contexts(connection, project_name):
-                if source_spool is not None:
-                    source_spool.append_context(project_name, context)
-                for number in sorted(context["analyses"]):
-                    row = context["analyses"][number]
-                    item = _semantic_analysis_item(dict(
-                        row, project_name=project_name,
-                        file_path_hash=context["file_path_hash"],
-                        file_path=context["file_path"],
-                    ))
-                    encoded = _json_compact(item)
-                    array_spools["analyses"].append_encoded(encoded)
-                    analysis_fragment_spool.write(b"A" + encoded)
-                    counts["analyses"] += 1
+            project_fragment_spool = _CanonicalMultisetSpool(
+                chunk_size=chunk_size
+            )
+            try:
+                for context in _iter_legacy_file_contexts(connection, project_name):
+                    if source_spool is not None:
+                        source_spool.append_context(project_name, context)
+                    for number in sorted(context["analyses"]):
+                        row = context["analyses"][number]
+                        item = _semantic_analysis_item(dict(
+                            row, project_name=project_name,
+                            file_path_hash=context["file_path_hash"],
+                            file_path=context["file_path"],
+                        ))
+                        component_spools["analyses"].append(item)
+                        project_fragment_spool.append({
+                            "component": "analyses", "record": item,
+                        })
+                        counts["analyses"] += 1
 
-                for number in sorted(context["lines"]):
-                    row = context["lines"][number]
-                    item = _semantic_line_item(dict(
-                        row, project_name=project_name,
-                        file_path_hash=context["file_path_hash"],
-                        file_path=context["file_path"],
-                    ))
-                    encoded = _json_compact(item)
-                    array_spools["lines"].append_encoded(encoded)
-                    line_fragment_spool.write(b"L" + encoded)
-                    source_line = context.get("source_lines", {}).get(number)
-                    if source_line is not None:
-                        counts["lines"] += 1
+                    for number in sorted(context["lines"]):
+                        row = context["lines"][number]
+                        item = _semantic_line_item(dict(
+                            row, project_name=project_name,
+                            file_path_hash=context["file_path_hash"],
+                            file_path=context["file_path"],
+                        ))
+                        component_spools["lines"].append(item)
+                        project_fragment_spool.append({
+                            "component": "lines", "record": item,
+                        })
+                        source_line = context.get("source_lines", {}).get(number)
+                        if source_line is not None:
+                            counts["lines"] += 1
 
-                for number, row in sorted(
-                        context["analyses"].items(),
-                        key=lambda item: str(item[0])):
-                    provenance_spools["coverage_analysis"].append(
-                        _source_provenance_item(
-                            "legacy_analysis", "coverage_analysis",
-                            "{}:{}:{}".format(
-                                project_name, context["file_path_hash"], number
-                            ), row, raw_status=row.get("status"),
-                            raw_is_draft=row.get("is_draft"),
+                    for number, row in sorted(
+                            context["analyses"].items(),
+                            key=lambda item: str(item[0])):
+                        component_spools["legacy_provenance"].append(
+                            _source_provenance_item(
+                                "legacy_analysis", "coverage_analysis",
+                                "{}:{}:{}".format(
+                                    project_name, context["file_path_hash"], number
+                                ), row, raw_status=row.get("status"),
+                                raw_is_draft=row.get("is_draft"),
+                            )
                         )
-                    )
-                for number, row in sorted(
-                        context.get("source_lines", {}).items(),
-                        key=lambda item: str(item[0])):
-                    provenance_spools["coverage_line_index"].append(
-                        _source_provenance_item(
-                            "line", "coverage_line_index",
-                            "{}:{}:{}".format(
-                                project_name, context["file_path_hash"], number
-                            ), row,
+                    for number, row in sorted(
+                            context.get("source_lines", {}).items(),
+                            key=lambda item: str(item[0])):
+                        component_spools["legacy_provenance"].append(
+                            _source_provenance_item(
+                                "line", "coverage_line_index",
+                                "{}:{}:{}".format(
+                                    project_name, context["file_path_hash"], number
+                                ), row,
+                            )
                         )
-                    )
+                project_fragments[project_name] = project_fragment_spool.hexdigest()
+            finally:
+                project_fragment_spool.close()
 
             state = fetchone(connection, """
                 SELECT * FROM coverage_project_state WHERE project_name=?
             """, (project_name,)) or {}
             if source_spool is not None:
                 source_spool.append_project_state(project_name, state)
-            provenance_spools["coverage_project_state"].append(
+            component_spools["legacy_provenance"].append(
                 _source_provenance_item(
                     "project_state", "coverage_project_state", project_name,
                     {"legacy_created_at": None,
@@ -1207,10 +1276,6 @@ def _stream_legacy_semantic_hash(connection, projects, data_versions,
                      "raw_payload_sha256": _legacy_payload_hash(state)},
                 )
             )
-            fragment_offsets[project_name] = {
-                "lines": (line_start, line_fragment_spool.tell()),
-                "analyses": (analysis_start, analysis_fragment_spool.tell()),
-            }
 
         for row in _iter_legacy_rows(connection, "coverage_background_jobs"):
             fact = _legacy_job_fact(row)
@@ -1221,12 +1286,12 @@ def _stream_legacy_semantic_hash(connection, projects, data_versions,
             if state in ("queued", "running", "interrupted"):
                 state = "interrupted"
                 error = error or "legacy active job requires manual migration decision"
-            array_spools["jobs"].append({
+            component_spools["jobs"].append(_semantic_job_item({
                 "job_id": fact["job_id"], "project_name": fact["project_name"],
                 "kind": fact["kind"], "state": state,
                 "data_version": fact["data_version"], "error_message": error,
-            })
-            provenance_spools["coverage_background_jobs"].append(
+            }))
+            component_spools["legacy_provenance"].append(
                 _source_provenance_item(
                     "job", "coverage_background_jobs", fact["job_id"], fact,
                     raw_status=fact.get("state"),
@@ -1235,70 +1300,27 @@ def _stream_legacy_semantic_hash(connection, projects, data_versions,
             counts["jobs"] += 1
 
         for project_name in project_names:
-            array_spools["projects"].append(project_name)
+            component_spools["projects"].append(
+                _semantic_project_item(project_name)
+            )
+            component_spools["project_data_versions"].append(
+                _semantic_project_data_version_item(
+                    project_name, data_versions.get(project_name, 0)
+                )
+            )
 
-        hasher = hashlib.sha256()
-        hasher.update(b"{")
-        fields = (
-            ("analyses", array_spools["analyses"]),
-            ("jobs", array_spools["jobs"]),
-            ("legacy_provenance", provenance_spools),
-            ("lines", array_spools["lines"]),
-            ("project_data_versions", dict(sorted(data_versions.items()))),
-            ("projects", array_spools["projects"]),
+        component_hashes = {
+            component: component_spools[component].hexdigest()
+            for component in SEMANTIC_COMPONENTS
+        }
+        contract_hash = _canonical_semantic_contract_hash_from_components(
+            component_hashes
         )
-        for index, (key, value) in enumerate(fields):
-            if index:
-                hasher.update(b",")
-            hasher.update(_json_compact(key))
-            hasher.update(b":")
-            if key == "legacy_provenance":
-                hasher.update(b"[")
-                first_group = True
-                for group in (
-                        "coverage_analysis", "coverage_background_jobs",
-                        "coverage_line_index", "coverage_project_state"):
-                    spool = value[group]
-                    if not spool.has_items:
-                        continue
-                    if not first_group:
-                        hasher.update(b",")
-                    spool.copy_to(hasher)
-                    first_group = False
-                hasher.update(b"]")
-            elif isinstance(value, _JsonArraySpool):
-                hasher.update(b"[")
-                value.copy_to(hasher)
-                hasher.update(b"]")
-            else:
-                hasher.update(_json_compact(value))
-        hasher.update(b"}")
-
-        project_fragments = {}
-        for project_name in project_names:
-            line_start, line_end = fragment_offsets[project_name]["lines"]
-            analysis_start, analysis_end = fragment_offsets[project_name]["analyses"]
-            fragment = hashlib.sha256()
-            line_fragment_spool.seek(line_start)
-            remaining = line_end - line_start
-            while remaining > 0:
-                chunk = line_fragment_spool.read(min(1024 * 1024, remaining))
-                if not chunk:
-                    raise RuntimeError("legacy line fragment spool ended early")
-                fragment.update(chunk)
-                remaining -= len(chunk)
-            analysis_fragment_spool.seek(analysis_start)
-            remaining = analysis_end - analysis_start
-            while remaining > 0:
-                chunk = analysis_fragment_spool.read(min(1024 * 1024, remaining))
-                if not chunk:
-                    raise RuntimeError("legacy analysis fragment spool ended early")
-                fragment.update(chunk)
-                remaining -= len(chunk)
-            project_fragments[project_name] = fragment.hexdigest()
 
         return {
-            "semantic_hash": hasher.hexdigest(), "projects": project_names,
+            "semantic_hash": contract_hash, "projects": project_names,
+            "semantic_hash_version": SEMANTIC_HASH_VERSION,
+            "component_hashes": component_hashes,
             "project_data_versions": dict(sorted(data_versions.items())),
             "source_line_facts": counts["lines"],
             "source_analysis_facts": counts["analyses"],
@@ -1306,11 +1328,7 @@ def _stream_legacy_semantic_hash(connection, projects, data_versions,
             "project_fragments": project_fragments,
         }
     finally:
-        line_fragment_spool.close()
-        analysis_fragment_spool.close()
-        for spool in array_spools.values():
-            spool.close()
-        for spool in provenance_spools.values():
+        for spool in component_spools.values():
             spool.close()
 
 
@@ -1834,154 +1852,102 @@ def capture_vnext_semantic_snapshot(connection):
     }
 
 
-def _stream_vnext_semantic_hash(connection, batch_size=LEGACY_STREAM_BATCH_SIZE):
-    """Hash the target semantic contract without materializing target facts.
+def _stream_vnext_semantic_contract(
+        connection, batch_size=LEGACY_STREAM_BATCH_SIZE,
+        chunk_size=SEMANTIC_HASH_CHUNK_SIZE):
+    """Stream target facts into canonical component multisets."""
+    component_spools = {
+        component: _CanonicalMultisetSpool(chunk_size=chunk_size)
+        for component in SEMANTIC_COMPONENTS
+    }
+    try:
+        for row in iter_rows(connection, """
+                SELECT p.project_name, f.file_path_hash, f.file_path,
+                       l.line_number, a.status, a.is_draft, a.reviewer,
+                       a.coverage_method, a.uncovered_reason, a.comment
+                FROM coverage_analyses a
+                JOIN coverage_lines l ON l.id = a.line_id
+                JOIN coverage_files f ON f.id = l.file_id
+                JOIN coverage_scans s ON s.id = f.scan_id
+                JOIN coverage_projects p ON p.id = s.project_id
+            """, batch_size=batch_size):
+            component_spools["analyses"].append(_semantic_analysis_item(row))
 
-    ``capture_vnext_semantic_snapshot`` remains a small-fixture diagnostic
-    helper, but the migration gate must not use it for production-sized
-    targets.  The query order and selected fields below intentionally mirror
-    that helper and ``_stream_legacy_semantic_hash`` so the resulting hash is
-    byte-for-byte comparable while rows are consumed in bounded batches.
-    """
-    hasher = hashlib.sha256()
-    hasher.update(b"{")
-    first_field = True
+        for row in iter_rows(connection, """
+                SELECT j.job_id, p.project_name, j.kind, j.state,
+                       COALESCE(j.data_version, 0) AS data_version,
+                       COALESCE(j.error_message, '') AS error_message
+                FROM coverage_background_jobs j
+                LEFT JOIN coverage_projects p ON p.id = j.project_id
+            """, batch_size=batch_size):
+            component_spools["jobs"].append(_semantic_job_item(row))
 
-    def field_prefix(name):
-        nonlocal first_field
-        if not first_field:
-            hasher.update(b",")
-        hasher.update(_json_compact(name))
-        hasher.update(b":")
-        first_field = False
-
-    def stream_array(rows, transform):
-        hasher.update(b"[")
-        first_item = True
-        for row in rows:
-            if not first_item:
-                hasher.update(b",")
-            hasher.update(_json_compact(transform(row)))
-            first_item = False
-        hasher.update(b"]")
-
-    field_prefix("analyses")
-    stream_array(iter_rows(connection, """
-            SELECT p.project_name, f.file_path_hash, f.file_path, l.line_number,
-                   a.status, a.is_draft, a.reviewer, a.coverage_method,
-                   a.uncovered_reason, a.comment
-            FROM coverage_analyses a
-            JOIN coverage_lines l ON l.id = a.line_id
-            JOIN coverage_files f ON f.id = l.file_id
-            JOIN coverage_scans s ON s.id = f.scan_id
-            JOIN coverage_projects p ON p.id = s.project_id
-            ORDER BY p.project_name, f.file_path_hash, l.line_number
-        """, batch_size=batch_size), lambda row: {
-            key: row.get(key) for key in (
-                "project_name", "file_path_hash", "file_path", "line_number",
-                "status", "is_draft", "reviewer", "coverage_method",
-                "uncovered_reason", "comment",
+        if _table_exists(connection, "coverage_legacy_provenance"):
+            provenance_rows = iter_rows(connection, """
+                    SELECT target_entity_type, source_table, source_identity,
+                           legacy_created_at, legacy_updated_at,
+                           legacy_raw_status, legacy_raw_is_draft,
+                           raw_payload_sha256
+                    FROM coverage_legacy_provenance
+                """, batch_size=batch_size)
+        else:
+            provenance_rows = ()
+        for row in provenance_rows:
+            component_spools["legacy_provenance"].append(
+                _semantic_provenance_item(row)
             )
-        })
 
-    field_prefix("jobs")
+        for row in iter_rows(connection, """
+                SELECT p.project_name, f.file_path_hash, f.file_path,
+                       l.line_number, l.line_text, l.block_start_line,
+                       l.block_end_line, l.block_type, l.function_name,
+                       l.function_hash, l.code_line_hash, l.code_occurrence
+                FROM coverage_lines l
+                JOIN coverage_files f ON f.id = l.file_id
+                JOIN coverage_scans s ON s.id = f.scan_id
+                JOIN coverage_projects p ON p.id = s.project_id
+            """, batch_size=batch_size):
+            component_spools["lines"].append(_semantic_line_item(row))
 
-    def normalize_job(row):
-        state = row.get("state")
-        error_message = row.get("error_message") or ""
-        if state in ("queued", "running", "interrupted"):
-            state = "interrupted"
-            error_message = error_message or (
-                "legacy active job requires manual migration decision"
+        for row in iter_rows(connection, """
+                SELECT p.project_name, s.data_version
+                FROM coverage_project_state s
+                JOIN coverage_projects p ON p.id = s.project_id
+            """, batch_size=batch_size):
+            component_spools["project_data_versions"].append(
+                _semantic_project_data_version_item(
+                    row.get("project_name"), row.get("data_version")
+                )
             )
+
+        for row in iter_rows(connection, """
+                SELECT project_name FROM coverage_projects
+            """, batch_size=batch_size):
+            component_spools["projects"].append(
+                _semantic_project_item(row.get("project_name"))
+            )
+
+        component_hashes = {
+            component: component_spools[component].hexdigest()
+            for component in SEMANTIC_COMPONENTS
+        }
         return {
-            "job_id": row.get("job_id"),
-            "project_name": row.get("project_name"),
-            "kind": row.get("kind"),
-            "state": state,
-            "data_version": row.get("data_version"),
-            "error_message": error_message,
+            "semantic_hash_version": SEMANTIC_HASH_VERSION,
+            "component_hashes": component_hashes,
+            "semantic_hash": _canonical_semantic_contract_hash_from_components(
+                component_hashes
+            ),
         }
+    finally:
+        for spool in component_spools.values():
+            spool.close()
 
-    stream_array(iter_rows(connection, """
-            SELECT j.job_id, p.project_name, j.kind, j.state,
-                   COALESCE(j.data_version, 0) AS data_version,
-                   COALESCE(j.error_message, '') AS error_message
-            FROM coverage_background_jobs j
-            LEFT JOIN coverage_projects p ON p.id = j.project_id
-            ORDER BY j.job_id
-        """, batch_size=batch_size), normalize_job)
 
-    field_prefix("legacy_provenance")
-
-    def normalize_provenance(row):
-        item = {
-            key: row.get(key) for key in (
-                "target_entity_type", "source_table", "source_identity",
-                "legacy_created_at", "legacy_updated_at", "legacy_raw_status",
-                "legacy_raw_is_draft", "raw_payload_sha256",
-            )
-        }
-        if item.get("legacy_raw_status") == "":
-            item["legacy_raw_status"] = None
-        return item
-
-    if _table_exists(connection, "coverage_legacy_provenance"):
-        provenance_rows = iter_rows(connection, """
-                SELECT target_entity_type, source_table, source_identity,
-                       legacy_created_at, legacy_updated_at,
-                       legacy_raw_status, legacy_raw_is_draft,
-                       raw_payload_sha256
-                FROM coverage_legacy_provenance
-                ORDER BY source_table, source_identity, target_entity_type
-            """, batch_size=batch_size)
-    else:
-        provenance_rows = ()
-    stream_array(provenance_rows, normalize_provenance)
-
-    field_prefix("lines")
-    stream_array(iter_rows(connection, """
-            SELECT p.project_name, f.file_path_hash, f.file_path, l.line_number,
-                   l.line_text, l.block_start_line, l.block_end_line, l.block_type,
-                   l.function_name, l.function_hash, l.code_line_hash,
-                   l.code_occurrence
-            FROM coverage_lines l
-            JOIN coverage_files f ON f.id = l.file_id
-            JOIN coverage_scans s ON s.id = f.scan_id
-            JOIN coverage_projects p ON p.id = s.project_id
-            ORDER BY p.project_name, f.file_path_hash, l.line_number
-        """, batch_size=batch_size), lambda row: {
-            key: row.get(key) for key in (
-                "project_name", "file_path_hash", "file_path", "line_number",
-                "line_text", "block_start_line", "block_end_line", "block_type",
-                "function_name", "function_hash", "code_line_hash",
-                "code_occurrence",
-            )
-        })
-
-    field_prefix("project_data_versions")
-    hasher.update(b"{")
-    first_project = True
-    for row in iter_rows(connection, """
-            SELECT p.project_name, s.data_version
-            FROM coverage_project_state s
-            JOIN coverage_projects p ON p.id = s.project_id
-            ORDER BY p.project_name
-        """, batch_size=batch_size):
-        if not first_project:
-            hasher.update(b",")
-        hasher.update(_json_compact(str(row.get("project_name") or "")))
-        hasher.update(b":")
-        hasher.update(_json_compact(int(row.get("data_version") or 0)))
-        first_project = False
-    hasher.update(b"}")
-
-    field_prefix("projects")
-    stream_array(iter_rows(connection, """
-            SELECT project_name FROM coverage_projects ORDER BY project_name
-        """, batch_size=batch_size), lambda row: row.get("project_name"))
-    hasher.update(b"}")
-    return hasher.hexdigest()
+def _stream_vnext_semantic_hash(connection, batch_size=LEGACY_STREAM_BATCH_SIZE):
+    """Return the canonical-multiset-v2 target contract hash."""
+    return _stream_vnext_semantic_contract(
+        connection, batch_size=batch_size
+    )["semantic_hash"]
 
 
 def capture_legacy_semantic_snapshot(connection, snapshot=None):
@@ -2175,6 +2141,90 @@ def semantic_hash(snapshot):
         default=_semantic_json_default,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _canonical_component_records(snapshot, component):
+    snapshot = snapshot or {}
+    value = snapshot.get(component) or ()
+    if component == "projects":
+        for item in value:
+            yield _semantic_project_item(item)
+        return
+    if component == "project_data_versions":
+        if isinstance(value, dict):
+            for project_name, data_version in value.items():
+                yield _semantic_project_data_version_item(
+                    project_name, data_version
+                )
+        else:
+            for item in value:
+                yield _semantic_project_data_version_item(item)
+        return
+    if component == "lines":
+        for item in value:
+            yield _semantic_line_item(item)
+        return
+    if component == "analyses":
+        for item in value:
+            yield _semantic_analysis_item(item)
+        return
+    if component == "jobs":
+        for item in value:
+            yield _semantic_job_item(item)
+        return
+    if component == "legacy_provenance":
+        for item in value:
+            yield _semantic_provenance_item(item)
+        return
+    raise ValueError("unknown semantic component: {}".format(component))
+
+
+def canonical_semantic_component_hash(records,
+                                      chunk_size=SEMANTIC_HASH_CHUNK_SIZE):
+    """Hash an order-independent multiset of semantic records.
+
+    The input may be any iterable, including a database stream.  Duplicate
+    records are deliberately retained, while only fixed-width digests are
+    sorted in memory and on temporary disk.
+    """
+    spool = _CanonicalMultisetSpool(chunk_size=chunk_size)
+    try:
+        for record in records or ():
+            spool.append(record)
+        return spool.hexdigest()
+    finally:
+        spool.close()
+
+
+def canonical_semantic_component_hashes(
+        snapshot, chunk_size=SEMANTIC_HASH_CHUNK_SIZE):
+    """Return canonical-multiset-v2 hashes for all semantic components."""
+    result = {}
+    for component in SEMANTIC_COMPONENTS:
+        result[component] = canonical_semantic_component_hash(
+            _canonical_component_records(snapshot, component),
+            chunk_size=chunk_size,
+        )
+    return result
+
+
+def _canonical_semantic_contract_hash_from_components(component_hashes):
+    payload = {
+        "semantic_hash_version": SEMANTIC_HASH_VERSION,
+        "components": {
+            component: str(component_hashes.get(component) or "")
+            for component in SEMANTIC_COMPONENTS
+        },
+    }
+    return hashlib.sha256(_json_compact(payload)).hexdigest()
+
+
+def canonical_semantic_contract_hash(
+        snapshot, chunk_size=SEMANTIC_HASH_CHUNK_SIZE):
+    """Hash the six canonical semantic component multisets as one contract."""
+    return _canonical_semantic_contract_hash_from_components(
+        canonical_semantic_component_hashes(snapshot, chunk_size=chunk_size)
+    )
 
 
 def _upsert_legacy_provenance(connection, migration_id, entity_type,
@@ -2791,7 +2841,7 @@ def _migrate_legacy_materialized(source_connection, target_connection, anomaly_p
         source_connection, snapshot=source
     )
     migration_id = migration_id or "legacy-v2-{}".format(
-        semantic_hash(source_semantic)[:32]
+        canonical_semantic_contract_hash(source_semantic)[:32]
     )
     anomalies = []
     project_repo = ProjectRepository()
@@ -3074,15 +3124,28 @@ def _migrate_legacy_materialized(source_connection, target_connection, anomaly_p
                 ),
             }])
 
-    target_hash = _stream_vnext_semantic_hash(target_connection)
-    source_hash = semantic_hash(source_semantic)
+    target_contract = _stream_vnext_semantic_contract(target_connection)
+    target_hash = target_contract["semantic_hash"]
+    source_components = canonical_semantic_component_hashes(source_semantic)
+    target_components = target_contract["component_hashes"]
+    source_hash = _canonical_semantic_contract_hash_from_components(
+        source_components
+    )
+    semantic_mismatch_components = [
+        component for component in SEMANTIC_COMPONENTS
+        if source_components.get(component) != target_components.get(component)
+    ]
     result = {
-        "status": "PASSED",
+        "status": "PASSED" if source_hash == target_hash else "FAILED",
         "source_projects": len(source["projects"]),
         "source_line_facts": len(source["lines"]),
         "source_analysis_facts": len(source["analyses"]),
         "source_jobs": len(source["jobs"]),
         "anomalies": anomalies,
+        "semantic_hash_version": SEMANTIC_HASH_VERSION,
+        "source_component_hashes": source_components,
+        "target_component_hashes": target_components,
+        "semantic_mismatch_components": semantic_mismatch_components,
         "source_semantic_hash": source_hash,
         "target_semantic_hash": target_hash,
         "authoritative_semantic_match": source_hash == target_hash,
@@ -3289,19 +3352,31 @@ def _migrate_legacy_with_source_spool(source_connection, target_connection,
     # legacy source.  The diagnostic snapshot helper is intentionally retained
     # for small fixtures, but must not turn a production-sized target into a
     # resident Python object before publication.
-    target_hash = _stream_vnext_semantic_hash(target_connection)
+    target_contract = _stream_vnext_semantic_contract(target_connection)
+    target_hash = target_contract["semantic_hash"]
+    source_hash = source_descriptor["semantic_hash"]
+    source_components = source_descriptor["component_hashes"]
+    target_components = target_contract["component_hashes"]
+    semantic_mismatch_components = [
+        component for component in SEMANTIC_COMPONENTS
+        if source_components.get(component) != target_components.get(component)
+    ]
     result = {
         "status": "FAILED", "source_projects": len(project_names),
         "source_line_facts": source_descriptor["source_line_facts"],
         "source_analysis_facts": source_descriptor["source_analysis_facts"],
         "source_jobs": source_descriptor["source_jobs"], "anomalies": anomalies,
-        "source_semantic_hash": source_descriptor["semantic_hash"],
+        "semantic_hash_version": SEMANTIC_HASH_VERSION,
+        "source_component_hashes": source_components,
+        "target_component_hashes": target_components,
+        "semantic_mismatch_components": semantic_mismatch_components,
+        "source_semantic_hash": source_hash,
         "target_semantic_hash": target_hash,
-        "authoritative_semantic_match": source_descriptor["semantic_hash"] == target_hash,
+        "authoritative_semantic_match": source_hash == target_hash,
         "release_sha": release_sha or "", "migration_id": migration_id,
         "captured_at": utc_iso(), "checkpointed": True,
     }
-    if source_descriptor["semantic_hash"] != target_hash:
+    if source_hash != target_hash:
         result["error_class"] = "semantic_zero_loss_gate_failed"
         if anomaly_path:
             parent = os.path.dirname(os.path.abspath(anomaly_path))
@@ -3425,6 +3500,16 @@ def main(argv=None):
                     and second.get("authoritative_semantic_match")
                     and first_target_hash == second_target_hash
                 ) else "FAILED",
+                "semantic_hash_version": SEMANTIC_HASH_VERSION,
+                "source_component_hashes": first.get(
+                    "source_component_hashes", {}
+                ),
+                "target_component_hashes": first.get(
+                    "target_component_hashes", {}
+                ),
+                "semantic_mismatch_components": first.get(
+                    "semantic_mismatch_components", []
+                ),
                 "first_run": first,
                 "second_run": second,
                 "first_target_semantic_hash": first_target_hash,

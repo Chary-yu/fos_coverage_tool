@@ -14,6 +14,10 @@ from scripts.upgrade.migration_runner import (
     create_sqlite_schema,
     migrate_legacy,
     semantic_hash,
+    SEMANTIC_HASH_VERSION,
+    canonical_semantic_component_hash,
+    canonical_semantic_component_hashes,
+    canonical_semantic_contract_hash,
     _stream_legacy_semantic_hash,
     _stream_vnext_semantic_hash,
     _legacy_file_contexts,
@@ -77,6 +81,21 @@ def legacy_connection():
     return connection
 
 
+def semantic_fixture():
+    return {
+        "projects": ["FOSv6R2", "FOS_V6R2", "Gemini-NOS"],
+        "project_data_versions": [
+            {"project_name": "FOSv6R2", "data_version": 1},
+            {"project_name": "FOS_V6R2", "data_version": 1},
+            {"project_name": "Gemini-NOS", "data_version": 1},
+        ],
+        "lines": [],
+        "analyses": [],
+        "jobs": [],
+        "legacy_provenance": [],
+    }
+
+
 class MigrationRunnerTest(unittest.TestCase):
     def test_checkpoint_identity_hash_handles_long_unicode_keys(self):
         target = sqlite3.connect(":memory:")
@@ -120,6 +139,102 @@ class MigrationRunnerTest(unittest.TestCase):
                     "legacy_created_at": "2026-08-21 12:34:56",
                 }],
             }),
+        )
+
+    def test_canonical_multiset_ignores_database_return_order(self):
+        source = semantic_fixture()
+        target = semantic_fixture()
+        target["projects"].reverse()
+        target["project_data_versions"].reverse()
+        self.assertEqual(
+            canonical_semantic_contract_hash(source),
+            canonical_semantic_contract_hash(target),
+        )
+        self.assertEqual(
+            canonical_semantic_component_hashes(source),
+            canonical_semantic_component_hashes(target),
+        )
+        self.assertEqual(SEMANTIC_HASH_VERSION, "canonical-multiset-v2")
+
+    def test_canonical_multiset_detects_data_version_change(self):
+        source = semantic_fixture()
+        target = semantic_fixture()
+        target["project_data_versions"][0]["data_version"] = 2
+        source_components = canonical_semantic_component_hashes(source)
+        target_components = canonical_semantic_component_hashes(target)
+        self.assertNotEqual(
+            source_components["project_data_versions"],
+            target_components["project_data_versions"],
+        )
+        self.assertNotEqual(
+            canonical_semantic_contract_hash(source),
+            canonical_semantic_contract_hash(target),
+        )
+
+    def test_canonical_multiset_detects_analysis_fact_changes(self):
+        analysis = {
+            "project_name": "FOSv6R2", "file_path_hash": "f" * 32,
+            "file_path": "src/a.c", "line_number": 10, "status": "可覆盖",
+            "is_draft": 0, "reviewer": "alice", "coverage_method": "unit",
+            "uncovered_reason": "", "comment": "original",
+        }
+        for field, value in (
+                ("status", "未确认"), ("reviewer", "bob"),
+                ("coverage_method", "manual"),
+                ("uncovered_reason", "needs review"),
+                ("comment", "changed")):
+            with self.subTest(field=field):
+                source = semantic_fixture()
+                target = semantic_fixture()
+                source["analyses"] = [dict(analysis)]
+                target["analyses"] = [dict(analysis)]
+                target["analyses"][0][field] = value
+                self.assertNotEqual(
+                    canonical_semantic_contract_hash(source),
+                    canonical_semantic_contract_hash(target),
+                )
+
+    def test_canonical_multiset_preserves_duplicate_count(self):
+        record_a = {"project_name": "A"}
+        record_b = {"project_name": "B"}
+        self.assertNotEqual(
+            canonical_semantic_component_hash(
+                [record_a, record_a, record_b], chunk_size=1
+            ),
+            canonical_semantic_component_hash(
+                [record_a, record_b], chunk_size=1
+            ),
+        )
+
+    def test_canonical_multiset_handles_unicode_case_and_symbols(self):
+        names = [
+            "FOSv6R2", "FOS_V6R2", "fosv6r2",
+            "项目A", "项目_A", "项目-A",
+        ]
+        source = semantic_fixture()
+        source["projects"] = names
+        source["project_data_versions"] = [
+            {"project_name": name, "data_version": index}
+            for index, name in enumerate(names, 1)
+        ]
+        target = semantic_fixture()
+        target["projects"] = list(reversed(names))
+        target["project_data_versions"] = list(reversed(
+            source["project_data_versions"]
+        ))
+        self.assertEqual(
+            canonical_semantic_contract_hash(source),
+            canonical_semantic_contract_hash(target),
+        )
+
+    def test_canonical_multiset_chunked_hash_matches_snapshot_hash(self):
+        snapshot = semantic_fixture()
+        snapshot["projects"] = [
+            "FOSv6R2", "FOS_V6R2", "Gemini-NOS", "项目A",
+        ]
+        self.assertEqual(
+            canonical_semantic_contract_hash(snapshot, chunk_size=1),
+            canonical_semantic_contract_hash(snapshot, chunk_size=50000),
         )
 
     def test_legacy_timestamp_columns_keep_microsecond_precision(self):
@@ -187,13 +302,21 @@ class MigrationRunnerTest(unittest.TestCase):
         self.assertEqual(first["source_analysis_facts"], 1)
         self.assertEqual(first["anomalies"], [])
         self.assertTrue(first["authoritative_semantic_match"])
+        self.assertEqual(first["semantic_hash_version"], SEMANTIC_HASH_VERSION)
+        self.assertEqual(
+            first["source_component_hashes"],
+            first["target_component_hashes"],
+        )
+        self.assertEqual(first["semantic_mismatch_components"], [])
         self.assertEqual(
             first["target_semantic_hash"],
             _stream_vnext_semantic_hash(target, batch_size=1),
         )
         self.assertEqual(
             first["target_semantic_hash"],
-            semantic_hash(capture_vnext_semantic_snapshot(target)),
+            canonical_semantic_contract_hash(
+                capture_vnext_semantic_snapshot(target), chunk_size=1
+            ),
         )
         project = target.execute(
             "SELECT project_name FROM coverage_projects"
@@ -223,6 +346,27 @@ class MigrationRunnerTest(unittest.TestCase):
         self.assertEqual(len(after["lines"]), len(before["lines"]))
         self.assertEqual(len(after["analyses"]), len(before["analyses"]))
 
+    def test_gate_reports_changed_project_data_version_component(self):
+        source = legacy_connection()
+        self.addCleanup(source.close)
+        target = sqlite3.connect(":memory:")
+        self.addCleanup(target.close)
+        target.row_factory = sqlite3.Row
+        create_sqlite_schema(target)
+        first = migrate_legacy(source, target)
+        self.assertEqual(first["status"], "PASSED")
+        target.execute(
+            "UPDATE coverage_project_state SET data_version= data_version + 1"
+        )
+        target.commit()
+        second = migrate_legacy(source, target)
+        self.assertEqual(second["status"], "FAILED")
+        self.assertEqual(
+            second["semantic_mismatch_components"],
+            ["project_data_versions"],
+        )
+        self.assertFalse(second["authoritative_semantic_match"])
+
     def test_legacy_semantic_hash_scans_each_file_context_once(self):
         source = legacy_connection()
         self.addCleanup(source.close)
@@ -249,7 +393,9 @@ class MigrationRunnerTest(unittest.TestCase):
              "可覆盖", 0, "unit", "", "comment-10"),
         )
         source.commit()
-        expected = semantic_hash(capture_legacy_semantic_snapshot(source))
+        expected = canonical_semantic_contract_hash(
+            capture_legacy_semantic_snapshot(source)
+        )
         with mock.patch(
                 "scripts.upgrade.migration_runner._legacy_file_contexts",
                 wraps=_legacy_file_contexts) as context_reader:
@@ -257,6 +403,12 @@ class MigrationRunnerTest(unittest.TestCase):
                 source, ["project-a"], {"project-a": 7},
             )
         self.assertEqual(descriptor["semantic_hash"], expected)
+        self.assertEqual(
+            descriptor["component_hashes"],
+            canonical_semantic_component_hashes(
+                capture_legacy_semantic_snapshot(source)
+            ),
+        )
         self.assertEqual(
             context_reader.call_count, 2,
             "one legacy file context read per physical file is expected",
