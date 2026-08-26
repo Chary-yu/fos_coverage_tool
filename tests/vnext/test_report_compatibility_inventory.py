@@ -13,7 +13,7 @@ class ReportCompatibilityInventoryTest(unittest.TestCase):
                 stream.write("asset-v1")
             with open(os.path.join(root, "current.html"), "w") as stream:
                 stream.write(
-                    '<meta name="api_contract_version" content="vnext-api-20260822.1">'
+                    '<meta name="api_contract_version" content="vnext-api-20260826.1">'
                     '<script src="assets/progress.js"></script>'
                     '<script>var x={"report_id":"report-a",'
                     '"scan_id":7,"commit_sha":"%s"};'

@@ -18,6 +18,10 @@ from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
+_RETRYABLE_READ_SQL_TOKENS = frozenset(
+    ("SELECT", "SHOW", "DESC", "DESCRIBE", "EXPLAIN")
+)
+
 try:
     import pymysql
     HAVE_PYMYSQL = True
@@ -42,6 +46,17 @@ def _is_connection_error(error):
         return False
 
 
+def _is_retryable_read_sql(sql):
+    """Return True only for explicitly idempotent read query families."""
+    if isinstance(sql, bytes):
+        try:
+            sql = sql.decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+    token = str(sql or "").lstrip().split(None, 1)
+    return bool(token and token[0].upper() in _RETRYABLE_READ_SQL_TOKENS)
+
+
 class _RetryingReadOnlyCursor:
     """DB-API cursor proxy that retries one verified MySQL disconnect."""
 
@@ -54,7 +69,14 @@ class _RetryingReadOnlyCursor:
         try:
             return method(*args, **kwargs)
         except Exception as error:
-            if not _is_connection_error(error) or not self._connection._reconnect():
+            # ``read_only=True`` is caller metadata, not a server-enforced
+            # transaction mode.  Retry only a single-statement, explicitly
+            # idempotent read.  In particular, never retry executemany or a
+            # write/DDL/CALL after an uncertain disconnect.
+            sql = args[0] if args else kwargs.get("query")
+            retryable = method_name == "execute" and _is_retryable_read_sql(sql)
+            if (not retryable or not _is_connection_error(error) or
+                    not self._connection._reconnect()):
                 raise
             try:
                 self._raw_cursor.close()
@@ -131,10 +153,10 @@ class PooledConnectionWrapper:
         except Exception:
             return False
 
-    def rollback_if_dirty(self) -> None:
+    def rollback_if_dirty(self) -> bool:
         if not self.pool.rollback_on_return:
             self.pool._record_metric("rollback_skips")
-            return
+            return True
         # read_only is only a Python-side hint. Skip cleanup only when the
         # DB-API connection itself confirms autocommit/read-transaction
         # semantics; ordinary PyMySQL connections use autocommit=False and
@@ -148,13 +170,17 @@ class PooledConnectionWrapper:
                 autocommit = False
         if self.read_only and autocommit:
             self.pool._record_metric("rollback_skips")
-            return
+            return True
         try:
-            if self.raw_conn and hasattr(self.raw_conn, "rollback"):
-                self.raw_conn.rollback()
-                self.pool._record_metric("rollbacks")
+            if not self.raw_conn or not hasattr(self.raw_conn, "rollback"):
+                raise RuntimeError("connection has no rollback method")
+            self.raw_conn.rollback()
+            self.pool._record_metric("rollbacks")
+            return True
         except Exception as e:
+            self.pool._record_metric("rollback_failures")
             logger.warning(f"Error rolling back connection on pool return: {e}")
+            return False
 
     def close(self) -> None:
         self.is_closed = True
@@ -201,7 +227,8 @@ class MySQLConnectionPool:
             "acquires": 0, "acquire_timeouts": 0, "reconnects": 0,
             "pings": 0, "ping_skips": 0, "rollbacks": 0,
             "rollback_skips": 0, "read_only_rollbacks": 0,
-            "read_reconnects": 0,
+            "read_reconnects": 0, "rollback_failures": 0,
+            "poisoned_discards": 0,
         }
 
     def _record_metric(self, name: str, amount: int = 1) -> None:
@@ -306,7 +333,10 @@ class MySQLConnectionPool:
             self._discard_wrapper(wrapper)
             return
             
-        wrapper.rollback_if_dirty()
+        if not wrapper.rollback_if_dirty():
+            self._record_metric("poisoned_discards")
+            self._discard_wrapper(wrapper)
+            return
         wrapper.last_returned_at = time.time()
         try:
             self._pool.put_nowait(wrapper)

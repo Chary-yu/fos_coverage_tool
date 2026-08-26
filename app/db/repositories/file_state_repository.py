@@ -421,16 +421,14 @@ class FileStateRepository(object):
             (int(scan_id), int(file_id), min(200, max(1, int(limit or 200)))))
         return [int(row["line_number"]) for row in rows]
 
-    def pending_line_references(self, connection, scan_id: int, limit=None, offset=0):
-        """Return file-qualified pending physical lines for a scan.
-
-        The optional window is used by the pending-detail page. Summary and
-        developer-task callers can omit it for their existing grouped view.
-        """
+    def pending_line_references(self, connection, scan_id: int, limit=None,
+                                cursor=None):
+        """Return a keyset window of pending physical lines for a scan."""
         uncovered = self._UNCOVERED_SQL
         confirmed = self._CONFIRMED_SQL
         sql = """
-            SELECT f.repository_name, f.file_path, l.line_number
+            SELECT f.id AS file_id, l.id AS line_id,
+                   f.repository_name, f.file_path, l.line_number
             FROM coverage_files f
             JOIN coverage_lines l ON l.file_id = f.id
             LEFT JOIN coverage_analyses a ON a.line_id = l.id
@@ -438,18 +436,105 @@ class FileStateRepository(object):
               ON q.scan_id = f.scan_id AND q.line_id = l.id AND q.is_active = 1
             LEFT JOIN coverage_analysis_records r ON r.id = q.analysis_record_id
             WHERE f.scan_id = ? AND {uncovered} AND NOT ({confirmed})
-            ORDER BY f.repository_name, f.file_path, l.line_number
         """.format(uncovered=uncovered, confirmed=confirmed)
         params = [int(scan_id)]
+        if cursor:
+            try:
+                file_id = int(cursor["file_id"])
+                line_number = int(cursor["line_number"])
+                line_id = int(cursor["line_id"])
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("PAGINATION_CURSOR_STALE")
+            sql += """
+              AND (
+                    f.id > ?
+                    OR (f.id = ? AND l.line_number > ?)
+                    OR (f.id = ? AND l.line_number = ? AND l.id > ?)
+              )
+            """
+            params.extend((file_id, file_id, line_number,
+                           file_id, line_number, line_id))
+        sql += """
+            ORDER BY f.id, l.line_number, l.id
+        """
         if limit is not None:
-            sql += " LIMIT ? OFFSET ?"
-            params.extend((max(1, int(limit)), max(0, int(offset))))
+            sql += " LIMIT ?"
+            params.append(max(1, int(limit)))
         rows = fetchall(connection, sql, params)
         return [{
+            "file_id": int(row["file_id"]),
+            "line_id": int(row["line_id"]),
             "repository_name": row.get("repository_name") or "",
             "file_path": row.get("file_path") or "",
             "line_number": int(row["line_number"]),
         } for row in rows]
+
+    def line_detail_page(self, connection, scan_id: int, file_id: int,
+                         limit=200, cursor=None):
+        """Return one bounded file-detail window using a line keyset."""
+        uncovered = self._UNCOVERED_SQL
+        confirmed = self._CONFIRMED_SQL
+        sql = """
+            SELECT l.id AS line_id, l.line_number, l.line_text, l.coverage_state,
+                   l.suggested_reviewer,
+                   CASE WHEN x.id IS NOT NULL THEN ''
+                        WHEN q.id IS NOT NULL THEN r.conclusion_status
+                        ELSE a.status END AS status,
+                   CASE WHEN x.id IS NOT NULL THEN 1
+                        WHEN q.id IS NOT NULL THEN
+                            CASE WHEN q.review_state IN ('MANUAL_DRAFT', 'INHERITED_PENDING')
+                                 THEN 1 ELSE 0 END
+                        ELSE a.is_draft END AS is_draft,
+                   CASE WHEN x.id IS NOT NULL THEN ''
+                        WHEN q.id IS NOT NULL THEN q.reviewed_by
+                        ELSE a.reviewer END AS reviewer,
+                   CASE WHEN x.id IS NOT NULL THEN ''
+                        WHEN q.id IS NOT NULL THEN r.coverage_method
+                        ELSE a.coverage_method END AS coverage_method,
+                   CASE WHEN x.id IS NOT NULL THEN ''
+                        WHEN q.id IS NOT NULL THEN r.uncovered_reason
+                        ELSE a.uncovered_reason END AS uncovered_reason,
+                   CASE WHEN x.id IS NOT NULL THEN x.rejected_at
+                        WHEN q.id IS NOT NULL THEN r.updated_at
+                        ELSE a.updated_at END AS updated_at,
+                   CASE WHEN x.id IS NOT NULL THEN 'INHERITANCE_REJECTED'
+                        ELSE q.review_state END AS review_state,
+                   q.relation_origin, q.analysis_record_id, q.relation_revision,
+                   q.is_active AS relation_is_active,
+                   x.id AS rejection_id, x.rejection_revision
+            FROM coverage_lines l
+            LEFT JOIN coverage_analyses a ON a.line_id = l.id
+            LEFT JOIN coverage_analysis_line_links q
+              ON q.scan_id=? AND q.line_id=l.id AND q.is_active=1
+            LEFT JOIN coverage_analysis_records r ON r.id=q.analysis_record_id
+            LEFT JOIN coverage_inheritance_rejections x
+              ON x.scan_id=? AND x.line_id=l.id AND x.is_active=1
+            WHERE l.file_id = ?
+        """
+        params = [int(scan_id), int(scan_id), int(file_id)]
+        if cursor:
+            try:
+                line_number = int(cursor["line_number"])
+                line_id = int(cursor["line_id"])
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("PAGINATION_CURSOR_STALE")
+            sql += " AND (l.line_number > ? OR (l.line_number = ? AND l.id > ?))"
+            params.extend((line_number, line_number, line_id))
+        page_limit = min(500, max(1, int(limit or 200)))
+        sql += " ORDER BY l.line_number, l.id LIMIT ?"
+        params.append(page_limit + 1)
+        rows = fetchall(connection, sql, params)
+        has_more = len(rows) > page_limit
+        rows = rows[:page_limit]
+        next_cursor = None
+        if has_more and rows:
+            last = rows[-1]
+            next_cursor = {
+                "line_number": int(last["line_number"]),
+                "line_id": int(last["line_id"]),
+            }
+        return {"rows": rows, "has_more": has_more,
+                "next_cursor": next_cursor}
 
     def pending_line_count(self, connection, scan_id: int):
         uncovered = self._UNCOVERED_SQL

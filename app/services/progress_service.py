@@ -126,23 +126,52 @@ class ProgressService(object):
         )
 
     def pending_page(self, connection, project_name, scan_id=None,
-                     page=1, page_size=100):
+                     page_size=100, cursor=None):
         project = self._project(connection, project_name)
         state = self.states.get(connection, project["id"]) or {}
         scan_id = scan_id or state.get("current_scan_id")
-        page = max(1, int(page))
         page_size = min(500, max(1, int(page_size)))
         if not scan_id:
-            return {"scan_id": None, "page": page, "page_size": page_size,
-                    "total": 0, "total_pages": 0, "rows": []}
-        offset = (page - 1) * page_size
+            return {"scan_id": None, "page_size": page_size, "total": 0,
+                    "rows": [], "has_more": False, "next_cursor": None}
         rows = self.file_states.pending_line_references(
-            connection, int(scan_id), limit=page_size, offset=offset
+            connection, int(scan_id), limit=page_size + 1, cursor=cursor
         )
-        total = self.file_states.pending_line_count(connection, int(scan_id))
+        has_more = len(rows) > page_size
+        rows = rows[:page_size]
+        next_cursor = None
+        if has_more and rows:
+            last = rows[-1]
+            next_cursor = {
+                "file_id": int(last["file_id"]),
+                "line_number": int(last["line_number"]),
+                "line_id": int(last["line_id"]),
+            }
+        total = None
+        if (int(state.get("data_version") or 0) > 0 and
+                int(state.get("file_state_version") or 0) == int(
+                    state.get("data_version") or 0
+                )):
+            aggregate = self.file_states.scan_aggregate(connection, int(scan_id))
+            if aggregate:
+                total = int(aggregate.get("pending_total") or 0)
+        if total is None:
+            # A stale/missing derived state is already an exceptional path;
+            # keep the list itself keyset-paginated and use one authoritative
+            # fallback rather than COUNT(*) on every page.
+            total = int(
+                (self.file_states.scan_summary_from_facts(
+                    connection, int(scan_id)
+                ) or {}).get("pending_total") or 0
+            )
         return {
-            "scan_id": int(scan_id), "page": page, "page_size": page_size,
-            "total": total,
-            "total_pages": (total + page_size - 1) // page_size if total else 0,
-            "rows": rows,
+            "scan_id": int(scan_id), "page_size": page_size, "total": total,
+            "rows": rows, "has_more": has_more, "next_cursor": next_cursor,
         }
+
+    def detail_page(self, connection, scan_id, file_id, page_size=200,
+                    cursor=None):
+        return self.file_states.line_detail_page(
+            connection, int(scan_id), int(file_id), limit=page_size,
+            cursor=cursor,
+        )

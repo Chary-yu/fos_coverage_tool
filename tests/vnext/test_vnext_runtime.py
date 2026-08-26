@@ -165,6 +165,54 @@ class VNextRuntimeTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(pending["files"][0]["pending_line_numbers"], [10, 11])
 
+        status, pending_window = self.application.dispatch(
+            "GET", "/api/coverage/progress/pending",
+            query={"project": "fixture", "page_size": "1"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(pending_window["rows"][0]["line_number"], 10)
+        self.assertTrue(pending_window["has_more"])
+        self.assertTrue(pending_window["next_cursor"])
+        status, pending_window_2 = self.application.dispatch(
+            "GET", "/api/coverage/progress/pending",
+            query={
+                "project": "fixture", "page_size": "1",
+                "cursor": pending_window["next_cursor"],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(pending_window_2["rows"][0]["line_number"], 11)
+        self.assertFalse(pending_window_2["has_more"])
+        status, rejected_page = self.application.dispatch(
+            "GET", "/api/coverage/progress/pending",
+            query={"project": "fixture", "page": "2", "page_size": "1"},
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(rejected_page["error"], "PAGINATION_CURSOR_REQUIRED")
+
+        status, detail_window = self.application.dispatch(
+            "GET", "/api/coverage/progress/details",
+            query={
+                "project": "fixture", "scan_id": scan_id,
+                "repository_name": "repo-a", "file": "src/fixture.c",
+                "page_size": "1",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(detail_window["rows"][0]["line_number"], 10)
+        self.assertTrue(detail_window["has_more"])
+        status, detail_window_2 = self.application.dispatch(
+            "GET", "/api/coverage/progress/details",
+            query={
+                "project": "fixture", "scan_id": scan_id,
+                "repository_name": "repo-a", "file": "src/fixture.c",
+                "page_size": "1", "cursor": detail_window["next_cursor"],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(detail_window_2["rows"][0]["line_number"], 11)
+        self.assertFalse(detail_window_2["has_more"])
+
         line_rows = self.connection.execute(
             "SELECT id FROM coverage_lines ORDER BY line_number"
         ).fetchall()
@@ -222,7 +270,7 @@ class VNextRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(
-            release["api_contract_version"], "vnext-api-20260822.1"
+            release["api_contract_version"], "vnext-api-20260826.1"
         )
 
     def test_progress_files_uses_bounded_keyset_windows(self):

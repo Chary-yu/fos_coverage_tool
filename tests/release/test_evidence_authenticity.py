@@ -9,14 +9,40 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from app.release_identity import (
+    ASSET_MANIFEST_VERSION,
     DEFAULT_RELEASE_ASSET_RELATIVE_PATHS,
-    get_current_release_identity, generate_release_identity, save_release_manifest,
+    build_asset_manifest, compute_asset_hash, get_current_release_identity,
+    generate_release_identity, save_release_manifest,
 )
 from scripts.release.build_release import main as build_release_main
 from scripts.upgrade.evidence_manifest import EvidenceManifestV2, ProductionEvidenceManifest
 
 
 class TestEvidenceAuthenticity(unittest.TestCase):
+    def test_asset_manifest_binds_path_size_and_missing_assets_fail_closed(self):
+        with tempfile.TemporaryDirectory() as root:
+            first = os.path.join(root, "static", "first.js")
+            second = os.path.join(root, "static", "second.js")
+            os.makedirs(os.path.dirname(first), exist_ok=True)
+            for path in (first, second):
+                with open(path, "wb") as stream:
+                    stream.write(b"same-bytes")
+
+            manifest = build_asset_manifest([second, first], repo_root=root)
+            self.assertEqual(
+                [item["path"] for item in manifest],
+                ["static/first.js", "static/second.js"],
+            )
+            self.assertEqual(manifest[0]["size"], len(b"same-bytes"))
+            self.assertEqual(len(manifest[0]["sha256"]), 64)
+            self.assertEqual(
+                compute_asset_hash([first, second], repo_root=root),
+                compute_asset_hash([second, first], repo_root=root),
+            )
+            os.remove(second)
+            with self.assertRaisesRegex(RuntimeError, "required release asset missing"):
+                build_asset_manifest([first, second], repo_root=root)
+
     def test_default_release_assets_include_progress_template_pair(self):
         required = {
             "coverage_progress.html",
@@ -34,15 +60,29 @@ class TestEvidenceAuthenticity(unittest.TestCase):
                 with open(path, "w", encoding="utf-8") as stream:
                     stream.write(contents)
 
-            original = generate_release_identity(root, commit_sha="a" * 40)
+            asset_files = [
+                os.path.join(root, *relative.split("/"))
+                for relative in (
+                    "coverage_progress.html",
+                    "web/templates/coverage_progress.html",
+                )
+            ]
+            original = generate_release_identity(
+                root, commit_sha="a" * 40, asset_files=asset_files
+            )
             with open(
                 os.path.join(root, "web", "templates", "coverage_progress.html"),
                 "a",
                 encoding="utf-8",
             ) as stream:
                 stream.write("-tampered")
-            changed = generate_release_identity(root, commit_sha="a" * 40)
+            changed = generate_release_identity(
+                root, commit_sha="a" * 40, asset_files=asset_files
+            )
             self.assertNotEqual(original["asset_hash"], changed["asset_hash"])
+            self.assertEqual(original["asset_manifest_version"], ASSET_MANIFEST_VERSION)
+            self.assertEqual(original["asset_count"], 2)
+            self.assertEqual(original["asset_manifest_hash"], original["asset_hash"])
 
     def test_missing_runtime_release_manifest_fails_closed(self):
         with tempfile.TemporaryDirectory() as root:
@@ -56,7 +96,8 @@ class TestEvidenceAuthenticity(unittest.TestCase):
             with open(asset, "w", encoding="utf-8") as stream:
                 stream.write("asset-v1")
             identity = generate_release_identity(
-                root, commit_sha="a" * 40, build_provenance="release-build"
+                root, commit_sha="a" * 40,
+                asset_files=[asset], build_provenance="release-build"
             )
             save_release_manifest(os.path.join(root, "release_manifest.json"), identity)
             self.assertEqual(

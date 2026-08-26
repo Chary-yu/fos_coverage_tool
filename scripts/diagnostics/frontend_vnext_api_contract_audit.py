@@ -57,7 +57,7 @@ def audit(repo_root=ROOT):
                       if re.search(pattern, text))
     progress_required = {
         "details_endpoint": r"/progress/details",
-        "top_level_details_renderer": r"renderDetailTable\(payload \|\| \{\}\)",
+        "top_level_details_renderer": r"renderDetailTable\(payload \|\| \{\}",
     }
     progress_missing = [
         name for name, pattern in progress_required.items()

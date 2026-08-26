@@ -15,6 +15,7 @@ from app.time_utils import utc_iso
 
 DEFAULT_VERSION = "v11.7 2026-08-19"
 DEFAULT_SCHEMA_VERSION = 2
+ASSET_MANIFEST_VERSION = 1
 RELEASE_MANIFEST_NAME = "release_manifest.json"
 _FULL_COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 
@@ -64,10 +65,17 @@ def _has_git_metadata(repo_root: str) -> bool:
 
 def _default_asset_files(repo_root: str) -> list:
     files = []
+    missing = []
     for relative in DEFAULT_RELEASE_ASSET_RELATIVE_PATHS:
         candidate = os.path.join(repo_root, *relative.split("/"))
         if os.path.isfile(candidate) and candidate not in files:
             files.append(candidate)
+        elif not os.path.isfile(candidate):
+            missing.append(relative)
+    if missing:
+        raise RuntimeError(
+            "required release asset(s) missing: " + ", ".join(missing)
+        )
     return files
 
 
@@ -79,18 +87,53 @@ def _manifest_build_id(manifest: Dict[str, Any]) -> str:
         version.split()[0], commit_sha[:8], asset_hash[:8]
     )
 
-def compute_asset_hash(file_paths: list) -> str:
-    """Compute deterministic SHA256 hash over a list of static asset files."""
-    hasher = hashlib.sha256()
-    for fp in sorted(file_paths):
-        if os.path.isfile(fp):
-            with open(fp, "rb") as f:
-                while True:
-                    chunk = f.read(65536)
-                    if not chunk:
-                        break
-                    hasher.update(chunk)
-    return hasher.hexdigest()[:16]
+def _asset_relative_path(file_path, repo_root=None):
+    file_path = os.path.abspath(str(file_path))
+    if repo_root is None:
+        return file_path.replace(os.sep, "/")
+    relative = os.path.relpath(file_path, os.path.abspath(repo_root))
+    return relative.replace(os.sep, "/")
+
+
+def build_asset_manifest(file_paths: list, repo_root: Optional[str] = None) -> list:
+    """Return a fail-closed, path/size/content manifest for release assets."""
+    entries = []
+    seen = set()
+    root = os.path.abspath(repo_root) if repo_root else None
+    for raw_path in file_paths or ():
+        path = str(raw_path)
+        if root and not os.path.isabs(path):
+            path = os.path.join(root, path)
+        path = os.path.abspath(path)
+        relative = _asset_relative_path(path, root)
+        if relative in seen:
+            raise RuntimeError("duplicate release asset path: " + relative)
+        seen.add(relative)
+        if not os.path.isfile(path):
+            raise RuntimeError("required release asset missing: " + relative)
+        digest = hashlib.sha256()
+        with open(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(65536), b""):
+                digest.update(chunk)
+        entries.append({
+            "path": relative,
+            "size": int(os.path.getsize(path)),
+            "sha256": digest.hexdigest(),
+        })
+    return sorted(entries, key=lambda item: item["path"])
+
+
+def _hash_asset_manifest(asset_manifest):
+    canonical = json.dumps(
+        asset_manifest or [], sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def compute_asset_hash(file_paths: list, repo_root: Optional[str] = None) -> str:
+    """Hash canonical path, size and content records for all assets."""
+    return _hash_asset_manifest(build_asset_manifest(file_paths, repo_root))
 
 def generate_release_identity(
     repo_root: Optional[str] = None,
@@ -113,8 +156,9 @@ def generate_release_identity(
     
     if asset_files is None:
         asset_files = _default_asset_files(repo_root)
-                
-    asset_hash = compute_asset_hash(asset_files)
+
+    asset_manifest = build_asset_manifest(asset_files, repo_root)
+    asset_hash = _hash_asset_manifest(asset_manifest)
     clean_ver = version.split()[0]
     build_id = f"{clean_ver}-{commit_sha[:8]}-{asset_hash[:8]}"
     
@@ -123,6 +167,10 @@ def generate_release_identity(
         "commit_sha": commit_sha,
         "build_id": build_id,
         "asset_hash": asset_hash,
+        "asset_manifest_version": ASSET_MANIFEST_VERSION,
+        "asset_count": len(asset_manifest),
+        "asset_manifest_hash": asset_hash,
+        "asset_manifest": asset_manifest,
         "schema_version": schema_version,
         "build_provenance": str(build_provenance or "git-checkout"),
         "built_at": utc_iso()
@@ -158,7 +206,11 @@ def get_current_release_identity(repo_root: Optional[str] = None) -> Dict[str, A
     manifest = load_release_manifest(manifest_path)
     if not manifest:
         raise RuntimeError("release_manifest.json is missing; generate it during build")
-    required = ("version", "commit_sha", "build_id", "asset_hash", "schema_version")
+    required = (
+        "version", "commit_sha", "build_id", "asset_hash", "schema_version",
+        "asset_manifest_version", "asset_count", "asset_manifest_hash",
+        "asset_manifest",
+    )
     missing = [key for key in required if manifest.get(key) in (None, "")]
     if missing:
         raise RuntimeError("release identity manifest is incomplete: " + ", ".join(missing))
@@ -167,10 +219,33 @@ def get_current_release_identity(repo_root: Optional[str] = None) -> Dict[str, A
             "release identity manifest has no concrete commit SHA; exact commit SHA required"
         )
 
-    actual_asset_hash = compute_asset_hash(_default_asset_files(repo_root))
+    declared_assets = manifest.get("asset_manifest")
+    if not isinstance(declared_assets, list):
+        raise RuntimeError("release identity asset_manifest is invalid")
+    if _has_git_metadata(repo_root):
+        asset_files = _default_asset_files(repo_root)
+    else:
+        asset_files = [
+            os.path.join(repo_root, *str(item.get("path") or "").split("/"))
+            for item in declared_assets
+            if isinstance(item, dict) and item.get("path")
+        ]
+    if (str(manifest.get("build_provenance") or "") == "release-build" and
+            not asset_files):
+        raise RuntimeError("release build has no declared assets")
+    actual_manifest = build_asset_manifest(asset_files, repo_root)
+    actual_asset_hash = _hash_asset_manifest(actual_manifest)
     mismatches = []
+    if declared_assets != actual_manifest:
+        mismatches.append("asset_manifest")
     if str(manifest.get("asset_hash")) != actual_asset_hash:
         mismatches.append("asset_hash")
+    if str(manifest.get("asset_manifest_hash")) != actual_asset_hash:
+        mismatches.append("asset_manifest_hash")
+    if int(manifest.get("asset_count") or 0) != len(actual_manifest):
+        mismatches.append("asset_count")
+    if int(manifest.get("asset_manifest_version") or 0) != ASSET_MANIFEST_VERSION:
+        mismatches.append("asset_manifest_version")
     if str(manifest.get("build_id")) != _manifest_build_id(manifest):
         mismatches.append("build_id")
     if _has_git_metadata(repo_root):
@@ -197,7 +272,10 @@ def verify_release_identity(repo_root: Optional[str] = None, target: Optional[Di
     """Verify runtime identity, optionally against an exact release target."""
     actual = get_current_release_identity(repo_root)
     if target:
-        for key in ("version", "commit_sha", "build_id", "asset_hash", "schema_version"):
+        for key in (
+                "version", "commit_sha", "build_id", "asset_hash", "schema_version",
+                "asset_manifest_version", "asset_count", "asset_manifest_hash",
+                "asset_manifest"):
             if target.get(key) != actual.get(key):
                 raise RuntimeError("target release mismatch: {}".format(key))
     return actual

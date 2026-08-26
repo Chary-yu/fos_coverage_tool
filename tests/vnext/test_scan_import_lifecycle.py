@@ -140,6 +140,23 @@ class ScanImportLifecycleTest(unittest.TestCase):
         )
         new_fence = reclaimed["locks"][0]["fencing_token"]
         self.assertGreater(new_fence, old_fence)
+        stale_batch = [{
+            "repository_name": "repo-a", "file_path": "src/stale.c",
+            "file_path_hash": "s" * 32,
+            "lines": [{"line_number": 1, "coverage_state": "uncovered"}],
+        }]
+        with self.assertRaisesRegex(ValueError, "LOCK_FENCING_FAILED"):
+            coordinator._ingest_coverage_batch(
+                self.connection, result["job"]["job_id"], result["owner_token"],
+                old_fence, result["scan"]["id"], stale_batch, 1, 0, 0, {},
+                coordinator._project_service(),
+            )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM coverage_files WHERE scan_id=?",
+                (result["scan"]["id"],),
+            ).fetchone()[0], 0
+        )
         with self.assertRaises(ValueError) as raised:
             coordinator.advance(
                 self.connection, result["job"]["job_id"],
@@ -471,6 +488,160 @@ class ScanImportLifecycleTest(unittest.TestCase):
         self.assertEqual(
             restarted.checkpoints.get(self.connection, result["job"]["job_id"])["phase"],
             "PUBLISHED",
+        )
+
+    def test_coverage_batches_commit_checkpoint_atomically_and_resume(self):
+        projects = ProjectRepository()
+        states = ProjectStateRepository()
+        repositories = RepositoryRepository()
+        project_service = ProjectService(
+            projects, states, LineIndexRepository(), repository_repo=repositories
+        )
+        domain_repository = AnalysisDomainRepository()
+        dependencies = dict(
+            project_repository=projects, state_repository=states,
+            repository_repository=repositories, project_service=project_service,
+            import_service=ScanImportService(project_service),
+            inheritance_engine=InheritanceEngine(domain_repository=domain_repository),
+            file_state_repository=FileStateRepository(),
+            analysis_domain_service=AnalysisDomainService(domain_repository),
+        )
+        info_path = os.path.join(self.temp.name, "three-files.info")
+        with open(info_path, "w") as stream:
+            stream.write(
+                "TN:\nSF:src/one.c\nDA:1,0\nend_of_record\n"
+                "TN:\nSF:src/two.c\nDA:2,0\nend_of_record\n"
+                "TN:\nSF:src/three.c\nDA:3,0\nend_of_record\n"
+            )
+
+        class StopAfterFirstBatch(ScanImportCoordinator):
+            COVERAGE_IMPORT_FILE_BATCH_SIZE = 1
+
+            def __init__(self, *args, **kwargs):
+                self.stopped = False
+                super().__init__(*args, **kwargs)
+
+            def _ingest_coverage_batch(self, *args, **kwargs):
+                result = super()._ingest_coverage_batch(*args, **kwargs)
+                batch_seq = int(args[6])
+                if batch_seq == 1 and not self.stopped:
+                    self.stopped = True
+                    raise RuntimeError("simulated process stop after committed batch")
+                return result
+
+        first = StopAfterFirstBatch(**dependencies)
+        created = first.create(
+            self.connection, "batched-restart", info_path,
+            repository_resource_ids=[self.resource_id],
+            staging_root=os.path.join(self.temp.name, "batched-stage"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "committed batch"):
+            first.execute(
+                self.connection, created["job"]["job_id"],
+                owner_token=created["owner_token"],
+                fencing_token=created["locks"][0]["fencing_token"],
+            )
+        checkpoint = first.checkpoints.get(
+            self.connection, created["job"]["job_id"]
+        )
+        payload = checkpoint["payload"]
+        if isinstance(payload, str):
+            import json
+            payload = json.loads(payload)
+        self.assertEqual(checkpoint["phase"], "INFO_STAGED")
+        self.assertEqual(payload["batch_seq"], 1)
+        self.assertEqual(payload["processed_file_count"], 1)
+        self.assertEqual(payload["processed_line_count"], 1)
+        self.assertEqual(payload["scan_id"], created["scan"]["id"])
+        self.assertEqual(payload["artifact_sha256"], created["artifact"]["sha256"])
+        self.assertEqual(payload["fencing_token"], created["locks"][0]["fencing_token"])
+        self.assertEqual(payload["last_file_identity"]["file_path"], "src/one.c")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM coverage_files WHERE scan_id=?",
+                (created["scan"]["id"],),
+            ).fetchone()[0], 1
+        )
+
+        restarted = ScanImportCoordinator(**dependencies)
+        restarted.COVERAGE_IMPORT_FILE_BATCH_SIZE = 1
+        state = restarted.execute(
+            self.connection, created["job"]["job_id"],
+            owner_token=created["owner_token"],
+            fencing_token=created["locks"][0]["fencing_token"],
+        )
+        self.assertEqual(state["current_scan_id"], created["scan"]["id"])
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM coverage_files WHERE scan_id=?",
+                (created["scan"]["id"],),
+            ).fetchone()[0], 3
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM coverage_lines l JOIN coverage_files f "
+                "ON f.id=l.file_id WHERE f.scan_id=?",
+                (created["scan"]["id"],),
+            ).fetchone()[0], 3
+        )
+        self.assertEqual(
+            restarted.checkpoints.get(
+                self.connection, created["job"]["job_id"]
+            )["phase"], "PUBLISHED"
+        )
+
+    def test_last_coverage_batch_failure_does_not_advance_phase(self):
+        projects = ProjectRepository()
+        states = ProjectStateRepository()
+        repositories = RepositoryRepository()
+        project_service = ProjectService(
+            projects, states, LineIndexRepository(), repository_repo=repositories
+        )
+        domain_repository = AnalysisDomainRepository()
+        dependencies = dict(
+            project_repository=projects, state_repository=states,
+            repository_repository=repositories, project_service=project_service,
+            import_service=ScanImportService(project_service),
+            inheritance_engine=InheritanceEngine(domain_repository=domain_repository),
+            file_state_repository=FileStateRepository(),
+            analysis_domain_service=AnalysisDomainService(domain_repository),
+        )
+        info_path = os.path.join(self.temp.name, "last-batch-failure.info")
+        with open(info_path, "w") as stream:
+            stream.write(
+                "TN:\nSF:src/first.c\nDA:1,0\nend_of_record\n"
+                "TN:\nSF:src/last.c\nDA:2,0\nend_of_record\n"
+            )
+
+        class FailLastBatch(ScanImportCoordinator):
+            COVERAGE_IMPORT_FILE_BATCH_SIZE = 1
+
+            def _ingest_coverage_batch(self, *args, **kwargs):
+                if int(args[6]) == 2:
+                    raise RuntimeError("simulated last batch failure")
+                return super()._ingest_coverage_batch(*args, **kwargs)
+
+        coordinator = FailLastBatch(**dependencies)
+        created = coordinator.create(
+            self.connection, "last-batch-failure", info_path,
+            repository_resource_ids=[self.resource_id],
+            staging_root=os.path.join(self.temp.name, "last-batch-stage"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "last batch failure"):
+            coordinator.execute(
+                self.connection, created["job"]["job_id"],
+                owner_token=created["owner_token"],
+                fencing_token=created["locks"][0]["fencing_token"],
+            )
+        checkpoint = coordinator.checkpoints.get(
+            self.connection, created["job"]["job_id"]
+        )
+        self.assertEqual(checkpoint["phase"], "INFO_STAGED")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM coverage_files WHERE scan_id=?",
+                (created["scan"]["id"],),
+            ).fetchone()[0], 1
         )
 
 

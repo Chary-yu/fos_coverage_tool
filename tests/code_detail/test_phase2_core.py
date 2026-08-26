@@ -157,5 +157,73 @@ class TestPhase2Core(unittest.TestCase):
         self.assertEqual(pool.metrics()["read_reconnects"], 1)
         pool.close_all()
 
+    def test_item_4_failed_rollback_discards_poisoned_connection(self):
+        class PoisonedConnection(object):
+            def __init__(self):
+                self.close_calls = 0
+
+            def rollback(self):
+                raise ConnectionError("server disconnected during rollback")
+
+            def close(self):
+                self.close_calls += 1
+
+        pool = MySQLConnectionPool(
+            db_config={}, min_connections=1, max_connections=1,
+        )
+        raw = PoisonedConnection()
+        wrapper = PooledConnectionWrapper(raw, pool)
+        pool.return_connection(wrapper)
+        self.assertTrue(wrapper.is_closed)
+        self.assertEqual(raw.close_calls, 1)
+        self.assertEqual(pool.metrics()["poisoned_discards"], 1)
+        self.assertEqual(pool.metrics()["idle"], 0)
+
+    def test_item_4_read_only_retry_rejects_uncertain_write_retry(self):
+        class FakeConnection(object):
+            __module__ = "pymysql.connections"
+
+            def __init__(self):
+                self.dead = True
+                self.ping_calls = 0
+
+            def ping(self, reconnect=False):
+                self.ping_calls += 1
+                self.dead = False
+
+            def cursor(self):
+                return FakeCursor(self)
+
+            def rollback(self):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeCursor(object):
+            def __init__(self, connection):
+                self.connection = connection
+
+            def execute(self, query, params=()):
+                if self.connection.dead:
+                    raise ConnectionError("server closed the connection")
+                return 1
+
+            def close(self):
+                pass
+
+        pool = MySQLConnectionPool(
+            db_config={}, min_connections=1, max_connections=1,
+        )
+        raw = FakeConnection()
+        pool.return_connection(PooledConnectionWrapper(raw, pool))
+        with pool.connection(read_only=True) as connection:
+            cursor = connection.cursor()
+            with self.assertRaises(ConnectionError):
+                cursor.execute("UPDATE coverage_files SET file_path=?", ("x",))
+            self.assertEqual(raw.ping_calls, 0)
+            cursor.close()
+        pool.close_all()
+
 if __name__ == "__main__":
     unittest.main()

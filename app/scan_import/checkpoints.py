@@ -76,6 +76,36 @@ class ImportCheckpointRepository(object):
             raise ValueError("STALE_IMPORT_CHECKPOINT")
         return self.get(connection, job_id)
 
+    def save_batch(self, connection, job_id, expected_seq,
+                   expected_fencing_token, payload):
+        """Persist one committed import batch without advancing its phase.
+
+        Coverage facts and this CAS update are intentionally called from the
+        same transaction by the coordinator.  A restart therefore sees either
+        both the batch and its checkpoint, or neither of them.
+        """
+        current = self.get(connection, job_id)
+        if not current:
+            raise KeyError("import checkpoint not found")
+        if str(current.get("phase") or "") != "INFO_STAGED":
+            raise ValueError("STALE_IMPORT_CHECKPOINT")
+        next_seq = int(expected_seq) + 1
+        cursor = connection.cursor()
+        cursor.execute(adapt_sql(connection, """
+            UPDATE coverage_import_checkpoints
+            SET checkpoint_seq=?, payload=?, updated_at=?
+            WHERE job_id=? AND phase='INFO_STAGED'
+              AND checkpoint_seq=? AND fencing_token=?
+        """), (
+            next_seq, json.dumps(payload or {}, sort_keys=True), utc_sql(),
+            str(job_id), int(expected_seq), int(expected_fencing_token),
+        ))
+        count = int(getattr(cursor, "rowcount", 0) or 0)
+        cursor.close()
+        if count != 1:
+            raise ValueError("STALE_IMPORT_CHECKPOINT")
+        return self.get(connection, job_id)
+
     def claim_fencing(self, connection, job_id, fencing_token):
         cursor = connection.cursor()
         cursor.execute(adapt_sql(connection, """

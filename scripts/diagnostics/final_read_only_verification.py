@@ -134,7 +134,10 @@ def verify(args):
                 violations.append("{} returned HTTP {}".format(path, status))
             if path == "/api/coverage/release" and expected_release:
                 actual = payload.get("release") if isinstance(payload, dict) else None
-                for field in ("commit_sha", "build_id", "asset_hash", "schema_version"):
+            for field in (
+                    "commit_sha", "build_id", "asset_hash", "schema_version",
+                    "asset_manifest_version", "asset_count", "asset_manifest_hash",
+                    "asset_manifest"):
                     if not isinstance(actual, dict) or actual.get(field) != expected_release.get(field):
                         http["status"] = "FAILED"
                         violations.append("release identity mismatch: {}".format(field))

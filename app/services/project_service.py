@@ -171,45 +171,77 @@ class ProjectService(object):
     def _ingest_files(self, connection, scan_id, files,
                       line_batch_size=LINE_INGEST_BATCH_SIZE,
                       file_batch_size=FILE_INGEST_BATCH_SIZE):
-        self.projects._assert_scan_building(connection, scan_id)
         pending = []
 
-        def ingest_pending():
-            if not pending:
-                return
-            file_rows = self.projects.ensure_files(
-                connection, scan_id, [entry[1] for entry in pending]
-            )
-            for item, normalized in pending:
-                key = (normalized["repository_name"], normalized["file_path_hash"])
-                file_row = file_rows[key]
-                line_records = item.get("lines")
-                batch = []
-                for record in line_records or ():
-                    batch.append(record)
-                    if len(batch) >= max(1, int(line_batch_size)):
-                        self.lines.upsert_lines(connection, file_row["id"], batch)
-                        batch = []
-                if batch:
-                    self.lines.upsert_lines(connection, file_row["id"], batch)
-            del pending[:]
-
         for item in files or ():
+            pending.append(item)
+            if len(pending) >= max(1, int(file_batch_size)):
+                self.ingest_file_batch(
+                    connection, scan_id, pending,
+                    line_batch_size=line_batch_size,
+                )
+                del pending[:]
+        if pending:
+            self.ingest_file_batch(
+                connection, scan_id, pending,
+                line_batch_size=line_batch_size,
+            )
+
+    def ingest_file_batch(self, connection, scan_id, files,
+                          line_batch_size=LINE_INGEST_BATCH_SIZE):
+        """Ingest one bounded file batch without owning a transaction.
+
+        The caller can therefore commit the physical facts and its durable
+        import checkpoint atomically.  Line batches still bound SQL packet
+        size, while the caller's file batch bounds the transaction lifetime.
+        """
+        self.projects._assert_scan_building(connection, scan_id)
+        batch = list(files or ())
+        if not batch:
+            return {"file_count": 0, "line_count": 0, "last_file_identity": None}
+
+        normalized_items = []
+        for item in batch:
             path = str(item.get("file_path") or "")
             repository_name = str(item.get("repository_name") or "")
             file_hash = str(item.get("file_path_hash") or "")
             if not file_hash:
                 file_hash = self._file_hash(path, repository_name)
-            normalized = {
+            normalized_items.append({
                 "repository_name": repository_name,
                 "file_path_hash": file_hash,
                 "file_path": path,
                 "source_file_name": item.get("source_file_name") or os.path.basename(path),
-            }
-            pending.append((item, normalized))
-            if len(pending) >= max(1, int(file_batch_size)):
-                ingest_pending()
-        ingest_pending()
+            })
+
+        file_rows = self.projects.ensure_files(
+            connection, scan_id, normalized_items
+        )
+        line_count = 0
+        for item, normalized in zip(batch, normalized_items):
+            key = (normalized["repository_name"], normalized["file_path_hash"])
+            file_row = file_rows[key]
+            line_records = item.get("lines")
+            line_batch = []
+            for record in line_records or ():
+                line_count += 1
+                line_batch.append(record)
+                if len(line_batch) >= max(1, int(line_batch_size)):
+                    self.lines.upsert_lines(connection, file_row["id"], line_batch)
+                    line_batch = []
+            if line_batch:
+                self.lines.upsert_lines(connection, file_row["id"], line_batch)
+
+        last = normalized_items[-1]
+        return {
+            "file_count": len(batch),
+            "line_count": line_count,
+            "last_file_identity": {
+                "repository_name": last["repository_name"],
+                "file_path_hash": last["file_path_hash"],
+                "file_path": last["file_path"],
+            },
+        }
 
     def create_scan_and_ingest(self, connection, project_name, files,
                                info_file_name="", info_sha256="", review_scope="full",

@@ -23,6 +23,7 @@ from app.observability.performance import current_collector, instrument_connecti
 
 class ScanImportCoordinator(object):
     HANDLER_VERSION = "SCAN_IMPORT_HANDLER_V1"
+    COVERAGE_IMPORT_FILE_BATCH_SIZE = 128
 
     def __init__(self, project_repository=None, state_repository=None,
                  job_repository=None, lock_service=None, checkpoint_repository=None,
@@ -267,24 +268,19 @@ class ScanImportCoordinator(object):
                             "INFO_STAGED", phase_payload)
         if files is not None:
             project_service = self._project_service()
-            def ingest_coverage(conn):
-                if self.performance is not None:
-                    with self.performance.phase("scan_import.coverage_import"):
-                        project_service._ingest_files(conn, scan_id, files)
-                else:
-                    project_service._ingest_files(conn, scan_id, files)
-                phase_payload.update({
-                    "file_count": int((import_stats or {}).get("files") or 0),
-                    "line_count": int((import_stats or {}).get("line_count") or 0),
-                    "function_range_fallback_files": int(
-                        (import_stats or {}).get("function_range_fallback_files") or 0
-                    ),
-                })
-            self._run_phase_operation(
-                connection, job_id, owner_token, fencing_token,
-                "COVERAGE_IMPORTED", phase_payload,
-                ingest_coverage,
-            )
+            if self.performance is not None:
+                with self.performance.phase("scan_import.coverage_import"):
+                    self._ingest_coverage_in_batches(
+                        connection, job_id, owner_token, fencing_token,
+                        scan_id, files, import_stats, phase_payload,
+                        project_service,
+                    )
+            else:
+                self._ingest_coverage_in_batches(
+                    connection, job_id, owner_token, fencing_token,
+                    scan_id, files, import_stats, phase_payload,
+                    project_service,
+                )
 
         if self._phase_before(self._checkpoint(connection, job_id), "GIT_VERIFIED"):
             self._verify_git_snapshots(
@@ -411,6 +407,167 @@ class ScanImportCoordinator(object):
                 conn, job_id, checkpoint["checkpoint_seq"], fencing_token,
                 target, payload=payload,
             )
+
+    def _ingest_coverage_in_batches(self, connection, job_id, owner_token,
+                                    fencing_token, scan_id, files, import_stats,
+                                    phase_payload, project_service):
+        """Import physical coverage facts with one transaction per file batch."""
+        batch_size = max(1, int(self.COVERAGE_IMPORT_FILE_BATCH_SIZE))
+        stored_batch_size = int(phase_payload.get("batch_size") or 0)
+        if stored_batch_size and stored_batch_size != batch_size:
+            raise ValueError("COVERAGE_IMPORT_BATCH_SIZE_CHANGED")
+
+        completed_batch_seq = int(phase_payload.get("batch_seq") or 0)
+        processed_file_count = int(
+            phase_payload.get("processed_file_count") or 0
+        )
+        processed_line_count = int(
+            phase_payload.get("processed_line_count") or 0
+        )
+        # The parser always starts at input Batch 1.  ``completed_batch_seq``
+        # is only the number of committed batches to replay/skip.
+        batch_seq = 0
+        pending = []
+
+        def consume_batch(batch):
+            nonlocal batch_seq, processed_file_count, processed_line_count
+            batch_seq += 1
+            replayed = batch_seq <= completed_batch_seq
+            if replayed:
+                result = self._consume_coverage_batch(batch, project_service)
+            else:
+                result = self._ingest_coverage_batch(
+                    connection, job_id, owner_token, fencing_token,
+                    scan_id, batch, batch_seq, processed_file_count,
+                    processed_line_count, phase_payload, project_service,
+                )
+            if not replayed:
+                processed_file_count += int(result["file_count"])
+                processed_line_count += int(result["line_count"])
+            phase_payload.update({
+                "batch_size": batch_size,
+                "batch_seq": batch_seq,
+                "last_file_identity": result.get("last_file_identity"),
+                "processed_file_count": processed_file_count,
+                "processed_line_count": processed_line_count,
+                "fencing_token": int(fencing_token),
+            })
+            return result
+
+        for item in files or ():
+            pending.append(item)
+            if len(pending) >= batch_size:
+                consume_batch(pending)
+                pending = []
+        if pending:
+            consume_batch(pending)
+
+        expected_file_count = int((import_stats or {}).get("files") or 0)
+        expected_line_count = int((import_stats or {}).get("line_count") or 0)
+        if (processed_file_count != expected_file_count or
+                processed_line_count != expected_line_count):
+            raise ValueError("COVERAGE_IMPORT_INPUT_COUNT_MISMATCH")
+
+        phase_payload.update({
+            "file_count": expected_file_count,
+            "line_count": expected_line_count,
+            "function_range_fallback_files": int(
+                (import_stats or {}).get("function_range_fallback_files") or 0
+            ),
+        })
+
+        def finalize_coverage(conn):
+            checkpoint = self._checkpoint(conn, job_id)
+            self._assert_all_fences(
+                conn, job_id, owner_token, fencing_token, checkpoint=checkpoint
+            )
+            counts = fetchone(conn, """
+                SELECT COUNT(DISTINCT f.id) AS file_count,
+                       COUNT(l.id) AS line_count
+                FROM coverage_files f
+                LEFT JOIN coverage_lines l ON l.file_id=f.id
+                WHERE f.scan_id=?
+            """, (int(scan_id),)) or {}
+            observed_file_count = int(counts.get("file_count") or 0)
+            observed_line_count = int(counts.get("line_count") or 0)
+            if (observed_file_count != expected_file_count or
+                    observed_line_count != expected_line_count):
+                raise ValueError("COVERAGE_IMPORT_COUNT_MISMATCH")
+            phase_payload["coverage_import_status"] = "COMPLETED"
+
+        self._run_phase_operation(
+            connection, job_id, owner_token, fencing_token,
+            "COVERAGE_IMPORTED", phase_payload, finalize_coverage,
+        )
+
+    @staticmethod
+    def _consume_coverage_batch(batch, project_service):
+        """Consume a replayed batch without writing it again."""
+        line_count = 0
+        last_identity = None
+        for item in batch or ():
+            for _ in item.get("lines") or ():
+                line_count += 1
+            last_identity = ScanImportCoordinator._file_identity(
+                item, project_service
+            )
+        return {
+            "file_count": len(batch or ()),
+            "line_count": line_count,
+            "last_file_identity": last_identity,
+        }
+
+    def _ingest_coverage_batch(self, connection, job_id, owner_token,
+                               fencing_token, scan_id, batch, batch_seq,
+                               processed_file_count, processed_line_count,
+                               phase_payload, project_service):
+        """Commit one batch of facts and its CAS checkpoint together."""
+        with transaction(connection) as conn:
+            checkpoint = self._checkpoint(conn, job_id)
+            if str(checkpoint.get("phase") or "") != "INFO_STAGED":
+                raise ValueError("STALE_IMPORT_CHECKPOINT")
+            self._assert_all_fences(
+                conn, job_id, owner_token, fencing_token, checkpoint=checkpoint
+            )
+            current_payload = self._checkpoint_payload(checkpoint)
+            expected_batch_seq = int(current_payload.get("batch_seq") or 0) + 1
+            if int(batch_seq) != expected_batch_seq:
+                raise ValueError("COVERAGE_IMPORT_BATCH_SEQUENCE")
+            result = project_service.ingest_file_batch(
+                conn, scan_id, batch,
+            )
+            next_payload = dict(phase_payload or {})
+            next_payload.update({
+                "batch_size": int(self.COVERAGE_IMPORT_FILE_BATCH_SIZE),
+                "batch_seq": int(batch_seq),
+                "last_file_identity": result.get("last_file_identity"),
+                "processed_file_count": int(processed_file_count) + int(
+                    result["file_count"]
+                ),
+                "processed_line_count": int(processed_line_count) + int(
+                    result["line_count"]
+                ),
+                "fencing_token": int(fencing_token),
+            })
+            self.checkpoints.save_batch(
+                conn, job_id, checkpoint["checkpoint_seq"], fencing_token,
+                payload=next_payload,
+            )
+            return result
+
+    @staticmethod
+    def _file_identity(item, project_service):
+        item = item or {}
+        repository_name = str(item.get("repository_name") or "")
+        file_path = str(item.get("file_path") or "")
+        file_path_hash = str(item.get("file_path_hash") or "")
+        if not file_path_hash:
+            file_path_hash = project_service._file_hash(file_path, repository_name)
+        return {
+            "repository_name": repository_name,
+            "file_path_hash": file_path_hash,
+            "file_path": file_path,
+        }
 
     def _project_service(self):
         if self.project_service is None:

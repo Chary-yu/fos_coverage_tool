@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "contract_version": "vnext-api-20260822.1",
+  "contract_version": "vnext-api-20260826.1",
   "contract_id": "vnext-inheritance-api-v1",
   "runtime": "vnext",
   "routes": {
@@ -23,8 +23,9 @@
     "default_limit": 100,
     "maximum_limit": 500,
     "cursor_binding": ["scan_id", "data_version", "filter"],
-    "progress_details_envelope": ["page", "page_size", "total", "total_pages", "rows"],
+    "progress_details_envelope": ["scan_id", "file_id", "page_size", "has_more", "rows", "next_cursor"],
     "progress_files_envelope": ["files", "page_size", "has_more", "next_cursor"],
+    "progress_pending_envelope": ["scan_id", "page_size", "total", "rows", "has_more", "next_cursor"],
     "pending_files_envelope": ["files", "page_size", "has_more", "next_cursor"]
   },
   "mutation_identity": [
@@ -62,7 +63,8 @@
     "STALE_REJECTION_REVISION",
     "UNDO_NOT_ALLOWED",
     "INVALID_SCAN_IDENTITY",
-    "PAGINATION_CURSOR_STALE"
+    "PAGINATION_CURSOR_STALE",
+    "PAGINATION_CURSOR_REQUIRED"
   ],
   "progress_conservation": [
     "ordinary_pending_total",

@@ -35,6 +35,9 @@
   let pendingFileHasMore = false;
   let currentDetailFile = '';
   let currentDetailPage = 1;
+  let detailPageCursors = [null];
+  let currentDetailNextCursor = null;
+  let currentDetailHasMore = false;
   let currentScanId = params.get('scan_id') || '';
   let currentRepositoryName = params.get('repository_name') || '';
 
@@ -268,7 +271,7 @@
     updateFilePager();
   }
 
-  function renderDetailTable(data) {
+  function renderDetailTable(data, page) {
     const rows = Array.isArray(data.rows) ? data.rows : [];
     const body = rows.length ? rows.map(row => `
       <tr><td>${asNumber(row.line_number)}</td><td class="code">${escapeHtml(row.line_text || '')}</td>
@@ -280,14 +283,20 @@
     document.getElementById('detailTable').innerHTML = `
       <thead><tr><th>行号</th><th>代码行</th><th>填写状态</th><th>结论</th><th>确认 Reviewer</th>
       <th>Suggested Reviewer</th><th>覆盖方法</th><th>无法覆盖原因</th><th>更新时间</th></tr></thead><tbody>${body}</tbody>`;
-    currentDetailPage = asNumber(data.page) || 1;
-    const totalPages = asNumber(data.total_pages);
+    currentDetailPage = asNumber(page) || 1;
+    currentDetailNextCursor = data.next_cursor || null;
+    currentDetailHasMore = Boolean(data.has_more && currentDetailNextCursor);
     document.getElementById('detailStatus').innerHTML = `
       <button id="detailPrevBtn" type="button" ${currentDetailPage <= 1 ? 'disabled' : ''}>上一页</button>
-      <button id="detailNextBtn" type="button" ${!totalPages || currentDetailPage >= totalPages ? 'disabled' : ''}>下一页</button>
-      <span>第 ${currentDetailPage} / ${totalPages || 0} 页，共 ${asNumber(data.total)} 行，每页 ${asNumber(data.page_size)} 行</span>`;
-    document.getElementById('detailPrevBtn').addEventListener('click', () => loadFileDetails(currentDetailFile, currentDetailPage - 1));
-    document.getElementById('detailNextBtn').addEventListener('click', () => loadFileDetails(currentDetailFile, currentDetailPage + 1));
+      <button id="detailNextBtn" type="button" ${!currentDetailHasMore ? 'disabled' : ''}>下一页</button>
+      <span>第 ${currentDetailPage} 页${currentDetailHasMore ? '（可继续）' : ''}，每页 ${asNumber(data.page_size)} 行</span>`;
+    document.getElementById('detailPrevBtn').addEventListener('click', () => loadFileDetails(
+      currentDetailFile, currentDetailPage - 1,
+      detailPageCursors[currentDetailPage - 2] || null,
+    ));
+    document.getElementById('detailNextBtn').addEventListener('click', () => loadFileDetails(
+      currentDetailFile, currentDetailPage + 1, currentDetailNextCursor,
+    ));
   }
 
   function renderOwnershipStatus(ownership) {
@@ -481,9 +490,16 @@
     }
   }
 
-  async function loadFileDetails(filePath, page) {
+  async function loadFileDetails(filePath, page, cursor) {
     const project = projectInput.value.trim();
     if (!project || !filePath) return;
+    page = Math.max(1, page || 1);
+    if (page === 1) {
+      detailPageCursors = [null];
+      cursor = null;
+    } else {
+      detailPageCursors[page - 1] = cursor || null;
+    }
     currentDetailFile = filePath;
     const section = document.getElementById('detailSection');
     section.hidden = false;
@@ -492,9 +508,16 @@
     const apiBase = resolvedApiBase || apiBaseCandidates()[0];
     try {
       const payload = await fetchJsonWithTimeout(
-        `${apiBase}/progress/details?project=${encodeURIComponent(project)}&scan_id=${encodeURIComponent(currentScanId)}&repository_name=${encodeURIComponent(currentRepositoryName)}&file=${encodeURIComponent(filePath)}&page=${Math.max(1, page || 1)}&page_size=200`, 15000
+        (() => {
+          const query = new URLSearchParams({
+            project, scan_id: currentScanId, repository_name: currentRepositoryName,
+            file: filePath, page_size: '200',
+          });
+          if (cursor) query.set('cursor', cursor);
+          return `${apiBase}/progress/details?${query.toString()}`;
+        })(), 15000
       );
-      renderDetailTable(payload || {});
+      renderDetailTable(payload || {}, page);
       section.scrollIntoView({ behavior: 'smooth', block: 'start' });
     } catch (error) {
       document.getElementById('detailStatus').innerHTML = `<span class="error">详细数据加载失败：${escapeHtml(error.message)}</span>`;

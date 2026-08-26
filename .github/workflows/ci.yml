@@ -467,10 +467,11 @@ jobs:
         run: |
           mkdir -p .artifacts
           set -o pipefail
-          docker run --rm \
+          docker run --rm -i \
             -v "$PWD:/workspace" -w /workspace python@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc \
             bash -s <<'PY' 2>&1 | tee .artifacts/py36-compat.log
           set -e
+          rm -f .artifacts/py36-runtime-evidence.json
           python -m pip install --no-cache-dir -r requirements-py36.txt
           python -c "import pymysql; assert pymysql.__version__ == '0.10.1', pymysql.__version__"
           python -m unittest \
@@ -483,11 +484,31 @@ jobs:
             tests.vnext.test_runtime_config \
             tests.vnext.test_vnext_runtime \
             tests.vnext.test_legacy_runtime_adapter -v
+          python - <<'PY_EVIDENCE'
+          import json
+          import pymysql
+          import sys
+
+          with open('.artifacts/py36-runtime-evidence.json', 'w') as stream:
+              json.dump({
+                  'status': 'PASSED',
+                  'python': '{}.{}'.format(*sys.version_info[:2]),
+                  'pymysql': pymysql.__version__,
+                  'tests_executed': True,
+              }, stream)
+          PY_EVIDENCE
           PY
+      - name: Verify Python 3.6 runtime evidence
+        run: |
+          test -s .artifacts/py36-runtime-evidence.json
+          grep -q '"status": "PASSED"' .artifacts/py36-runtime-evidence.json
+          grep -q '"python": "3.6' .artifacts/py36-runtime-evidence.json
+          grep -q '"tests_executed": true' .artifacts/py36-runtime-evidence.json
+          grep -q '"pymysql": "0.10.1"' .artifacts/py36-runtime-evidence.json
       - name: Isolate failing Python 3.6 compatibility module
         if: ${{ failure() }}
         run: |
-          docker run --rm \
+          docker run --rm -i \
             -v "$PWD:/workspace" -w /workspace python@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc \
             bash -s <<'PY'
           set -e
@@ -522,7 +543,9 @@ jobs:
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
         with:
           name: py36-compatibility-log
-          path: .artifacts/py36-compat.log
+          path: |
+            .artifacts/py36-compat.log
+            .artifacts/py36-runtime-evidence.json
           if-no-files-found: error
 
   candidate-release-gate:

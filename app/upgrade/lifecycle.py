@@ -162,7 +162,10 @@ class UpgradeLifecycle:
             actual = payload.get("release") if isinstance(payload, dict) else None
             if not isinstance(actual, dict):
                 raise RuntimeError("previous release endpoint returned no release identity")
-            for key in ("version", "commit_sha", "build_id", "asset_hash", "schema_version"):
+            for key in (
+                    "version", "commit_sha", "build_id", "asset_hash", "schema_version",
+                    "asset_manifest_version", "asset_count", "asset_manifest_hash",
+                    "asset_manifest"):
                 if actual.get(key) != self.previous_release.get(key):
                     raise RuntimeError("previous release endpoint mismatch: {}".format(key))
 

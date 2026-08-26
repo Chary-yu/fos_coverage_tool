@@ -17,7 +17,7 @@ import sys
 from urllib.parse import urlsplit
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-_CURRENT_API_VERSION = "vnext-api-20260822.1"
+_CURRENT_API_VERSION = "vnext-api-20260826.1"
 _DEFAULT_MAX_FILES = 100000
 _MAX_HTML_BYTES = 32 * 1024 * 1024
 _ASSET_RE = re.compile(

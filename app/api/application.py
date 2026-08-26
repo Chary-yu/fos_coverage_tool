@@ -129,6 +129,7 @@ class VNextApplication(object):
                 "REJECTION_NOT_ACTIVE": ("UNDO_NOT_ALLOWED", 409),
                 "INHERITANCE_RELATION_NOT_ACTIVE": ("UNDO_NOT_ALLOWED", 409),
                 "PAGINATION_CURSOR_STALE": ("PAGINATION_CURSOR_STALE", 409),
+                "PAGINATION_CURSOR_REQUIRED": ("PAGINATION_CURSOR_REQUIRED", 400),
             }
             code, status = error_map.get(raw_code, ("invalid_request", 400))
             return status, {"error": code, "message": "request was rejected"}
@@ -368,6 +369,39 @@ class VNextApplication(object):
         }, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return base64.urlsafe_b64encode(raw).decode("ascii")
 
+    @staticmethod
+    def _decode_keyset_cursor(value, scan_id, data_version, filter_key):
+        if not value:
+            return None
+        try:
+            if isinstance(value, dict):
+                payload = value
+            else:
+                raw = base64.urlsafe_b64decode(str(value).encode("ascii"))
+                payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError
+            if (int(payload.get("scan_id")) != int(scan_id) or
+                    int(payload.get("data_version")) != int(data_version) or
+                    str(payload.get("filter") or "") != str(filter_key)):
+                raise ValueError("stale")
+            cursor = payload.get("cursor")
+            if not isinstance(cursor, dict):
+                raise ValueError("missing cursor")
+            return cursor
+        except Exception:
+            raise ValueError("PAGINATION_CURSOR_STALE")
+
+    @staticmethod
+    def _encode_keyset_cursor(cursor, scan_id, data_version, filter_key):
+        if not cursor:
+            return None
+        raw = json.dumps({
+            "cursor": dict(cursor), "scan_id": int(scan_id),
+            "data_version": int(data_version), "filter": str(filter_key),
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii")
+
     def _inheritance_scan(self, connection, scan_id):
         scan = self.runtime.projects.get_scan(connection, int(scan_id))
         if not scan:
@@ -590,7 +624,6 @@ class VNextApplication(object):
         repository_name = str(query.get("repository_name") or "").strip()
         if not scan_id or not file_path:
             raise ValueError("scan_id and file are required")
-        page = max(1, int(query.get("page") or 1))
         page_size = min(200, max(1, int(query.get("page_size") or 200)))
         project = None
         with self._read_connection() as connection:
@@ -600,6 +633,8 @@ class VNextApplication(object):
             scan = self.runtime.projects.get_scan(connection, int(scan_id))
             if not scan or int(scan["project_id"]) != int(project["id"]):
                 raise KeyError("scan is not bound to project")
+            state = self.runtime.states.get(connection, int(project["id"])) or {}
+            data_version = int(state.get("data_version") or 0)
             file_hash = compute_db_file_path_hash(file_path, repository_name)
             file_rows = fetchall(connection, """
                 SELECT * FROM coverage_files
@@ -611,54 +646,28 @@ class VNextApplication(object):
             file_row = file_rows[0] if file_rows else None
             if not file_row:
                 raise KeyError("file identity not found")
-            total_row = fetchone(connection, """
-                SELECT COUNT(*) AS total FROM coverage_lines WHERE file_id = ?
-            """, (int(file_row["id"]),))
-            offset = (page - 1) * page_size
-            rows = fetchall(connection, """
-                SELECT l.line_number, l.line_text, l.coverage_state,
-                       l.suggested_reviewer,
-                       CASE WHEN x.id IS NOT NULL THEN ''
-                            WHEN q.id IS NOT NULL THEN r.conclusion_status
-                            ELSE a.status END AS status,
-                       CASE WHEN x.id IS NOT NULL THEN 1
-                            WHEN q.id IS NOT NULL THEN
-                                CASE WHEN q.review_state IN ('MANUAL_DRAFT', 'INHERITED_PENDING')
-                                     THEN 1 ELSE 0 END
-                            ELSE a.is_draft END AS is_draft,
-                       CASE WHEN x.id IS NOT NULL THEN ''
-                            WHEN q.id IS NOT NULL THEN q.reviewed_by
-                            ELSE a.reviewer END AS reviewer,
-                       CASE WHEN x.id IS NOT NULL THEN ''
-                            WHEN q.id IS NOT NULL THEN r.coverage_method
-                            ELSE a.coverage_method END AS coverage_method,
-                       CASE WHEN x.id IS NOT NULL THEN ''
-                            WHEN q.id IS NOT NULL THEN r.uncovered_reason
-                            ELSE a.uncovered_reason END AS uncovered_reason,
-                       CASE WHEN x.id IS NOT NULL THEN x.rejected_at
-                            WHEN q.id IS NOT NULL THEN r.updated_at
-                            ELSE a.updated_at END AS updated_at,
-                       CASE WHEN x.id IS NOT NULL THEN 'INHERITANCE_REJECTED'
-                            ELSE q.review_state END AS review_state,
-                       q.relation_origin, q.analysis_record_id, q.relation_revision,
-                       q.is_active AS relation_is_active,
-                       x.id AS rejection_id, x.rejection_revision
-                FROM coverage_lines l
-                LEFT JOIN coverage_analyses a ON a.line_id = l.id
-                  LEFT JOIN coverage_analysis_line_links q
-                  ON q.scan_id=? AND q.line_id=l.id
-                LEFT JOIN coverage_analysis_records r ON r.id=q.analysis_record_id
-                LEFT JOIN coverage_inheritance_rejections x
-                  ON x.scan_id=? AND x.line_id=l.id AND x.is_active=1
-                WHERE l.file_id = ?
-                ORDER BY l.line_number
-                LIMIT ? OFFSET ?
-            """, (int(scan_id), int(scan_id), int(file_row["id"]), page_size, offset))
-        total = int((total_row or {}).get("total") or 0)
+            cursor = self._decode_keyset_cursor(
+                query.get("cursor"), int(scan_id), data_version,
+                "progress_details",
+            )
+            if cursor and int(cursor.get("file_id") or 0) != int(file_row["id"]):
+                raise ValueError("PAGINATION_CURSOR_STALE")
+            page = self.runtime.progress_service.detail_page(
+                connection, int(scan_id), int(file_row["id"]),
+                page_size=page_size,
+                cursor=cursor,
+            )
+        next_cursor = page.get("next_cursor")
+        if next_cursor:
+            next_cursor = dict(next_cursor)
+            next_cursor["file_id"] = int(file_row["id"])
         return 200, {
-            "page": page, "page_size": page_size, "total": total,
-            "total_pages": (total + page_size - 1) // page_size if total else 0,
-            "rows": rows,
+            "scan_id": int(scan_id), "file_id": int(file_row["id"]),
+            "page_size": page_size, "rows": page.get("rows") or [],
+            "has_more": bool(page.get("has_more")),
+            "next_cursor": self._encode_keyset_cursor(
+                next_cursor, int(scan_id), data_version, "progress_details"
+            ),
         }
 
     def progress_files(self, query, body, headers, remote_address):
@@ -707,14 +716,31 @@ class VNextApplication(object):
             query, self.config.get("project_name") or ""
         )
         scan_id = query.get("scan_id")
-        page = max(1, int(query.get("page") or 1))
         page_size = min(500, max(1, int(query.get("page_size") or 100)))
+        legacy_page = max(1, int(query.get("page") or 1))
         with self._read_connection() as connection:
-            return 200, self.runtime.progress_service.pending_page(
-                connection, project_name,
-                int(scan_id) if scan_id else None,
-                page=page, page_size=page_size,
+            project = self.runtime.projects.get_project_by_name(connection, project_name)
+            if not project:
+                raise KeyError("project not found")
+            state = self.runtime.states.get(connection, int(project["id"])) or {}
+            effective_scan_id = int(scan_id) if scan_id else int(
+                state.get("current_scan_id") or 0
             )
+            if legacy_page > 1 and not query.get("cursor"):
+                raise ValueError("PAGINATION_CURSOR_REQUIRED")
+            cursor = self._decode_keyset_cursor(
+                query.get("cursor"), effective_scan_id,
+                int(state.get("data_version") or 0), "progress_pending",
+            ) if query.get("cursor") else None
+            page = self.runtime.progress_service.pending_page(
+                connection, project_name,
+                effective_scan_id or None, page_size=page_size, cursor=cursor,
+            )
+        next_cursor = page.get("next_cursor")
+        return 200, dict(page, next_cursor=self._encode_keyset_cursor(
+            next_cursor, effective_scan_id,
+            int(state.get("data_version") or 0), "progress_pending"
+        ) if next_cursor and effective_scan_id else None)
 
     def unanalyzed(self, query, body, headers, remote_address):
         project_name = progress_endpoint.project_name(query, self.config.get("project_name") or "")

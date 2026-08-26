@@ -58,6 +58,8 @@ def release_identity_id(identity):
 
 RELEASE_IDENTITY_FIELDS = (
     "version", "commit_sha", "build_id", "asset_hash", "schema_version",
+    "asset_manifest_version", "asset_count", "asset_manifest_hash",
+    "asset_manifest",
 )
 
 

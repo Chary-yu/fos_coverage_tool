@@ -279,7 +279,10 @@ class UpgradeOrchestrator:
         actual = payload.get("release") if isinstance(payload, dict) else None
         if not isinstance(actual, dict):
             raise RuntimeError("release endpoint did not return a release identity")
-        for key in ("version", "commit_sha", "build_id", "asset_hash", "schema_version"):
+        for key in (
+                "version", "commit_sha", "build_id", "asset_hash", "schema_version",
+                "asset_manifest_version", "asset_count", "asset_manifest_hash",
+                "asset_manifest"):
             if actual.get(key) != identity.get(key):
                 raise RuntimeError("release endpoint mismatch: {}".format(key))
         return {

@@ -3,7 +3,7 @@
 `COMPAT-005` uses an explicit report contract instead of guessing which API a
 static HTML file expects. New VNext reports carry:
 
-- `api_contract_version`: `vnext-api-20260822.1`;
+- `api_contract_version`: `vnext-api-20260826.1`;
 - the immutable release fields `version`, exact `commit_sha`, `build_id`,
   `asset_hash`, and `schema_version`;
 - `asset_identity`, a compact database/cache token derived from the release

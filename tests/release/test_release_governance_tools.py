@@ -61,6 +61,11 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn(
             "pymysql.__version__ == '0.10.1'", workflow,
         )
+        self.assertEqual(workflow.count("docker run --rm -i"), 2)
+        self.assertIn(".artifacts/py36-runtime-evidence.json", workflow)
+        self.assertIn("test -s .artifacts/py36-runtime-evidence.json", workflow)
+        self.assertIn("grep -q '\"tests_executed\": true' .artifacts/py36-runtime-evidence.json", workflow)
+        self.assertIn("grep -q '\"pymysql\": \"0.10.1\"' .artifacts/py36-runtime-evidence.json", workflow)
 
     def test_perf_benchmark_help_is_side_effect_free(self):
         with tempfile.TemporaryDirectory() as directory:
