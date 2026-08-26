@@ -26,6 +26,10 @@ class TestEvidenceAuthenticity(unittest.TestCase):
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as stream:
                 stream.write("asset:" + relative)
+        backend = os.path.join(root, "app", "services", "backend.py")
+        os.makedirs(os.path.dirname(backend), exist_ok=True)
+        with open(backend, "w", encoding="utf-8") as stream:
+            stream.write("def backend_value():\n    return 1\n")
         if not initialize_git:
             return ""
         subprocess.check_call(["git", "init", "-q", root])
@@ -197,6 +201,34 @@ class TestEvidenceAuthenticity(unittest.TestCase):
                     "--commit-sha", other,
                 ])
             self.assertEqual(mismatch.exception.code, 2)
+
+    def test_build_release_rejects_tracked_source_changes_in_git_tree(self):
+        with tempfile.TemporaryDirectory() as root:
+            head = self._prepare_release_tree(root, initialize_git=True)
+            backend = os.path.join(root, "app", "services", "backend.py")
+            with open(backend, "a", encoding="utf-8") as stream:
+                stream.write("\n# uncommitted source change\n")
+            with self.assertRaises(SystemExit) as dirty:
+                build_release_main([
+                    "--repo-root", root,
+                    "--output", os.path.join(root, "release_manifest.json"),
+                    "--commit-sha", head,
+                ])
+            self.assertEqual(dirty.exception.code, 2)
+
+    def test_build_release_rejects_untracked_files_in_git_tree(self):
+        with tempfile.TemporaryDirectory() as root:
+            head = self._prepare_release_tree(root, initialize_git=True)
+            untracked = os.path.join(root, "app", "services", "untracked.py")
+            with open(untracked, "w", encoding="utf-8") as stream:
+                stream.write("UNTRACKED = True\n")
+            with self.assertRaises(SystemExit) as dirty:
+                build_release_main([
+                    "--repo-root", root,
+                    "--output", os.path.join(root, "release_manifest.json"),
+                    "--commit-sha", head,
+                ])
+            self.assertEqual(dirty.exception.code, 2)
 
     def test_build_release_accepts_external_sha_without_git_metadata(self):
         with tempfile.TemporaryDirectory() as root:

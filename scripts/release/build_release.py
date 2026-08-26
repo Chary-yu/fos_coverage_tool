@@ -58,11 +58,14 @@ def main(argv=None):
         if not is_valid_commit_sha(args.commit_sha):
             parser.error("--commit-sha must be a concrete 40-character Git SHA")
         commit_sha = args.commit_sha
-    identity = generate_release_identity(
-        repo_root,
-        commit_sha=commit_sha,
-        build_provenance="release-build",
-    )
+    try:
+        identity = generate_release_identity(
+            repo_root,
+            commit_sha=commit_sha,
+            build_provenance="release-build",
+        )
+    except RuntimeError as exc:
+        parser.error(str(exc))
     save_release_manifest(os.path.abspath(args.output), identity)
     print(identity["build_id"])
 

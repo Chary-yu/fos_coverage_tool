@@ -63,6 +63,29 @@ def _has_git_metadata(repo_root: str) -> bool:
     return os.path.exists(os.path.join(os.path.abspath(repo_root), ".git"))
 
 
+def assert_clean_git_checkout(repo_root: str) -> None:
+    """Require a clean Git checkout before creating a release manifest."""
+    repo_root = os.path.abspath(repo_root)
+    if not _has_git_metadata(repo_root):
+        raise RuntimeError(
+            "release build requires .git metadata for a clean exact checkout"
+        )
+    try:
+        output = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=repo_root,
+            stderr=subprocess.STDOUT,
+        ).decode("utf-8", "replace")
+    except Exception as exc:
+        raise RuntimeError(
+            "release build cannot inspect Git worktree: {}: {}".format(
+                type(exc).__name__, exc
+            )
+        )
+    if output.strip():
+        raise RuntimeError("release build requires a clean exact checkout")
+
+
 def _default_asset_files(repo_root: str) -> list:
     files = []
     missing = []
@@ -178,6 +201,10 @@ def generate_release_identity(
         ).strip()
     if not is_valid_commit_sha(commit_sha):
         raise RuntimeError("release build requires a concrete commit SHA")
+
+    provenance = str(build_provenance or "git-checkout")
+    if provenance == "release-build" and _has_git_metadata(repo_root):
+        assert_clean_git_checkout(repo_root)
     
     if asset_files is None:
         asset_files = _default_asset_files(repo_root)
@@ -197,7 +224,7 @@ def generate_release_identity(
         "asset_manifest_hash": asset_hash,
         "asset_manifest": asset_manifest,
         "schema_version": schema_version,
-        "build_provenance": str(build_provenance or "git-checkout"),
+        "build_provenance": provenance,
         "built_at": utc_iso()
     }
     return identity
