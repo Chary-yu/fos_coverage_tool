@@ -692,6 +692,26 @@ class ScanImportLifecycleTest(unittest.TestCase):
             )["phase"], "PUBLISHED"
         )
 
+    def test_continuation_chunks_preserve_zero_file_count_delta(self):
+        files = [{
+            "repository_name": "repo",
+            "file_path": "src/large.c",
+            "file_path_hash": "large-file-hash",
+            "lines": [{"line_number": number} for number in range(1, 6)],
+        }]
+        batches = list(ScanImportCoordinator._iter_coverage_batches(
+            files, max_files=128, max_lines=2, max_est_bytes=0
+        ))
+        chunks = [chunk for batch in batches for chunk in batch]
+
+        self.assertEqual(
+            [chunk["_coverage_chunk"]["file_count_delta"] for chunk in chunks],
+            [1, 0, 0],
+        )
+        replay = ScanImportCoordinator._consume_coverage_batch(chunks, None)
+        self.assertEqual(replay["file_count"], 1)
+        self.assertEqual(replay["line_count"], 5)
+
     def test_last_coverage_batch_failure_does_not_advance_phase(self):
         projects = ProjectRepository()
         states = ProjectStateRepository()

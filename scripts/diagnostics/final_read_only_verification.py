@@ -26,20 +26,31 @@ from app.time_utils import utc_iso
 
 
 RELEASE_IDENTITY_FIELDS = (
-    "commit_sha", "build_id", "asset_hash", "schema_version",
+    "version", "commit_sha", "build_id", "asset_hash", "schema_version",
     "asset_manifest_version", "asset_count", "asset_manifest_hash",
     "asset_manifest",
 )
 
 
-def _verify_release_payload(actual, expected_release):
-    """Return explicit release mismatches without touching other HTTP routes."""
+def _release_identity_mismatches(actual, expected_release, label):
+    """Compare only the canonical release identity contract fields."""
     violations = []
     for field in RELEASE_IDENTITY_FIELDS:
-        if (not isinstance(actual, dict) or
-                actual.get(field) != expected_release.get(field)):
-            violations.append("release identity mismatch: {}".format(field))
+        actual_value = actual.get(field) if isinstance(actual, dict) else None
+        expected_value = (
+            expected_release.get(field)
+            if isinstance(expected_release, dict) else None
+        )
+        if actual_value != expected_value:
+            violations.append("{} mismatch: {}".format(label, field))
     return violations
+
+
+def _verify_release_payload(actual, expected_release):
+    """Return explicit release mismatches without touching other HTTP routes."""
+    return _release_identity_mismatches(
+        actual, expected_release, "release identity"
+    )
 
 
 def _load_config(path):
@@ -122,10 +133,43 @@ def _database_checks(config_path):
 def verify(args):
     violations = []
     config = _load_config(args.config)
-    expected_release = None
-    if args.release_identity:
-        with open(args.release_identity, "r", encoding="utf-8") as stream:
-            expected_release = json.load(stream)
+    operator_release = None
+    operator_release_loaded = False
+    release_artifact_path = getattr(args, "release_identity", None)
+    if release_artifact_path:
+        try:
+            with open(release_artifact_path, "r", encoding="utf-8") as stream:
+                operator_release = json.load(stream)
+            operator_release_loaded = True
+        except Exception as exc:
+            violations.append(
+                "release identity artifact load failed: {}: {}".format(
+                    type(exc).__name__, exc
+                )
+            )
+        if operator_release_loaded and not isinstance(operator_release, dict):
+            violations.append("release identity artifact must be a JSON object")
+
+    canonical_release = None
+    try:
+        canonical_release = generate_release_identity(repo_root=ROOT)
+    except Exception as exc:
+        violations.append(
+            "canonical release identity generation failed: {}: {}".format(
+                type(exc).__name__, exc
+            )
+        )
+    if canonical_release is not None and not isinstance(canonical_release, dict):
+        violations.append("canonical release identity must be a JSON object")
+    if isinstance(canonical_release, dict):
+        if release_artifact_path and isinstance(operator_release, dict):
+            violations.extend(_release_identity_mismatches(
+                operator_release,
+                canonical_release,
+                "operator release identity",
+            ))
+
+    expected_release = canonical_release if isinstance(canonical_release, dict) else None
     db = _database_checks(args.config)
     if db.get("status") != "PASSED":
         violations.extend(db.get("violations") or ["database read-only verification unavailable"])
@@ -161,9 +205,6 @@ def verify(args):
             http["status"] = "INCOMPLETE"
             violations.append("{}: {}".format(path, exc))
 
-    configured_release = generate_release_identity(repo_root=ROOT)
-    if expected_release and expected_release.get("commit_sha") != configured_release.get("commit_sha"):
-        violations.append("operator release artifact does not match checked-out revision")
     return {
         "status": "PASSED" if not violations else "INCOMPLETE",
         "evidence_class": "final_target_read_only_verification",
@@ -174,7 +215,7 @@ def verify(args):
             "database": (config.get("mysql") or config).get("database", ""),
             "server": config.get("server") or {},
         },
-        "release_identity": expected_release or configured_release,
+        "release_identity": expected_release or {},
         "database": db,
         "http": http,
         "write_routes_exercised": [],
@@ -188,7 +229,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--endpoint", required=True)
-    parser.add_argument("--release-identity")
+    parser.add_argument(
+        "--release-identity",
+        help=(
+            "optional operator artifact; the Candidate is always compared "
+            "with the exact checkout identity"
+        ),
+    )
     parser.add_argument("--project")
     parser.add_argument("--scan-id")
     parser.add_argument("--header", action="append")

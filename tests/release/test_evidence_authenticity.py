@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 import json
+import subprocess
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
@@ -19,6 +20,24 @@ from scripts.upgrade.evidence_manifest import EvidenceManifestV2, ProductionEvid
 
 
 class TestEvidenceAuthenticity(unittest.TestCase):
+    def _prepare_release_tree(self, root, initialize_git=False):
+        for relative in DEFAULT_RELEASE_ASSET_RELATIVE_PATHS:
+            path = os.path.join(root, *relative.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write("asset:" + relative)
+        if not initialize_git:
+            return ""
+        subprocess.check_call(["git", "init", "-q", root])
+        subprocess.check_call(["git", "add", "."], cwd=root)
+        subprocess.check_call([
+            "git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-qm", "initial",
+        ], cwd=root)
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=root
+        ).decode("utf-8").strip()
+
     def test_asset_manifest_binds_path_size_and_missing_assets_fail_closed(self):
         with tempfile.TemporaryDirectory() as root:
             first = os.path.join(root, "static", "first.js")
@@ -157,6 +176,40 @@ class TestEvidenceAuthenticity(unittest.TestCase):
                     "--commit-sha", "0" * 40,
                 ])
             self.assertEqual(zero.exception.code, 2)
+
+    def test_build_release_uses_git_head_and_rejects_mismatched_sha(self):
+        with tempfile.TemporaryDirectory() as root:
+            head = self._prepare_release_tree(root, initialize_git=True)
+            output = os.path.join(root, "release_manifest.json")
+
+            build_release_main([
+                "--repo-root", root, "--output", output,
+                "--commit-sha", head,
+            ])
+            with open(output, "r", encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            self.assertEqual(manifest["commit_sha"], head)
+
+            other = "b" * 40 if head.lower() != "b" * 40 else "c" * 40
+            with self.assertRaises(SystemExit) as mismatch:
+                build_release_main([
+                    "--repo-root", root, "--output", output,
+                    "--commit-sha", other,
+                ])
+            self.assertEqual(mismatch.exception.code, 2)
+
+    def test_build_release_accepts_external_sha_without_git_metadata(self):
+        with tempfile.TemporaryDirectory() as root:
+            self._prepare_release_tree(root)
+            output = os.path.join(root, "release_manifest.json")
+            external_sha = "a" * 40
+            build_release_main([
+                "--repo-root", root, "--output", output,
+                "--commit-sha", external_sha,
+            ])
+            with open(output, "r", encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            self.assertEqual(manifest["commit_sha"], external_sha)
 
     def test_mock_backup_and_browser_cannot_pass_final_gate(self):
         with tempfile.TemporaryDirectory() as root:

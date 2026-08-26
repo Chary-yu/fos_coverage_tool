@@ -156,9 +156,26 @@ def generate_release_identity(
     if repo_root is None:
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     
-    commit_sha = str(
-        _get_git_commit_sha(repo_root) if commit_sha is None else commit_sha
-    ).strip()
+    requested_commit_sha = (
+        None if commit_sha is None else str(commit_sha).strip()
+    )
+    if _has_git_metadata(repo_root):
+        checkout_commit_sha = _get_git_commit_sha(repo_root)
+        if not is_valid_commit_sha(checkout_commit_sha):
+            raise RuntimeError(
+                "release build cannot resolve the checked-out commit SHA"
+            )
+        if (requested_commit_sha and
+                requested_commit_sha.lower() != checkout_commit_sha.lower()):
+            raise RuntimeError(
+                "explicit commit SHA does not match checked-out HEAD"
+            )
+        commit_sha = checkout_commit_sha
+    else:
+        commit_sha = str(
+            _get_git_commit_sha(repo_root)
+            if requested_commit_sha is None else requested_commit_sha
+        ).strip()
     if not is_valid_commit_sha(commit_sha):
         raise RuntimeError("release build requires a concrete commit SHA")
     

@@ -606,7 +606,7 @@ class ScanImportCoordinator(object):
         for chunk in cls._iter_coverage_file_chunks(
                 files, max_lines, max_est_bytes):
             metadata = chunk.get("_coverage_chunk") or {}
-            chunk_files = int(metadata.get("file_count_delta") or 1)
+            chunk_files = int(metadata.get("file_count_delta", 1))
             chunk_lines = int(metadata.get("line_count") or 0)
             chunk_bytes = int(metadata.get("estimated_bytes") or 0)
             over_file_limit = (
@@ -642,7 +642,7 @@ class ScanImportCoordinator(object):
         last_identity = None
         for item in batch or ():
             metadata = item.get("_coverage_chunk") or {}
-            file_count += int(metadata.get("file_count_delta") or 1)
+            file_count += int(metadata.get("file_count_delta", 1))
             line_count += int(metadata.get("line_count") or 0)
             if "line_count" not in metadata:
                 for _ in item.get("lines") or ():

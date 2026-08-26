@@ -15,6 +15,7 @@ class FinalReadOnlyVerificationTest(unittest.TestCase):
         with open(self.config_path, "w", encoding="utf-8") as stream:
             json.dump({"mysql": {"database": "coverage"}}, stream)
         self.release = {
+            "version": "v-test",
             "commit_sha": "a" * 40,
             "build_id": "build-a",
             "asset_hash": "b" * 64,
@@ -65,9 +66,19 @@ class FinalReadOnlyVerificationTest(unittest.TestCase):
             generate_release_identity=mock.Mock(return_value=self.release),
         )
 
-    def test_without_release_identity_health_projects_and_progress_are_checked(self):
-        with self._patched(self._args(), self._http()):
-            result = verifier.verify(self._args())
+    def test_without_release_identity_wrong_http_release_fails_closed(self):
+        actual = dict(self.release, commit_sha="d" * 40)
+        args = self._args()
+        with self._patched(args, self._http({"release": actual})):
+            result = verifier.verify(args)
+
+        self.assertNotEqual(result["status"], "PASSED")
+        self.assertTrue(any("commit_sha" in item for item in result["violations"]))
+
+    def test_without_release_identity_exact_http_release_passes(self):
+        args = self._args()
+        with self._patched(args, self._http()):
+            result = verifier.verify(args)
 
         self.assertEqual(result["status"], "PASSED")
 
@@ -89,6 +100,15 @@ class FinalReadOnlyVerificationTest(unittest.TestCase):
         self.assertTrue(any("asset_manifest_hash" in item
                             for item in result["violations"]))
 
+    def test_version_mismatch_fails_release_comparison(self):
+        actual = dict(self.release, version="v-drift")
+        args = self._args()
+        with self._patched(args, self._http({"release": actual})):
+            result = verifier.verify(args)
+
+        self.assertNotEqual(result["status"], "PASSED")
+        self.assertTrue(any("version" in item for item in result["violations"]))
+
     def test_health_failure_does_not_pollute_release_comparison(self):
         args = self._args(with_release=True)
         with self._patched(
@@ -108,6 +128,30 @@ class FinalReadOnlyVerificationTest(unittest.TestCase):
 
         self.assertNotEqual(result["status"], "PASSED")
         self.assertTrue(any("release identity mismatch" in item
+                            for item in result["violations"]))
+
+    def test_malformed_release_artifact_returns_structured_incomplete(self):
+        with open(self.release_path, "w", encoding="utf-8") as stream:
+            stream.write("not-json")
+        args = self._args(with_release=True)
+        with self._patched(args, self._http()):
+            result = verifier.verify(args)
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertTrue(any("artifact load failed" in item
+                            for item in result["violations"]))
+
+    def test_non_object_release_artifact_returns_structured_incomplete(self):
+        with open(self.release_path, "w", encoding="utf-8") as stream:
+            json.dump([self.release], stream)
+        args = self._args(with_release=True)
+        with self._patched(args, self._http()):
+            result = verifier.verify(args)
+
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["status"], "INCOMPLETE")
+        self.assertTrue(any("must be a JSON object" in item
                             for item in result["violations"]))
 
 
