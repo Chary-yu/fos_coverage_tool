@@ -337,6 +337,100 @@ class VNextRuntimeTest(unittest.TestCase):
         self.assertFalse(second["has_more"])
         self.assertEqual([row["file_path"] for row in second["files"]], ["src/b.c"])
 
+    def test_progress_rejects_cross_project_scans_and_rebuilds_only_current_scan(self):
+        service = self.runtime.project_service
+
+        def make_scan(project_name, info_sha, file_path):
+            return service.create_scan_and_ingest(
+                self.connection, project_name, [{
+                    "repository_name": "repo",
+                    "file_path": file_path,
+                    "lines": [{
+                        "line_number": 1,
+                        "line_text": "return 0;",
+                        "coverage_state": "uncovered",
+                    }],
+                }], info_sha256=info_sha,
+            )
+
+        historical_a = make_scan("identity-a", "a" * 64, "src/old.c")
+        current_a = make_scan("identity-a", "b" * 64, "src/current.c")
+        current_b = make_scan("identity-b", "c" * 64, "src/other.c")
+        self.assertNotEqual(historical_a["id"], current_a["id"])
+
+        status, payload = self.application.dispatch(
+            "GET", "/api/coverage/progress",
+            query={"project": "identity-a", "scan_id": str(current_b["id"])},
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["error"], "INVALID_SCAN_IDENTITY")
+
+        project_a = self.runtime.projects.get_project_by_name(
+            self.connection, "identity-a"
+        )
+        project_b = self.runtime.projects.get_project_by_name(
+            self.connection, "identity-b"
+        )
+        before_a = self.runtime.states.get(self.connection, project_a["id"])
+        before_b = self.runtime.states.get(self.connection, project_b["id"])
+        before_b_file_state = self.connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(data_version), 0) "
+            "FROM coverage_file_state WHERE scan_id=?",
+            (current_b["id"],),
+        ).fetchone()
+
+        with self.assertRaisesRegex(ValueError, "INVALID_SCAN_IDENTITY"):
+            self.runtime.progress_service.files_page(
+                self.connection, "identity-a", current_b["id"]
+            )
+        with self.assertRaisesRegex(ValueError, "INVALID_SCAN_IDENTITY"):
+            self.runtime.progress_service.pending_by_file(
+                self.connection, "identity-a", current_b["id"]
+            )
+        with self.assertRaisesRegex(ValueError, "INVALID_SCAN_IDENTITY"):
+            self.runtime.progress_service.pending_page(
+                self.connection, "identity-a", current_b["id"]
+            )
+        with self.assertRaisesRegex(ValueError, "MUTATION_REQUIRES_CURRENT_SCAN"):
+            self.runtime.progress_service.rebuild(
+                self.connection, "identity-a", historical_a["id"]
+            )
+
+        after_rejected_a = self.runtime.states.get(
+            self.connection, project_a["id"]
+        )
+        after_rejected_b = self.runtime.states.get(
+            self.connection, project_b["id"]
+        )
+        after_rejected_b_file_state = self.connection.execute(
+            "SELECT COUNT(*), COALESCE(SUM(data_version), 0) "
+            "FROM coverage_file_state WHERE scan_id=?",
+            (current_b["id"],),
+        ).fetchone()
+        self.assertEqual(
+            int(after_rejected_a["file_state_version"]),
+            int(before_a["file_state_version"]),
+        )
+        self.assertEqual(
+            int(after_rejected_b["file_state_version"]),
+            int(before_b["file_state_version"]),
+        )
+        self.assertEqual(tuple(after_rejected_b_file_state),
+                         tuple(before_b_file_state))
+
+        self.runtime.progress_service.rebuild(
+            self.connection, "identity-a", current_a["id"]
+        )
+        ready_a = self.runtime.states.get(self.connection, project_a["id"])
+        self.assertEqual(int(ready_a["file_state_version"]),
+                         int(ready_a["data_version"]))
+        self.assertEqual(
+            int(self.runtime.states.get(self.connection, project_b["id"])[
+                "file_state_version"
+            ]),
+            int(before_b["file_state_version"]),
+        )
+
     def test_serializer_handles_cross_layer_values(self):
         value = to_jsonable({
             "amount": Decimal("1.50"),

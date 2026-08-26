@@ -170,6 +170,10 @@ class VNextJobsTest(unittest.TestCase):
                 )
                 self.assertEqual(status, 201)
                 scan_id = payload["scan"]["id"]
+                # Progress state rebuild is a mutation of the Project's
+                # CURRENT derived state; publish this fixture Scan first.
+                with runtime.connection_context(read_only=False) as connection:
+                    runtime.project_service.ingest_files(connection, scan_id, [])
                 status, payload = app.dispatch(
                     "POST", "/api/coverage/jobs",
                     body={"kind": "rebuild_progress", "scan_id": scan_id},

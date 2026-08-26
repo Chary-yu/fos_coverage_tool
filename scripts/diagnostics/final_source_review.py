@@ -57,6 +57,11 @@ def _run_check(name, callback):
         }
 
 
+def _audit_release_identity(repo_root):
+    identity = generate_release_identity(repo_root=repo_root)
+    return {"status": "PASSED", "identity": identity}
+
+
 def audit(repo_root=ROOT):
     repo_root = os.path.abspath(repo_root)
     started_at = utc_iso()
@@ -80,6 +85,7 @@ def audit(repo_root=ROOT):
         _run_check("task_manifest", lambda: audit_tasks(repo_root)),
         _run_check("connection_pool", audit_pool),
         _run_check("job_lifecycle", audit_jobs),
+        _run_check("release_identity", lambda: _audit_release_identity(repo_root)),
     ]
     if not revision:
         violations.append("candidate revision is unavailable")
@@ -89,8 +95,12 @@ def audit(repo_root=ROOT):
         if check["status"] != "PASSED":
             violations.append("{} audit is {}".format(check["name"], check["status"]))
 
-    identity = generate_release_identity(repo_root=repo_root)
-    if revision and identity.get("commit_sha") != revision:
+    release_check = next(
+        (item for item in checks if item["name"] == "release_identity"),
+        {"result": {}},
+    )
+    identity = (release_check.get("result") or {}).get("identity") or {}
+    if identity and revision and identity.get("commit_sha") != revision:
         violations.append("release identity commit does not match HEAD")
     result = with_contract({
         "status": "PASSED" if not violations else "INCOMPLETE",

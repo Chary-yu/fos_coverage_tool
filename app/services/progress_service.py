@@ -16,13 +16,30 @@ class ProgressService(object):
             raise KeyError("project not found: {}".format(project_name))
         return project
 
+    def _resolve_scan_for_project(self, connection, project, state,
+                                  scan_id=None, require_current=False):
+        """Resolve a Scan only after binding it to the requested Project."""
+        resolved = int(scan_id or state.get("current_scan_id") or 0)
+        if not resolved:
+            return None
+        scan = self.projects.get_scan(connection, resolved)
+        if not scan:
+            raise KeyError("scan not found")
+        if int(scan.get("project_id") or 0) != int(project["id"]):
+            raise ValueError("INVALID_SCAN_IDENTITY")
+        if (require_current and
+                resolved != int(state.get("current_scan_id") or 0)):
+            raise ValueError("MUTATION_REQUIRES_CURRENT_SCAN")
+        return resolved
+
     def summary(self, connection, project_name, scan_id=None):
         project = self._project(connection, project_name)
         state = self.states.get(connection, project["id"]) or {
             "data_version": 0, "file_state_version": 0
         }
-        if scan_id is None:
-            scan_id = state.get("current_scan_id")
+        scan_id = self._resolve_scan_for_project(
+            connection, project, state, scan_id=scan_id,
+        )
         if not scan_id:
             return {
                 "project_name": project_name, "scan_id": None, "source": "authoritative",
@@ -91,7 +108,9 @@ class ProgressService(object):
     def rebuild(self, connection, project_name, scan_id=None):
         project = self._project(connection, project_name)
         state = self.states.get(connection, project["id"]) or {}
-        scan_id = scan_id or state.get("current_scan_id")
+        scan_id = self._resolve_scan_for_project(
+            connection, project, state, scan_id=scan_id, require_current=True,
+        )
         if not scan_id:
             return self.summary(connection, project_name, scan_id)
         with transaction(connection) as conn:
@@ -105,7 +124,9 @@ class ProgressService(object):
                         page_size=200, cursor=None):
         project = self._project(connection, project_name)
         state = self.states.get(connection, project["id"]) or {}
-        scan_id = scan_id or state.get("current_scan_id")
+        scan_id = self._resolve_scan_for_project(
+            connection, project, state, scan_id=scan_id,
+        )
         if not scan_id:
             return {"rows": [], "has_more": False, "next_cursor": None}
         page = self.file_states.pending_file_page(
@@ -117,7 +138,9 @@ class ProgressService(object):
                    page_size=200, cursor=None):
         project = self._project(connection, project_name)
         state = self.states.get(connection, project["id"]) or {}
-        scan_id = scan_id or state.get("current_scan_id")
+        scan_id = self._resolve_scan_for_project(
+            connection, project, state, scan_id=scan_id,
+        )
         if not scan_id:
             return {"rows": [], "has_more": False, "next_cursor": None}
         return self.file_states.file_page(
@@ -129,7 +152,9 @@ class ProgressService(object):
                      page_size=100, cursor=None):
         project = self._project(connection, project_name)
         state = self.states.get(connection, project["id"]) or {}
-        scan_id = scan_id or state.get("current_scan_id")
+        scan_id = self._resolve_scan_for_project(
+            connection, project, state, scan_id=scan_id,
+        )
         page_size = min(500, max(1, int(page_size)))
         if not scan_id:
             return {"scan_id": None, "page_size": page_size, "total": 0,

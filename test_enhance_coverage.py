@@ -633,10 +633,11 @@ class TestScalableProgress(unittest.TestCase):
             content = page_file.read()
         self.assertIn("/progress?", content)
         self.assertIn("/jobs/", content)
-        self.assertIn("/progress/details?project=", content)
+        self.assertIn("/progress/details?", content)
+        self.assertIn("currentDetailFile", content)
         self.assertIn("/exports", content)
         self.assertIn("后台导出详细 CSV", content)
-        self.assertIn("page_size=200", content)
+        self.assertIn("page_size: '200'", content)
         self.assertIn("showConnecting();", content)
         with open(enhance_coverage.PROGRESS_PAGE_SOURCE_PATH, "r", encoding="utf-8") as html_file:
             html_content = html_file.read()

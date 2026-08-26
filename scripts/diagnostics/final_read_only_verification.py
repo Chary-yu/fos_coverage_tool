@@ -25,6 +25,23 @@ from scripts.upgrade.migration_runner import capture_vnext_semantic_snapshot, se
 from app.time_utils import utc_iso
 
 
+RELEASE_IDENTITY_FIELDS = (
+    "commit_sha", "build_id", "asset_hash", "schema_version",
+    "asset_manifest_version", "asset_count", "asset_manifest_hash",
+    "asset_manifest",
+)
+
+
+def _verify_release_payload(actual, expected_release):
+    """Return explicit release mismatches without touching other HTTP routes."""
+    violations = []
+    for field in RELEASE_IDENTITY_FIELDS:
+        if (not isinstance(actual, dict) or
+                actual.get(field) != expected_release.get(field)):
+            violations.append("release identity mismatch: {}".format(field))
+    return violations
+
+
 def _load_config(path):
     with open(path, "r", encoding="utf-8") as stream:
         value = json.load(stream)
@@ -134,13 +151,12 @@ def verify(args):
                 violations.append("{} returned HTTP {}".format(path, status))
             if path == "/api/coverage/release" and expected_release:
                 actual = payload.get("release") if isinstance(payload, dict) else None
-            for field in (
-                    "commit_sha", "build_id", "asset_hash", "schema_version",
-                    "asset_manifest_version", "asset_count", "asset_manifest_hash",
-                    "asset_manifest"):
-                    if not isinstance(actual, dict) or actual.get(field) != expected_release.get(field):
-                        http["status"] = "FAILED"
-                        violations.append("release identity mismatch: {}".format(field))
+                release_violations = _verify_release_payload(
+                    actual, expected_release
+                )
+                if release_violations:
+                    http["status"] = "FAILED"
+                    violations.extend(release_violations)
         except Exception as exc:
             http["status"] = "INCOMPLETE"
             violations.append("{}: {}".format(path, exc))

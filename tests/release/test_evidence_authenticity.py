@@ -43,6 +43,14 @@ class TestEvidenceAuthenticity(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "required release asset missing"):
                 build_asset_manifest([first, second], repo_root=root)
 
+    def test_asset_manifest_rejects_paths_outside_repository_root(self):
+        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as outside:
+            asset = os.path.join(outside, "not-in-repo.js")
+            with open(asset, "w", encoding="utf-8") as stream:
+                stream.write("outside")
+            with self.assertRaisesRegex(RuntimeError, "outside repository root"):
+                build_asset_manifest([asset], repo_root=root)
+
     def test_default_release_assets_include_progress_template_pair(self):
         required = {
             "coverage_progress.html",
@@ -111,9 +119,10 @@ class TestEvidenceAuthenticity(unittest.TestCase):
     def test_no_git_release_artifact_rejects_non_exact_manifest_sha(self):
         with tempfile.TemporaryDirectory() as root:
             identity = generate_release_identity(
-                root, commit_sha="not-a-sha", asset_files=[],
+                root, commit_sha="a" * 40, asset_files=[],
                 build_provenance="release-build",
             )
+            identity["commit_sha"] = "not-a-sha"
             save_release_manifest(os.path.join(root, "release_manifest.json"), identity)
             with self.assertRaisesRegex(RuntimeError, "exact commit SHA"):
                 get_current_release_identity(root)
@@ -121,12 +130,20 @@ class TestEvidenceAuthenticity(unittest.TestCase):
     def test_no_git_release_artifact_rejects_all_zero_manifest_sha(self):
         with tempfile.TemporaryDirectory() as root:
             identity = generate_release_identity(
-                root, commit_sha="0" * 40, asset_files=[],
+                root, commit_sha="a" * 40, asset_files=[],
                 build_provenance="release-build",
             )
+            identity["commit_sha"] = "0" * 40
             save_release_manifest(os.path.join(root, "release_manifest.json"), identity)
             with self.assertRaisesRegex(RuntimeError, "concrete commit SHA"):
                 get_current_release_identity(root)
+
+    def test_generate_release_identity_rejects_an_explicit_invalid_sha(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(RuntimeError, "concrete commit SHA"):
+                generate_release_identity(
+                    root, commit_sha="not-a-sha", asset_files=[]
+                )
 
     def test_build_release_requires_concrete_sha_without_git_metadata(self):
         with tempfile.TemporaryDirectory() as root:

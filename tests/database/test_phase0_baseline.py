@@ -43,9 +43,10 @@ class TestPhase0Baseline(unittest.TestCase):
             f.write("console.log('v1');")
             
         ident = generate_release_identity(
-            repo_root=_REPO_ROOT,
+            repo_root=self.test_dir,
             version="v11.4",
-            asset_files=[dummy_js]
+            asset_files=[dummy_js],
+            commit_sha="a" * 40,
         )
         self.assertEqual(ident["version"], "v11.4")
         self.assertTrue(len(ident["commit_sha"]) >= 8)

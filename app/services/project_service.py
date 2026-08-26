@@ -233,14 +233,24 @@ class ProjectService(object):
                 self.lines.upsert_lines(connection, file_row["id"], line_batch)
 
         last = normalized_items[-1]
+        last_chunk = batch[-1].get("_coverage_chunk") or {}
+        last_identity = {
+            "repository_name": last["repository_name"],
+            "file_path_hash": last["file_path_hash"],
+            "file_path": last["file_path"],
+        }
+        if last_chunk.get("last_line_number") is not None:
+            last_identity["last_line_number"] = last_chunk["last_line_number"]
+        if "file_complete" in last_chunk:
+            last_identity["file_complete"] = bool(last_chunk["file_complete"])
         return {
-            "file_count": len(batch),
+            "file_count": sum(
+                int((item.get("_coverage_chunk") or {}).get(
+                    "file_count_delta", 1
+                )) for item in batch
+            ),
             "line_count": line_count,
-            "last_file_identity": {
-                "repository_name": last["repository_name"],
-                "file_path_hash": last["file_path_hash"],
-                "file_path": last["file_path"],
-            },
+            "last_file_identity": last_identity,
         }
 
     def create_scan_and_ingest(self, connection, project_name, files,

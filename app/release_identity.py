@@ -99,12 +99,21 @@ def build_asset_manifest(file_paths: list, repo_root: Optional[str] = None) -> l
     """Return a fail-closed, path/size/content manifest for release assets."""
     entries = []
     seen = set()
-    root = os.path.abspath(repo_root) if repo_root else None
+    root = os.path.realpath(os.path.abspath(repo_root)) if repo_root else None
     for raw_path in file_paths or ():
         path = str(raw_path)
         if root and not os.path.isabs(path):
             path = os.path.join(root, path)
-        path = os.path.abspath(path)
+        path = os.path.realpath(os.path.abspath(path))
+        if root:
+            try:
+                contained = os.path.commonpath((root, path)) == root
+            except ValueError:
+                contained = False
+            if not contained:
+                raise RuntimeError(
+                    "release asset outside repository root: {}".format(path)
+                )
         relative = _asset_relative_path(path, root)
         if relative in seen:
             raise RuntimeError("duplicate release asset path: " + relative)
@@ -147,12 +156,11 @@ def generate_release_identity(
     if repo_root is None:
         repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     
-    resolved_from_checkout = commit_sha is None
     commit_sha = str(
-        _get_git_commit_sha(repo_root) if resolved_from_checkout else commit_sha
+        _get_git_commit_sha(repo_root) if commit_sha is None else commit_sha
     ).strip()
-    if resolved_from_checkout and not is_valid_commit_sha(commit_sha):
-        raise RuntimeError("release build has no concrete commit SHA")
+    if not is_valid_commit_sha(commit_sha):
+        raise RuntimeError("release build requires a concrete commit SHA")
     
     if asset_files is None:
         asset_files = _default_asset_files(repo_root)

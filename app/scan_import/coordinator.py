@@ -24,6 +24,8 @@ from app.observability.performance import current_collector, instrument_connecti
 class ScanImportCoordinator(object):
     HANDLER_VERSION = "SCAN_IMPORT_HANDLER_V1"
     COVERAGE_IMPORT_FILE_BATCH_SIZE = 128
+    COVERAGE_IMPORT_MAX_LINES = 20000
+    COVERAGE_IMPORT_MAX_EST_BYTES = 8 * 1024 * 1024
 
     def __init__(self, project_repository=None, state_repository=None,
                  job_repository=None, lock_service=None, checkpoint_repository=None,
@@ -411,13 +413,31 @@ class ScanImportCoordinator(object):
     def _ingest_coverage_in_batches(self, connection, job_id, owner_token,
                                     fencing_token, scan_id, files, import_stats,
                                     phase_payload, project_service):
-        """Import physical coverage facts with one transaction per file batch."""
+        """Import physical coverage facts with bounded transactions."""
         batch_size = max(1, int(self.COVERAGE_IMPORT_FILE_BATCH_SIZE))
+        max_lines = max(0, int(self.COVERAGE_IMPORT_MAX_LINES or 0))
+        max_est_bytes = max(0, int(self.COVERAGE_IMPORT_MAX_EST_BYTES or 0))
         stored_batch_size = int(phase_payload.get("batch_size") or 0)
         if stored_batch_size and stored_batch_size != batch_size:
             raise ValueError("COVERAGE_IMPORT_BATCH_SIZE_CHANGED")
+        policy_present = (
+            "max_lines" in phase_payload or
+            "max_est_bytes" in phase_payload
+        )
+        stored_max_lines = int(phase_payload.get("max_lines") or 0)
+        stored_max_est_bytes = int(phase_payload.get("max_est_bytes") or 0)
+        if policy_present and (
+                stored_max_lines != max_lines or
+                stored_max_est_bytes != max_est_bytes):
+            raise ValueError("COVERAGE_IMPORT_BATCH_POLICY_CHANGED")
 
         completed_batch_seq = int(phase_payload.get("batch_seq") or 0)
+        # A pre-policy checkpoint was created with file-count-only batches.
+        # Preserve those boundaries while it is being resumed; changing the
+        # replay shape would make a batch sequence ambiguous.
+        if completed_batch_seq and not policy_present:
+            max_lines = 0
+            max_est_bytes = 0
         processed_file_count = int(
             phase_payload.get("processed_file_count") or 0
         )
@@ -427,7 +447,12 @@ class ScanImportCoordinator(object):
         # The parser always starts at input Batch 1.  ``completed_batch_seq``
         # is only the number of committed batches to replay/skip.
         batch_seq = 0
-        pending = []
+        phase_payload.update({
+            "batch_size": batch_size,
+            "max_lines": max_lines,
+            "max_est_bytes": max_est_bytes,
+            "fencing_token": int(fencing_token),
+        })
 
         def consume_batch(batch):
             nonlocal batch_seq, processed_file_count, processed_line_count
@@ -454,13 +479,9 @@ class ScanImportCoordinator(object):
             })
             return result
 
-        for item in files or ():
-            pending.append(item)
-            if len(pending) >= batch_size:
-                consume_batch(pending)
-                pending = []
-        if pending:
-            consume_batch(pending)
+        for batch in self._iter_coverage_batches(
+                files, batch_size, max_lines, max_est_bytes):
+            consume_batch(batch)
 
         expected_file_count = int((import_stats or {}).get("files") or 0)
         expected_line_count = int((import_stats or {}).get("line_count") or 0)
@@ -501,18 +522,144 @@ class ScanImportCoordinator(object):
         )
 
     @staticmethod
+    def _estimate_json_bytes(value):
+        try:
+            encoded = json.dumps(
+                value, ensure_ascii=False, sort_keys=True, default=str,
+                separators=(",", ":"),
+            )
+            return len(encoded.encode("utf-8"))
+        except (TypeError, ValueError, UnicodeError):
+            return len(repr(value).encode("utf-8"))
+
+    @classmethod
+    def _iter_coverage_file_chunks(cls, files, max_lines, max_est_bytes):
+        """Yield deterministic file chunks without consuming legacy replays."""
+        split_enabled = bool(max_lines or max_est_bytes)
+        for raw_item in files or ():
+            item = dict(raw_item or {})
+            if not split_enabled:
+                item["_coverage_chunk"] = {
+                    "file_count_delta": 1,
+                    "file_complete": True,
+                }
+                yield item
+                continue
+
+            base = dict(item)
+            base.pop("lines", None)
+            base.pop("_coverage_chunk", None)
+            base_bytes = cls._estimate_json_bytes(base) + 64
+            lines = item.get("lines") or ()
+            chunk_lines = []
+            chunk_bytes = base_bytes
+            first_chunk = True
+
+            def emit(file_complete):
+                nonlocal chunk_lines, chunk_bytes, first_chunk
+                if not chunk_lines and not file_complete:
+                    return None
+                chunk = dict(base)
+                chunk["lines"] = list(chunk_lines)
+                last_line_number = None
+                if chunk_lines:
+                    last_line_number = chunk_lines[-1].get("line_number")
+                chunk["_coverage_chunk"] = {
+                    "file_count_delta": 1 if first_chunk else 0,
+                    "line_count": len(chunk_lines),
+                    "estimated_bytes": int(chunk_bytes),
+                    "last_line_number": last_line_number,
+                    "file_complete": bool(file_complete),
+                }
+                first_chunk = False
+                chunk_lines = []
+                chunk_bytes = base_bytes
+                return chunk
+
+            for record in lines:
+                record_bytes = cls._estimate_json_bytes(record) + 1
+                line_limit_reached = (
+                    max_lines > 0 and len(chunk_lines) >= max_lines
+                )
+                bytes_limit_reached = (
+                    max_est_bytes > 0 and chunk_lines and
+                    chunk_bytes + record_bytes > max_est_bytes
+                )
+                if chunk_lines and (line_limit_reached or bytes_limit_reached):
+                    chunk = emit(False)
+                    if chunk is not None:
+                        yield chunk
+                chunk_lines.append(record)
+                chunk_bytes += record_bytes
+
+            chunk = emit(True)
+            if chunk is not None:
+                yield chunk
+
+    @classmethod
+    def _iter_coverage_batches(cls, files, max_files, max_lines, max_est_bytes):
+        """Group file chunks by file, line and estimated payload budgets."""
+        batch = []
+        batch_files = 0
+        batch_lines = 0
+        batch_bytes = 0
+        for chunk in cls._iter_coverage_file_chunks(
+                files, max_lines, max_est_bytes):
+            metadata = chunk.get("_coverage_chunk") or {}
+            chunk_files = int(metadata.get("file_count_delta") or 1)
+            chunk_lines = int(metadata.get("line_count") or 0)
+            chunk_bytes = int(metadata.get("estimated_bytes") or 0)
+            over_file_limit = (
+                bool(batch) and chunk_files > 0 and
+                batch_files >= max(1, int(max_files))
+            )
+            over_line_limit = (
+                bool(batch) and max_lines > 0 and
+                batch_lines + chunk_lines > max_lines
+            )
+            over_bytes_limit = (
+                bool(batch) and max_est_bytes > 0 and
+                batch_bytes + chunk_bytes > max_est_bytes
+            )
+            if over_file_limit or over_line_limit or over_bytes_limit:
+                yield batch
+                batch = []
+                batch_files = 0
+                batch_lines = 0
+                batch_bytes = 0
+            batch.append(chunk)
+            batch_files += chunk_files
+            batch_lines += chunk_lines
+            batch_bytes += chunk_bytes
+        if batch:
+            yield batch
+
+    @staticmethod
     def _consume_coverage_batch(batch, project_service):
         """Consume a replayed batch without writing it again."""
+        file_count = 0
         line_count = 0
         last_identity = None
         for item in batch or ():
-            for _ in item.get("lines") or ():
-                line_count += 1
+            metadata = item.get("_coverage_chunk") or {}
+            file_count += int(metadata.get("file_count_delta") or 1)
+            line_count += int(metadata.get("line_count") or 0)
+            if "line_count" not in metadata:
+                for _ in item.get("lines") or ():
+                    line_count += 1
             last_identity = ScanImportCoordinator._file_identity(
                 item, project_service
             )
+            if metadata.get("last_line_number") is not None:
+                last_identity["last_line_number"] = metadata[
+                    "last_line_number"
+                ]
+            if "file_complete" in metadata:
+                last_identity["file_complete"] = bool(
+                    metadata["file_complete"]
+                )
         return {
-            "file_count": len(batch or ()),
+            "file_count": file_count,
             "line_count": line_count,
             "last_file_identity": last_identity,
         }
@@ -538,7 +685,15 @@ class ScanImportCoordinator(object):
             )
             next_payload = dict(phase_payload or {})
             next_payload.update({
-                "batch_size": int(self.COVERAGE_IMPORT_FILE_BATCH_SIZE),
+                "batch_size": int(phase_payload.get(
+                    "batch_size", self.COVERAGE_IMPORT_FILE_BATCH_SIZE
+                )),
+                "max_lines": int(phase_payload.get(
+                    "max_lines", self.COVERAGE_IMPORT_MAX_LINES or 0
+                )),
+                "max_est_bytes": int(phase_payload.get(
+                    "max_est_bytes", self.COVERAGE_IMPORT_MAX_EST_BYTES or 0
+                )),
                 "batch_seq": int(batch_seq),
                 "last_file_identity": result.get("last_file_identity"),
                 "processed_file_count": int(processed_file_count) + int(

@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -583,6 +584,107 @@ class ScanImportLifecycleTest(unittest.TestCase):
                 "ON f.id=l.file_id WHERE f.scan_id=?",
                 (created["scan"]["id"],),
             ).fetchone()[0], 3
+        )
+        self.assertEqual(
+            restarted.checkpoints.get(
+                self.connection, created["job"]["job_id"]
+            )["phase"], "PUBLISHED"
+        )
+
+    def test_large_file_line_budget_commits_and_resumes_inside_file(self):
+        projects = ProjectRepository()
+        states = ProjectStateRepository()
+        repositories = RepositoryRepository()
+        project_service = ProjectService(
+            projects, states, LineIndexRepository(), repository_repo=repositories
+        )
+        domain_repository = AnalysisDomainRepository()
+        dependencies = dict(
+            project_repository=projects, state_repository=states,
+            repository_repository=repositories, project_service=project_service,
+            import_service=ScanImportService(project_service),
+            inheritance_engine=InheritanceEngine(domain_repository=domain_repository),
+            file_state_repository=FileStateRepository(),
+            analysis_domain_service=AnalysisDomainService(domain_repository),
+        )
+        info_path = os.path.join(self.temp.name, "large-file.info")
+        with open(info_path, "w") as stream:
+            stream.write("TN:\nSF:src/large.c\n")
+            for line_number in range(1, 6):
+                stream.write("DA:{},0\n".format(line_number))
+            stream.write("end_of_record\n")
+
+        class StopInsideLargeFile(ScanImportCoordinator):
+            COVERAGE_IMPORT_FILE_BATCH_SIZE = 128
+            COVERAGE_IMPORT_MAX_LINES = 2
+            COVERAGE_IMPORT_MAX_EST_BYTES = 0
+
+            def __init__(self, *args, **kwargs):
+                self.stopped = False
+                super().__init__(*args, **kwargs)
+
+            def _ingest_coverage_batch(self, *args, **kwargs):
+                result = super()._ingest_coverage_batch(*args, **kwargs)
+                if int(args[6]) == 1 and not self.stopped:
+                    self.stopped = True
+                    raise RuntimeError("simulated stop inside large file")
+                return result
+
+        first = StopInsideLargeFile(**dependencies)
+        created = first.create(
+            self.connection, "large-file-restart", info_path,
+            repository_resource_ids=[self.resource_id],
+            staging_root=os.path.join(self.temp.name, "large-file-stage"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "inside large file"):
+            first.execute(
+                self.connection, created["job"]["job_id"],
+                owner_token=created["owner_token"],
+                fencing_token=created["locks"][0]["fencing_token"],
+            )
+
+        checkpoint = first.checkpoints.get(
+            self.connection, created["job"]["job_id"]
+        )
+        payload = checkpoint["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        self.assertEqual(checkpoint["phase"], "INFO_STAGED")
+        self.assertEqual(payload["max_lines"], 2)
+        self.assertEqual(payload["processed_file_count"], 1)
+        self.assertEqual(payload["processed_line_count"], 2)
+        self.assertEqual(payload["last_file_identity"]["last_line_number"], 2)
+        self.assertFalse(payload["last_file_identity"]["file_complete"])
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM coverage_lines l JOIN coverage_files f "
+                "ON f.id=l.file_id WHERE f.scan_id=?",
+                (created["scan"]["id"],),
+            ).fetchone()[0], 2
+        )
+
+        restarted = ScanImportCoordinator(**dependencies)
+        restarted.COVERAGE_IMPORT_FILE_BATCH_SIZE = 128
+        restarted.COVERAGE_IMPORT_MAX_LINES = 2
+        restarted.COVERAGE_IMPORT_MAX_EST_BYTES = 0
+        state = restarted.execute(
+            self.connection, created["job"]["job_id"],
+            owner_token=created["owner_token"],
+            fencing_token=created["locks"][0]["fencing_token"],
+        )
+        self.assertEqual(state["current_scan_id"], created["scan"]["id"])
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM coverage_files WHERE scan_id=?",
+                (created["scan"]["id"],),
+            ).fetchone()[0], 1
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM coverage_lines l JOIN coverage_files f "
+                "ON f.id=l.file_id WHERE f.scan_id=?",
+                (created["scan"]["id"],),
+            ).fetchone()[0], 5
         )
         self.assertEqual(
             restarted.checkpoints.get(
