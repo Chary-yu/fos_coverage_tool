@@ -25,6 +25,7 @@ def audit_canonical_ownership(repo_root: str) -> Dict[str, Any]:
         "coverage_progress.js": "web/assets/js/coverage_progress.js",
         "incremental_coverage.js": "web/assets/js/incremental_coverage.js",
         "incremental_developer_tasks.js": "web/assets/js/incremental_developer_tasks.js",
+        "pending_snapshot.js": "web/assets/js/pending_snapshot.js",
         "coverage_enhance.css": "web/assets/css/coverage_enhance.css",
         "coverage_progress.html": "web/templates/coverage_progress.html",
     }
@@ -54,6 +55,7 @@ def audit_canonical_ownership(repo_root: str) -> Dict[str, Any]:
         "app/db/repositories/line_index_repository.py",
         "app/db/repositories/project_state_repository.py",
         "app/db/repositories/file_state_repository.py",
+        "app/services/file_state_service.py",
         "app/db/repositories/job_repository.py",
         "app/reports/registry.py",
         "app/services/project_service.py",
@@ -71,6 +73,9 @@ def audit_canonical_ownership(repo_root: str) -> Dict[str, Any]:
         "app/jobs/service.py",
         "scripts/upgrade/vnext_schema.sql",
         "scripts/upgrade/migration_runner.py",
+        "app/db/retry.py",
+        "app/release_publication.py",
+        "scripts/upgrade/validation_session.py",
     ]
     missing_modules = [
         path for path in required_modules

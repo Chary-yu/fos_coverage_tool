@@ -18,12 +18,18 @@
         }
     }
 
-    const ENHANCE_VERSION = 'lazy-collapse-20260819_v11_7';
+    const ENHANCE_VERSION = 'lazy-collapse-20260828_v1';
     const SERVER_URL = '/api/coverage';
     const DEFAULT_PROJECT = getMetaContent('coverage-project') || 'Gemini-NOS';
     const DEFAULT_REPORT_ID = getMetaContent('coverage-report-id') || '';
     const DEFAULT_SCAN_ID = getMetaContent('coverage-scan-id') || '';
     const DEFAULT_REPOSITORY_NAME = getMetaContent('coverage-repository-name') || '';
+    const DECLARED_REPORT_MODE = getMetaContent('coverage-report-mode');
+    // Report mode is a persisted artifact fact. Missing or invalid metadata
+    // must remain the safe static path; complete-looking identity fields may
+    // not promote a historical page to VNext by browser-side inference.
+    const REPORT_MODE = DECLARED_REPORT_MODE === 'VNEXT_ARTIFACT_READY'
+        ? 'VNEXT_ARTIFACT_READY' : 'LEGACY_STATIC';
     const RENDER_MODE = getMetaContent('coverage-render-mode') || 'lazy_collapse'; // 'lazy_collapse', 'lazy', 'immediate'
     const REVIEW_SCOPE = getMetaContent('coverage-review-scope') || 'full'; // 'full' or 'incremental'
     const ENHANCE_SCRIPT_URL = document.currentScript && document.currentScript.src
@@ -603,6 +609,9 @@
             is_draft: isDraft
         }));
 
+        if (REPORT_MODE !== 'VNEXT_ARTIFACT_READY') {
+            throw new Error('LEGACY_STATIC_REPORT');
+        }
         const result = await requestCoverageApi('/analysis', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -1921,6 +1930,15 @@
                 _origSavedConfirmed: origSavedConfirmed
             });
             panelsMap.set(startLineNum, panelState);
+            if (REPORT_MODE === 'LEGACY_STATIC') {
+                [select, previousBtn, nextBtn, inheritBtn, batchInheritBtn,
+                 rejectBtn, undoRejectBtn, reviewerInput, methodInput,
+                 reasonInput, saveBtn].forEach(control => {
+                    control.disabled = true;
+                });
+                panel.setAttribute('data-report-mode', 'LEGACY_STATIC');
+                panel.title = '历史静态报告：VNext 分析操作不可用';
+            }
             if (isDirty) {
                 dirtyPanelStartLines.add(startLineNum);
             }
@@ -2279,7 +2297,8 @@
         },
 
         async findServerInheritanceCandidate(panel) {
-            if (!panel || !currentScanId || !this.filePath) return null;
+            if (REPORT_MODE !== 'VNEXT_ARTIFACT_READY' ||
+                    !panel || !currentScanId || !this.filePath) return null;
             const query = new URLSearchParams({
                 repository_name: currentRepositoryName || '',
                 file_path: this.filePath,
@@ -2293,6 +2312,7 @@
         },
 
         async confirmServerInheritance(panel, candidate) {
+            if (REPORT_MODE !== 'VNEXT_ARTIFACT_READY') return false;
             const lineId = Number(candidate && candidate.candidate_line_id);
             const revision = Number(candidate && candidate.relation_revision);
             if (!lineId || !revision) return false;
@@ -2336,6 +2356,7 @@
         },
 
         async rejectServerInheritance(panel) {
+            if (REPORT_MODE !== 'VNEXT_ARTIFACT_READY') return false;
             const meta = panel && panel.inheritance;
             if (!meta || !meta.inheritedPending || !meta.lineId || !meta.relationRevision) return false;
             if (typeof window !== 'undefined' && typeof window.confirm === 'function' &&
@@ -2377,6 +2398,7 @@
         },
 
         async undoServerInheritance(panel) {
+            if (REPORT_MODE !== 'VNEXT_ARTIFACT_READY') return false;
             const meta = panel && panel.inheritance;
             if (!meta || !meta.rejected || !meta.lineId || !meta.rejectionId ||
                     !meta.rejectionRevision || !meta.relationRevision) return false;
@@ -3057,11 +3079,13 @@
         }
 
         createModeToggler();
-        createBatchToolbar(filePath);
+        if (REPORT_MODE === 'VNEXT_ARTIFACT_READY') {
+            createBatchToolbar(filePath);
+        }
         CodeRegionController.installPanelDelegation(preSource);
 
         // Branch by ACTIVE_MODE
-        if (ACTIVE_MODE === 'lazy_collapse') {
+        if (REPORT_MODE === 'VNEXT_ARTIFACT_READY' && ACTIVE_MODE === 'lazy_collapse') {
             try {
                 const query = codeDetailQuery(filePath);
 
@@ -3309,7 +3333,7 @@
 
         // Static legacy display modes remain usable offline, but optional
         // overlays use only the canonical paged VNext endpoint.
-        if (!currentScanId) {
+        if (REPORT_MODE === 'LEGACY_STATIC' || !currentScanId) {
             reviewControlsReady = true;
             updateReviewNavigation();
             updateHeaderStatistics();

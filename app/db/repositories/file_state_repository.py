@@ -18,8 +18,8 @@ class FileStateRepository(object):
     _CONFIRMED_SQL = "({status}) IN ('可覆盖', '无法覆盖', '冗余代码') AND ({draft}) = 0".format(
         status=_STATUS_SQL, draft=_DRAFT_SQL
     )
-    _ORDINARY_PENDING_SQL = "({uncovered} AND q.id IS NULL)".format(
-        uncovered=_UNCOVERED_SQL
+    _ORDINARY_PENDING_SQL = "({uncovered} AND q.id IS NULL AND NOT ({confirmed}))".format(
+        uncovered=_UNCOVERED_SQL, confirmed=_CONFIRMED_SQL
     )
     _INHERITED_PENDING_SQL = "({uncovered} AND q.id IS NOT NULL AND q.review_state = 'INHERITED_PENDING')".format(
         uncovered=_UNCOVERED_SQL
@@ -220,28 +220,122 @@ class FileStateRepository(object):
             FROM coverage_file_state WHERE scan_id = ?
         """, (scan_id,))
 
-    def pending_conservation(self, connection, scan_id: int):
-        """Verify the Gate E pending partition using only derived SQL rows."""
-        row = fetchone(connection, """
-            SELECT COUNT(*) AS file_count,
-                   COALESCE(SUM(CASE WHEN pending_total =
-                       ordinary_pending_total + inherited_pending_total +
-                       manual_draft_pending_total THEN 0 ELSE 1 END), 0) AS mismatched_files,
-                   COALESCE(SUM(pending_total), 0) AS pending_total,
-                   COALESCE(SUM(ordinary_pending_total), 0) AS ordinary_pending_total,
-                   COALESCE(SUM(inherited_pending_total), 0) AS inherited_pending_total,
-                   COALESCE(SUM(manual_draft_pending_total), 0) AS manual_draft_pending_total
-            FROM coverage_file_state WHERE scan_id=?
+    def file_state_completeness(self, connection, scan_id: int,
+                                data_version=None):
+        """Return the file-state coverage/version gate for one immutable Scan.
+
+        ``coverage_file_state`` is a rebuildable projection.  A row count that
+        merely happens to be non-zero is not enough: every physical file must
+        have exactly one state row, and every row must carry the version being
+        published.  Keep this check in SQL so the online read path never has
+        to materialize a large project.
+        """
+        if data_version is not None:
+            row = fetchone(connection, """
+                SELECT COUNT(DISTINCT f.id) AS expected_file_count,
+                       COUNT(DISTINCT fs.file_id) AS state_file_count,
+                       COALESCE(SUM(CASE WHEN fs.file_id IS NULL THEN 1 ELSE 0 END), 0)
+                           AS missing_file_count,
+                       COALESCE(SUM(CASE WHEN fs.file_id IS NOT NULL
+                                              AND fs.data_version = ?
+                                         THEN 0 ELSE 1 END), 0) AS stale_file_count
+                FROM coverage_files f
+                LEFT JOIN coverage_file_state fs
+                  ON fs.scan_id = f.scan_id AND fs.file_id = f.id
+                WHERE f.scan_id = ?
+                """, (int(data_version), int(scan_id)))
+        else:
+            row = fetchone(connection, """
+                SELECT COUNT(DISTINCT f.id) AS expected_file_count,
+                       COUNT(DISTINCT fs.file_id) AS state_file_count,
+                       COALESCE(SUM(CASE WHEN fs.file_id IS NULL THEN 1 ELSE 0 END), 0)
+                           AS missing_file_count,
+                       0 AS stale_file_count
+                FROM coverage_files f
+                LEFT JOIN coverage_file_state fs
+                  ON fs.scan_id = f.scan_id AND fs.file_id = f.id
+                WHERE f.scan_id = ?
+            """, (int(scan_id),))
+        orphan_row = fetchone(connection, """
+            SELECT COUNT(*) AS orphan_state_count
+            FROM coverage_file_state fs
+            LEFT JOIN coverage_files f
+              ON f.id = fs.file_id AND f.scan_id = fs.scan_id
+            WHERE fs.scan_id = ? AND f.id IS NULL
         """, (int(scan_id),)) or {}
+        row = row or {}
+        expected = int(row.get("expected_file_count") or 0)
+        states = int(row.get("state_file_count") or 0)
+        missing = int(row.get("missing_file_count") or 0)
+        stale = int(row.get("stale_file_count") or 0)
+        orphaned = int(orphan_row.get("orphan_state_count") or 0)
         return {
             "scan_id": int(scan_id),
-            "file_count": int(row.get("file_count") or 0),
-            "mismatched_files": int(row.get("mismatched_files") or 0),
+            "data_version": None if data_version is None else int(data_version),
+            "expected_file_count": expected,
+            "state_file_count": states,
+            "missing_file_count": missing,
+            "stale_file_count": stale,
+            "orphan_state_count": orphaned,
+            "status": "PASSED" if expected == states and not missing and
+                       not stale and not orphaned
+                       else "FAILED",
+        }
+
+    def pending_conservation(self, connection, scan_id: int):
+        """Verify pending partition and file-row completeness in one query."""
+        row = fetchone(connection, """
+                SELECT COUNT(DISTINCT f.id) AS expected_file_count,
+                       COUNT(DISTINCT fs.file_id) AS state_file_count,
+                       COALESCE(SUM(CASE WHEN fs.file_id IS NULL THEN 1 ELSE 0 END), 0)
+                           AS missing_file_count,
+                       COALESCE(SUM(CASE WHEN fs.file_id IS NOT NULL AND
+                       fs.pending_total = fs.ordinary_pending_total +
+                       fs.inherited_pending_total + fs.manual_draft_pending_total
+                       THEN 0 WHEN fs.file_id IS NULL THEN 0 ELSE 1 END), 0)
+                       AS mismatched_files,
+                   COALESCE(SUM(CASE WHEN fs.file_id IS NOT NULL THEN fs.pending_total ELSE 0 END), 0)
+                       AS pending_total,
+                   COALESCE(SUM(CASE WHEN fs.file_id IS NOT NULL THEN fs.ordinary_pending_total ELSE 0 END), 0)
+                       AS ordinary_pending_total,
+                   COALESCE(SUM(CASE WHEN fs.file_id IS NOT NULL THEN fs.inherited_pending_total ELSE 0 END), 0)
+                       AS inherited_pending_total,
+                   COALESCE(SUM(CASE WHEN fs.file_id IS NOT NULL THEN fs.manual_draft_pending_total ELSE 0 END), 0)
+                       AS manual_draft_pending_total
+            FROM coverage_files f
+            LEFT JOIN coverage_file_state fs
+              ON fs.scan_id = f.scan_id AND fs.file_id = f.id
+            WHERE f.scan_id=?
+        """, (int(scan_id),)) or {}
+        expected = int(row.get("expected_file_count") or 0)
+        states = int(row.get("state_file_count") or 0)
+        missing = int(row.get("missing_file_count") or 0)
+        mismatched = int(row.get("mismatched_files") or 0)
+        orphan_row = fetchone(connection, """
+            SELECT COUNT(*) AS orphan_state_count
+            FROM coverage_file_state fs
+            LEFT JOIN coverage_files f
+              ON f.id = fs.file_id AND f.scan_id = fs.scan_id
+            WHERE fs.scan_id = ? AND f.id IS NULL
+        """, (int(scan_id),)) or {}
+        orphaned = int(orphan_row.get("orphan_state_count") or 0)
+        # A missing row is a mismatch for the gate even though its totals are
+        # represented as zero by the LEFT JOIN.
+        mismatched += missing
+        mismatched += orphaned
+        return {
+            "scan_id": int(scan_id),
+            "file_count": states,
+            "expected_file_count": expected,
+            "state_file_count": states,
+            "missing_file_count": missing,
+            "orphan_state_count": orphaned,
+            "mismatched_files": mismatched,
             "pending_total": int(row.get("pending_total") or 0),
             "ordinary_pending_total": int(row.get("ordinary_pending_total") or 0),
             "inherited_pending_total": int(row.get("inherited_pending_total") or 0),
             "manual_draft_pending_total": int(row.get("manual_draft_pending_total") or 0),
-            "status": "PASSED" if not int(row.get("mismatched_files") or 0) else "FAILED",
+            "status": "PASSED" if expected == states and not mismatched else "FAILED",
         }
 
     def scan_summary_from_facts(self, connection, scan_id: int):
@@ -289,7 +383,8 @@ class FileStateRepository(object):
         }
 
     def file_page(self, connection, scan_id: int, limit=200, cursor=None,
-                  pending_only=False):
+                  pending_only=False, repository_name=None,
+                  data_version=None, derived_ready=None):
         """Return a bounded file window without materializing physical lines.
 
         ``pending_only`` keeps the historical developer-task query narrow;
@@ -298,20 +393,45 @@ class FileStateRepository(object):
         """
         page_limit = min(500, max(1, int(limit or 200)))
         after_id = int((cursor or {}).get("file_id") or 0)
-        coverage = fetchone(connection, """
-            SELECT COUNT(DISTINCT f.id) AS files,
-                   COUNT(DISTINCT fs.file_id) AS states
-            FROM coverage_files f
-            LEFT JOIN coverage_file_state fs
-              ON fs.scan_id=f.scan_id AND fs.file_id=f.id
-            WHERE f.scan_id=?
-        """, (int(scan_id),)) or {}
+        repository_clause = ""
+        repository_params = []
+        if repository_name is not None:
+            repository_clause = " AND f.repository_name = ?"
+            repository_params.append(str(repository_name or ""))
+        if data_version is not None:
+            coverage_sql = """
+                SELECT COUNT(DISTINCT f.id) AS files,
+                       COUNT(DISTINCT fs.file_id) AS states,
+                       COUNT(DISTINCT CASE WHEN fs.data_version = ?
+                                           THEN fs.file_id END) AS matching_states
+                FROM coverage_files f
+                LEFT JOIN coverage_file_state fs
+                  ON fs.scan_id=f.scan_id AND fs.file_id=f.id
+                WHERE f.scan_id=? {repository_clause}
+            """
+            coverage_params = (int(data_version), int(scan_id)) + tuple(repository_params)
+        else:
+            coverage_sql = """
+                SELECT COUNT(DISTINCT f.id) AS files,
+                       COUNT(DISTINCT fs.file_id) AS states,
+                       COUNT(DISTINCT fs.file_id) AS matching_states
+                FROM coverage_files f
+                LEFT JOIN coverage_file_state fs
+                  ON fs.scan_id=f.scan_id AND fs.file_id=f.id
+                WHERE f.scan_id=? {repository_clause}
+            """
+            coverage_params = (int(scan_id),) + tuple(repository_params)
+        coverage = fetchone(connection, coverage_sql.format(
+            repository_clause=repository_clause
+        ), coverage_params) or {}
         use_derived = (
+            derived_ready is not False and
             int(coverage.get("files") or 0) > 0 and
-            int(coverage.get("files") or 0) == int(coverage.get("states") or 0)
+            int(coverage.get("files") or 0) ==
+            int(coverage.get("matching_states") or 0)
         )
         if use_derived:
-            derived_filter = "f.scan_id=? AND f.id>?"
+            derived_filter = "f.scan_id=? AND f.id>?{}".format(repository_clause)
             if pending_only:
                 derived_filter += " AND fs.pending_total > 0"
             rows = fetchall(connection, """
@@ -327,11 +447,14 @@ class FileStateRepository(object):
                 ORDER BY f.id
                 LIMIT ?
             """.format(where=derived_filter),
-                (int(scan_id), after_id, page_limit + 1))
+                (int(scan_id), after_id) + tuple(repository_params) +
+                (page_limit + 1,))
         else:
             uncovered = self._UNCOVERED_SQL
             confirmed = self._CONFIRMED_SQL
             grouped_filter = "grouped.file_id > ?"
+            if repository_name is not None:
+                grouped_filter += " AND grouped.repository_name = ?"
             if pending_only:
                 grouped_filter = "grouped.pending_total > 0 AND " + grouped_filter
             rows = fetchall(connection, """
@@ -362,7 +485,7 @@ class FileStateRepository(object):
                     LEFT JOIN coverage_analysis_line_links q
                       ON q.scan_id=f.scan_id AND q.line_id=l.id AND q.is_active=1
                     LEFT JOIN coverage_analysis_records r ON r.id=q.analysis_record_id
-                    WHERE f.scan_id=?
+                    WHERE f.scan_id=? {repository_clause}
                     GROUP BY f.id, f.repository_name, f.file_path
                 ) grouped
                 WHERE {where}
@@ -373,8 +496,13 @@ class FileStateRepository(object):
                 confirmed=confirmed, ordinary=self._ORDINARY_PENDING_SQL,
                 inherited=self._INHERITED_PENDING_SQL,
                 manual=self._MANUAL_DRAFT_PENDING_SQL,
+                repository_clause=repository_clause,
                 where=grouped_filter,
-            ), (int(scan_id), after_id, page_limit + 1))
+            ),
+                (int(scan_id),) + tuple(repository_params) +
+                (after_id,) + ((str(repository_name or ""),)
+                               if repository_name is not None else ()) +
+                (page_limit + 1,))
         has_more = len(rows) > page_limit
         rows = rows[:page_limit]
         result = []
@@ -398,10 +526,14 @@ class FileStateRepository(object):
         )
         return {"rows": result, "has_more": has_more, "next_cursor": next_cursor}
 
-    def pending_file_page(self, connection, scan_id: int, limit=200, cursor=None):
+    def pending_file_page(self, connection, scan_id: int, limit=200, cursor=None,
+                          repository_name=None, data_version=None,
+                          derived_ready=None):
         """Compatibility wrapper for the bounded pending-file API."""
         return self.file_page(
-            connection, scan_id, limit=limit, cursor=cursor, pending_only=True
+            connection, scan_id, limit=limit, cursor=cursor, pending_only=True,
+            repository_name=repository_name, data_version=data_version,
+            derived_ready=derived_ready,
         )
 
     def pending_line_numbers_for_file(self, connection, scan_id, file_id, limit=200):

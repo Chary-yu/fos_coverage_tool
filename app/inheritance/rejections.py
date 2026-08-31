@@ -5,12 +5,16 @@ from __future__ import absolute_import
 from app.db.repositories.base import adapt_sql, execute, fetchone
 from app.db.repositories.project_state_repository import ProjectStateRepository
 from app.db.transaction import transaction
+from app.services.file_state_service import FileStateService
 from app.time_utils import utc_sql
 
 
 class InheritanceRejectionService(object):
-    def __init__(self, state_repository=None):
+    def __init__(self, state_repository=None, file_state_service=None):
         self.states = state_repository or ProjectStateRepository()
+        self.file_state_service = file_state_service or FileStateService(
+            state_repo=self.states
+        )
 
     def reject(self, connection, project_id, scan_id, line_id, rejected_by,
                expected_relation_revision):
@@ -48,7 +52,10 @@ class InheritanceRejectionService(object):
                 cursor.close()
                 raise ValueError("STALE_RELATION_REVISION")
             cursor.close()
-            self.states.advance(conn, int(project_id))
+            state = self.states.advance(conn, int(project_id))
+            self.file_state_service.rebuild_validate_and_mark_ready_in_transaction(
+                conn, int(project_id), int(scan_id), int(state["data_version"])
+            )
             return fetchone(conn, """
                 SELECT * FROM coverage_inheritance_rejections
                 WHERE scan_id=? AND line_id=? ORDER BY id DESC LIMIT 1
@@ -92,7 +99,10 @@ class InheritanceRejectionService(object):
                 cursor.close()
                 raise ValueError("STALE_REJECTION_REVISION")
             cursor.close()
-            self.states.advance(conn, int(project_id))
+            state = self.states.advance(conn, int(project_id))
+            self.file_state_service.rebuild_validate_and_mark_ready_in_transaction(
+                conn, int(project_id), int(scan_id), int(state["data_version"])
+            )
             return fetchone(conn, """
                 SELECT * FROM coverage_inheritance_rejections WHERE id=?
             """, (int(rejection_id),))

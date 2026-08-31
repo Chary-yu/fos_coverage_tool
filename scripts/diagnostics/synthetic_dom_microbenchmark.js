@@ -20,6 +20,7 @@ async function runVirtualScrollWorkload(browser) {
   let maxResponseBytes = 0;
   const html = `<!doctype html><html><head>
     <meta name="coverage-project" content="PerfE2E">
+    <meta name="coverage-report-mode" content="VNEXT_ARTIFACT_READY">
     <meta name="coverage-report-id" content="report_perf_e2e">
     <meta name="coverage-scan-id" content="1">
     <meta name="coverage-repository-name" content="">

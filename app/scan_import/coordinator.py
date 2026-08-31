@@ -10,8 +10,10 @@ import uuid
 from app.db.repositories import JobRepository, ProjectRepository, ProjectStateRepository
 from app.db.repositories.base import execute, fetchall, fetchone
 from app.db.transaction import transaction
+from app.db.retry import run_transaction_with_deadlock_retry
 from app.db.repositories.repository_repository import RepositoryRepository
 from app.db.repositories.file_state_repository import FileStateRepository
+from app.services.file_state_service import FileStateService
 from app.scan_import.artifacts import ImmutableArtifactStager
 from app.scan_import.checkpoints import ImportCheckpointRepository, PHASES
 from app.scan_import.locks import RepositoryResourceLockService
@@ -26,13 +28,14 @@ class ScanImportCoordinator(object):
     COVERAGE_IMPORT_FILE_BATCH_SIZE = 128
     COVERAGE_IMPORT_MAX_LINES = 20000
     COVERAGE_IMPORT_MAX_EST_BYTES = 8 * 1024 * 1024
+    COVERAGE_IMPORT_DEADLOCK_RETRIES = 2
 
     def __init__(self, project_repository=None, state_repository=None,
                  job_repository=None, lock_service=None, checkpoint_repository=None,
                  publication_service=None, stager=None, repository_repository=None,
                  import_service=None, inheritance_engine=None,
                  file_state_repository=None, analysis_domain_service=None,
-                 project_service=None, performance=None):
+                 project_service=None, performance=None, file_state_service=None):
         self.projects = project_repository or ProjectRepository()
         self.states = state_repository or ProjectStateRepository()
         self.jobs = job_repository or JobRepository()
@@ -44,6 +47,9 @@ class ScanImportCoordinator(object):
         self.import_service = import_service
         self.inheritance = inheritance_engine
         self.file_states = file_state_repository or FileStateRepository()
+        self.file_state_service = file_state_service or FileStateService(
+            self.file_states, self.states
+        )
         self.analysis_domain_service = analysis_domain_service
         self.project_service = project_service
         self.performance = performance
@@ -94,6 +100,12 @@ class ScanImportCoordinator(object):
                     status="IMPORTING", predecessor_scan_id=predecessor,
                     algorithm_version=algorithm_version,
                 )
+                # Reserve a new project snapshot version while the candidate
+                # is still unpublished.  This makes the existing CURRENT
+                # projection visibly stale during import instead of allowing
+                # a prior FileState version to look ready throughout a long
+                # construction window.
+                state = self.states.advance(conn, project["id"])
                 for snapshot in repositories:
                     snapshot = dict(snapshot or {})
                     repository_name = str(snapshot.get("repository_name") or "")
@@ -126,6 +138,7 @@ class ScanImportCoordinator(object):
                         source_signature=report.get("source_signature", ""),
                         sidecar_schema=report.get("sidecar_schema", 0),
                         asset_identity=report.get("asset_identity", ""),
+                        report_mode=report.get("report_mode"),
                     )
                 job_payload = {
                     "project_id": project["id"], "project_name": project_name,
@@ -314,14 +327,13 @@ class ScanImportCoordinator(object):
 
         checkpoint = self._checkpoint(connection, job_id)
         if self._phase_before(checkpoint, "STATS_REBUILT"):
-            job = self.jobs.get(connection, job_id)
-            data_version = int(job.get("data_version") or 0)
+            # Canonical Analysis Domain verification must happen before any
+            # derived FileState rebuild.  Keep the durable phase boundary for
+            # recovery, but defer the actual rebuild to CONSISTENCY_VERIFIED.
             self._run_phase_operation(
                 connection, job_id, owner_token, fencing_token,
                 "STATS_REBUILT", phase_payload,
-                lambda conn: self.file_states.rebuild_scan(
-                    conn, scan_id, data_version=data_version, file_rows=None
-                ),
+                lambda conn: None,
             )
 
         checkpoint = self._checkpoint(connection, job_id)
@@ -332,6 +344,14 @@ class ScanImportCoordinator(object):
                 ) if self.analysis_domain_service else {"status": "PASSED"})
                 if audit.get("status") != "PASSED":
                     raise ValueError("ANALYSIS_DOMAIN_INCONSISTENT")
+                job = self.jobs.get(conn, job_id)
+                scan = self.projects.get_scan(conn, scan_id)
+                if not scan:
+                    raise KeyError("scan not found")
+                self.file_state_service.rebuild_validate_and_mark_ready_in_transaction(
+                    conn, int(scan["project_id"]), int(scan_id),
+                    int(job.get("data_version") or 0),
+                )
                 phase_payload["consistency"] = "PASSED"
             self._run_phase_operation(
                 connection, job_id, owner_token, fencing_token,
@@ -599,6 +619,12 @@ class ScanImportCoordinator(object):
     @classmethod
     def _iter_coverage_batches(cls, files, max_files, max_lines, max_est_bytes):
         """Group file chunks by file, line and estimated payload budgets."""
+        def ordered(items):
+            # All writers in a batch acquire file/line keys in one stable
+            # order.  This is deliberately bounded to the current batch so a
+            # streaming parser never has to materialize the full scan.
+            return sorted(items, key=cls._coverage_sort_key)
+
         batch = []
         batch_files = 0
         batch_lines = 0
@@ -622,7 +648,7 @@ class ScanImportCoordinator(object):
                 batch_bytes + chunk_bytes > max_est_bytes
             )
             if over_file_limit or over_line_limit or over_bytes_limit:
-                yield batch
+                yield ordered(batch)
                 batch = []
                 batch_files = 0
                 batch_lines = 0
@@ -632,7 +658,18 @@ class ScanImportCoordinator(object):
             batch_lines += chunk_lines
             batch_bytes += chunk_bytes
         if batch:
-            yield batch
+            yield ordered(batch)
+
+    @staticmethod
+    def _coverage_sort_key(item):
+        item = item or {}
+        metadata = item.get("_coverage_chunk") or {}
+        return (
+            str(item.get("repository_name") or ""),
+            str(item.get("file_path_hash") or ""),
+            str(item.get("file_path") or ""),
+            int(metadata.get("last_line_number") or 0),
+        )
 
     @staticmethod
     def _consume_coverage_batch(batch, project_service):
@@ -669,7 +706,7 @@ class ScanImportCoordinator(object):
                                processed_file_count, processed_line_count,
                                phase_payload, project_service):
         """Commit one batch of facts and its CAS checkpoint together."""
-        with transaction(connection) as conn:
+        def ingest(conn):
             checkpoint = self._checkpoint(conn, job_id)
             if str(checkpoint.get("phase") or "") != "INFO_STAGED":
                 raise ValueError("STALE_IMPORT_CHECKPOINT")
@@ -709,6 +746,11 @@ class ScanImportCoordinator(object):
                 payload=next_payload,
             )
             return result
+
+        return run_transaction_with_deadlock_retry(
+            connection, ingest,
+            max_retries=self.COVERAGE_IMPORT_DEADLOCK_RETRIES,
+        )
 
     @staticmethod
     def _file_identity(item, project_service):

@@ -3,6 +3,10 @@
 from typing import Any, Optional
 
 from app.db.repositories.base import adapt_sql, execute, fetchall, fetchone, insert_id, row_to_dict
+from app.reports.identity import (
+    SUPPORTED_SIDECAR_SCHEMA_VERSIONS, validate_report_mode, LEGACY_STATIC,
+    VNEXT_ARTIFACT_READY,
+)
 from app.time_utils import utc_sql
 
 
@@ -180,20 +184,31 @@ class ProjectRepository(object):
 
     def bind_report(self, connection, scan_id: int, report_id: str, report_root: str = "",
                     source_signature: str = "", sidecar_schema: int = 0,
-                    asset_identity: str = "", generated_at=None):
+                    asset_identity: str = "", generated_at=None, report_mode=None):
         if not report_id:
             raise ValueError("report_id is required")
+        if report_mode is None:
+            report_mode = VNEXT_ARTIFACT_READY if report_root else LEGACY_STATIC
+        report_mode = validate_report_mode(report_mode)
+        if report_mode == VNEXT_ARTIFACT_READY:
+            if not report_root:
+                raise ValueError("VNEXT report_root is required")
+            if not str(asset_identity or "").strip():
+                raise ValueError("VNEXT asset_identity is required")
+            if int(sidecar_schema or 0) not in SUPPORTED_SIDECAR_SCHEMA_VERSIONS:
+                raise ValueError("VNEXT sidecar_schema is unsupported")
         existing = self.get_report(connection, report_id)
         values = (scan_id, report_root or "", source_signature or "", int(sidecar_schema or 0),
-                  asset_identity or "", _now(generated_at))
+                  asset_identity or "", _now(generated_at), report_mode)
         if existing:
             if int(existing["scan_id"]) != int(scan_id):
                 raise ValueError("report_id is already bound to another scan")
             current = (
                 existing.get("report_root") or "", existing.get("source_signature") or "",
                 int(existing.get("sidecar_schema") or 0), existing.get("asset_identity") or "",
+                validate_report_mode(existing.get("report_mode")),
             )
-            requested = (values[1], values[2], values[3], values[4])
+            requested = (values[1], values[2], values[3], values[4], values[6])
             if current != requested:
                 raise ValueError("report identity is immutable")
             return existing
@@ -201,8 +216,8 @@ class ProjectRepository(object):
         cursor = execute(connection, """
             INSERT INTO coverage_reports(
                 scan_id, report_id, report_root, source_signature, sidecar_schema,
-                asset_identity, generated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                asset_identity, generated_at, report_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (scan_id, report_id) + values[1:])
         report_db_id = insert_id(cursor)
         cursor.close()

@@ -31,6 +31,9 @@ from app.db.repositories.base import (
 )
 from app.db.identity_keys import stable_identity_hash
 from app.db.transaction import transaction
+from app.services.file_state_service import FileStateService
+from app.scan_import.publication import ScanPublicationService
+from scripts.upgrade.domain_migration import apply_analysis_domain
 from app.time_utils import utc_iso, utc_sql
 from scripts.upgrade.database_identity import (
     assert_separate_connections, fingerprint_connection,
@@ -64,7 +67,8 @@ CREATE TABLE IF NOT EXISTS coverage_reports (
     id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL,
     report_id TEXT NOT NULL UNIQUE, report_root TEXT NOT NULL DEFAULT '',
     source_signature TEXT NOT NULL DEFAULT '', sidecar_schema INTEGER NOT NULL DEFAULT 0,
-    asset_identity TEXT NOT NULL DEFAULT '', generated_at TEXT
+    asset_identity TEXT NOT NULL DEFAULT '', generated_at TEXT,
+    report_mode TEXT NOT NULL DEFAULT 'LEGACY_STATIC'
 );
 CREATE TABLE IF NOT EXISTS coverage_files (
     id INTEGER PRIMARY KEY AUTOINCREMENT, scan_id INTEGER NOT NULL,
@@ -276,6 +280,9 @@ SQLITE_ADDITIVE_COLUMNS = {
     "coverage_scans": [
         ("predecessor_scan_id", "INTEGER"),
         ("algorithm_version", "TEXT NOT NULL DEFAULT ''"),
+    ],
+    "coverage_reports": [
+        ("report_mode", "TEXT NOT NULL DEFAULT 'LEGACY_STATIC'"),
     ],
     "coverage_scan_repositories": [
         ("repository_id", "INTEGER"),
@@ -2392,11 +2399,14 @@ def create_sqlite_schema(connection):
     # additive columns so the helper also works for a brand-new SQLite target.
     connection.executescript(SQLITE_DOMAIN_SCHEMA)
     for table_name, columns in SQLITE_ADDITIVE_COLUMNS.items():
-        existing = {
-            str(row[1]) for row in connection.execute(
+        pragma_cursor = connection.cursor()
+        try:
+            pragma_cursor.execute(
                 "PRAGMA table_info({})".format(table_name)
-            ).fetchall()
-        }
+            )
+            existing = {str(row[1]) for row in pragma_cursor.fetchall()}
+        finally:
+            pragma_cursor.close()
         for column_name, definition in columns:
             if column_name not in existing:
                 connection.execute(
@@ -2876,6 +2886,8 @@ def _migrate_legacy_materialized(source_connection, target_connection, anomaly_p
     analysis_repo = AnalysisRepository()
     state_repo = ProjectStateRepository()
     file_state_repo = FileStateRepository()
+    file_state_service = FileStateService(file_state_repo, state_repo)
+    publication = ScanPublicationService(state_repo)
     job_repo = JobRepository()
 
     with transaction(target_connection) as conn:
@@ -2908,6 +2920,7 @@ def _migrate_legacy_materialized(source_connection, target_connection, anomaly_p
             project_repo.bind_report(
                 conn, scan["id"], "legacy_{}".format(scan_key[:16]),
                 source_signature="legacy_migration", sidecar_schema=0,
+                report_mode="LEGACY_STATIC",
             )
             project_lines = [
                 row for row in source["lines"] if row["project_name"] == project_name
@@ -3075,7 +3088,7 @@ def _migrate_legacy_materialized(source_connection, target_connection, anomaly_p
                     "raw_payload_sha256": source_analysis.get("raw_payload_sha256", ""),
                 })
             state_repo.ensure(
-                conn, project["id"], current_scan_id=scan["id"], data_version=data_version
+                conn, project["id"], current_scan_id=None, data_version=data_version
             )
             project_metadata = source.get("project_metadata", {}).get(project_name)
             if project_metadata is not None:
@@ -3090,10 +3103,6 @@ def _migrate_legacy_materialized(source_connection, target_connection, anomaly_p
                     "raw_payload_sha256": project_metadata.get("raw_payload_sha256", ""),
                 })
             _upsert_legacy_provenance_many(conn, migration_id, provenance_rows)
-            state_repo.set_current_scan(conn, project["id"], scan["id"])
-            file_state_repo.rebuild_scan(conn, scan["id"], data_version, None)
-            state_repo.mark_ready(conn, project["id"], data_version)
-            project_repo.seal_scan(conn, scan["id"])
 
         project_by_name = {
             row["project_name"]: row for row in project_repo.list_projects(conn)
@@ -3151,6 +3160,9 @@ def _migrate_legacy_materialized(source_connection, target_connection, anomaly_p
                 ),
             }])
 
+    apply_analysis_domain(
+        target_connection, release_sha=release_sha, record_ledger=False
+    )
     target_contract = _stream_vnext_semantic_contract(target_connection)
     target_hash = target_contract["semantic_hash"]
     source_components = canonical_semantic_component_hashes(source_semantic)
@@ -3163,7 +3175,7 @@ def _migrate_legacy_materialized(source_connection, target_connection, anomaly_p
         if source_components.get(component) != target_components.get(component)
     ]
     result = {
-        "status": "PASSED" if source_hash == target_hash else "FAILED",
+        "status": "FAILED",
         "source_projects": len(source["projects"]),
         "source_line_facts": len(source["lines"]),
         "source_analysis_facts": len(source["analyses"]),
@@ -3186,6 +3198,38 @@ def _migrate_legacy_materialized(source_connection, target_connection, anomaly_p
             os.makedirs(parent, exist_ok=True)
         with open(anomaly_path, "w", encoding="utf-8") as stream:
             json.dump(result, stream, ensure_ascii=False, indent=2, sort_keys=True)
+    if source_hash != target_hash:
+        return result
+    with transaction(target_connection) as conn:
+        for project_name in source["projects"]:
+            project = project_repo.get_project_by_name(conn, project_name)
+            data_version = int(source["project_data_versions"].get(project_name, 0))
+            scan_key = hashlib.sha256(json.dumps({
+                "project": project_name,
+                "source": "legacy_migrated",
+                "analysis_hash": semantic_hash([
+                    row for row in source["analyses"]
+                    if row["project_name"] == project_name
+                ]),
+                "line_hash": semantic_hash([
+                    row for row in source["lines"]
+                    if row["project_name"] == project_name
+                ]),
+            }, sort_keys=True).encode("utf-8")).hexdigest()
+            scan = project_repo.get_scan_by_key(conn, scan_key)
+            if not project or not scan:
+                raise KeyError("migrated scan identity not found")
+            file_state_service.rebuild_validate_and_mark_ready_in_transaction(
+                conn, project["id"], scan["id"], data_version
+            )
+            project_repo.seal_scan(conn, scan["id"])
+            publication.publish_in_transaction(
+                conn, project["id"], scan["id"],
+                expected_current_scan_id=(state_repo.get(conn, project["id"]) or {}).get(
+                    "current_scan_id"
+                ),
+            )
+    result["status"] = "PASSED"
     return result
 
 
@@ -3217,6 +3261,8 @@ def _migrate_legacy_with_source_spool(source_connection, target_connection,
     analysis_repo = AnalysisRepository()
     state_repo = ProjectStateRepository()
     file_state_repo = FileStateRepository()
+    file_state_service = FileStateService(file_state_repo, state_repo)
+    publication = ScanPublicationService(state_repo)
     job_repo = JobRepository()
     scan_ids = {}
     project_ids = {}
@@ -3243,6 +3289,7 @@ def _migrate_legacy_with_source_spool(source_connection, target_connection,
             project_repo.bind_report(
                 conn, scan["id"], "legacy_{}".format(scan_key[:16]),
                 source_signature="legacy_migration_v3", sidecar_schema=0,
+                report_mode="LEGACY_STATIC",
             )
             state_repo.ensure(
                 conn, project["id"], current_scan_id=None,
@@ -3311,9 +3358,6 @@ def _migrate_legacy_with_source_spool(source_connection, target_connection,
                 "legacy_raw_status": None, "legacy_raw_is_draft": None,
                 "raw_payload_sha256": _legacy_payload_hash(project_metadata),
             }])
-            file_state_repo.rebuild_scan(
-                conn, scan_id, int(data_versions.get(project_name, 0)), None
-            )
             _upsert_migration_checkpoint(
                 conn, migration_id, project_checkpoint, "PROJECT",
                 project_name, project_fragment,
@@ -3375,6 +3419,10 @@ def _migrate_legacy_with_source_spool(source_connection, target_connection,
                 job_fragment, {"job_id": old_job["job_id"]},
             )
 
+    # Canonical Analysis Domain is complete before any derived state is built.
+    apply_analysis_domain(
+        target_connection, release_sha=release_sha, record_ledger=False
+    )
     # Keep the final zero-loss gate bounded on the target as well as on the
     # legacy source.  The diagnostic snapshot helper is intentionally retained
     # for small fixtures, but must not turn a production-sized target into a
@@ -3413,6 +3461,23 @@ def _migrate_legacy_with_source_spool(source_connection, target_connection,
                 json.dump(result, stream, ensure_ascii=False, indent=2, sort_keys=True)
         return result
 
+    # Rebuild and publish readiness only after the authoritative zero-loss
+    # comparison has passed.  A changed target version must be reported as a
+    # semantic failure, not converted into a partially-ready migration error.
+    for project_name in project_names:
+        with transaction(target_connection) as conn:
+            file_state_service.rebuild_validate_and_mark_ready_in_transaction(
+                conn, project_ids[project_name], scan_ids[project_name],
+                int(data_versions.get(project_name, 0)),
+            )
+            _upsert_migration_checkpoint(
+                conn, migration_id, "project:" + project_name, "PROJECT",
+                project_name,
+                source_descriptor["project_fragments"].get(project_name, ""),
+                {"scan_id": scan_ids[project_name], "project_id": project_ids[project_name]},
+                state="READY_TO_PUBLISH",
+            )
+
     # Publication is the final transaction and occurs only after the
     # authoritative semantic zero-loss gate. A process kill before this point
     # leaves only building Scans and durable file/job checkpoints.
@@ -3420,11 +3485,24 @@ def _migrate_legacy_with_source_spool(source_connection, target_connection,
         for project_name in project_names:
             project_id = project_ids[project_name]
             scan_id = scan_ids[project_name]
-            state_repo.set_current_scan(conn, project_id, scan_id)
-            state_repo.mark_ready(conn, project_id, int(data_versions.get(project_name, 0)))
             current = project_repo.get_scan(conn, scan_id)
+            state = state_repo.get(conn, project_id) or {}
+            if int(state.get("current_scan_id") or 0) == int(scan_id):
+                _upsert_migration_checkpoint(
+                    conn, migration_id, "project:{}".format(project_name), "PUBLISHED",
+                    project_name,
+                    source_descriptor["project_fragments"].get(project_name, ""),
+                    {"scan_id": scan_id, "project_id": project_id}, state="PUBLISHED",
+                )
+                continue
             if str(current.get("status") or "").lower() in {"building", "importing", "constructing"}:
                 project_repo.seal_scan(conn, scan_id)
+            publication.publish_in_transaction(
+                conn, project_id, scan_id,
+                expected_current_scan_id=(state_repo.get(conn, project_id) or {}).get(
+                    "current_scan_id"
+                ),
+            )
             _upsert_migration_checkpoint(
                 conn, migration_id, "project:{}".format(project_name), "PUBLISHED",
                 project_name,

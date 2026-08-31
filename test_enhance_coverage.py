@@ -491,19 +491,17 @@ class TestIntegration(unittest.TestCase):
         self.assertTrue(os.path.exists(progress_html))
         with open(progress_html, "r", encoding="utf-8") as f:
             progress_content = f.read()
-        self.assertIn('src="coverage_progress.js?v=', progress_content)
-        self.assertNotIn('<script>\n', progress_content)
+        # Legacy Static reports intentionally keep the previous inline
+        # progress runtime; they must not load the VNext cursor/API bundle.
+        self.assertIn('data-review-scope="full"', progress_content)
+        self.assertNotIn('src="coverage_progress.js?v=', progress_content)
+        self.assertNotIn('/progress/files', progress_content)
         self.assertIn('id="teamTable"', progress_content)
         self.assertIn('小组 / 组长填写进度', progress_content)
-        self.assertIn('returnSummaryLink', progress_content)
-        self.assertIn('返回全量审查汇总', progress_content)
+        self.assertIn('id="loadBtn"', progress_content)
+        self.assertIn('id="csvLink"', progress_content)
         progress_js = os.path.join(self.output_dir, "coverage_progress.js")
-        self.assertTrue(os.path.exists(progress_js))
-        with open(progress_js, "r", encoding="utf-8") as f:
-            progress_runtime = f.read()
-        self.assertIn('coverage-review-progress-updated', progress_runtime)
-        self.assertIn('function renderOwnershipStatus', progress_runtime)
-        self.assertIn('ownership_status', progress_runtime)
+        self.assertFalse(os.path.exists(progress_js))
 
 
 class TestInheritAnalysis(unittest.TestCase):
@@ -847,7 +845,8 @@ class TestNewFeaturesAndIntegrity(unittest.TestCase):
         self.assertIn("mod-chip", js_content)
         self.assertIn("mod-more-chip", js_content)
         self.assertIn("bar-high", js_content)
-        self.assertIn("visible-progress-20260818_v9_12", js_content)
+        self.assertIn("visible-progress-vnext-20260828_v1", js_content)
+        self.assertNotIn("visible-progress-20260818_v9_12", js_content)
 
     def test_atomic_write_file_creates_and_renames(self):
         target_path = os.path.join(enhance_coverage.BACKGROUND_JOBS_STORAGE_DIR, "test_atomic.json")

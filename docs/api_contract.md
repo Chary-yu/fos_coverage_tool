@@ -8,12 +8,27 @@ All inheritance reads are explicitly bound to `scan_id` and use opaque cursors t
 
 Progress exposes ordinary, inherited-pending and manual-draft counts separately. They are mutually exclusive and must conserve to pending_total. Missing identity, stale revisions, repository busy state and stale cursors fail closed with the frozen error codes in the JSON contract.
 
+The canonical Progress summary fields are `total_uncovered`, `filled_total`,
+`draft_total`, `confirmed_total`, `pending_total`, the three pending
+partitions, `pending_conservation`, `data_version`, `file_state_version`,
+`source`, and `derived_state_status`. Display rates are local projections from
+the canonical totals; omitted or non-finite required fields are a contract
+error, never an implicit zero.
+
 Progress Details is a canonical top-level keyset envelope. Its response
 fields are scan_id, file_id, page_size, has_more, rows, and next_cursor;
 the opaque cursor is bound to scan/data-version/filter and the file identity.
 The pending-line endpoint returns the same keyset shape plus the derived
 total; it does not use deep page/offset queries. The pending-file homepage
 endpoint is likewise bounded and may return has_more and next_cursor.
+The pending-file cursor is bound to the exact Scan, data version, and
+repository filter. A complete client snapshot must reject mixed versions and
+fail closed with `PENDING_SNAPSHOT_STALE` after bounded restarts.
+For the progress-file and pending-file endpoints, `data_version` is always a
+non-negative integer, including the valid initial value `0`; `scan_id` may be
+null only when the project has no current Scan. When the request supplies
+`scan_id`, every page must echo that exact Scan identity.
 `GET /api/coverage/progress/files` is the canonical bounded keyset window for
-the Progress file table. Physical line detail is loaded only through the
-explicit file detail route.
+the Progress file table. Its envelope carries project_name, scan_id,
+data_version, repository_name, files, page_size, has_more, and next_cursor;
+physical line detail is loaded only through the explicit file detail route.

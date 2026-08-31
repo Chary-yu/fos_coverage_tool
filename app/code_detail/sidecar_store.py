@@ -300,6 +300,8 @@ class SidecarStore:
         try:
             with open(legacy_path, "r", encoding="utf-8") as stream:
                 data = json.load(stream)
+            if str(data.get("report_id") or "") != str(report_id):
+                raise ValueError("sidecar report identity mismatch")
             payload = {
                 "schema_version": 1,
                 "project_name": data.get("project_name", ""),

@@ -338,37 +338,18 @@
     }
 
     var resolvedApiBase = "";
-    var isRefreshing = false;
     var lastRefreshTime = 0;
+    var refreshGeneration = 0;
 
     function getApiBaseCandidates() {
         return ["/api/coverage"];
     }
-    function fileKey(repositoryName, filePath) {
-        var repository = String(repositoryName || "").trim();
-        var path = String(filePath || "").replace(/\\/g, "/").replace(/^\.\//, "");
-        return repository ? repository + "::" + path : path;
-    }
-
-    function fetchUnanalyzedFromCandidates(candidates, index) {
-        if (index >= candidates.length) {
-            return Promise.reject(new Error("All API endpoints unavailable"));
-        }
-        var base = candidates[index];
-        var url = base + "/incremental/unanalyzed?project=" + encodeURIComponent(projectName);
-        return fetch(url).then(function(res) {
-            if (!res.ok) throw new Error("HTTP " + res.status);
-            resolvedApiBase = base;
-            return res.json();
-        });
-    }
-
     function refreshUnanalyzedCounts() {
-        if (!projectName || isRefreshing) return;
+        if (!projectName) return;
         var now = Date.now();
         if (now - lastRefreshTime < 2000) return;
-        isRefreshing = true;
         lastRefreshTime = now;
+        var generation = ++refreshGeneration;
 
         var rawCandidates = resolvedApiBase ? [resolvedApiBase].concat(getApiBaseCandidates()) : getApiBaseCandidates();
         var candidates = [];
@@ -378,32 +359,35 @@
                 candidates.push(candidateItem);
             }
         }
-        fetchUnanalyzedFromCandidates(candidates, 0)
-            .then(function(resData) {
-                isRefreshing = false;
-                if (!resData || (resData.status && resData.status !== "success")) return;
-                var payload = resData.data || resData;
-                var files = payload.files || [];
-                var map = {};
-                for (var i = 0; i < files.length; i++) {
-                    map[fileKey(files[i].repository_name, files[i].file_path)] = files[i].unanalyzed;
-                    if (!files[i].repository_name) {
-                        map[files[i].file_path] = files[i].unanalyzed;
-                    }
-                }
-
+        var requests = candidates.map(function(base) {
+            return function() {
+                resolvedApiBase = base;
+                return window.CoveragePendingSnapshot.fetchComplete({
+                    apiBase: base, projectName: projectName, pageSize: 200,
+                    requestToken: function() { return generation === refreshGeneration; }
+                });
+            };
+        });
+        function tryCandidate(index) {
+            if (index >= requests.length) return Promise.reject(new Error("All API endpoints unavailable"));
+            return requests[index]().catch(function() { return tryCandidate(index + 1); });
+        }
+        tryCandidate(0)
+            .then(function(snapshot) {
+                if (generation !== refreshGeneration) return;
+                var map = snapshot.map || {};
                 var total = 0;
                 var rows = body.rows;
                 for (var j = 0; j < rows.length; j++) {
                     var row = rows[j];
-                    var key = row.getAttribute("data-file-key");
+                    var rowKey = row.getAttribute("data-file-key");
                     var cell = row.querySelector(".js-unanalyzed-count") || row.cells[9];
                     if (cell) {
-                        var count = (key && key in map) ? map[key] : parseInt(cell.getAttribute("data-sort-value") || cell.textContent.trim() || "0", 10);
-                        if (key && key in map) {
-                            cell.textContent = count;
-                            cell.setAttribute("data-sort-value", count);
-                        }
+                        var count = rowKey && Object.prototype.hasOwnProperty.call(map, rowKey)
+                            ? Number(map[rowKey].unanalyzed) : 0;
+                        if (!Number.isFinite(count)) count = 0;
+                        cell.textContent = String(count);
+                        cell.setAttribute("data-sort-value", String(count));
                         total += count;
                     }
                 }
@@ -420,10 +404,23 @@
                 }
             })
             .catch(function(err) {
-                isRefreshing = false;
+                if (generation !== refreshGeneration) return;
+                var rows = body.rows;
+                for (var j = 0; j < rows.length; j++) {
+                    var row = rows[j];
+                    var cell = row.querySelector(".js-unanalyzed-count") || row.cells[9];
+                    if (cell) {
+                        // A failed refresh must never leave a server-rendered
+                        // count looking current.  The next complete snapshot
+                        // is the only source allowed to populate this field.
+                        cell.textContent = "--";
+                        cell.setAttribute("data-sort-value", "");
+                    }
+                }
                 var totalEl = document.getElementById("incremental-unanalyzed-total");
                 if (totalEl) {
-                    totalEl.setAttribute("title", "待分析动态刷新失败，正在显示当前快照数值 (" + (err.message || err) + ")");
+                    totalEl.textContent = "--";
+                    totalEl.setAttribute("title", "待分析动态刷新失败，未应用不完整快照 (" + (err.message || err) + ")");
                     if (totalEl.classList) totalEl.classList.add("refresh-failed");
                 }
                 console.warn("[Unanalyzed Refresh] API failed:", err);

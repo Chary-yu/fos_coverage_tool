@@ -41,6 +41,9 @@ except ImportError:  # pragma: no cover - the command fails closed below.
     pymysql = None
 
 from app.release_identity import generate_release_identity
+from app.db.repositories import FileStateRepository, ProjectStateRepository
+from app.db.repositories.base import fetchall
+from app.services.file_state_service import FileStateService
 from app.time_utils import utc_iso
 from scripts.diagnostics.contract import with_contract
 from scripts.upgrade.evidence_manifest import EvidenceManifestV2
@@ -162,6 +165,55 @@ def _database_collation(connection):
             "collation": str(row.get("collation_database", "")),
         }
     return {"character_set": str(row[0]), "collation": str(row[1])}
+
+
+def _migrated_file_state_ready_evidence(connection):
+    """Validate every published migrated project before Gate A can pass."""
+    service = FileStateService(FileStateRepository(), ProjectStateRepository())
+    projects = fetchall(connection, """
+        SELECT p.project_name, p.id AS project_id,
+               s.current_scan_id, s.data_version, s.file_state_version
+        FROM coverage_projects p
+        JOIN coverage_project_state s ON s.project_id = p.id
+        ORDER BY p.project_name
+    """)
+    evidence = {}
+    violations = []
+    for project in projects:
+        name = str(project.get("project_name") or "")
+        project_id = int(project.get("project_id") or 0)
+        scan_id = int(project.get("current_scan_id") or 0)
+        data_version = int(project.get("data_version") or 0)
+        file_state_version = int(project.get("file_state_version") or 0)
+        item = {
+            "status": "INCOMPLETE",
+            "project_id": project_id,
+            "scan_id": scan_id,
+            "data_version": data_version,
+            "file_state_version": file_state_version,
+        }
+        if not scan_id:
+            item["reason"] = "CURRENT_SCAN_MISSING"
+            violations.append("{}: CURRENT scan is missing".format(name))
+        else:
+            gate = service.validate_rebuilt(
+                connection, project_id, scan_id, data_version
+            )
+            item["gate"] = gate
+            item["status"] = gate.get("status") or "INCOMPLETE"
+            if item["status"] != "PASSED":
+                violations.append(
+                    "{}: FileState Ready gate failed: {}".format(name, gate)
+                )
+        if data_version != file_state_version:
+            violations.append("{}: FileState version is not current".format(name))
+        evidence[name] = item
+    return {
+        "status": "PASSED" if projects and not violations else "INCOMPLETE",
+        "project_count": len(projects),
+        "projects": evidence,
+        "violations": violations,
+    }
 
 
 def _drop_database(client, common, env, name):
@@ -529,12 +581,14 @@ def run(args):
             source_connection, target_connection, release_sha=revision,
         )
         first_domain = apply_analysis_domain(target_connection, release_sha=revision)
+        first_file_state = _migrated_file_state_ready_evidence(target_connection)
         target_semantic = capture_vnext_semantic_snapshot(target_connection)
         second_migration = migrate_legacy(
             source_connection, target_connection, release_sha=revision,
         )
         target_semantic_second = capture_vnext_semantic_snapshot(target_connection)
         second_domain = apply_analysis_domain(target_connection, release_sha=revision)
+        second_file_state = _migrated_file_state_ready_evidence(target_connection)
         second_schema = apply_schema(target_connection, schema_path, release_sha=revision)
         semantic_match = bool(first_migration.get("authoritative_semantic_match"))
         idempotent = bool(second_migration.get("authoritative_semantic_match")) \
@@ -551,6 +605,10 @@ def run(args):
             "core_schema_second_apply": second_schema,
             "analysis_domain_first_apply": first_domain,
             "analysis_domain_second_apply": second_domain,
+            "file_state_ready_gate": {
+                "first_run": first_file_state,
+                "second_run": second_file_state,
+            },
             "migration_first_run": first_migration,
             "migration_second_run": second_migration,
             "authoritative_semantic_match": semantic_match,
@@ -589,6 +647,9 @@ def run(args):
             raise RuntimeError("restored Legacy -> VNext semantic hash mismatch")
         if not idempotent:
             raise RuntimeError("second migration changed the target semantic snapshot")
+        if (first_file_state.get("status") != "PASSED" or
+                second_file_state.get("status") != "PASSED"):
+            raise RuntimeError("migrated FileState Ready gate did not pass")
         result["status"] = "PASSED"
         result["exit_code"] = 0
     except Exception as exc:

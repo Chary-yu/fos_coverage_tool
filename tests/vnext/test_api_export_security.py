@@ -424,6 +424,16 @@ class VNextApiExportSecurityTest(unittest.TestCase):
             body={"line_id": line_id, "expected_relation_revision": link["relation_revision"]},
         )
         self.assertEqual(status, 200)
+        state = runtime.states.get(self.connection, project_id)
+        self.assertEqual(
+            int(state["file_state_version"]), int(state["data_version"])
+        )
+        self.assertEqual(
+            runtime.progress_service.summary(
+                self.connection, "inheritance-api", scan["id"]
+            )["source"],
+            "coverage_file_state",
+        )
         rejection_id = rejected["rejection"]["id"]
         current_revision = self.connection.execute(
             "SELECT relation_revision FROM coverage_analysis_line_links WHERE id=?",
@@ -441,18 +451,39 @@ class VNextApiExportSecurityTest(unittest.TestCase):
             },
         )
         self.assertEqual(status, 200)
+        state = runtime.states.get(self.connection, project_id)
+        self.assertEqual(
+            int(state["file_state_version"]), int(state["data_version"])
+        )
         restored = self.connection.execute(
             "SELECT is_active, review_state, relation_revision "
             "FROM coverage_analysis_line_links WHERE id=?", (link["id"],)
         ).fetchone()
         self.assertEqual(tuple(restored), (1, INHERITED_PENDING, current_revision + 1))
-
         status, payload = app.dispatch(
             "POST", "/api/coverage/scans/{}/inheritance/reject".format(scan["id"]),
             body={"line_id": line_id, "expected_relation_revision": link["relation_revision"]},
         )
         self.assertEqual(status, 409)
         self.assertEqual(payload["error"], "STALE_RELATION_REVISION")
+        status, confirmed = app.dispatch(
+            "POST", "/api/coverage/scans/{}/inheritance/confirm".format(
+                scan["id"]
+            ),
+            body={
+                "selected_line_ids": [line_id],
+                "expected_relation_revisions": {
+                    str(line_id): current_revision + 1
+                },
+            },
+            headers={"X-Coverage-Role": "reviewer"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(confirmed["items"][0]["line_id"], line_id)
+        state = runtime.states.get(self.connection, project_id)
+        self.assertEqual(
+            int(state["file_state_version"]), int(state["data_version"])
+        )
 
     def test_inheritance_cursor_is_bound_to_scan_version_and_filter(self):
         runtime = self._runtime()

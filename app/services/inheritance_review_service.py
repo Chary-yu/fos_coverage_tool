@@ -11,15 +11,21 @@ from app.db.repositories.base import adapt_sql, execute, fetchone
 from app.db.repositories.project_state_repository import ProjectStateRepository
 from app.db.transaction import transaction
 from app.inheritance.rejections import InheritanceRejectionService
+from app.services.file_state_service import FileStateService
 from app.time_utils import utc_sql
 
 
 class InheritanceReviewService(object):
     def __init__(self, state_repository=None, analysis_service=None,
-                 rejection_service=None):
+                 rejection_service=None, file_state_service=None):
         self.states = state_repository or ProjectStateRepository()
         self.analysis_service = analysis_service
-        self.rejections = rejection_service or InheritanceRejectionService(self.states)
+        self.file_state_service = file_state_service or FileStateService(
+            state_repo=self.states
+        )
+        self.rejections = rejection_service or InheritanceRejectionService(
+            self.states, self.file_state_service
+        )
 
     def confirm(self, connection, project_id, scan_id, selected_line_ids,
                 expected_relation_revisions=None, default_expected_revision=None,
@@ -66,7 +72,10 @@ class InheritanceReviewService(object):
                     "relation_revision": expected + 1,
                     "reviewed_by": reviewer or "",
                 })
-            self.states.advance(conn, int(project_id))
+            state = self.states.advance(conn, int(project_id))
+            self.file_state_service.rebuild_validate_and_mark_ready_in_transaction(
+                conn, int(project_id), int(scan_id), int(state["data_version"])
+            )
         return {"scan_id": int(scan_id), "items": results,
                 "reviewed_by": reviewer or ""}
 

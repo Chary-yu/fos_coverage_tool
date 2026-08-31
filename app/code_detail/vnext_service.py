@@ -9,6 +9,10 @@ from app.code_detail.cache_budget import ByteBudget
 from app.code_detail.code_region import FunctionRange, build_code_regions
 from app.code_detail.sidecar_store import SidecarStore
 from app.code_detail.source_reader import calc_sidecar_file_key, compute_db_file_path_hash
+from app.reports.identity import (
+    LEGACY_STATIC, SUPPORTED_SIDECAR_SCHEMA_VERSIONS, VNEXT_ARTIFACT_READY,
+    validate_report_mode,
+)
 from app.db.repositories.base import fetchall, fetchone
 from app.db.repositories.analysis_domain_repository import (
     AnalysisDomainRepository, INHERITED_PENDING, MANUAL_DRAFT,
@@ -270,6 +274,40 @@ class VNextCodeDetailService(object):
                 report = self.projects.get_report(connection, report_id)
                 if not report or int(report["scan_id"]) != int(scan_id):
                     raise KeyError("report_id is not bound to scan_id")
+                report_mode = validate_report_mode(
+                    report.get("report_mode"),
+                    default=(VNEXT_ARTIFACT_READY if report.get("report_root")
+                             else LEGACY_STATIC),
+                )
+                if report_mode == LEGACY_STATIC:
+                    raise ValueError("LEGACY_STATIC_REPORT")
+                asset_identity = str(report.get("asset_identity") or "").strip()
+                sidecar_schema = int(report.get("sidecar_schema") or 0)
+                if not asset_identity:
+                    raise ValueError("VNEXT asset_identity is required")
+                if sidecar_schema not in SUPPORTED_SIDECAR_SCHEMA_VERSIONS:
+                    raise ValueError("VNEXT sidecar_schema is unsupported")
+                registry_entry = self.registry.load_exact(report_id)
+                if (registry_entry and
+                        registry_entry.get("report_mode_explicit") and
+                        str(registry_entry.get("report_mode") or "").upper() == LEGACY_STATIC):
+                    raise ValueError("LEGACY_STATIC_REPORT")
+                if registry_entry:
+                    entry_mode = validate_report_mode(
+                        registry_entry.get("report_mode"), default=report_mode
+                    )
+                    if (registry_entry.get("report_mode_explicit") and
+                            entry_mode != report_mode):
+                        raise ValueError("REPORT_MODE_IDENTITY_MISMATCH")
+                    entry_scan = registry_entry.get("scan_id")
+                    if entry_scan is not None and int(entry_scan) != int(scan_id):
+                        raise KeyError("report registry scan identity mismatch")
+                    entry_asset = str(registry_entry.get("asset_identity") or "").strip()
+                    if entry_asset and entry_asset != asset_identity:
+                        raise KeyError("report registry asset identity mismatch")
+                    entry_schema = int(registry_entry.get("sidecar_schema") or 0)
+                    if entry_schema and entry_schema != sidecar_schema:
+                        raise KeyError("report registry sidecar schema mismatch")
                 file_hash = compute_db_file_path_hash(file_path, repository_name)
                 file_query = """
                     SELECT f.*, s.project_id,
@@ -307,7 +345,6 @@ class VNextCodeDetailService(object):
                 report_root = registry_root or declared_root
                 if not report_root:
                     raise FileNotFoundError("report root is unavailable")
-                asset_identity = str(report.get("asset_identity") or "")
                 store_key = (report_root, asset_identity)
                 sidecar = self._sidecar_store(
                     store_key, report_root, asset_identity
@@ -514,6 +551,7 @@ class VNextCodeDetailService(object):
         meta = sidecar.load_metadata(report_id, key)
         if not meta:
             raise FileNotFoundError("report sidecar metadata is unavailable")
+        self._validate_sidecar_metadata(report, meta)
         raw_ranges = meta.get("function_ranges") or []
         ranges = []
         for item in raw_ranges:
@@ -626,8 +664,21 @@ class VNextCodeDetailService(object):
         if not meta:
             raise FileNotFoundError("report sidecar metadata is unavailable")
         plan.meta = meta
+        self._validate_sidecar_metadata(plan.report, meta)
         plan.normalized_ranges = self._normalize_batch_ranges(meta, plan.ranges)
         return plan
+
+    @staticmethod
+    def _validate_sidecar_metadata(report, meta):
+        """Require the physical sidecar to match the persisted artifact mode."""
+        expected = int(report.get("sidecar_schema") or 0)
+        actual = int(meta.get("schema_version") or 0)
+        if expected not in SUPPORTED_SIDECAR_SCHEMA_VERSIONS:
+            raise ValueError("VNEXT sidecar_schema is unsupported")
+        if actual != expected:
+            raise ValueError("SIDECAR_SCHEMA_IDENTITY_MISMATCH")
+        if str(meta.get("report_id") or "") != str(report.get("report_id") or ""):
+            raise ValueError("SIDECAR_REPORT_IDENTITY_MISMATCH")
 
     def load_lines_batch_overlay(self, connection, plan):
         """Load the analysis overlay in a short DB-only phase."""

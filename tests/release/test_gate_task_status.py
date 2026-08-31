@@ -59,6 +59,14 @@ class GateTaskStatusTest(unittest.TestCase):
             item["name"] == "upstream_gate_dependencies"
             for item in task_b01["blockers"]
         ))
+        dependency_blocker = next(
+            item for item in task_b01["blockers"]
+            if item["name"] == "upstream_gate_dependencies"
+        )
+        self.assertEqual(
+            dependency_blocker["violations"],
+            ["upstream task A-03 is not PASSED"],
+        )
 
 
 if __name__ == "__main__":

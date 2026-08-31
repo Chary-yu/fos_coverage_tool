@@ -137,8 +137,8 @@ def _resolve_task_status(task_id, task_by_id, gate_by_id, cache, visiting):
             "name": "upstream_gate_dependencies",
             "status": "BLOCKED",
             "violations": [
-                "upstream task {} is not PASSED".format(task_id)
-                for task, value in dependency_statuses.items()
+                "upstream task {} is not PASSED".format(dependency)
+                for dependency, value in dependency_statuses.items()
                 if value != "PASSED"
             ],
         })

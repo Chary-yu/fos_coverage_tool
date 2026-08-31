@@ -62,6 +62,24 @@ class TestPhase6Sidecar(unittest.TestCase):
         self.assertEqual(range_lines[0]["line_no"], 10)
         self.assertEqual(range_lines[-1]["line_no"], 20)
 
+    def test_legacy_sidecar_report_identity_is_not_reused(self):
+        report_id = "rep_legacy_identity"
+        file_path = "src/legacy/identity.c"
+        file_key = calc_sidecar_file_key(file_path)
+        context = SourceContext(
+            "LegacyProj", file_path,
+            [SourceLineDTO(1, "return 0;", coverage_state="covered")],
+            report_id=report_id,
+        )
+        save_source_sidecar(self.test_dir, report_id, file_key, context)
+
+        self.assertIsNone(
+            self.store.load_metadata("another_report", file_key)
+        )
+        self.assertIsNone(
+            self.store.load_full_source_context("another_report", file_key)
+        )
+
     def test_item_13_chunked_v2_sidecar_creation_and_range_read(self):
         """Verify SidecarStore writes Chunked v2 format and performs partial chunk reading."""
         report_id = "rep_chunked"

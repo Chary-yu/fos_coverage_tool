@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS coverage_reports (
     sidecar_schema INT NOT NULL DEFAULT 0,
     asset_identity VARCHAR(128) NOT NULL DEFAULT '',
     generated_at DATETIME NULL,
+    report_mode VARCHAR(32) NOT NULL DEFAULT 'LEGACY_STATIC',
     PRIMARY KEY (id),
     UNIQUE KEY uq_coverage_reports_report_id (report_id),
     KEY idx_coverage_reports_scan (scan_id),

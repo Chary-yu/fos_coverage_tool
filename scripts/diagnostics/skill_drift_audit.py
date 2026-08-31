@@ -30,7 +30,11 @@ REQUIRED_SKILLS = (
 )
 REQUIRED_FIELDS = (
     "routing_current", "helpers_current", "test_selector_current",
-    "audits_current", "root_owner",
+    "audits_current", "root_owner", "capability_manifest_current",
+    "http_vhost_current", "semantic_identity_current",
+    "redaction_modes_current", "canonical_analysis_authority_current",
+    "served_root_registry_sidecar_cursor_current",
+    "validation_session_teardown_current",
 )
 
 
@@ -57,6 +61,30 @@ def audit(payload, candidate_revision=""):
         checks[name] = {"present": isinstance(item, dict), "missing": missing}
         if missing:
             violations.append("{} missing: {}".format(name, ", ".join(missing)))
+    capability_manifest = payload.get("capability_manifest")
+    if capability_manifest is not None:
+        if not isinstance(capability_manifest, dict):
+            violations.append("capability_manifest must be an object")
+        else:
+            manifest_revision = str(
+                capability_manifest.get("candidate_revision") or ""
+            )
+            if observed_revision and manifest_revision != observed_revision:
+                violations.append(
+                    "capability_manifest candidate_revision does not match"
+                )
+            manifest_skills = capability_manifest.get("skills")
+            if not isinstance(manifest_skills, dict):
+                violations.append("capability_manifest skills object is missing")
+            else:
+                for name in REQUIRED_SKILLS:
+                    item = manifest_skills.get(name)
+                    if not isinstance(item, dict) or not item.get("capabilities"):
+                        violations.append(
+                            "capability_manifest missing capabilities: {}".format(name)
+                        )
+            if capability_manifest.get("status") != "PASSED":
+                violations.append("capability_manifest is not PASSED")
     return with_contract({
         "status": "PASSED" if not violations else "INCOMPLETE",
         "evidence_class": "skill_drift_audit",
@@ -74,11 +102,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", required=True)
     parser.add_argument("--candidate-revision", default="")
+    parser.add_argument("--capability-manifest", default="")
     parser.add_argument("--output")
     args = parser.parse_args(argv)
     try:
         with open(args.input, "r", encoding="utf-8") as stream:
             payload = json.load(stream)
+        if args.capability_manifest:
+            with open(args.capability_manifest, "r", encoding="utf-8") as stream:
+                payload["capability_manifest"] = json.load(stream)
         result = audit(payload, args.candidate_revision)
     except (OSError, TypeError, ValueError) as exc:
         result = audit({}, args.candidate_revision)

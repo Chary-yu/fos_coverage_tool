@@ -11,8 +11,8 @@
     }
 
     var resolvedApiBase = "";
-    var isRefreshing = false;
     var lastRefreshTime = 0;
+    var refreshGeneration = 0;
     var urlParams = null;
     try {
         urlParams = new URLSearchParams(window.location.search || "");
@@ -22,25 +22,6 @@
 
     function getApiBaseCandidates() {
         return ["/api/coverage"];
-    }
-    function fileKey(repositoryName, filePath) {
-        var repository = String(repositoryName || "").trim();
-        var path = String(filePath || "").replace(/\\/g, "/").replace(/^\.\//, "");
-        return repository ? repository + "::" + path : path;
-    }
-    function fetchUnanalyzedFromCandidates(candidates, index) {
-        if (!candidates.length || index >= candidates.length) {
-            return Promise.reject(new Error("Canonical API endpoint unavailable"));
-        }
-        var base = candidates[index];
-        var url = base + "/incremental/unanalyzed?project=" + encodeURIComponent(projectName);
-        if (scanId) url += "&scan_id=" + encodeURIComponent(scanId);
-        if (repositoryName) url += "&repository_name=" + encodeURIComponent(repositoryName);
-        return fetch(url).then(function(res) {
-            if (!res.ok) throw new Error("HTTP " + res.status);
-            resolvedApiBase = base;
-            return res.json();
-        });
     }
     function escapeHtml(str) {
         return String(str)
@@ -72,11 +53,11 @@
     }
 
     function refreshDeveloperTasks() {
-        if (!projectName || isRefreshing) return;
+        if (!projectName) return;
         var now = Date.now();
         if (now - lastRefreshTime < 2000) return;
-        isRefreshing = true;
         lastRefreshTime = now;
+        var generation = ++refreshGeneration;
 
         var rawCandidates = resolvedApiBase ? [resolvedApiBase].concat(getApiBaseCandidates()) : getApiBaseCandidates();
         var candidates = [];
@@ -87,25 +68,25 @@
             }
         }
 
-        fetchUnanalyzedFromCandidates(candidates, 0)
-            .then(function(resData) {
-                isRefreshing = false;
-                if (!resData || (resData.status && resData.status !== "success")) return;
-                var payload = resData.data || resData;
-                var files = payload.files || [];
-                var unanalyzedMap = {};
-                var pendingLineMap = {};
-                for (var i = 0; i < files.length; i++) {
-                    var key = fileKey(files[i].repository_name, files[i].file_path);
-                    unanalyzedMap[key] = files[i].unanalyzed;
-                    pendingLineMap[key] = parseLineNumbers(files[i].pending_line_numbers);
-                    // Legacy responses did not carry repository identity;
-                    // retain a path-only alias only for those responses.
-                    if (!files[i].repository_name) {
-                        unanalyzedMap[files[i].file_path] = files[i].unanalyzed;
-                        pendingLineMap[files[i].file_path] = parseLineNumbers(files[i].pending_line_numbers);
-                    }
-                }
+        var requests = candidates.map(function(base) {
+            return function() {
+                resolvedApiBase = base;
+                return window.CoveragePendingSnapshot.fetchComplete({
+                    apiBase: base, projectName: projectName, scanId: scanId,
+                    repositoryName: repositoryName, pageSize: 200,
+                    requestToken: function() { return generation === refreshGeneration; }
+                });
+            };
+        });
+        function tryCandidate(index) {
+            if (index >= requests.length) return Promise.reject(new Error("Canonical API endpoint unavailable"));
+            return requests[index]().catch(function() { return tryCandidate(index + 1); });
+        }
+        tryCandidate(0)
+            .then(function(snapshot) {
+                if (generation !== refreshGeneration) return;
+                var unanalyzedMap = snapshot.map || {};
+                var pendingLineMap = snapshot.pendingLineMap || {};
 
                 var devSections = document.querySelectorAll("section[id]");
                 for (var s = 0; s < devSections.length; s++) {
@@ -124,18 +105,17 @@
                         var unanalyzedCell = row.querySelector(".js-task-unanalyzed");
                         var actionCell = row.querySelector(".js-task-action");
 
-                        var count;
+                        var count = 0;
                         if (ownerSpecific && rowFileKey && Object.prototype.hasOwnProperty.call(pendingLineMap, rowFileKey)) {
                             // A file can belong to several developers.  The
                             // API returns current pending line numbers; only
                             // the intersection with this row's owned lines is
                             // the developer's live task count.
                             count = countOwnedPendingLines(row, pendingLineMap[rowFileKey]);
-                        } else if (rowFileKey && (rowFileKey in unanalyzedMap)) {
-                            count = unanalyzedMap[rowFileKey];
-                        } else {
-                            count = parseInt((unanalyzedCell && unanalyzedCell.textContent) ? unanalyzedCell.textContent.trim() : "0", 10);
+                        } else if (rowFileKey && Object.prototype.hasOwnProperty.call(unanalyzedMap, rowFileKey)) {
+                            count = Number(unanalyzedMap[rowFileKey].unanalyzed);
                         }
+                        if (!Number.isFinite(count)) count = 0;
 
                         if (unanalyzedCell) {
                             unanalyzedCell.textContent = count;
@@ -199,7 +179,36 @@
                 }
             })
             .catch(function(err) {
-                isRefreshing = false;
+                if (generation !== refreshGeneration) return;
+                var failedSections = document.querySelectorAll("section[id]");
+                for (var fs = 0; fs < failedSections.length; fs++) {
+                    var failedRows = failedSections[fs].querySelectorAll("tbody tr[data-file-key]");
+                    for (var fr = 0; fr < failedRows.length; fr++) {
+                        var failedCell = failedRows[fr].querySelector(".js-task-unanalyzed");
+                        if (failedCell) {
+                            // Do not retain the generated HTML value after a
+                            // failed snapshot.  A complete response is needed
+                            // before the task count is trustworthy.
+                            failedCell.textContent = "--";
+                            failedCell.setAttribute("data-sort-value", "");
+                        }
+                        var failedAction = failedRows[fr].querySelector(".js-task-action");
+                        if (failedAction) {
+                            failedAction.innerHTML = '<span class="todo">待分析快照暂不可用</span>';
+                        }
+                    }
+                    var failedReviewFiles = failedSections[fs].querySelector(".js-dev-review-files");
+                    var failedUncovered = failedSections[fs].querySelector(".js-dev-uncovered-lines");
+                    if (failedReviewFiles) failedReviewFiles.textContent = "--";
+                    if (failedUncovered) failedUncovered.textContent = "--";
+                }
+                var failedSummaryRows = document.querySelectorAll("tr[data-dev-anchor]");
+                for (var sr = 0; sr < failedSummaryRows.length; sr++) {
+                    var summaryReviewFiles = failedSummaryRows[sr].querySelector(".js-summary-review-files");
+                    var summaryUncovered = failedSummaryRows[sr].querySelector(".js-summary-uncovered-lines");
+                    if (summaryReviewFiles) summaryReviewFiles.textContent = "--";
+                    if (summaryUncovered) summaryUncovered.textContent = "--";
+                }
                 console.warn("[Developer Tasks Refresh] API failed:", err);
             });
     }

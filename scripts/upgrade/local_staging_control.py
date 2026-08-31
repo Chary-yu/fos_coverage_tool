@@ -14,9 +14,15 @@ import subprocess
 import sys
 import time
 import urllib.request
-
+import uuid
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from scripts.upgrade.validation_session import (
+    ValidationSession, _pid_exists, validate_bind,
+)
 
 
 def _read_pid(path):
@@ -24,11 +30,66 @@ def _read_pid(path):
         return int(stream.read().strip())
 
 
-def start(config_path, pid_path, endpoint):
+def _load_server_binding(config_path):
+    with open(config_path, "r", encoding="utf-8") as stream:
+        config = json.load(stream)
+    server = config.get("server") or {}
+    host = str(server.get("host") or "127.0.0.1")
+    port = int(server.get("port") or 0)
+    if port <= 0 or port > 65535:
+        raise ValueError("staging server port is invalid")
+    return host, port
+
+
+def _get_or_create_session(manifest_path, session_id, candidate_sha,
+                           baseline_sha, host, port, allow_non_loopback,
+                           allowlist, temporary_token, expires_at):
+    bind = validate_bind(
+        host, port, allow_non_loopback=allow_non_loopback,
+        allowlist=allowlist, temporary_token=temporary_token,
+        expires_at=expires_at,
+    )
+    bind.update({
+        "allow_non_loopback": bool(allow_non_loopback),
+        "temporary_token": str(temporary_token or ""),
+        "expires_at": str(expires_at or ""),
+    })
+    if os.path.isfile(manifest_path):
+        session = ValidationSession.load(manifest_path)
+        if session_id and session.data.get("session_id") != session_id:
+            raise ValueError("validation session id does not match manifest")
+        return session
+    resolved_id = str(session_id or "staging-{}-{}".format(
+        os.getpid(), uuid.uuid4().hex[:12]
+    ))
+    return ValidationSession.create(
+        manifest_path, resolved_id, candidate_sha=candidate_sha,
+        baseline_sha=baseline_sha, ports=[port], binds=[bind],
+    )
+
+
+def start(config_path, pid_path, endpoint, session_manifest="",
+          session_id="", candidate_sha="", baseline_sha="",
+          allow_non_loopback=False, allowlist=None, temporary_token="",
+          expires_at=""):
+    host, port = _load_server_binding(config_path)
+    session_manifest = session_manifest or (pid_path + ".session.json")
+    session = _get_or_create_session(
+        session_manifest, session_id, candidate_sha, baseline_sha,
+        host, port, allow_non_loopback, allowlist or [], temporary_token,
+        expires_at,
+    )
     if os.path.isfile(pid_path):
         try:
-            os.kill(_read_pid(pid_path), 0)
-            return
+            existing_pid = _read_pid(pid_path)
+            if _pid_exists(existing_pid):
+                owned = (existing_pid in (session.data.get("pids") or []) and
+                         session._owned_pid(existing_pid))
+                if not owned:
+                    raise RuntimeError(
+                        "existing staging process is not owned by validation session"
+                    )
+                return
         except (OSError, ValueError):
             pass
     env = dict(os.environ)
@@ -41,8 +102,12 @@ def start(config_path, pid_path, endpoint):
         cwd=ROOT, env=env, stdout=log_stream, stderr=subprocess.STDOUT,
         start_new_session=True,
     )
+    session.add_process(process.pid, port=port, listener={
+        "host": host, "port": port, "pid": process.pid,
+    })
     with open(pid_path, "w", encoding="utf-8") as stream:
         stream.write(str(process.pid))
+    log_stream.close()
     deadline = time.time() + 20
     while time.time() < deadline:
         try:
@@ -51,25 +116,25 @@ def start(config_path, pid_path, endpoint):
                     return
         except Exception:
             time.sleep(0.25)
+    session.teardown(evidence_path=session_manifest + ".teardown.json")
     raise RuntimeError("staging API did not become ready; see {}".format(log_path))
 
 
-def stop(pid_path):
+def stop(pid_path, session_manifest="", evidence_path=""):
+    session_manifest = session_manifest or (pid_path + ".session.json")
+    if os.path.isfile(session_manifest):
+        session = ValidationSession.load(session_manifest)
+        return session.teardown(
+            evidence_path=evidence_path or session_manifest + ".teardown.json"
+        )
     if not os.path.isfile(pid_path):
-        return
-    pid = _read_pid(pid_path)
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return
-        time.sleep(0.1)
-    os.kill(pid, signal.SIGKILL)
+        return {"status": "PASSED", "pids_closed": True, "ports_closed": True}
+    # A PID file without a session manifest has no safe ownership proof.  Do
+    # not signal a potentially unrelated or PID-reused process.
+    return {
+        "status": "FAILED", "pids_closed": False, "ports_closed": False,
+        "reason": "validation session manifest is required to stop a process",
+    }
 
 
 def main():
@@ -78,11 +143,32 @@ def main():
     parser.add_argument("--config", required=True)
     parser.add_argument("--pid-file", required=True)
     parser.add_argument("--endpoint", default="http://127.0.0.1:19528/api/coverage/release")
+    parser.add_argument("--session-manifest", default="")
+    parser.add_argument("--session-id", default="")
+    parser.add_argument("--candidate-sha", default="")
+    parser.add_argument("--baseline-sha", default="")
+    parser.add_argument("--allow-non-loopback", action="store_true")
+    parser.add_argument("--allowlist", action="append", default=[])
+    parser.add_argument("--temporary-token", default="")
+    parser.add_argument("--expires-at", default="")
+    parser.add_argument("--evidence", default="")
     args = parser.parse_args()
     if args.action == "start":
-        start(args.config, args.pid_file, args.endpoint)
+        start(
+            args.config, args.pid_file, args.endpoint,
+            session_manifest=args.session_manifest,
+            session_id=args.session_id,
+            candidate_sha=args.candidate_sha,
+            baseline_sha=args.baseline_sha,
+            allow_non_loopback=args.allow_non_loopback,
+            allowlist=args.allowlist,
+            temporary_token=args.temporary_token,
+            expires_at=args.expires_at,
+        )
     elif args.action == "stop":
-        stop(args.pid_file)
+        result = stop(args.pid_file, args.session_manifest, args.evidence)
+        if result and result.get("status") != "PASSED":
+            raise SystemExit(1)
     # freeze/open are enforced by the shared marker in UpgradeLifecycle;
     # these commands are explicit lifecycle acknowledgements.
     elif args.action in ("freeze", "drain", "open"):

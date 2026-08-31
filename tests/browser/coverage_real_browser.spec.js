@@ -7,7 +7,9 @@ const { URL } = require('url');
 const ROOT = path.join(__dirname, '../..');
 const CLIENT_JS = fs.readFileSync(path.join(ROOT, 'web/assets/js/coverage_enhance.js'), 'utf8');
 const CLIENT_CSS = fs.readFileSync(path.join(ROOT, 'web/assets/css/coverage_enhance.css'), 'utf8');
+const PENDING_JS = fs.readFileSync(path.join(ROOT, 'web/assets/js/pending_snapshot.js'), 'utf8');
 const TASK_JS = fs.readFileSync(path.join(ROOT, 'web/assets/js/incremental_developer_tasks.js'), 'utf8');
+const INCREMENTAL_JS = fs.readFileSync(path.join(ROOT, 'web/assets/js/incremental_coverage.js'), 'utf8');
 
 function makeLines(start, end, withPanels, savedReviewers, inheritance = null) {
   const lines = [];
@@ -73,7 +75,8 @@ function makeLayout(large) {
 }
 
 function createHarness({ large = false, failOnce = false, taskPendingLines = null,
-  inheritanceLifecycle = false } = {}) {
+  taskPendingFiles = null, inheritanceLifecycle = false,
+  reorderPendingResponses = false, reportMode = 'VNEXT_ARTIFACT_READY' } = {}) {
   const layout = makeLayout(large);
   const requests = [];
   const failedRequests = [];
@@ -82,8 +85,18 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
   let failureUsed = false;
   const savedReviewers = new Map();
   let currentTaskPendingLines = taskPendingLines;
+  let currentTaskPendingFiles = taskPendingFiles;
+  let pendingPageRequests = 0;
+  let pendingRequestSequence = 0;
   let inheritanceRejected = false;
   let inheritanceRevision = 1;
+  const reportModeMeta = reportMode
+    ? `<meta name="coverage-report-mode" content="${reportMode}">`
+    : '';
+  const staticSource = reportMode !== 'VNEXT_ARTIFACT_READY'
+    ? '<span id="L1" class="lineNoCov">1: return 0;</span>\n'
+      + '<span id="L2" class="lineCov">2: return 1;</span>'
+    : '';
   const inheritanceLineId = 9001;
   const inheritanceCandidate = () => ({
     candidate_line_id: inheritanceLineId,
@@ -96,6 +109,24 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
     coverage_method: 'unit',
     uncovered_reason: '',
   });
+  const incrementalRows = Array.from({ length: 401 }, (_, index) => {
+    const repository = index < 201 ? 'repo-a' : 'repo-b';
+    const filePath = index === 0 ? 'src/fixture.c' : `src/pending-${index}.c`;
+    const fileKey = `${repository}::${filePath}`;
+    const team = repository === 'repo-a' ? 'core' : 'platform';
+    const leader = repository === 'repo-a' ? 'Alice' : 'Bob';
+    const module = repository === 'repo-a' ? 'coverage' : 'runtime';
+    return `<tr data-repo="${repository}" data-module="${module}" data-team="${team}" data-leader="${leader}" data-ownership="${team} / ${leader}" data-file-key="${fileKey}">
+      <td data-sort-value="${repository}">${repository}</td>
+      <td data-sort-value="${team}">${team}</td>
+      <td data-sort-value="${leader}">${leader}</td>
+      <td data-sort-value="${module}">${module}</td>
+      <td data-sort-value="${filePath}">${filePath}</td>
+      <td data-sort-value="1">1</td><td data-sort-value="0">0</td>
+      <td data-sort-value="1">1</td><td data-sort-value="0">0</td>
+      <td class="js-unanalyzed-count" data-sort-value="1">1</td>
+    </tr>`;
+  }).join('');
 
   const server = http.createServer((req, res) => {
     const parsed = new URL(req.url, 'http://127.0.0.1');
@@ -112,6 +143,7 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
     if (pathname === '/' || pathname.endsWith('.gcov.html')) {
       return sendStatic(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
         <meta name="coverage-project" content="BrowserFixture">
+        ${reportModeMeta}
         <meta name="coverage-report-id" content="report_browser_fixture">
         <meta name="coverage-scan-id" content="1">
         <meta name="coverage-repository-name" content="">
@@ -119,7 +151,7 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
         <meta name="coverage-render-mode" content="lazy_collapse">
         <meta name="coverage-review-scope" content="full">
         <style>${CLIENT_CSS}</style><script src="/coverage_enhance.js"></script>
-        </head><body><pre class="source"></pre></body></html>`, 'text/html');
+        </head><body><pre class="source">${staticSource}</pre></body></html>`, 'text/html');
     }
     if (pathname === '/tasks.html') {
       return sendStatic(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"></head><body>
@@ -133,28 +165,86 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
             </tbody></table>
           </section>
           <table><tbody><tr data-dev-anchor="developer-alice"><td class="js-summary-review-files">1</td><td class="js-summary-uncovered-lines">2</td></tr></tbody></table>
-        </main><script>${TASK_JS}</script></body></html>`, 'text/html');
+        </main><script>${PENDING_JS}</script><script>${TASK_JS}</script></body></html>`, 'text/html');
+    }
+    if (pathname === '/incremental.html') {
+      return sendStatic(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"></head><body>
+        <main data-project="TaskFixture">
+          <div id="incremental-unanalyzed-total">1</div>
+          <div class="filters">
+            <select id="repo-filter"><option value="">全部仓库</option></select>
+            <select id="team-filter"><option value="">全部小组</option></select>
+            <select id="leader-filter"><option value="">全部组长</option></select>
+            <select id="module-filter"><option value="">全部组件</option></select>
+            <input id="file-search" type="text"><button id="reset-filters-btn" type="button">重置</button>
+            <span id="filter-count"></span>
+          </div>
+          <table id="incremental-file-table"><thead><tr>
+            <th><button class="sort-button" data-sort-key="repository" data-sort-type="text">仓库</button></th>
+            <th><button class="sort-button" data-sort-key="team" data-sort-type="text">小组</button></th>
+            <th><button class="sort-button" data-sort-key="leader" data-sort-type="text">组长</button></th>
+            <th><button class="sort-button" data-sort-key="module" data-sort-type="text">组件</button></th>
+            <th><button class="sort-button" data-sort-key="file" data-sort-type="text">文件</button></th>
+            <th><button class="sort-button" data-sort-key="changed" data-sort-type="number">新增</button></th>
+            <th><button class="sort-button" data-sort-key="covered" data-sort-type="number">已覆盖</button></th>
+            <th><button class="sort-button" data-sort-key="uncovered" data-sort-type="number">未覆盖</button></th>
+            <th><button class="sort-button" data-sort-key="ignored" data-sort-type="number">忽略</button></th>
+            <th><button class="sort-button" data-sort-key="unanalyzed" data-sort-type="number">待分析</button></th>
+          </tr></thead><tbody>${incrementalRows}</tbody></table>
+        </main><script>${PENDING_JS}</script><script>${INCREMENTAL_JS}</script></body></html>`, 'text/html');
     }
     if (pathname === '/coverage_enhance.js') return sendStatic(CLIENT_JS, 'text/javascript');
     if (pathname === '/coverage_enhance.css') return sendStatic(CLIENT_CSS, 'text/css');
 
     if (pathname === '/api/coverage/incremental/unanalyzed') {
-      const pending = currentTaskPendingLines;
-      if (pending === null) {
+      if (currentTaskPendingLines === null && currentTaskPendingFiles === null) {
         return json(404, { status: 'error', message: 'task fixture disabled' });
       }
-      return json(200, {
-        status: 'success',
-        data: {
-          project_name: 'TaskFixture',
-          data_version: 1,
-          total_unanalyzed: pending.length,
-          files: [{ file_path: 'src/fixture.c', unanalyzed: pending.length, pending_line_numbers: pending }],
-        },
-      });
+      pendingPageRequests += 1;
+      const pendingFiles = currentTaskPendingFiles !== null
+        ? currentTaskPendingFiles
+        : [{ file_path: 'src/fixture.c', unanalyzed: currentTaskPendingLines.length,
+          pending_line_numbers: currentTaskPendingLines }];
+      const requestSequence = ++pendingRequestSequence;
+      const pageSize = Math.min(200, Math.max(1,
+        Number(parsed.searchParams.get('page_size') || 200)));
+      const rawCursor = parsed.searchParams.get('cursor');
+      const offset = rawCursor === null ? 0 : Number(rawCursor);
+      if (!Number.isInteger(offset) || offset < 0 || offset > pendingFiles.length) {
+        return json(409, { status: 'error', error: 'PAGINATION_CURSOR_STALE' });
+      }
+      const files = pendingFiles.slice(offset, offset + pageSize);
+      const nextOffset = offset + files.length;
+      const hasMore = nextOffset < pendingFiles.length;
+      const totalUnanalyzed = pendingFiles.reduce((sum, file) => {
+        const count = Number(file.unanalyzed);
+        return sum + (Number.isFinite(count) ? count :
+          (Array.isArray(file.pending_line_numbers) ? file.pending_line_numbers.length : 0));
+      }, 0);
+      const payload = {
+        project_name: 'TaskFixture',
+        scan_id: 1,
+        data_version: 1,
+        repository_name: parsed.searchParams.get('repository_name') || '',
+        total_unanalyzed: totalUnanalyzed,
+        has_more: hasMore,
+        next_cursor: hasMore ? String(nextOffset) : null,
+        files,
+      };
+      // Keep the first snapshot in flight while a newer generation is
+      // requested.  This is a real HTTP reordering fixture: the old response
+      // must not overwrite the complete snapshot applied by the newer one.
+      if (reorderPendingResponses && requestSequence === 1) {
+        return setTimeout(() => json(200, payload), 3500);
+      }
+      return json(200, payload);
     }
 
     if (pathname === '/api/coverage/code-layout') {
+      requests.push({
+        path: pathname,
+        query: Object.fromEntries(parsed.searchParams.entries()),
+      });
       return json(200, layout);
     }
     if (pathname === '/api/coverage/code-lines/batch' && req.method === 'POST') {
@@ -246,7 +336,9 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
     failedRequests,
     get maxConcurrent() { return maxConcurrent; },
     get failureUsed() { return failureUsed; },
+    get pendingPageRequests() { return pendingPageRequests; },
     setTaskPendingLines(lines) { currentTaskPendingLines = lines; },
+    setTaskPendingFiles(files) { currentTaskPendingFiles = files; },
   };
 }
 
@@ -273,6 +365,14 @@ test('real Chromium coverage lifecycle: collapse, expand, draft survival, restor
     await expect(page.locator('pre.source > .coverage-region-container')).toHaveCount(3);
     await expect(page.locator('.coverage-lazy-toolbar')).toBeVisible();
     await expect(page.locator('pre.source > span')).toHaveCount(0);
+    const layoutRequest = harness.requests.find(item => item.path === '/api/coverage/code-layout');
+    expect(layoutRequest.query).toMatchObject({
+      scan_id: '1',
+      report_id: 'report_browser_fixture',
+      repository_name: '',
+      file_path: 'src/fixture.c',
+      scope: 'full',
+    });
 
     // Scenarios 5-8: expand, exact line order, no duplicate DOM, and bounded chunks.
     await page.locator('.coverage-region-placeholder').nth(0).click();
@@ -394,6 +494,48 @@ test('real Chromium inheritance reject and undo keep the relation reviewable', a
   }
 });
 
+test('real Chromium Legacy static mode stays offline and disables VNext controls', async ({ page, browserName }) => {
+  expect(browserName).toBe('chromium');
+  const harness = await startHarness({ reportMode: 'LEGACY_STATIC' });
+  const apiRequests = [];
+  page.on('request', request => {
+    const url = new URL(request.url());
+    if (url.pathname.startsWith('/api/coverage')) apiRequests.push(url.pathname);
+  });
+  try {
+    await page.goto(`${harness.baseUrl}/fixture.c.gcov.html`, { waitUntil: 'networkidle' });
+    await expect(page.locator('#L1')).toBeVisible();
+    await expect(page.locator('#L1 .coverage-analysis-panel')).toHaveCount(1);
+    await expect(page.locator('#L1 select[data-panel-action="status"]')).toBeDisabled();
+    await expect(page.locator('#L1 input.reviewer-input')).toBeDisabled();
+    expect(apiRequests).toEqual([]);
+    expect(harness.failedRequests).toEqual([]);
+  } finally {
+    await stopHarness(harness);
+  }
+});
+
+test('real Chromium missing report mode defaults to safe Legacy static behavior', async ({ page, browserName }) => {
+  expect(browserName).toBe('chromium');
+  const harness = await startHarness({ reportMode: '' });
+  const apiRequests = [];
+  page.on('request', request => {
+    const url = new URL(request.url());
+    if (url.pathname.startsWith('/api/coverage')) apiRequests.push(url.pathname);
+  });
+  try {
+    await page.goto(`${harness.baseUrl}/fixture.c.gcov.html`, { waitUntil: 'networkidle' });
+    await expect(page.locator('#L1 .coverage-analysis-panel')).toHaveCount(1);
+    await expect(page.locator('#L1 .coverage-analysis-panel')).toHaveAttribute(
+      'data-report-mode', 'LEGACY_STATIC'
+    );
+    await expect(page.locator('#L1 select[data-panel-action="status"]')).toBeDisabled();
+    expect(apiRequests).toEqual([]);
+  } finally {
+    await stopHarness(harness);
+  }
+});
+
 test('real Chromium virtualizes data and reuses cached viewport windows', async ({ page, browserName }) => {
   expect(browserName).toBe('chromium');
   const harness = await startHarness({ large: true });
@@ -461,6 +603,96 @@ test('real Chromium developer task refresh intersects owner lines with live pend
     await expect(row.locator('.js-task-unanalyzed')).toHaveText('0', { timeout: 10000 });
     await expect(page.locator('.js-dev-uncovered-lines')).toHaveText('0');
     await expect(row.locator('.js-task-action')).toContainText('已全部填写完成');
+  } finally {
+    await stopHarness(harness);
+  }
+});
+
+test('real Chromium developer task consumes the complete paginated pending snapshot', async ({ page, browserName }) => {
+  expect(browserName).toBe('chromium');
+  const taskPendingFiles = Array.from({ length: 401 }, (_, index) => ({
+    file_path: index === 0 ? 'src/fixture.c' : `src/pending-${index}.c`,
+    unanalyzed: index === 0 ? 1 : 0,
+    pending_line_numbers: index === 0 ? [2] : [],
+  }));
+  const harness = await startHarness({ taskPendingFiles });
+  try {
+    await page.goto(`${harness.baseUrl}/tasks.html`, { waitUntil: 'networkidle' });
+    await expect.poll(() => harness.pendingPageRequests).toBe(3);
+    await expect(page.locator('tr[data-owner-specific="true"] .js-task-unanalyzed')).toHaveText('1');
+    await expect(page.locator('.js-dev-uncovered-lines')).toHaveText('1');
+  } finally {
+    await stopHarness(harness);
+  }
+});
+
+test('real Chromium incremental page consumes complete pages, preserves filters, and applies zero transition', async ({ page, browserName }) => {
+  expect(browserName).toBe('chromium');
+  const taskPendingFiles = Array.from({ length: 401 }, (_, index) => ({
+    repository_name: index < 201 ? 'repo-a' : 'repo-b',
+    file_path: index === 0 ? 'src/fixture.c' : `src/pending-${index}.c`,
+    unanalyzed: index === 0 ? 1 : 0,
+    pending_line_numbers: index === 0 ? [2] : [],
+  }));
+  const harness = await startHarness({ taskPendingFiles });
+  try {
+    await page.goto(`${harness.baseUrl}/incremental.html`, { waitUntil: 'networkidle' });
+    await expect.poll(() => harness.pendingPageRequests).toBe(3);
+
+    const target = page.locator('tr[data-file-key="repo-a::src/fixture.c"]');
+    await expect(target.locator('.js-unanalyzed-count')).toHaveText('1');
+    await expect(page.locator('#incremental-unanalyzed-total')).toHaveText('1');
+
+    await page.locator('#repo-filter').selectOption('repo-a');
+    await expect(page.locator('#filter-count')).toHaveText('已筛选出 201 / 401 个文件');
+    await page.locator('.sort-button[data-sort-key="unanalyzed"]').click();
+    await expect(target).toBeVisible();
+
+    harness.setTaskPendingFiles(taskPendingFiles.map(file => ({
+      ...file,
+      unanalyzed: 0,
+      pending_line_numbers: [],
+    })));
+    await page.waitForTimeout(2200);
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await expect(target.locator('.js-unanalyzed-count')).toHaveText('0', { timeout: 10000 });
+    await expect(target.locator('.js-unanalyzed-count')).toHaveAttribute('data-sort-value', '0');
+    await expect(page.locator('#incremental-unanalyzed-total')).toHaveText('0');
+    await expect(page.locator('#filter-count')).toHaveText('已筛选出 201 / 401 个文件');
+  } finally {
+    await stopHarness(harness);
+  }
+});
+
+test('real Chromium ignores a reordered stale pending snapshot response', async ({ page, browserName }) => {
+  expect(browserName).toBe('chromium');
+  const taskPendingFiles = [{
+    repository_name: 'repo-a', file_path: 'src/fixture.c',
+    unanalyzed: 1, pending_line_numbers: [2],
+  }];
+  const harness = await startHarness({
+    taskPendingFiles, reorderPendingResponses: true,
+  });
+  try {
+    await page.goto(`${harness.baseUrl}/incremental.html`, { waitUntil: 'domcontentloaded' });
+    await expect.poll(() => harness.pendingPageRequests).toBe(1);
+    const target = page.locator('tr[data-file-key="repo-a::src/fixture.c"]');
+    await expect(target.locator('.js-unanalyzed-count')).toHaveText('1');
+
+    harness.setTaskPendingFiles([{
+      repository_name: 'repo-a', file_path: 'src/fixture.c',
+      unanalyzed: 0, pending_line_numbers: [],
+    }]);
+    await page.waitForTimeout(2200);
+    await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+    await expect.poll(() => harness.pendingPageRequests).toBe(2);
+    await expect(target.locator('.js-unanalyzed-count')).toHaveText('0', { timeout: 10000 });
+
+    // The delayed first response arrives after the new generation and must be
+    // ignored instead of restoring the old server-rendered count.
+    await page.waitForTimeout(1800);
+    await expect(target.locator('.js-unanalyzed-count')).toHaveText('0');
+    await expect(page.locator('#incremental-unanalyzed-total')).toHaveText('0');
   } finally {
     await stopHarness(harness);
   }

@@ -240,6 +240,7 @@ def build_fixture():
                 html = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="coverage-project" content="HttpFixture">
+<meta name="coverage-report-mode" content="VNEXT_ARTIFACT_READY">
 <meta name="coverage-report-id" content="report_http_fixture">
 <meta name="coverage-scan-id" content="{scan_id}">
 <meta name="coverage-repository-name" content="repo-a">

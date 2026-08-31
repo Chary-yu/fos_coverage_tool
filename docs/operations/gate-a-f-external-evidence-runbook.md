@@ -39,7 +39,7 @@ JSON 复制到对应 bundle 文件，并在 Evidence Manifest v2 中记录外部
 - 数据库类证据的 `database_runtime_identity`；
 - 参与计算的 source artifact SHA256。
 
-Gate matrix 会拒绝把某个 Gate 的 manifest 复用给另一个 Gate，也会拒绝旧 commit、手写 `status=PASSED` 或 hash 不匹配的 artifact。
+Gate matrix 会拒绝把某个 Gate 的 manifest 复用给另一个 Gate，也会拒绝旧 commit、手写 `status=PASSED` 或 hash 不匹配的 artifact。对 Gate A 的 MariaDB rehearsal，运行时指纹还必须包含以 `5.5` 开头的数据库版本；Gate A backup、Gate B backfill 和 Gate C restart 的 flat JSON 证据同样必须显式携带非空 `database_runtime_identity`，不能靠通用 `evidence_class` 名称绕过校验。
 
 ## Gate A：真实备份恢复迁移
 

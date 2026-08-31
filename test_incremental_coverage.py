@@ -354,8 +354,7 @@ class TestIncrementalReviewInjection(unittest.TestCase):
         self.assertIn('meta name="coverage-review-scope" content="incremental"', enhanced)
         with open(os.path.join(self.output_dir, "coverage_progress.html"), "r", encoding="utf-8") as progress_file:
             self.assertIn('data-review-scope="incremental"', progress_file.read())
-        with open(os.path.join(self.output_dir, "coverage_progress.js"), "r", encoding="utf-8") as progress_js_file:
-            self.assertIn('const DEFAULT_REVIEW_SCOPE = "incremental";', progress_js_file.read())
+        self.assertFalse(os.path.exists(os.path.join(self.output_dir, "coverage_progress.js")))
         self.assertTrue(os.path.exists(os.path.join(self.output_dir, "incremental_coverage.html")))
         self.assertTrue(os.path.exists(os.path.join(self.output_dir, "incremental_developer_tasks.html")))
         self.assertTrue(os.path.exists(os.path.join(self.output_dir, "incremental_coverage.xlsx")))
@@ -584,9 +583,9 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         with open(js_path, "r", encoding="utf-8") as f:
             js_content = f.read()
 
-        self.assertIn('/incremental/unanalyzed', js_content)
+        self.assertIn('CoveragePendingSnapshot.fetchComplete', js_content)
         self.assertIn('refreshDeveloperTasks', js_content)
-        self.assertIn('fetchUnanalyzedFromCandidates', js_content)
+        self.assertNotIn('fetchUnanalyzedFromCandidates', js_content)
         self.assertIn('visibilitychange', js_content)
         self.assertIn('pageshow', js_content)
         self.assertIn('focus', js_content)
@@ -595,9 +594,12 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         self.assertIn('.js-task-action', js_content)
         self.assertIn('.js-dev-review-files', js_content)
         self.assertIn('.js-dev-uncovered-lines', js_content)
-        self.assertIn('pending_line_numbers', js_content)
         self.assertIn('countOwnedPendingLines', js_content)
         self.assertIn('data-owned-lines', js_content)
+        with open(enhance_coverage.PENDING_SNAPSHOT_JS_SOURCE_PATH, "r", encoding="utf-8") as pending_file:
+            pending_js = pending_file.read()
+        self.assertIn('/incremental/unanalyzed', pending_js)
+        self.assertIn('pending_line_numbers', pending_js)
 
     def test_url_search_param_parsing_and_history_replace_state_in_incremental_js(self):
         js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH
@@ -616,12 +618,17 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         with open(js_path, "r", encoding="utf-8") as f:
             js_content = f.read()
 
-        self.assertIn('PROGRESS_PAGE_VERSION = \'visible-progress-20260818_v9_12\'', js_content)
+        self.assertIn('PROGRESS_PAGE_VERSION = \'visible-progress-vnext-20260828_v1\'', js_content)
+        self.assertNotIn('visible-progress-20260818_v9_12', js_content)
 
         html_path = enhance_coverage.PROGRESS_PAGE_SOURCE_PATH
         with open(html_path, "r", encoding="utf-8") as f:
             html_content = f.read()
 
+        self.assertIn(
+            'src="coverage_progress.js?v=visible-progress-vnext-20260828_v1"',
+            html_content,
+        )
         self.assertIn('.progress-link', html_content)
         self.assertIn('.progress-link:hover', html_content)
         self.assertIn('页面版本', html_content)
@@ -763,10 +770,10 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
             handler.send_json_response = send_json
             enhance_coverage.CoverageHTTPRequestHandler.do_GET(handler)
             self.assertEqual(sent_data.get("code"), 200)
-            self.assertEqual(sent_data["body"]["status"], "success")
-            self.assertEqual(sent_data["body"]["data"]["project_name"], "FOS_V6R2")
-            self.assertEqual(sent_data["body"]["data"]["data_version"], 42)
-            self.assertEqual(sent_data["body"]["data"]["total_unanalyzed"], 3)
+            self.assertEqual(sent_data["body"]["project_name"], "FOS_V6R2")
+            self.assertEqual(sent_data["body"]["data_version"], 42)
+            self.assertEqual(sent_data["body"]["total_unanalyzed"], 3)
+            self.assertIn("scan_id", sent_data["body"])
 
     def test_api_incremental_unanalyzed_includes_pending_line_numbers(self):
         counts = {"src/a.c": 2}
@@ -787,7 +794,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
                 )
                 enhance_coverage.CoverageHTTPRequestHandler.do_GET(handler)
                 self.assertEqual(
-                    sent_data["body"]["data"]["files"][0]["pending_line_numbers"],
+                    sent_data["body"]["files"][0]["pending_line_numbers"],
                     [10, 12],
                 )
         finally:
@@ -841,7 +848,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
             js_content = f.read()
 
         self.assertIn('function refreshUnanalyzedCounts()', js_content)
-        self.assertIn('/incremental/unanalyzed', js_content)
+        self.assertIn('CoveragePendingSnapshot.fetchComplete', js_content)
         self.assertIn('pageshow', js_content)
         self.assertIn('visibilitychange', js_content)
         self.assertIn('focus', js_content)
@@ -937,7 +944,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         with open(js_path, "r", encoding="utf-8") as f:
             js_content = f.read()
 
-        self.assertIn('totalEl.setAttribute("title", "待分析动态刷新失败，正在显示当前快照数值 (" + (err.message || err) + ")");', js_content)
+        self.assertIn('totalEl.setAttribute("title", "待分析动态刷新失败，未应用不完整快照 (" + (err.message || err) + ")");', js_content)
         self.assertIn('totalEl.classList.add("refresh-failed")', js_content)
         self.assertIn('totalEl.removeAttribute("title")', js_content)
 
@@ -970,13 +977,14 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
             self.assertIn("Database query failed for configured MySQL database", str(cm.exception))
 
     def test_incremental_js_supports_multi_candidate_api_resolution(self):
-        """Test 18: Verify incremental_coverage.js includes getApiBaseCandidates and fetchUnanalyzedFromCandidates."""
+        """Test 18: Verify incremental_coverage.js uses the shared complete snapshot client."""
         js_path = enhance_coverage.INCREMENTAL_JS_SOURCE_PATH
         with open(js_path, "r", encoding="utf-8") as f:
             js_content = f.read()
 
         self.assertIn("function getApiBaseCandidates()", js_content)
-        self.assertIn("function fetchUnanalyzedFromCandidates(", js_content)
+        self.assertIn("CoveragePendingSnapshot.fetchComplete", js_content)
+        self.assertNotIn("function fetchUnanalyzedFromCandidates(", js_content)
         self.assertIn("resolvedApiBase", js_content)
 
     def test_unanalyzed_cache_refreshes_after_data_version_change(self):
@@ -1014,6 +1022,7 @@ class TestMultiRepositoryReviewInjection(unittest.TestCase):
         mock_config = {"mysql": {"host": "127.0.0.1", "port": 3306}}
 
         sqlite_conn = sqlite3.connect(":memory:", check_same_thread=False)
+        self.addCleanup(sqlite_conn.close)
         sqlite_conn.row_factory = sqlite3.Row
         cur = sqlite_conn.cursor()
 

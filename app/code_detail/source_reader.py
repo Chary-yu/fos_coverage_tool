@@ -1058,6 +1058,8 @@ def load_source_sidecar(
         try:
             with open(sidecar_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            if str(data.get("report_id") or "") != str(report_id):
+                raise ValueError("sidecar report identity mismatch")
             return SourceContext.from_dict(data)
         except Exception as e:
             logger.warning(f"[SourceReader] Failed to load sidecar {sidecar_path}: {e}")

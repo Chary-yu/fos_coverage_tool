@@ -74,13 +74,16 @@ def _executemany_batched(connection, statement, rows, batch_size=1000):
 
 
 def seed_legacy_fixture(connection, project_name="fixture", line_count=2,
-                        analysis_count=None, job_count=0):
+                        analysis_count=None, job_count=0, draft_stride=0):
     """Populate deterministic facts and return source counts.
 
     ``line_count`` and ``analysis_count`` are intentionally independent so
     analysis-only rows can be exercised by migration tests.
     """
     analysis_count = line_count if analysis_count is None else int(analysis_count)
+    draft_stride = int(draft_stride or 0)
+    if draft_stride < 0:
+        raise ValueError("draft_stride must be non-negative")
     stamp = utc_sql()
     path = "src/fixture.c"
     path_hash = hashlib.md5(path.encode("utf-8")).hexdigest()
@@ -98,18 +101,21 @@ def seed_legacy_fixture(connection, project_name="fixture", line_count=2,
          stamp, stamp)
         for line_number in range(1, int(line_count) + 1)
     ])
+    analysis_rows = []
+    for line_number in range(1, int(analysis_count) + 1):
+        is_draft = int(bool(draft_stride and line_number % draft_stride == 0))
+        analysis_rows.append(
+            (project_name, path, path_hash, "fixture.c", line_number,
+             "reviewer", "可覆盖", is_draft, "unit", "", "comment", "remark",
+             stamp, stamp)
+        )
     _executemany_batched(connection, """
         INSERT INTO coverage_analysis(
             project_name, file_path, file_path_hash, source_file_name,
             line_number, reviewer, status, is_draft, coverage_method,
             uncovered_reason, comment, remark, created_at, updated_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, [
-        (project_name, path, path_hash, "fixture.c", line_number,
-         "reviewer", "可覆盖", 0, "unit", "", "comment", "remark",
-         stamp, stamp)
-        for line_number in range(1, int(analysis_count) + 1)
-    ])
+    """, analysis_rows)
     cursor = connection.cursor()
     cursor.execute(adapt_sql(connection, """
         INSERT INTO coverage_project_state(
@@ -134,13 +140,17 @@ def seed_legacy_fixture(connection, project_name="fixture", line_count=2,
     ])
     connection.commit()
     return {"projects": 1, "lines": int(line_count),
-            "analyses": int(analysis_count), "jobs": int(job_count)}
+            "analyses": int(analysis_count),
+            "drafts": sum(row[7] for row in analysis_rows),
+            "jobs": int(job_count)}
 
 
-def sqlite_legacy_fixture(line_count=2, analysis_count=None, job_count=0):
+def sqlite_legacy_fixture(line_count=2, analysis_count=None, job_count=0,
+                          draft_stride=0):
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
     create_legacy_fixture_schema(connection)
     seed_legacy_fixture(connection, line_count=line_count,
-                        analysis_count=analysis_count, job_count=job_count)
+                        analysis_count=analysis_count, job_count=job_count,
+                        draft_stride=draft_stride)
     return connection

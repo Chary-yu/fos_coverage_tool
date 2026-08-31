@@ -42,6 +42,10 @@ from app.config.runtime_config import (
     validate_production_config,
 )
 from app.release_identity import generate_release_identity, verify_release_identity
+from app.reports.identity import (
+    LEGACY_STATIC, VNEXT_ARTIFACT_READY, validate_report_mode,
+)
+from app.api.serialization import to_jsonable
 from app.db.connection_pool import get_global_pool
 from app.progress.service import ProgressService
 from app.progress.file_state_service import (
@@ -104,12 +108,15 @@ PROGRESS_PAGE_SOURCE_PATH = os.path.join(SCRIPT_DIR, "web", "templates", "covera
 PROGRESS_JS_SOURCE_PATH = os.path.join(WEB_ASSET_ROOT, "js", "coverage_progress.js")
 INCREMENTAL_JS_SOURCE_PATH = os.path.join(WEB_ASSET_ROOT, "js", "incremental_coverage.js")
 DEVELOPER_TASKS_JS_SOURCE_PATH = os.path.join(WEB_ASSET_ROOT, "js", "incremental_developer_tasks.js")
+PENDING_SNAPSHOT_JS_SOURCE_PATH = os.path.join(WEB_ASSET_ROOT, "js", "pending_snapshot.js")
 DEFAULT_OWNERSHIP_XLSX_PATH = os.path.join(SCRIPT_DIR, "代码目录归属模块统计.xlsx")
 
 
 def _compute_asset_version() -> str:
     hasher = hashlib.sha256()
-    for fp in (JS_SOURCE_PATH, CSS_SOURCE_PATH, INCREMENTAL_JS_SOURCE_PATH, PROGRESS_JS_SOURCE_PATH, DEVELOPER_TASKS_JS_SOURCE_PATH):
+    for fp in (JS_SOURCE_PATH, CSS_SOURCE_PATH, INCREMENTAL_JS_SOURCE_PATH,
+               PROGRESS_JS_SOURCE_PATH, DEVELOPER_TASKS_JS_SOURCE_PATH,
+               PENDING_SNAPSHOT_JS_SOURCE_PATH):
         if os.path.isfile(fp):
             try:
                 with open(fp, "rb") as f:
@@ -1710,7 +1717,12 @@ def _finish_background_job(job_id, **values):
             _ensure_background_jobs_storage_dir()
             res_path = os.path.join(get_background_jobs_storage_dir(), f"progress_{job_id}.json")
             try:
-                json_str = json.dumps(values["data"], ensure_ascii=False)
+                # Background jobs cross the legacy/runtime boundary.  Keep
+                # Decimal/date/tuple normalization in the single API
+                # serializer rather than relying on a local json default.
+                json_str = json.dumps(
+                    to_jsonable(values["data"]), ensure_ascii=False
+                )
                 atomic_write_file(res_path, json_str)
                 job["result_path"] = res_path
                 job["output_path"] = res_path
@@ -2489,7 +2501,18 @@ def release_identity_meta_tags(identity: Optional[Dict[str, Any]] = None) -> str
     )
 
 
-def write_progress_page_targets(output_dir, real_output_html, review_scope="full"):
+def write_progress_page_targets(output_dir, real_output_html, review_scope="full",
+                                report_mode=LEGACY_STATIC):
+    """Write the progress page for the selected report contract.
+
+    The previous-release runtime deliberately keeps ``LEGACY_STATIC`` on its
+    old single-summary endpoint.  The repository template is the VNext
+    artifact and its cursor/detail calls must not leak into a legacy report.
+    VNext publication owns that template directly; this compatibility helper
+    therefore only emits the legacy inline page unless explicitly asked for a
+    VNext artifact.
+    """
+    report_mode = validate_report_mode(report_mode, default=LEGACY_STATIC)
     target_paths = [
         os.path.join(output_dir, "coverage_progress.html"),
         os.path.join(real_output_html, "coverage_progress.html"),
@@ -2499,7 +2522,10 @@ def write_progress_page_targets(output_dir, real_output_html, review_scope="full
         if target not in unique_targets:
             unique_targets.append(target)
 
-    source_exists = os.path.exists(PROGRESS_PAGE_SOURCE_PATH)
+    source_exists = (
+        report_mode == VNEXT_ARTIFACT_READY
+        and os.path.exists(PROGRESS_PAGE_SOURCE_PATH)
+    )
     for target in unique_targets:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         if source_exists:
@@ -2548,12 +2574,37 @@ def write_progress_page_targets(output_dir, real_output_html, review_scope="full
                 "w", encoding="utf-8"
             ) as runtime_target:
                 runtime_target.write(runtime_content)
+            shutil.copy2(
+                PENDING_SNAPSHOT_JS_SOURCE_PATH,
+                os.path.join(os.path.dirname(target), "pending_snapshot.js"),
+            )
         else:
+            legacy_content = DEFAULT_PROGRESS_PAGE_HTML
+            scope_literal = html.escape(str(review_scope), quote=True)
+            legacy_content, scope_replacement_count = re.subn(
+                r"(<body\b[^>]*\bdata-review-scope=)[\"'][^\"']*[\"']",
+                r'\1"{}"'.format(scope_literal),
+                legacy_content,
+                count=1,
+            )
+            if scope_replacement_count == 0:
+                legacy_content, scope_replacement_count = re.subn(
+                    r"<body\b([^>]*)>",
+                    r'<body\1 data-review-scope="{}">'.format(scope_literal),
+                    legacy_content,
+                    count=1,
+                )
+            if scope_replacement_count != 1:
+                raise RuntimeError("Failed to inject review scope into legacy coverage_progress.html")
             with open(target, "w", encoding="utf-8") as f:
-                f.write(DEFAULT_PROGRESS_PAGE_HTML)
+                f.write(legacy_content)
 
     if source_exists:
         print(f"[Injector] Copied progress page to: {', '.join(unique_targets)}")
+    elif report_mode == LEGACY_STATIC:
+        print(
+            f"[Injector] Wrote legacy progress page to: {', '.join(unique_targets)}"
+        )
     else:
         print(
             "[Warning] coverage_progress.html not found beside enhance_coverage.py; "
@@ -4836,14 +4887,40 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                     for fpath in all_file_paths
                 ]
                 total = sum(counts_map.values())
+                page_size = min(200, max(1, int(
+                    query_params.get("page_size", ["200"])[0] or 200
+                )))
+                raw_cursor = query_params.get("cursor", [""])[0]
+                offset = 0
+                if raw_cursor:
+                    try:
+                        cursor = json.loads(raw_cursor)
+                        if (int(cursor.get("data_version")) != int(ver) or
+                                int(cursor.get("offset")) < 0):
+                            raise ValueError
+                        offset = int(cursor["offset"])
+                    except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                        self.send_json_response(409, {
+                            "error": "PAGINATION_CURSOR_STALE",
+                            "message": "pending snapshot changed",
+                        })
+                        return
+                page = file_list[offset:offset + page_size]
+                next_offset = offset + len(page)
+                has_more = next_offset < len(file_list)
                 self.send_json_response(200, {
-                    "status": "success",
-                    "data": {
-                        "project_name": project_name,
-                        "data_version": ver,
-                        "total_unanalyzed": total,
-                        "files": file_list,
-                    }
+                    "project_name": project_name,
+                    "scan_id": None,
+                    "data_version": ver,
+                    "repository_name": None,
+                    "total_unanalyzed": total,
+                    "files": page,
+                    "page_size": page_size,
+                    "has_more": has_more,
+                    "next_cursor": (json.dumps({
+                        "data_version": int(ver), "offset": next_offset,
+                    }, sort_keys=True, separators=(",", ":"))
+                                    if has_more else None),
                 })
             except Exception as err:
                 print("[Incremental Unanalyzed API] Failed for project '{}': {}".format(project_name, err), flush=True)
@@ -5423,7 +5500,12 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
                                  source_input_file=None, can_reuse=False,
                                  incremental_reviewers_by_file=None,
                                  function_ranges_by_file=None, metadata_resolver=None,
-                                 scan_id=None, repository_name=""):
+                                 scan_id=None, repository_name="",
+                                 report_mode=LEGACY_STATIC):
+    report_mode = validate_report_mode(report_mode, default=LEGACY_STATIC)
+    if report_mode == VNEXT_ARTIFACT_READY and not (
+            report_id and scan_id and repository_name):
+        raise ValueError("VNEXT report identity is incomplete")
     depth = len(rel_path.split(os.sep)) - 1
     prefix = "../" * depth
 
@@ -5538,6 +5620,7 @@ def process_gcov_file_for_inject(file_path, rel_path, project_name, config, sync
         f'<meta name="coverage-scan-id" content="{html.escape(str(resolved_scan_id))}">\n'
         f'<meta name="coverage-repository-name" content="{html.escape(str(resolved_repository_name))}">\n'
         f'<meta name="coverage-file-path" content="{html.escape(report_file_path)}">\n'
+        f'<meta name="coverage-report-mode" content="{html.escape(report_mode)}">\n'
         f'<meta name="coverage-render-mode" content="{html.escape(render_mode)}">\n'
         f'<meta name="coverage-review-scope" content="{html.escape(review_scope)}">\n'
     )
@@ -5670,6 +5753,7 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
     register_report_directory(
         report_id, real_output_html, output_dir, os.path.join(real_output_html, ".source_cache"),
         sidecar_required=(render_mode == "lazy_collapse"),
+        report_mode=LEGACY_STATIC,
     )
     get_code_detail_service(search_dirs=[real_output_html, output_dir, os.path.join(real_output_html, ".source_cache")])
 
@@ -5677,7 +5761,10 @@ def inject_coverage_report(input_dir, output_dir, project_name=None, workers=Non
         os.path.join(real_output_html, "coverage_enhance.js"), project_name, render_mode, review_scope, report_id=report_id
     )
     shutil.copy2(CSS_SOURCE_PATH, os.path.join(real_output_html, "coverage_enhance.css"))
-    write_progress_page_targets(output_dir, real_output_html, review_scope)
+    write_progress_page_targets(
+        output_dir, real_output_html, review_scope,
+        report_mode=LEGACY_STATIC,
+    )
     print(f"[Injector] Copied static resources to: {real_output_html}")
     print(f"[Injector] Frontend project name: {project_name}")
     print(f"[Injector] Frontend render mode: {render_mode}")
@@ -6231,6 +6318,10 @@ def write_incremental_summary_page(output_html_dir, project_name, result, config
         shutil.copy2(INCREMENTAL_JS_SOURCE_PATH, target_js_path)
     else:
         raise RuntimeError(f"Required static asset {INCREMENTAL_JS_SOURCE_PATH} not found beside enhance_coverage.py")
+    shutil.copy2(
+        PENDING_SNAPSHOT_JS_SOURCE_PATH,
+        os.path.join(output_html_dir, "pending_snapshot.js"),
+    )
 
     rate = summary["coverage_rate"]
     rate_text = "N/A" if rate is None else "{:.2f}%".format(rate)
@@ -6387,7 +6478,7 @@ td a:hover{{text-decoration:underline}}
     </div>
   </div>
 </div>
-</main><script src="incremental_coverage.js?v={asset_version}"></script></body></html>""".format(
+</main><script src="pending_snapshot.js?v={asset_version}"></script><script src="incremental_coverage.js?v={asset_version}"></script></body></html>""".format(
         asset_version=ASSET_VERSION,
         version_label=VERSION_DISPLAY_LABEL,
         project=escaped(project_name),
@@ -6416,6 +6507,10 @@ def write_incremental_developer_tasks_page(output_html_dir, project_name, result
         shutil.copy2(DEVELOPER_TASKS_JS_SOURCE_PATH, target_js_path)
     else:
         raise RuntimeError(f"Required static asset {DEVELOPER_TASKS_JS_SOURCE_PATH} not found beside enhance_coverage.py")
+    shutil.copy2(
+        PENDING_SNAPSHOT_JS_SOURCE_PATH,
+        os.path.join(output_html_dir, "pending_snapshot.js"),
+    )
 
     def escaped(value):
         return html.escape(str(value), quote=True)
@@ -6568,7 +6663,7 @@ td a:hover{{text-decoration:underline}}
 <section><h2>👥 人员概览</h2><div class="table-wrap"><table><thead><tr><th>开发人员</th><th>提交数</th><th>提交文件</th><th>本人新增行</th><th>本人新增行引用</th><th>需填写文件</th><th>本人待填写行</th><th>本人待填写行引用</th></tr></thead><tbody>{summary_rows}</tbody></table></div></section>
 <aside class="muted" style="margin:12px 0 20px;text-align:center">说明：按 newgit 最终代码的 Git blame“姓名 + 邮箱”区分人员；多人提交同一文件时，每个开发人员只统计自己拥有的新增行，待填写行号可追溯到对应文件。</aside>
 {sections}
-</main><script src="incremental_developer_tasks.js?v={version_tag}"></script></body></html>""".format(
+</main><script src="pending_snapshot.js?v={version_tag}"></script><script src="incremental_developer_tasks.js?v={version_tag}"></script></body></html>""".format(
         project=escaped(project_name),
         project_url=escaped(urllib.parse.quote(str(project_name), safe="")),
         summary_rows=summary_table_rows,

@@ -9,11 +9,16 @@ from app.config.path_policy import realpath_within, reject_relative_traversal
 from app.db.repositories import (
     ProjectRepository, ProjectStateRepository, LineIndexRepository,
     RepositoryRepository,
+    FileStateRepository,
 )
 from app.db.transaction import transaction
-from app.reports.identity import validate_report_id
+from app.reports.identity import (
+    DEFAULT_SIDECAR_SCHEMA_VERSION, LEGACY_STATIC, VNEXT_ARTIFACT_READY,
+    SUPPORTED_SIDECAR_SCHEMA_VERSIONS, validate_report_id, validate_report_mode,
+)
 from app.reports.compatibility import with_report_compatibility
 from app.scan_import.publication import ScanPublicationService
+from app.services.file_state_service import FileStateService
 
 
 CONSTRUCTION_STATUSES = {"building", "importing", "constructing"}
@@ -24,11 +29,16 @@ FILE_INGEST_BATCH_SIZE = 128
 class ProjectService(object):
     def __init__(self, project_repo=None, state_repo=None, line_repo=None,
                  allowed_report_roots=None, repository_repo=None,
-                 release_identity=None, api_contract_version=None):
+                 release_identity=None, api_contract_version=None,
+                 file_state_repo=None, file_state_service=None):
         self.projects = project_repo or ProjectRepository()
         self.states = state_repo or ProjectStateRepository()
         self.lines = line_repo or LineIndexRepository()
         self.repositories = repository_repo or RepositoryRepository()
+        self.file_states = file_state_repo or FileStateRepository()
+        self.file_state_service = file_state_service or FileStateService(
+            self.file_states, self.states
+        )
         self.publication = ScanPublicationService(self.states)
         self.allowed_report_roots = [os.path.realpath(root) for root in
                                      (allowed_report_roots or [])]
@@ -37,15 +47,35 @@ class ProjectService(object):
 
     def prepare_report(self, report):
         """Normalize report metadata before binding it to an immutable Scan."""
-        return with_report_compatibility(
+        prepared = with_report_compatibility(
             report, self.release_identity,
             api_contract_version=self.api_contract_version,
         )
+        if not prepared:
+            return prepared
+        default_mode = VNEXT_ARTIFACT_READY if prepared.get("report_root") else LEGACY_STATIC
+        prepared = dict(prepared)
+        prepared["report_mode"] = validate_report_mode(
+            prepared.get("report_mode"), default=default_mode
+        )
+        if (prepared["report_mode"] == VNEXT_ARTIFACT_READY and
+                int(prepared.get("sidecar_schema") or 0) <= 0):
+            prepared["sidecar_schema"] = DEFAULT_SIDECAR_SCHEMA_VERSION
+        return prepared
 
     def _validate_report(self, report):
         if not report:
             return
         validate_report_id(report.get("report_id"))
+        mode = validate_report_mode(report.get("report_mode"))
+        if mode == VNEXT_ARTIFACT_READY and not report.get("report_root"):
+            raise ValueError("VNEXT report_root is required")
+        if mode == VNEXT_ARTIFACT_READY:
+            if not str(report.get("asset_identity") or "").strip():
+                raise ValueError("VNEXT asset_identity is required")
+            if int(report.get("sidecar_schema") or 0) not in \
+                    SUPPORTED_SIDECAR_SCHEMA_VERSIONS:
+                raise ValueError("VNEXT sidecar_schema is unsupported")
         roots = [report.get("report_root")] + list(report.get("directories") or [])
         for root in roots:
             if not root:
@@ -163,6 +193,7 @@ class ProjectService(object):
                     source_signature=report.get("source_signature", ""),
                     sidecar_schema=report.get("sidecar_schema", 0),
                     asset_identity=report.get("asset_identity", ""),
+                    report_mode=report.get("report_mode"),
                 )
             self.states.ensure(conn, project["id"])
             self.states.advance(conn, project["id"])
@@ -311,10 +342,14 @@ class ProjectService(object):
                     source_signature=report.get("source_signature", ""),
                     sidecar_schema=report.get("sidecar_schema", 0),
                     asset_identity=report.get("asset_identity", ""),
+                    report_mode=report.get("report_mode"),
                 )
             self._ingest_files(conn, scan["id"], files)
             self.states.ensure(conn, project["id"])
-            self.states.advance(conn, project["id"])
+            next_state = self.states.advance(conn, project["id"])
+            self.file_state_service.rebuild_validate_and_mark_ready_in_transaction(
+                conn, project["id"], scan["id"], int(next_state["data_version"])
+            )
             self.projects.seal_scan(conn, scan["id"])
             # Synchronous compatibility API: the actual pointer mutation is
             # still owned by ScanPublicationService and happens only after
@@ -356,7 +391,10 @@ class ProjectService(object):
         with transaction(connection) as conn:
             self._ingest_files(conn, scan_id, files)
             self.states.ensure(conn, project["id"])
-            self.states.advance(conn, project["id"])
+            next_state = self.states.advance(conn, project["id"])
+            self.file_state_service.rebuild_validate_and_mark_ready_in_transaction(
+                conn, project["id"], scan_id, int(next_state["data_version"])
+            )
             self.projects.seal_scan(conn, scan_id)
             self.publication.publish_in_transaction(
                 conn, project["id"], scan_id,

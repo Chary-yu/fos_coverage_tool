@@ -4,7 +4,9 @@ import json
 import os
 import tempfile
 
-from app.reports.identity import validate_report_id
+from app.reports.identity import (
+    LEGACY_STATIC, VNEXT_ARTIFACT_READY, validate_report_id, validate_report_mode,
+)
 
 
 class ReportRegistry(object):
@@ -17,7 +19,63 @@ class ReportRegistry(object):
 
     def register(self, report_id, directories, **metadata):
         report_id = validate_report_id(report_id)
-        directories = [self._canonical_report_root(report_id, path) for path in directories or []]
+        existing_metadata = self.load_exact(report_id) or {}
+        requested_mode = metadata.get("report_mode")
+        mode_explicit = requested_mode is not None
+        if requested_mode is None:
+            requested_mode = existing_metadata.get("report_mode")
+            mode_explicit = bool(existing_metadata.get("report_mode_explicit"))
+            if requested_mode is None or not mode_explicit:
+                # ``sidecar_required`` was part of the pre-mode registry
+                # format. It cannot, by itself, promote an historical report
+                # to VNext. Infer promotion only when the complete identity
+                # tuple is present; new code should pass ``report_mode``.
+                requested_mode = (
+                    VNEXT_ARTIFACT_READY if (
+                        metadata.get("asset_identity") and
+                        int(metadata.get("sidecar_schema") or 0) > 0 and
+                        (metadata.get("report_root") or directories) and
+                        metadata.get("scan_id") is not None
+                    ) else LEGACY_STATIC
+                )
+                mode_explicit = bool(
+                    metadata.get("asset_identity") and
+                    int(metadata.get("sidecar_schema") or 0) > 0 and
+                    (metadata.get("report_root") or directories) and
+                    metadata.get("scan_id") is not None
+                )
+        report_mode = validate_report_mode(requested_mode)
+        effective_root = (
+            metadata.get("report_root") or existing_metadata.get("report_root") or ""
+        )
+        effective_asset = (
+            metadata.get("asset_identity")
+            if metadata.get("asset_identity") not in (None, "")
+            else existing_metadata.get("asset_identity") or ""
+        )
+        effective_schema = int(
+            metadata.get("sidecar_schema")
+            if metadata.get("sidecar_schema") not in (None, "")
+            else existing_metadata.get("sidecar_schema") or 0
+        )
+        effective_scan = (
+            metadata.get("scan_id")
+            if metadata.get("scan_id") is not None
+            else existing_metadata.get("scan_id")
+        )
+        directories = list(directories or [])
+        if not directories and effective_root:
+            directories = [effective_root]
+        if report_mode == VNEXT_ARTIFACT_READY:
+            if not effective_root and not directories:
+                raise ValueError("VNEXT report_root is required")
+            if not effective_asset:
+                raise ValueError("VNEXT asset_identity is required")
+            if effective_schema <= 0:
+                raise ValueError("VNEXT sidecar_schema is required")
+            if effective_scan is None:
+                raise ValueError("VNEXT scan_id is required")
+        directories = [self._canonical_report_root(report_id, path) for path in directories]
         directories = list(dict.fromkeys(
             path for path in directories
             if path and os.path.isdir(path) and not os.path.islink(path)
@@ -46,14 +104,29 @@ class ReportRegistry(object):
         payload = {
             "report_id": report_id,
             "directories": merged,
-            "sidecar_required": bool(metadata.get(
-                "sidecar_required", current.get("sidecar_required", False)
-            )),
+            "sidecar_required": (
+                True if report_mode == VNEXT_ARTIFACT_READY else bool(metadata.get(
+                    "sidecar_required", current.get("sidecar_required", False)
+                ))
+            ),
             "report_root": metadata.get("report_root", current.get("report_root", "")),
             "scan_id": metadata.get("scan_id", current.get("scan_id")),
             "source_signature": metadata.get(
                 "source_signature", current.get("source_signature", "")
             ),
+            "report_mode": report_mode,
+            "report_mode_explicit": bool(mode_explicit),
+            "sidecar_schema": int(metadata.get(
+                "sidecar_schema", current.get("sidecar_schema", 0)
+            ) or 0),
+            "asset_identity": metadata.get(
+                "asset_identity", current.get("asset_identity", "")
+            ) or "",
+            "repository_names": sorted(set(str(item or "") for item in (
+                metadata.get("repository_names", current.get("repository_names", []))
+                or []
+            ) if str(item or ""))),
+            "session_id": metadata.get("session_id", current.get("session_id", "")) or "",
         }
         fd, temp_path = tempfile.mkstemp(prefix=".registry-", dir=self.registry_dir)
         try:

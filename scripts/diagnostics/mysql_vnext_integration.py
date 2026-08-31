@@ -47,7 +47,9 @@ from app.code_detail.source_reader import (
 )
 from app.db.manager import DatabaseManager
 from app.db.repositories.base import fetchone
+from app.db.repositories import FileStateRepository, ProjectStateRepository
 from app.scan_import import RepositoryBusyError
+from app.services.file_state_service import FileStateService
 from scripts.upgrade.migration_runner import apply_schema
 from scripts.upgrade.migration_runner import (
     capture_vnext_semantic_snapshot,
@@ -171,6 +173,52 @@ def _assert(condition, message):
         raise AssertionError(message)
 
 
+def _file_state_ready_evidence(runtime, connection, scan):
+    """Return the complete FileState readiness proof for one MariaDB Scan.
+
+    The disposable integration already exercises the production Ready owner
+    through ingest, analysis writes and an explicit rebuild.  Keep the
+    evidence structured so a compatibility lane cannot pass while only
+    checking that a migration marker exists: the state version, completeness,
+    pending conservation and authoritative reconciliation must all be present
+    and successful.
+    """
+    state = runtime.states.get(connection, int(scan["project_id"])) or {}
+    data_version = int(state.get("data_version") or 0)
+    file_state_version = int(state.get("file_state_version") or 0)
+    gate = runtime.file_state_service.validate_rebuilt(
+        connection, int(scan["project_id"]), int(scan["id"]), data_version
+    )
+    _assert(
+        data_version == file_state_version,
+        "MariaDB FileState version was not Ready for the current data version",
+    )
+    _assert(
+        gate.get("status") == "PASSED",
+        "MariaDB FileState Ready gate failed: {}".format(gate),
+    )
+    _assert(
+        (gate.get("completeness") or {}).get("status") == "PASSED",
+        "MariaDB FileState completeness gate failed",
+    )
+    _assert(
+        (gate.get("pending_conservation") or {}).get("status") == "PASSED",
+        "MariaDB pending conservation gate failed",
+    )
+    _assert(
+        (gate.get("reconciliation") or {}).get("status") == "PASSED",
+        "MariaDB FileState reconciliation gate failed",
+    )
+    return {
+        "status": "PASSED",
+        "project_id": int(scan["project_id"]),
+        "scan_id": int(scan["id"]),
+        "data_version": data_version,
+        "file_state_version": file_state_version,
+        "gate": gate,
+    }
+
+
 def _create_database(connection, database, collation="utf8mb4_unicode_ci"):
     with connection.cursor() as cursor:
         cursor.execute(
@@ -189,6 +237,77 @@ def _database_collation(connection):
         "character_set": str(row[0]),
         "collation": str(row[1]),
     }
+
+
+def _legacy_file_state_ready_evidence(connection, fixtures):
+    """Validate migrated FileState partitions for each generated project."""
+    service = FileStateService(FileStateRepository(), ProjectStateRepository())
+    evidence = {}
+    for project_name, fixture in fixtures.items():
+        project = fetchone(
+            connection,
+            "SELECT id FROM coverage_projects WHERE project_name=?",
+            (project_name,),
+        )
+        _assert(project, "migrated MariaDB project is missing: {}".format(project_name))
+        scan = fetchone(
+            connection,
+            "SELECT id FROM coverage_scans WHERE project_id=? ORDER BY id DESC LIMIT 1",
+            (project["id"],),
+        )
+        _assert(scan, "migrated MariaDB scan is missing: {}".format(project_name))
+        state = fetchone(
+            connection,
+            "SELECT data_version, file_state_version, current_scan_id "
+            "FROM coverage_project_state WHERE project_id=?",
+            (project["id"],),
+        ) or {}
+        data_version = int(state.get("data_version") or 0)
+        file_state_version = int(state.get("file_state_version") or 0)
+        gate = service.validate_rebuilt(
+            connection, int(project["id"]), int(scan["id"]), data_version
+        )
+        aggregate = fetchone(
+            connection,
+            "SELECT COALESCE(SUM(pending_total), 0) AS pending_total, "
+            "COALESCE(SUM(ordinary_pending_total), 0) AS ordinary_pending_total, "
+            "COALESCE(SUM(inherited_pending_total), 0) AS inherited_pending_total, "
+            "COALESCE(SUM(manual_draft_pending_total), 0) AS manual_draft_pending_total "
+            "FROM coverage_file_state WHERE scan_id=?",
+            (scan["id"],),
+        ) or {}
+        expected_ordinary = max(
+            0, int(fixture["lines"]) - int(fixture["analyses"])
+        )
+        expected_drafts = int(fixture.get("drafts") or 0)
+        _assert(data_version == file_state_version,
+                "migrated MariaDB FileState version is not Ready")
+        _assert(gate.get("status") == "PASSED",
+                "migrated MariaDB FileState gate failed: {}".format(gate))
+        _assert(int(aggregate.get("ordinary_pending_total") or 0)
+                == expected_ordinary,
+                "migrated MariaDB ordinary pending partition is incorrect")
+        _assert(int(aggregate.get("inherited_pending_total") or 0) == 0,
+                "migrated MariaDB unexpectedly created inherited pending facts")
+        _assert(int(aggregate.get("manual_draft_pending_total") or 0)
+                == expected_drafts,
+                "migrated MariaDB manual draft partition is incorrect")
+        _assert(int(aggregate.get("pending_total") or 0)
+                == expected_ordinary + expected_drafts,
+                "migrated MariaDB pending partition is not conserved")
+        _assert(int(state.get("current_scan_id") or 0) == int(scan["id"]),
+                "migrated MariaDB CURRENT scan was not published")
+        evidence[project_name] = {
+            "status": "PASSED",
+            "scan_id": int(scan["id"]),
+            "data_version": data_version,
+            "file_state_version": file_state_version,
+            "expected_ordinary_pending_total": expected_ordinary,
+            "expected_manual_draft_pending_total": expected_drafts,
+            "aggregate": aggregate,
+            "gate": gate,
+        }
+    return evidence
 
 
 def _drop_database(host, port, user, password, database):
@@ -255,11 +374,12 @@ def _run_legacy_migration_rehearsal(args):
         second_lines = total_lines - first_lines
         first_analyses = min(total_analyses, max(1, total_analyses // 2))
         second_analyses = max(0, total_analyses - first_analyses)
-        seed_legacy_fixture(
+        first_fixture = seed_legacy_fixture(
             source, project_name="fixture-a", line_count=first_lines,
             analysis_count=first_analyses, job_count=int(args.migration_jobs),
+            draft_stride=7,
         )
-        seed_legacy_fixture(
+        second_fixture = seed_legacy_fixture(
             source, project_name="fixture-b", line_count=second_lines,
             analysis_count=second_analyses, job_count=0,
         )
@@ -270,6 +390,9 @@ def _run_legacy_migration_rehearsal(args):
         first_schema = apply_schema(target, schema_path, release_sha=release_sha)
         first = migrate_legacy(source, target, release_sha=release_sha)
         domain = apply_analysis_domain(target, release_sha=release_sha)
+        first_file_state = _legacy_file_state_ready_evidence(
+            target, {"fixture-a": first_fixture, "fixture-b": second_fixture}
+        )
         source.rollback()
         first_snapshot = capture_vnext_semantic_snapshot(target)
 
@@ -290,6 +413,9 @@ def _run_legacy_migration_rehearsal(args):
 
         second = migrate_legacy(source, target, release_sha=release_sha)
         second_snapshot = capture_vnext_semantic_snapshot(target)
+        second_file_state = _legacy_file_state_ready_evidence(
+            target, {"fixture-a": first_fixture, "fixture-b": second_fixture}
+        )
         domain_again = apply_analysis_domain(target, release_sha=release_sha)
         second_schema = apply_schema(target, schema_path, release_sha=release_sha)
 
@@ -316,6 +442,7 @@ def _run_legacy_migration_rehearsal(args):
             "evidence_class": "real_mariadb_legacy_migration_rehearsal",
             "database_engine": "MariaDB",
             "database_version": _database_version(args),
+            "python_runtime": platform.python_version(),
             "synthetic": True,
             "synthetic_reason": "generated legacy fixture; not production backup evidence",
             "source_database": source_database,
@@ -334,6 +461,10 @@ def _run_legacy_migration_rehearsal(args):
                 "legacy_migration_first_run": first,
                 "analysis_domain_first_apply": domain,
                 "analysis_domain_second_apply": domain_again,
+                "file_state_ready_gate": {
+                    "first_run": first_file_state,
+                    "second_run": second_file_state,
+                },
                 "semantic_snapshot_stable_on_rerun": True,
                 "target_counts": counts,
             },
@@ -695,6 +826,10 @@ def run(args):
         _assert(str(scan["status"]) in ("ready", "sealed"),
                 "scan was not sealed after MySQL ingest")
         checks["bulk_scan_ingest_and_seal"] = True
+        with runtime.connection_context(read_only=True) as connection:
+            ready_after_ingest = _file_state_ready_evidence(
+                runtime, connection, scan
+            )
 
         application = runtime.application()
         status, layout = application.dispatch(
@@ -736,9 +871,22 @@ def run(args):
         _assert(status == 200 and int(saved["saved"]) == 1,
                 "real MySQL bulk analysis save failed")
         checks["bulk_analysis_upsert"] = True
+        with runtime.connection_context(read_only=True) as connection:
+            ready_after_analysis = _file_state_ready_evidence(
+                runtime, connection, scan
+            )
 
         with runtime.connection_context(read_only=False) as connection:
             runtime.progress_service.rebuild(connection, project_name, scan["id"])
+        with runtime.connection_context(read_only=True) as connection:
+            ready_after_rebuild = _file_state_ready_evidence(
+                runtime, connection, scan
+            )
+        checks["file_state_ready_gate"] = {
+            "after_ingest": ready_after_ingest,
+            "after_analysis": ready_after_analysis,
+            "after_explicit_rebuild": ready_after_rebuild,
+        }
         status, summary = application.dispatch(
             "GET", "/api/coverage/progress",
             query={"project": project_name, "scan_id": scan["id"]},
@@ -751,6 +899,67 @@ def run(args):
             "real MySQL SQL progress aggregate is incorrect",
         )
         checks["sql_progress_aggregate"] = True
+
+        status, files_page = application.dispatch(
+            "GET", "/api/coverage/progress/files",
+            query={
+                "project": project_name, "scan_id": scan["id"],
+                "page_size": 1,
+            },
+        )
+        _assert(
+            status == 200
+            and int(files_page.get("data_version") or -1)
+                == int(summary.get("data_version") or -2)
+            and len(files_page.get("files") or []) == 1
+            and int(files_page["files"][0].get("pending_total") or 0) == 1,
+            "real MySQL FileState files page is incorrect",
+        )
+        files_status = status
+        status, pending_page = application.dispatch(
+            "GET", "/api/coverage/progress/pending",
+            query={
+                "project": project_name, "scan_id": scan["id"],
+                "page_size": 1,
+            },
+        )
+        _assert(
+            status == 200
+            and int(pending_page.get("total") or 0) == 1
+            and len(pending_page.get("rows") or []) == 1,
+            "real MySQL pending line page is incorrect",
+        )
+        pending_status = status
+        status, incremental_page = application.dispatch(
+            "GET", "/api/coverage/incremental/unanalyzed",
+            query={
+                "project": project_name, "scan_id": scan["id"],
+                "page_size": 1,
+            },
+        )
+        _assert(
+            status == 200
+            and int(incremental_page.get("data_version") or -1)
+                == int(summary.get("data_version") or -2)
+            and len(incremental_page.get("files") or []) == 1
+            and int(incremental_page["files"][0].get("unanalyzed") or 0) == 1,
+            "real MySQL incremental pending page is incorrect",
+        )
+        checks["file_state_paged_reads"] = {
+            "files": {
+                "status": files_status,
+                "rows": len(files_page.get("files") or []),
+            },
+            "pending": {
+                "status": pending_status,
+                "total": int(pending_page.get("total") or 0),
+                "rows": len(pending_page.get("rows") or []),
+            },
+            "incremental": {
+                "status": status,
+                "rows": len(incremental_page.get("files") or []),
+            },
+        }
 
         with runtime.connection_context(read_only=False) as connection:
             before = fetchone(
@@ -958,6 +1167,7 @@ def main(argv=None):
             "required_version_prefix": str(
                 getattr(args, "require_version_prefix", "") or ""
             ),
+            "python_runtime": platform.python_version(),
             "synthetic": True,
             "synthetic_reason": "generated disposable input/report; real database runtime only",
             "candidate_revision": _revision(),

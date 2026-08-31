@@ -41,6 +41,16 @@ class ProjectStateRepository(object):
         cursor.close()
         return self.get(connection, project_id)
 
+    def invalidate(self, connection, project_id: int):
+        """Explicitly mark the derived projection stale before a rebuild."""
+        cursor = execute(connection, """
+            UPDATE coverage_project_state
+            SET file_state_version = 0, updated_at = CURRENT_TIMESTAMP
+            WHERE project_id = ?
+        """, (int(project_id),))
+        cursor.close()
+        return self.get(connection, project_id)
+
     def mark_ready(self, connection, project_id: int, version: int):
         cursor = execute(connection, """
             UPDATE coverage_project_state SET file_state_version = ?, updated_at = CURRENT_TIMESTAMP

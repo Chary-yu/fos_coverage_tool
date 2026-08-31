@@ -114,6 +114,127 @@ class GateMatrixEvidenceTest(unittest.TestCase):
             except OSError:
                 pass
 
+    def test_database_external_pass_requires_runtime_identity_and_mariadb_version(self):
+        old = os.environ.get("COVERAGE_GATE_TEST_EVIDENCE")
+        with tempfile.TemporaryDirectory(prefix="coverage-gate-db-") as directory:
+            path = os.path.join(directory, "mariadb.json")
+            artifact = os.path.join(directory, "mariadb.payload")
+            with open(artifact, "w", encoding="utf-8") as stream:
+                stream.write("MariaDB rehearsal artifact\n")
+            with open(artifact, "rb") as stream:
+                artifact_sha = hashlib.sha256(stream.read()).hexdigest()
+            payload = {
+                "status": "PASSED",
+                "gate": "gate-a",
+                "candidate_revision": self.revision,
+                "host_identity": {"hostname": "test"},
+                "evidence_class": "external_rehearsal",
+                "command_or_action": "MariaDB 5.5 rehearsal",
+                "started_at": "2026-08-21T00:00:00Z",
+                "finished_at": "2026-08-21T00:00:01Z",
+                "exit_code": 0,
+                "artifact_path": artifact,
+                "artifact_sha256": artifact_sha,
+                "release_identity": {"commit_sha": self.revision},
+                "synthetic": False,
+            }
+            os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = path
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream)
+            missing_identity = _external(
+                "mariadb_55_rehearsal", "MariaDB 5.5 rehearsal",
+                "COVERAGE_GATE_TEST_EVIDENCE", self.revision,
+                self.repo_root, "gate-a",
+            )
+            self.assertEqual(missing_identity["status"], "INCOMPLETE")
+            self.assertTrue(any(
+                "database_runtime_identity" in item
+                for item in missing_identity["violations"]
+            ))
+
+            payload["database_runtime_identity"] = {
+                "version": "10.11.8-MariaDB"
+            }
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream)
+            wrong_version = _external(
+                "mariadb_55_rehearsal", "MariaDB 5.5 rehearsal",
+                "COVERAGE_GATE_TEST_EVIDENCE", self.revision,
+                self.repo_root, "gate-a",
+            )
+            self.assertEqual(wrong_version["status"], "INCOMPLETE")
+            self.assertTrue(any(
+                "must start with 5.5" in item
+                for item in wrong_version["violations"]
+            ))
+
+            payload["database_runtime_identity"]["version"] = "5.5.68-MariaDB"
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream)
+            passed = _external(
+                "mariadb_55_rehearsal", "MariaDB 5.5 rehearsal",
+                "COVERAGE_GATE_TEST_EVIDENCE", self.revision,
+                self.repo_root, "gate-a",
+            )
+            self.assertEqual(passed["status"], "PASSED")
+            self.assertEqual(passed["violations"], [])
+        if old is None:
+            os.environ.pop("COVERAGE_GATE_TEST_EVIDENCE", None)
+        else:
+            os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = old
+
+    def test_database_external_v2_generic_record_cannot_hide_missing_identity(self):
+        old = os.environ.get("COVERAGE_GATE_TEST_EVIDENCE")
+        with tempfile.TemporaryDirectory(prefix="coverage-gate-db-v2-") as directory:
+            manifest_path = os.path.join(directory, "mariadb-manifest.json")
+            artifact = os.path.join(directory, "mariadb.payload")
+            with open(artifact, "w", encoding="utf-8") as stream:
+                stream.write("MariaDB v2 rehearsal artifact\n")
+            manifest = EvidenceManifestV2(
+                self.repo_root, "gate-a", candidate_revision=self.revision,
+                release_identity={"commit_sha": self.revision},
+                database_runtime_identity={"version": "5.5.68-MariaDB"},
+                manifest_path=manifest_path,
+            )
+            manifest.record(
+                "mariadb-rehearsal", "external_rehearsal", "PASSED",
+                command_or_action="MariaDB 5.5 rehearsal", exit_code=0,
+                artifact_path=artifact, candidate_revision=self.revision,
+                host_identity={"hostname": "test"},
+                database_runtime_identity={"version": "5.5.68-MariaDB"},
+                release_identity={"commit_sha": self.revision},
+                synthetic=False,
+            )
+            os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = manifest_path
+            manifest.data["evidence"][0]["database_runtime_identity"] = {}
+            manifest.save()
+            rejected = _external(
+                "mariadb_55_rehearsal", "MariaDB 5.5 rehearsal",
+                "COVERAGE_GATE_TEST_EVIDENCE", self.revision,
+                self.repo_root, "gate-a",
+            )
+            self.assertEqual(rejected["status"], "INCOMPLETE")
+            self.assertTrue(any(
+                "record 0 database_runtime_identity" in item
+                for item in rejected["violations"]
+            ))
+
+            manifest.data["evidence"][0]["database_runtime_identity"] = {
+                "version": "5.5.68-MariaDB"
+            }
+            manifest.save()
+            accepted = _external(
+                "mariadb_55_rehearsal", "MariaDB 5.5 rehearsal",
+                "COVERAGE_GATE_TEST_EVIDENCE", self.revision,
+                self.repo_root, "gate-a",
+            )
+            self.assertEqual(accepted["status"], "PASSED")
+            self.assertEqual(accepted["violations"], [])
+        if old is None:
+            os.environ.pop("COVERAGE_GATE_TEST_EVIDENCE", None)
+        else:
+            os.environ["COVERAGE_GATE_TEST_EVIDENCE"] = old
+
     def test_external_evidence_cannot_be_replayed_into_another_gate(self):
         fd, path = tempfile.mkstemp(prefix="coverage-gate-wrong-gate-", suffix=".json")
         os.close(fd)
@@ -198,6 +319,7 @@ class GateMatrixEvidenceTest(unittest.TestCase):
                 "status": "PASSED",
                 "gate": "gate-a",
                 "candidate_revision": self.revision,
+                "database_runtime_identity": {"version": "11.8"},
                 "host_identity": {"hostname": "test"},
                 "evidence_class": "verified_production_backup_restore_rehearsal",
                 "command_or_action": "verified backup rehearsal",

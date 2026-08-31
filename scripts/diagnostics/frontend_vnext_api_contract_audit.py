@@ -42,6 +42,7 @@ def audit(repo_root=ROOT):
         "scan_identity": r"scan_id:\s*currentScanId",
         "repository_identity": r"repository_name:\s*currentRepositoryName",
         "range_save": r"line_start:\s*panel\.block\.startLine",
+        "explicit_report_mode": r"coverage-report-mode",
     }
     missing = [name for name, pattern in required.items()
                if not re.search(pattern, text)]
@@ -57,7 +58,10 @@ def audit(repo_root=ROOT):
                       if re.search(pattern, text))
     progress_required = {
         "details_endpoint": r"/progress/details",
-        "top_level_details_renderer": r"renderDetailTable\(payload \|\| \{\}",
+        # The renderer receives a validated top-level envelope.  The old
+        # ``payload || {}`` fallback silently converted a missing response to
+        # an empty details table and is intentionally no longer required.
+        "top_level_details_renderer": r"renderDetailTable\(payload(?:\s*\|\|\s*\{\})?",
     }
     progress_missing = [
         name for name, pattern in progress_required.items()
@@ -67,7 +71,7 @@ def audit(repo_root=ROOT):
         "missing canonical Progress contract: {}".format(item)
         for item in progress_missing
     )
-    if re.search(r"payload\.data", progress_text):
+    if re.search(r"payload\.data\b", progress_text):
         violations.append(
             "canonical Progress asset must not unwrap the legacy payload.data envelope"
         )

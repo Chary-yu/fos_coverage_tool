@@ -1,0 +1,66 @@
+"""CLI for immutable report publication and atomic CURRENT switching."""
+
+from __future__ import print_function
+
+import argparse
+import json
+import os
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from app.release_identity import load_release_manifest
+from app.release_publication import ImmutableReleasePublisher
+
+
+def _load(path):
+    with open(path, "r", encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError("release identity must be a JSON object")
+    return value
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="publish_release.py")
+    parser.add_argument("--publish-root", required=True)
+    parser.add_argument("--source-root")
+    parser.add_argument("--release-identity")
+    parser.add_argument("--session-id")
+    parser.add_argument("--api-contract-version", default="")
+    parser.add_argument("--switch", action="store_true")
+    parser.add_argument("--rollback-session")
+    parser.add_argument("--validate-current", action="store_true")
+    args = parser.parse_args(argv)
+    publisher = ImmutableReleasePublisher(args.publish_root)
+    if args.validate_current:
+        result = publisher.validate_current()
+    elif args.rollback_session:
+        result = publisher.rollback(args.rollback_session)
+    else:
+        if not args.source_root or not args.release_identity or not args.session_id:
+            parser.error(
+                "--source-root, --release-identity and --session-id are required"
+            )
+        identity = _load(args.release_identity)
+        manifest = publisher.prepare(
+            args.source_root, identity, args.session_id,
+            api_contract_version=args.api_contract_version,
+        )
+        result = {
+            "status": "PASSED",
+            "release_validation_session_id": args.session_id,
+            "release_root": publisher.release_path(args.session_id),
+            "report_ids": manifest.get("report_ids") or [],
+        }
+        if args.switch:
+            result["switch"] = publisher.switch_current(args.session_id)
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0 if result.get("status") == "PASSED" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+

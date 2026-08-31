@@ -152,13 +152,25 @@ def apply_domain_constraints(connection, release_sha="", repo_root=None):
             "idempotent": False, "ddl_sha256": ddl_sha}
 
 
-def apply_analysis_domain(connection, release_sha="", scan_id=None):
+def apply_analysis_domain(connection, release_sha="", scan_id=None,
+                          record_ledger=True):
+    """Backfill and verify canonical Analysis Domain rows.
+
+    The compatibility ``migrate_legacy`` API historically leaves the target
+    schema-migration ledger empty; its caller owns the outer legacy migration
+    evidence.  ``record_ledger=False`` preserves that contract while still
+    executing the same authoritative backfill and consistency gate.
+    """
     service = AnalysisDomainService()
     with transaction(connection) as conn:
         result = service.repository.backfill_legacy(conn, scan_id=scan_id)
         audit = service.audit_consistency(conn, scan_id=scan_id)
         if audit["status"] != "PASSED":
             raise ValueError("analysis domain consistency failed: {}".format(audit))
+        if not record_ledger:
+            return {"status": "PASSED", "migration_id": DOMAIN_MIGRATION_ID,
+                    "backfill": result, "consistency": audit,
+                    "constraints": {"status": "SKIPPED", "reason": "legacy outer ledger"}}
         ddl_sha = hashlib.sha256(b"coverage-analysis-domain-v1").hexdigest()
         existing = fetchone(conn, """
             SELECT * FROM coverage_schema_migrations WHERE migration_id=?

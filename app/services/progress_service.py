@@ -1,14 +1,18 @@
 """Freshness-aware progress service over authoritative VNext facts."""
 
 from app.db.repositories import FileStateRepository, ProjectRepository, ProjectStateRepository
-from app.db.transaction import transaction
+from app.services.file_state_service import FileStateService
 
 
 class ProgressService(object):
-    def __init__(self, file_state_repo=None, project_repo=None, state_repo=None):
+    def __init__(self, file_state_repo=None, project_repo=None, state_repo=None,
+                 file_state_service=None):
         self.file_states = file_state_repo or FileStateRepository()
         self.projects = project_repo or ProjectRepository()
         self.states = state_repo or ProjectStateRepository()
+        self.file_state_service = file_state_service or FileStateService(
+            self.file_states, self.states
+        )
 
     def _project(self, connection, project_name):
         project = self.projects.get_project_by_name(connection, project_name)
@@ -32,6 +36,47 @@ class ProgressService(object):
             raise ValueError("MUTATION_REQUIRES_CURRENT_SCAN")
         return resolved
 
+    def _derived_gate(self, connection, project, state, scan_id):
+        """Return the full Ready gate, or ``None`` when the marker is stale.
+
+        A matching version is only a necessary condition.  Consumers of the
+        rebuildable FileState projection must also pass completeness,
+        conservation and authoritative reconciliation before they may read it.
+        Keeping that rule here prevents individual paged endpoints from
+        accidentally treating a partially rebuilt projection as Ready.
+        """
+        data_version = int(state.get("data_version") or 0)
+        file_state_version = int(state.get("file_state_version") or 0)
+        # Zero is the valid initial snapshot version (and is also preserved
+        # by the Legacy-to-VNext migration for projects with no historical
+        # mutation).  Equality plus the full gate below, rather than
+        # positivity, determines whether the derived projection is usable.
+        if file_state_version != data_version:
+            return None
+        try:
+            return self.file_state_service.validate_rebuilt(
+                connection, project["id"], int(scan_id), data_version
+            )
+        except Exception:
+            # Validation is an online read gate, not a reason to expose a
+            # broken projection as HTTP 500.  A malformed derived row,
+            # incompatible driver value or transient repository error must
+            # force every progress consumer onto authoritative facts.  Keep
+            # this diagnostic deliberately generic so database details do not
+            # leak into the response; rebuild jobs still receive the original
+            # exception and invalidate readiness in their own transaction.
+            return {
+                "status": "FAILED",
+                "reason": "FILE_STATE_VALIDATION_ERROR",
+                "project_id": int(project["id"]),
+                "scan_id": int(scan_id),
+                "data_version": data_version,
+                "pending_conservation": {
+                    "status": "FAILED",
+                    "reason": "FILE_STATE_VALIDATION_ERROR",
+                },
+            }
+
     def summary(self, connection, project_name, scan_id=None):
         project = self._project(connection, project_name)
         state = self.states.get(connection, project["id"]) or {
@@ -43,6 +88,8 @@ class ProgressService(object):
         if not scan_id:
             return {
                 "project_name": project_name, "scan_id": None, "source": "authoritative",
+                "derived_state_status": "NOT_APPLICABLE",
+                "derived_state_reason": "NO_CURRENT_SCAN",
                 "data_version": int(state.get("data_version") or 0),
                 "file_state_version": int(state.get("file_state_version") or 0),
                 "total_uncovered": 0, "filled_total": 0, "draft_total": 0,
@@ -51,34 +98,39 @@ class ProgressService(object):
                 "manual_draft_pending_total": 0, "pending_line_references": [],
                 "pending_conservation": {"status": "PASSED", "mismatched_files": 0},
             }
-        ready = (
-            int(state.get("file_state_version") or 0) == int(state.get("data_version") or 0)
-            and int(state.get("data_version") or 0) > 0
-        )
-        if ready:
+        data_version = int(state.get("data_version") or 0)
+        file_state_version = int(state.get("file_state_version") or 0)
+        gate = self._derived_gate(connection, project, state, scan_id)
+        if gate and gate.get("status") == "PASSED":
             aggregate = self.file_states.scan_aggregate(connection, scan_id)
-            if aggregate and int(aggregate.get("file_count") or 0) > 0:
+            if aggregate is not None:
                 result = self._aggregate_file_state_summary(
                     project_name, scan_id, state, aggregate
                 )
-                result["pending_conservation"] = self.file_states.pending_conservation(
-                    connection, int(scan_id)
-                )
+                result["pending_conservation"] = gate["pending_conservation"]
                 return result
         result = self.file_states.scan_summary_from_facts(connection, scan_id)
+        if gate is not None:
+            derived_status = "INVALID"
+            derived_reason = gate.get("reason") or "FILE_STATE_READY_GATE_FAILED"
+            conservation = gate.get("pending_conservation") or {}
+        else:
+            derived_status = "STALE"
+            derived_reason = (
+                "DATA_VERSION_MISMATCH" if file_state_version != data_version
+                else "DATA_VERSION_NOT_PUBLISHABLE"
+            )
+            conservation = self.file_states.pending_conservation(
+                connection, int(scan_id)
+            )
         result.update({
             "project_name": project_name,
             "source": "authoritative",
-            "data_version": int(state.get("data_version") or 0),
-            "file_state_version": int(state.get("file_state_version") or 0),
-            "pending_conservation": {
-                "status": "PASSED" if int(result.get("pending_total") or 0) == (
-                    int(result.get("ordinary_pending_total") or 0)
-                    + int(result.get("inherited_pending_total") or 0)
-                    + int(result.get("manual_draft_pending_total") or 0)
-                ) else "FAILED",
-                "mismatched_files": 0,
-            },
+            "data_version": data_version,
+            "file_state_version": file_state_version,
+            "derived_state_status": derived_status,
+            "derived_state_reason": derived_reason,
+            "pending_conservation": conservation,
         })
         return result
 
@@ -87,6 +139,8 @@ class ProgressService(object):
         return {
             "project_name": project_name, "scan_id": scan_id,
             "source": "coverage_file_state",
+            "derived_state_status": "READY",
+            "derived_state_reason": "READY",
             "data_version": int(state.get("data_version") or 0),
             "file_state_version": int(state.get("file_state_version") or 0),
             "file_count": int(aggregate.get("file_count") or 0),
@@ -113,15 +167,18 @@ class ProgressService(object):
         )
         if not scan_id:
             return self.summary(connection, project_name, scan_id)
-        with transaction(connection) as conn:
-            self.file_states.rebuild_scan(
-                conn, scan_id, int(state.get("data_version") or 0), None
-            )
-            self.states.mark_ready(conn, project["id"], int(state.get("data_version") or 0))
+        # This service method owns its transaction so a failed gate can persist
+        # the invalidation in a second transaction.  Calling the in-transaction
+        # variant here would roll that invalidation back together with the
+        # failed rebuild and could leave a pre-existing false-ready marker.
+        self.file_state_service.rebuild_validate_and_mark_ready(
+            connection, project["id"], scan_id,
+            int(state.get("data_version") or 0),
+        )
         return self.summary(connection, project_name, scan_id)
 
     def pending_by_file(self, connection, project_name, scan_id=None,
-                        page_size=200, cursor=None):
+                        page_size=200, cursor=None, repository_name=None):
         project = self._project(connection, project_name)
         state = self.states.get(connection, project["id"]) or {}
         scan_id = self._resolve_scan_for_project(
@@ -129,13 +186,17 @@ class ProgressService(object):
         )
         if not scan_id:
             return {"rows": [], "has_more": False, "next_cursor": None}
+        gate = self._derived_gate(connection, project, state, scan_id)
         page = self.file_states.pending_file_page(
-            connection, int(scan_id), limit=page_size, cursor=cursor
+            connection, int(scan_id), limit=page_size, cursor=cursor,
+            repository_name=repository_name,
+            data_version=int(state.get("data_version") or 0),
+            derived_ready=bool(gate and gate.get("status") == "PASSED"),
         )
         return page
 
     def files_page(self, connection, project_name, scan_id=None,
-                   page_size=200, cursor=None):
+                   page_size=200, cursor=None, repository_name=None):
         project = self._project(connection, project_name)
         state = self.states.get(connection, project["id"]) or {}
         scan_id = self._resolve_scan_for_project(
@@ -143,9 +204,12 @@ class ProgressService(object):
         )
         if not scan_id:
             return {"rows": [], "has_more": False, "next_cursor": None}
+        gate = self._derived_gate(connection, project, state, scan_id)
         return self.file_states.file_page(
             connection, int(scan_id), limit=page_size, cursor=cursor,
-            pending_only=False,
+            pending_only=False, repository_name=repository_name,
+            data_version=int(state.get("data_version") or 0),
+            derived_ready=bool(gate and gate.get("status") == "PASSED"),
         )
 
     def pending_page(self, connection, project_name, scan_id=None,
@@ -172,11 +236,9 @@ class ProgressService(object):
                 "line_number": int(last["line_number"]),
                 "line_id": int(last["line_id"]),
             }
+        gate = self._derived_gate(connection, project, state, scan_id)
         total = None
-        if (int(state.get("data_version") or 0) > 0 and
-                int(state.get("file_state_version") or 0) == int(
-                    state.get("data_version") or 0
-                )):
+        if gate and gate.get("status") == "PASSED":
             aggregate = self.file_states.scan_aggregate(connection, int(scan_id))
             if aggregate:
                 total = int(aggregate.get("pending_total") or 0)

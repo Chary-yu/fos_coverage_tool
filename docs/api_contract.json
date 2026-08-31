@@ -24,9 +24,48 @@
     "maximum_limit": 500,
     "cursor_binding": ["scan_id", "data_version", "filter"],
     "progress_details_envelope": ["scan_id", "file_id", "page_size", "has_more", "rows", "next_cursor"],
-    "progress_files_envelope": ["files", "page_size", "has_more", "next_cursor"],
+    "progress_files_envelope": ["project_name", "scan_id", "data_version", "repository_name", "files", "page_size", "has_more", "next_cursor"],
     "progress_pending_envelope": ["scan_id", "page_size", "total", "rows", "has_more", "next_cursor"],
-    "pending_files_envelope": ["files", "page_size", "has_more", "next_cursor"]
+    "pending_files_envelope": ["project_name", "scan_id", "data_version", "repository_name", "files", "page_size", "has_more", "next_cursor"],
+    "progress_files_identity": {
+      "scan_id": "integer or null only when the project has no current Scan",
+      "data_version": "non-negative integer",
+      "request_scan_id_echo": true
+    },
+    "pending_files_identity": {
+      "scan_id": "integer or null only when the project has no current Scan",
+      "data_version": "non-negative integer",
+      "request_scan_id_echo": true
+    }
+  },
+  "progress_summary": {
+    "required_fields": [
+      "total_uncovered",
+      "filled_total",
+      "draft_total",
+      "confirmed_total",
+      "pending_total",
+      "ordinary_pending_total",
+      "inherited_pending_total",
+      "manual_draft_pending_total",
+      "pending_conservation",
+      "data_version",
+      "file_state_version",
+      "source",
+      "derived_state_status"
+    ],
+    "display_rates": {
+      "fill_rate": "filled_total * 100 / total_uncovered when total_uncovered > 0, otherwise 0",
+      "confirmed_rate": "confirmed_total * 100 / total_uncovered when total_uncovered > 0, otherwise 0"
+    },
+    "deprecated_fields": [
+      "unfilled_total",
+      "coverable_total",
+      "uncoverable_total",
+      "redundant_total",
+      "fill_rate",
+      "confirmed_rate"
+    ]
   },
   "mutation_identity": [
     "project",
@@ -64,7 +103,8 @@
     "UNDO_NOT_ALLOWED",
     "INVALID_SCAN_IDENTITY",
     "PAGINATION_CURSOR_STALE",
-    "PAGINATION_CURSOR_REQUIRED"
+    "PAGINATION_CURSOR_REQUIRED",
+    "PENDING_SNAPSHOT_STALE"
   ],
   "progress_conservation": [
     "ordinary_pending_total",

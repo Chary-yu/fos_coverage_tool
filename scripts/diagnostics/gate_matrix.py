@@ -95,6 +95,74 @@ _KNOWN_STATUSES = {
     "UNAVAILABLE", "SKIPPED",
 }
 
+_DATABASE_EXTERNAL_EVIDENCE = {
+    "verified_backup_restore",
+    "mariadb_55_rehearsal",
+    "target_backfill_semantic_hash",
+    "durable_restart_rehearsal",
+}
+
+
+def _database_runtime_identity_violations(name, evidence_payload,
+                                           observed_status):
+    """Require DB identity on every externally supplied database PASS.
+
+    Evidence Manifest v2 validates the record's identity when its class name
+    happens to contain ``database``, ``mysql`` or ``mariadb``.  Gate names are
+    the stronger source of truth here: an operator must not be able to hide a
+    database rehearsal behind a generic evidence class, and a flat JSON
+    artifact needs the same protection as a v2 manifest.
+    """
+    if name not in _DATABASE_EXTERNAL_EVIDENCE or observed_status != "PASSED":
+        return []
+
+    violations = []
+    top_identity = evidence_payload.get("database_runtime_identity")
+    if not isinstance(top_identity, dict) or not top_identity:
+        violations.append(
+            "PASSED database evidence database_runtime_identity is missing"
+        )
+    identities = [top_identity] if isinstance(top_identity, dict) else []
+
+    if evidence_payload.get("evidence_schema_version") == 2:
+        records = evidence_payload.get("evidence") or []
+        for index, record in enumerate(records):
+            if not isinstance(record, dict) or \
+                    str(record.get("status") or "INCOMPLETE").upper() != "PASSED":
+                continue
+            record_identity = record.get("database_runtime_identity")
+            if not isinstance(record_identity, dict) or not record_identity:
+                violations.append(
+                    "PASSED database evidence record {} database_runtime_identity is missing".format(
+                        index
+                    )
+                )
+            elif record_identity not in identities:
+                identities.append(record_identity)
+
+    if name == "mariadb_55_rehearsal":
+        versions = []
+        for identity in identities:
+            if not isinstance(identity, dict):
+                continue
+            for key in ("version", "server_version", "database_version"):
+                value = str(identity.get(key) or "").strip()
+                if value:
+                    versions.append(value)
+                    break
+        payload_version = str(evidence_payload.get("database_version") or "").strip()
+        if payload_version:
+            versions.append(payload_version)
+        if not versions:
+            violations.append(
+                "PASSED MariaDB 5.5 evidence database version is missing"
+            )
+        elif any(not version.startswith("5.5") for version in versions):
+            violations.append(
+                "PASSED MariaDB rehearsal database version must start with 5.5"
+            )
+    return violations
+
 
 def _backup_provenance_violations(payload, evidence_path, repo_root):
     """Revalidate the independent production-backup manifest at Gate Matrix time."""
@@ -247,6 +315,9 @@ def _external(name, requirement, env_name=None, candidate_revision="",
                         violations.append("PASSED external evidence referenced artifact is missing")
                     elif _sha256(referenced) != artifact_sha:
                         violations.append("PASSED external evidence artifact SHA256 does not match")
+        violations.extend(_database_runtime_identity_violations(
+            name, evidence_payload, observed_status,
+        ))
         if name == "verified_backup_restore" and observed_status == "PASSED":
             if evidence_payload.get("evidence_schema_version") == 2:
                 records = evidence_payload.get("evidence") or []

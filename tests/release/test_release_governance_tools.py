@@ -61,6 +61,31 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn(
             "pymysql.__version__ == '0.10.1'", workflow,
         )
+        self.assertIn("Run MariaDB 5.5 rehearsal under Python 3.6", workflow)
+        self.assertIn("mariadb55_py36_compatibility.json", workflow)
+        self.assertIn("evidence['python_runtime'].startswith('3.6')", workflow)
+        self.assertIn("file_state = evidence['checks']['file_state_ready_gate']", workflow)
+        self.assertIn("for project in file_state[run]['projects'].values()", workflow)
+        self.assertIn(
+            "--manifest-output .artifacts/verified-production-mariadb55/evidence-manifest-v2.json",
+            workflow,
+        )
+        self.assertIn(
+            "manifest['evidence_schema_version'] == 2", workflow,
+        )
+        for test_module in (
+                "tests.vnext.test_reliability_repairs",
+                "tests.release.test_gate_matrix",
+                "tests.release.test_immutable_release_publication",
+                "tests.release.test_legacy_background_serialization",
+                "tests.release.test_validation_session",
+                "tests.release.test_verified_backup_rehearsal"):
+            self.assertIn(test_module, workflow)
+        for evidence_field in (
+                "evidence['checks']['file_state_ready_gate']",
+                "evidence['checks']['file_state_paged_reads']",
+                "evidence['checks']['transaction_rollback']"):
+            self.assertIn(evidence_field, workflow)
         self.assertEqual(workflow.count("docker run --rm -i"), 2)
         self.assertIn(".artifacts/py36-runtime-evidence.json", workflow)
         self.assertIn("test -s .artifacts/py36-runtime-evidence.json", workflow)

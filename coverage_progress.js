@@ -2,7 +2,7 @@
 (function () {
   'use strict';
 
-  const PROGRESS_PAGE_VERSION = 'visible-progress-20260818_v9_12';
+  const PROGRESS_PAGE_VERSION = 'visible-progress-vnext-20260828_v1';
   const DEFAULT_REVIEW_SCOPE = 'full';
   const params = new URLSearchParams(window.location.search);
   const configuredScope = document.body.getAttribute('data-review-scope') || DEFAULT_REVIEW_SCOPE;
@@ -33,6 +33,7 @@
   let currentTeamRows = [];
   let pendingFileCursor = null;
   let pendingFileHasMore = false;
+  let currentFileDataVersion = '';
   let currentDetailFile = '';
   let currentDetailPage = 1;
   let detailPageCursors = [null];
@@ -40,6 +41,12 @@
   let currentDetailHasMore = false;
   let currentScanId = params.get('scan_id') || '';
   let currentRepositoryName = params.get('repository_name') || '';
+  const contractErrors = new Set();
+  const CANONICAL_SUMMARY_FIELDS = [
+    'total_uncovered', 'filled_total', 'draft_total', 'confirmed_total',
+    'pending_total', 'ordinary_pending_total', 'inherited_pending_total',
+    'manual_draft_pending_total', 'data_version', 'file_state_version',
+  ];
 
   document.documentElement.setAttribute('data-progress-version', PROGRESS_PAGE_VERSION);
   if (returnSummaryLink) {
@@ -60,7 +67,59 @@
 
   function fmtRate(value) {
     const number = Number(value);
-    return Number.isFinite(number) ? `${number.toFixed(1)}%` : '0.0%';
+    return Number.isFinite(number) ? `${number.toFixed(1)}%` : '--';
+  }
+
+  function canonicalNumber(row, field) {
+    const raw = row && row[field];
+    const number = (raw === null || raw === undefined || raw === '')
+      ? NaN : Number(raw);
+    if (Number.isFinite(number)) return number;
+    contractErrors.add(field);
+    return '--';
+  }
+
+  function canonicalText(row, field) {
+    const raw = row && row[field];
+    if ((typeof raw === 'string' || typeof raw === 'number') &&
+        String(raw).trim() !== '') {
+      return String(raw);
+    }
+    contractErrors.add(field);
+    return '--';
+  }
+
+  function canonicalConservationStatus(row) {
+    const conservation = row && row.pending_conservation;
+    const status = conservation && conservation.status;
+    if (typeof status === 'string' && status.trim() !== '') {
+      return String(status);
+    }
+    contractErrors.add('pending_conservation');
+    return '--';
+  }
+
+  function canonicalRate(row, numerator) {
+    const rawTotal = row && row.total_uncovered;
+    const rawValue = row && row[numerator];
+    const total = (rawTotal === null || rawTotal === undefined || rawTotal === '')
+      ? NaN : Number(rawTotal);
+    const value = (rawValue === null || rawValue === undefined || rawValue === '')
+      ? NaN : Number(rawValue);
+    if (!Number.isFinite(total) || !Number.isFinite(value)) {
+      contractErrors.add(!Number.isFinite(total) ? 'total_uncovered' : numerator);
+      return '--';
+    }
+    const rate = total > 0 ? value * 100 / total : 0;
+    return `${fmtRate(rate)} ${bar(rate)}`;
+  }
+
+  function showContractErrors() {
+    if (!contractErrors.size) return;
+    const fields = Array.from(contractErrors).sort().join(', ');
+    const message = `VNext Progress API contract error：缺少或非法字段 ${fields}`;
+    console.error(message);
+    statusEl.innerHTML = `<span class="error">${escapeHtml(message)}，请刷新发布一致的报告资源。</span>`;
   }
 
   function bar(rate) {
@@ -89,19 +148,19 @@
     return rows.map(row => `
       <tr>
         <td class="path">${escapeHtml(row[pathKey] || '(root)')}</td>
-        <td>${asNumber(row.total_uncovered)}</td><td>${asNumber(row.filled_total)}</td>
-        <td>${asNumber(row.unfilled_total)}</td><td>${asNumber(row.confirmed_total)}</td>
-        <td>${asNumber(row.coverable_total)}</td><td>${asNumber(row.uncoverable_total)}</td>
-        <td>${asNumber(row.redundant_total)}</td>
-        <td>${fmtRate(row.fill_rate)} ${bar(row.fill_rate)}</td>
-        <td>${fmtRate(row.confirmed_rate)} ${bar(row.confirmed_rate)}</td>
+        <td>${canonicalNumber(row, 'total_uncovered')}</td><td>${canonicalNumber(row, 'filled_total')}</td>
+        <td>${canonicalNumber(row, 'pending_total')}</td><td>${canonicalNumber(row, 'confirmed_total')}</td>
+        <td>${canonicalNumber(row, 'ordinary_pending_total')}</td><td>${canonicalNumber(row, 'inherited_pending_total')}</td>
+        <td>${canonicalNumber(row, 'manual_draft_pending_total')}</td>
+        <td>${canonicalRate(row, 'filled_total')}</td>
+        <td>${canonicalRate(row, 'confirmed_total')}</td>
       </tr>`).join('');
   }
 
   function renderTable(id, rows, pathKey) {
     document.getElementById(id).innerHTML = `
-      <thead><tr><th>路径</th><th>未覆盖</th><th>已填</th><th>未填</th><th>已确认</th>
-      <th>可覆盖</th><th>无法覆盖</th><th>冗余</th><th>填写率</th><th>确认率</th></tr></thead>
+      <thead><tr><th>路径</th><th>未覆盖</th><th>已填</th><th>待处理</th><th>已确认</th>
+      <th>普通待处理</th><th>继承待处理</th><th>草稿待处理</th><th>填写率</th><th>确认率</th></tr></thead>
       <tbody>${tableRows(rows, pathKey)}</tbody>`;
   }
 
@@ -120,15 +179,15 @@
           <td class="muted">-</td>
           <td class="path muted">${escapeHtml(mod.module || '')}</td>
           <td>${asNumber(mod.file_total)}</td>
-          <td>${asNumber(mod.total_uncovered)}</td>
-          <td>${asNumber(mod.filled_total)}</td>
-          <td>${asNumber(mod.unfilled_total)}</td>
-          <td>${asNumber(mod.confirmed_total)}</td>
-          <td>${asNumber(mod.coverable_total)}</td>
-          <td>${asNumber(mod.uncoverable_total)}</td>
-          <td>${asNumber(mod.redundant_total)}</td>
-          <td>${fmtRate(mod.fill_rate)} ${bar(mod.fill_rate)}</td>
-          <td>${fmtRate(mod.confirmed_rate)} ${bar(mod.confirmed_rate)}</td>
+          <td>${canonicalNumber(mod, 'total_uncovered')}</td>
+          <td>${canonicalNumber(mod, 'filled_total')}</td>
+          <td>${canonicalNumber(mod, 'pending_total')}</td>
+          <td>${canonicalNumber(mod, 'confirmed_total')}</td>
+          <td>${canonicalNumber(mod, 'ordinary_pending_total')}</td>
+          <td>${canonicalNumber(mod, 'inherited_pending_total')}</td>
+          <td>${canonicalNumber(mod, 'manual_draft_pending_total')}</td>
+          <td>${canonicalRate(mod, 'filled_total')}</td>
+          <td>${canonicalRate(mod, 'confirmed_total')}</td>
           <td>${escapeHtml(mod.last_updated || '')}</td>
         </tr>`;
     }).join('');
@@ -140,8 +199,8 @@
     if (!rows || rows.length === 0) {
       document.getElementById('teamTable').innerHTML = `
         <thead><tr><th>小组</th><th>组长</th><th>模块</th><th>文件数</th><th>未覆盖</th>
-        <th>已填</th><th>未填</th><th>已确认</th><th>可覆盖</th><th>无法覆盖</th>
-        <th>冗余</th><th>填写率</th><th>确认率</th><th>最后更新</th></tr></thead>
+        <th>已填</th><th>待处理</th><th>已确认</th><th>普通待处理</th><th>继承待处理</th>
+        <th>草稿待处理</th><th>填写率</th><th>确认率</th><th>最后更新</th></tr></thead>
         <tbody><tr><td colspan="14">暂无数据</td></tr></tbody>`;
       return;
     }
@@ -189,15 +248,15 @@
           <td>${leaderLinkHtml}</td>
           <td class="path">${moduleCellHtml}</td>
           <td>${asNumber(row.file_total)}</td>
-          <td>${asNumber(row.total_uncovered)}</td>
-          <td>${asNumber(row.filled_total)}</td>
-          <td>${asNumber(row.unfilled_total)}</td>
-          <td>${asNumber(row.confirmed_total)}</td>
-          <td>${asNumber(row.coverable_total)}</td>
-          <td>${asNumber(row.uncoverable_total)}</td>
-          <td>${asNumber(row.redundant_total)}</td>
-          <td>${fmtRate(row.fill_rate)} ${bar(row.fill_rate)}</td>
-          <td>${fmtRate(row.confirmed_rate)} ${bar(row.confirmed_rate)}</td>
+          <td>${canonicalNumber(row, 'total_uncovered')}</td>
+          <td>${canonicalNumber(row, 'filled_total')}</td>
+          <td>${canonicalNumber(row, 'pending_total')}</td>
+          <td>${canonicalNumber(row, 'confirmed_total')}</td>
+          <td>${canonicalNumber(row, 'ordinary_pending_total')}</td>
+          <td>${canonicalNumber(row, 'inherited_pending_total')}</td>
+          <td>${canonicalNumber(row, 'manual_draft_pending_total')}</td>
+          <td>${canonicalRate(row, 'filled_total')}</td>
+          <td>${canonicalRate(row, 'confirmed_total')}</td>
           <td>${escapeHtml(row.last_updated || '')}</td>
         </tr>`;
       htmlParts.push(parentTr);
@@ -206,8 +265,8 @@
 
     document.getElementById('teamTable').innerHTML = `
       <thead><tr><th>小组</th><th>组长</th><th>模块</th><th>文件数</th><th>未覆盖</th>
-      <th>已填</th><th>未填</th><th>已确认</th><th>可覆盖</th><th>无法覆盖</th>
-      <th>冗余</th><th>填写率</th><th>确认率</th><th>最后更新</th></tr></thead>
+      <th>已填</th><th>待处理</th><th>已确认</th><th>普通待处理</th><th>继承待处理</th>
+      <th>草稿待处理</th><th>填写率</th><th>确认率</th><th>最后更新</th></tr></thead>
       <tbody>${htmlParts.join('')}</tbody>`;
 
     document.querySelectorAll('.toggle-team-btn').forEach(btn => {
@@ -258,16 +317,16 @@
           <td>${escapeHtml(row.module || '')}</td><td>${escapeHtml(row.team || '')}</td>
           <td>${escapeHtml(row.leader || '')}</td>
           <td><span class="badge-pill ${badgeClass}">${escapeHtml(row.ownership_status || '')}</span></td>
-          <td>${asNumber(row.total_uncovered)}</td><td>${asNumber(row.filled_total)}</td>
-          <td>${asNumber(row.unfilled_total)}</td><td>${asNumber(row.confirmed_total)}</td>
-          <td>${asNumber(row.coverable_total)}</td><td>${asNumber(row.uncoverable_total)}</td>
-          <td>${asNumber(row.redundant_total)}</td><td>${fmtRate(row.fill_rate)} ${bar(row.fill_rate)}</td>
-          <td>${fmtRate(row.confirmed_rate)} ${bar(row.confirmed_rate)}</td></tr>`;
+          <td>${canonicalNumber(row, 'total_uncovered')}</td><td>${canonicalNumber(row, 'filled_total')}</td>
+          <td>${canonicalNumber(row, 'pending_total')}</td><td>${canonicalNumber(row, 'confirmed_total')}</td>
+          <td>${canonicalNumber(row, 'ordinary_pending_total')}</td><td>${canonicalNumber(row, 'inherited_pending_total')}</td>
+          <td>${canonicalNumber(row, 'manual_draft_pending_total')}</td><td>${canonicalRate(row, 'filled_total')}</td>
+          <td>${canonicalRate(row, 'confirmed_total')}</td></tr>`;
       }).join('');
     document.getElementById('fileTable').innerHTML = `
       <thead><tr><th>文件路径</th><th>模块</th><th>小组</th><th>组长</th><th>匹配状态</th>
-      <th>未覆盖</th><th>已填</th><th>未填</th><th>已确认</th><th>可覆盖</th>
-      <th>无法覆盖</th><th>冗余</th><th>填写率</th><th>确认率</th></tr></thead><tbody>${body}</tbody>`;
+      <th>未覆盖</th><th>已填</th><th>待处理</th><th>已确认</th><th>普通待处理</th>
+      <th>继承待处理</th><th>草稿待处理</th><th>填写率</th><th>确认率</th></tr></thead><tbody>${body}</tbody>`;
     updateFilePager();
   }
 
@@ -332,9 +391,119 @@
     return fetch(url, Object.assign({}, options || {}, { signal: controller.signal }))
       .finally(() => clearTimeout(timer))
       .then(response => response.json().catch(() => ({})).then(payload => {
-        if (!response.ok) throw new Error(payload.message || `HTTP ${response.status}`);
+        if (!response.ok) {
+          const error = new Error(payload.message || payload.error || `HTTP ${response.status}`);
+          error.code = payload.error || (response.status === 409 ? 'PAGINATION_CURSOR_STALE' : 'HTTP_ERROR');
+          throw error;
+        }
+        if (payload && payload.status === 'error') {
+          const error = new Error(payload.message || payload.error || 'API error');
+          error.code = payload.error || 'API_ERROR';
+          throw error;
+        }
         return payload;
       }));
+  }
+
+  function progressContractFailure(field, message) {
+    contractErrors.add(field);
+    const error = new Error(`VNext Progress API contract error: ${message}`);
+    error.code = 'API_CONTRACT_ERROR';
+    return error;
+  }
+
+  function validateFileEnvelope(payload, project, append) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw progressContractFailure('progress_files', 'response must be an object');
+    }
+    const required = [
+      'project_name', 'scan_id', 'data_version', 'repository_name',
+      'files', 'page_size', 'has_more', 'next_cursor',
+    ];
+    required.forEach(field => {
+      if (!Object.prototype.hasOwnProperty.call(payload, field)) {
+        throw progressContractFailure(`progress_files.${field}`, `missing ${field}`);
+      }
+    });
+    if (String(payload.project_name || '') !== String(project || '')) {
+      throw progressContractFailure('progress_files.project_name', 'project identity mismatch');
+    }
+    if (currentScanId && String(payload.scan_id || '') !== String(currentScanId)) {
+      throw progressContractFailure('progress_files.scan_id', 'scan identity mismatch');
+    }
+    const rawVersion = payload.data_version;
+    const numericVersion = rawVersion === null || rawVersion === undefined || rawVersion === ''
+      ? NaN : Number(rawVersion);
+    if (!Number.isSafeInteger(numericVersion) || numericVersion < 0) {
+      throw progressContractFailure(
+        'progress_files.data_version',
+        'data_version is not a non-negative integer'
+      );
+    }
+    const receivedRepository = payload.repository_name == null
+      ? '' : String(payload.repository_name);
+    if (receivedRepository !== String(currentRepositoryName || '')) {
+      throw progressContractFailure('progress_files.repository_name', 'repository identity mismatch');
+    }
+    if (!Array.isArray(payload.files)) {
+      throw progressContractFailure('progress_files.files', 'files must be an array');
+    }
+    if (typeof payload.has_more !== 'boolean') {
+      throw progressContractFailure('progress_files.has_more', 'has_more must be boolean');
+    }
+    if (payload.next_cursor !== null && typeof payload.next_cursor !== 'string') {
+      throw progressContractFailure('progress_files.next_cursor', 'next_cursor must be string or null');
+    }
+    if (payload.has_more && !payload.next_cursor) {
+      throw progressContractFailure('progress_files.next_cursor', 'has_more requires next_cursor');
+    }
+    if (!payload.has_more && payload.next_cursor !== null) {
+      throw progressContractFailure('progress_files.next_cursor', 'terminal page must not have next_cursor');
+    }
+    if (append && currentFileDataVersion &&
+        String(payload.data_version) !== currentFileDataVersion) {
+      const error = new Error('progress file snapshot changed during pagination');
+      error.code = 'PAGINATION_CURSOR_STALE';
+      throw error;
+    }
+    return payload;
+  }
+
+  function validateDetailEnvelope(payload) {
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      throw progressContractFailure('progress_details', 'response must be an object');
+    }
+    const required = ['scan_id', 'file_id', 'page_size', 'has_more', 'rows', 'next_cursor'];
+    required.forEach(field => {
+      if (!Object.prototype.hasOwnProperty.call(payload, field)) {
+        throw progressContractFailure(`progress_details.${field}`, `missing ${field}`);
+      }
+    });
+    if (currentScanId && String(payload.scan_id || '') !== String(currentScanId)) {
+      throw progressContractFailure('progress_details.scan_id', 'scan identity mismatch');
+    }
+    if (!Number.isFinite(Number(payload.file_id)) || Number(payload.file_id) <= 0) {
+      throw progressContractFailure('progress_details.file_id', 'file_id is not positive');
+    }
+    if (!Number.isFinite(Number(payload.page_size)) || Number(payload.page_size) <= 0) {
+      throw progressContractFailure('progress_details.page_size', 'page_size is not positive');
+    }
+    if (!Array.isArray(payload.rows)) {
+      throw progressContractFailure('progress_details.rows', 'rows must be an array');
+    }
+    if (typeof payload.has_more !== 'boolean') {
+      throw progressContractFailure('progress_details.has_more', 'has_more must be boolean');
+    }
+    if (payload.next_cursor !== null && typeof payload.next_cursor !== 'string') {
+      throw progressContractFailure('progress_details.next_cursor', 'next_cursor must be string or null');
+    }
+    if (payload.has_more && !payload.next_cursor) {
+      throw progressContractFailure('progress_details.next_cursor', 'has_more requires next_cursor');
+    }
+    if (!payload.has_more && payload.next_cursor !== null) {
+      throw progressContractFailure('progress_details.next_cursor', 'terminal page must not have next_cursor');
+    }
+    return payload;
   }
 
   function updateLinks(project, apiBase) {
@@ -389,13 +558,18 @@
   }
 
   function renderProgressData(project, apiBase, data) {
+    contractErrors.clear();
     const projectRows = Array.isArray(data.project) ? data.project : (data.total_uncovered != null ? [data] : []);
-    const projectRow = projectRows[0] || {};
+    const projectRow = Object.assign({}, data, projectRows[0] || {});
     const meta = data.meta || {};
-    metric('totalUncovered', asNumber(projectRow.total_uncovered));
-    metric('filledTotal', asNumber(projectRow.filled_total));
-    metric('fillRate', fmtRate(projectRow.fill_rate));
-    metric('confirmedRate', fmtRate(projectRow.confirmed_rate));
+    CANONICAL_SUMMARY_FIELDS.forEach(field => { canonicalNumber(projectRow, field); });
+    canonicalConservationStatus(projectRow);
+    canonicalText(projectRow, 'source');
+    canonicalText(projectRow, 'derived_state_status');
+    metric('totalUncovered', canonicalNumber(projectRow, 'total_uncovered'));
+    metric('filledTotal', canonicalNumber(projectRow, 'filled_total'));
+    metric('fillRate', canonicalRate(projectRow, 'filled_total'));
+    metric('confirmedRate', canonicalRate(projectRow, 'confirmed_total'));
     renderOwnershipStatus(data.ownership || { available: false, warning: 'VNext 汇总不提供旧版目录归属表。' });
     renderTeamTable(data.teams || []);
     renderTable('dirTable', data.dirs || [], 'dir_path');
@@ -405,22 +579,40 @@
     } else {
       statusEl.innerText = `已加载 ${asNumber(data.file_count || meta.indexed_file_total)} 个文件的填写摘要；项目：${project}，接口：${apiBase}`;
     }
+    showContractErrors();
   }
 
-  async function loadFilePage(apiBase, project, append, token) {
+  async function loadFilePage(apiBase, project, append, token, restartCount = 0) {
     const query = new URLSearchParams({
       project, scope: reviewScope, page_size: '100',
     });
     if (currentScanId) query.set('scan_id', currentScanId);
+    if (currentRepositoryName) query.set('repository_name', currentRepositoryName);
     if (append && pendingFileCursor) query.set('cursor', pendingFileCursor);
-    const payload = await fetchJsonWithTimeout(
-      `${apiBase}/progress/files?${query.toString()}`, 10000
-    );
+    let payload;
+    try {
+      payload = await fetchJsonWithTimeout(
+        `${apiBase}/progress/files?${query.toString()}`, 10000
+      );
+      validateFileEnvelope(payload, project, append);
+    } catch (error) {
+      if (error.code === 'PAGINATION_CURSOR_STALE' && restartCount < 2) {
+        pendingFileCursor = null;
+        pendingFileHasMore = false;
+        currentFileDataVersion = '';
+        return loadFilePage(apiBase, project, false, token, restartCount + 1);
+      }
+      if (error.code === 'PAGINATION_CURSOR_STALE') throw new Error('数据正在变化，请稍后刷新');
+      throw error;
+    }
     if (token != null && token !== activeLoadToken) {
       throw new Error('已取消过期的文件窗口加载');
     }
     pendingFileCursor = payload.next_cursor || null;
     pendingFileHasMore = Boolean(payload.has_more && pendingFileCursor);
+    currentFileDataVersion = String(
+      payload.data_version == null ? '' : payload.data_version
+    );
     renderFileTable(payload.files || []);
     return payload;
   }
@@ -465,6 +657,7 @@
           updateLinks(project, apiBase);
           pendingFileCursor = null;
           pendingFileHasMore = false;
+          currentFileDataVersion = '';
           renderProgressData(project, apiBase, payload || {});
           await loadFilePage(apiBase, project, false, token);
           const url = new URL(window.location.href);
@@ -480,7 +673,11 @@
       throw lastError || new Error('无法连接接口');
     } catch (error) {
       showJobProgress({ state: 'failed', percent: 2, stage: 'failed', message: error.message, elapsed_seconds: (Date.now() - startedAt) / 1000 }, '填写进展');
-      statusEl.innerHTML = `<span class="error">加载失败：${escapeHtml(error.message)}。已尝试：${escapeHtml(candidates.join(' , '))}</span>`;
+      if (contractErrors.size) {
+        showContractErrors();
+      } else {
+        statusEl.innerHTML = `<span class="error">加载失败：${escapeHtml(error.message)}。已尝试：${escapeHtml(candidates.join(' , '))}</span>`;
+      }
     } finally {
       window.clearInterval(connectingTimer);
       if (token === activeLoadToken) {
@@ -517,7 +714,8 @@
           return `${apiBase}/progress/details?${query.toString()}`;
         })(), 15000
       );
-      renderDetailTable(payload || {}, page);
+      validateDetailEnvelope(payload);
+      renderDetailTable(payload, page);
       section.scrollIntoView({ behavior: 'smooth', block: 'start' });
     } catch (error) {
       document.getElementById('detailStatus').innerHTML = `<span class="error">详细数据加载失败：${escapeHtml(error.message)}</span>`;
@@ -607,7 +805,11 @@
           resolvedApiBase, projectInput.value.trim(), true, activeLoadToken
         );
       } catch (error) {
-        statusEl.innerHTML = `<span class="error">文件窗口加载失败：${escapeHtml(error.message)}</span>`;
+        if (contractErrors.size) {
+          showContractErrors();
+        } else {
+          statusEl.innerHTML = `<span class="error">文件窗口加载失败：${escapeHtml(error.message)}</span>`;
+        }
       } finally {
         loadMoreFilesBtn.disabled = false;
       }

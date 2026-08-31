@@ -23,6 +23,7 @@ from app.code_detail.vnext_service import VNextCodeDetailService
 from app.reports.registry import ReportRegistry
 from app.services.analysis_service import AnalysisService
 from app.services.analysis_domain_service import AnalysisDomainService
+from app.services.file_state_service import FileStateService
 from app.services.repository_service import RepositoryService
 from app.scan_import import (
     ImmutableArtifactStager, ScanImportCoordinator, ScanImportRecoveryService,
@@ -86,6 +87,7 @@ class VNextRuntime(object):
         self.analyses = AnalysisRepository()
         self.states = ProjectStateRepository()
         self.file_states = FileStateRepository()
+        self.file_state_service = FileStateService(self.file_states, self.states)
         self.job_repository = JobRepository()
         self.incremental_results = IncrementalRepository()
         self.repository_repository = RepositoryRepository()
@@ -118,6 +120,8 @@ class VNextRuntime(object):
             self.projects, self.states, self.lines,
             allowed_report_roots=report_roots,
             repository_repo=self.repository_repository,
+            file_state_repo=self.file_states,
+            file_state_service=self.file_state_service,
             release_identity=self.release_identity,
             api_contract_version=REPORT_API_CONTRACT_VERSION,
         )
@@ -134,6 +138,7 @@ class VNextRuntime(object):
             self.analyses, self.projects, self.states, self.lines,
             domain_repo=self.analysis_domain_repository,
             file_state_repo=self.file_states,
+            file_state_service=self.file_state_service,
         )
         state_root = state_config.get("root") or os.path.join(self.repo_root, ".runtime-state")
         if not os.path.isabs(state_root):
@@ -156,6 +161,7 @@ class VNextRuntime(object):
                 performance=self.performance,
             ),
             file_state_repository=self.file_states,
+            file_state_service=self.file_state_service,
             analysis_domain_service=self.analysis_domain_service,
             project_service=self.project_service,
             performance=self.performance,
@@ -167,7 +173,10 @@ class VNextRuntime(object):
             projects=self.projects,
             stager=ImmutableArtifactStager(import_root),
         )
-        self.progress_service = ProgressService(self.file_states, self.projects, self.states)
+        self.progress_service = ProgressService(
+            self.file_states, self.projects, self.states,
+            file_state_service=self.file_state_service,
+        )
         self.incremental_service = IncrementalReportService(
             self.projects, self.incremental_results,
             release_identity=self.release_identity,

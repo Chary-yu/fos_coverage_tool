@@ -337,6 +337,80 @@ class VNextRuntimeTest(unittest.TestCase):
         self.assertFalse(second["has_more"])
         self.assertEqual([row["file_path"] for row in second["files"]], ["src/b.c"])
 
+        status, rejected_filter = self.application.dispatch(
+            "GET", "/api/coverage/progress/files",
+            query={
+                "project": "progress-files", "repository_name": "other-repo",
+                "page_size": "1", "cursor": first["next_cursor"],
+            },
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(rejected_filter["error"], "PAGINATION_CURSOR_STALE")
+
+        project = self.runtime.projects.get_project_by_name(
+            self.connection, "progress-files"
+        )
+        self.runtime.states.advance(self.connection, int(project["id"]))
+        self.connection.commit()
+        status, rejected_version = self.application.dispatch(
+            "GET", "/api/coverage/progress/files",
+            query={
+                "project": "progress-files", "page_size": "1",
+                "cursor": first["next_cursor"],
+            },
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(rejected_version["error"], "PAGINATION_CURSOR_STALE")
+
+    def test_incremental_unanalyzed_cursor_is_bound_to_filter_and_version(self):
+        scan = self.runtime.project_service.create_scan_and_ingest(
+            self.connection, "unanalyzed-cursor", [
+                {
+                    "repository_name": "repo-a", "file_path": "src/a.c",
+                    "file_path_hash": "a" * 32,
+                    "lines": [{"line_number": 1, "coverage_state": "uncovered"}],
+                },
+                {
+                    "repository_name": "repo-a", "file_path": "src/b.c",
+                    "file_path_hash": "b" * 32,
+                    "lines": [{"line_number": 1, "coverage_state": "uncovered"}],
+                },
+            ],
+            info_sha256="unanalyzed-cursor-info",
+        )
+        status, first = self.application.dispatch(
+            "GET", "/api/coverage/incremental/unanalyzed",
+            query={"project": "unanalyzed-cursor", "page_size": "1"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(first["has_more"])
+        self.assertTrue(first["next_cursor"])
+
+        status, rejected_filter = self.application.dispatch(
+            "GET", "/api/coverage/incremental/unanalyzed",
+            query={
+                "project": "unanalyzed-cursor", "repository_name": "other-repo",
+                "page_size": "1", "cursor": first["next_cursor"],
+            },
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(rejected_filter["error"], "PAGINATION_CURSOR_STALE")
+
+        project = self.runtime.projects.get_project_by_name(
+            self.connection, "unanalyzed-cursor"
+        )
+        self.runtime.states.advance(self.connection, int(project["id"]))
+        self.connection.commit()
+        status, rejected_version = self.application.dispatch(
+            "GET", "/api/coverage/incremental/unanalyzed",
+            query={
+                "project": "unanalyzed-cursor", "page_size": "1",
+                "cursor": first["next_cursor"],
+            },
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(rejected_version["error"], "PAGINATION_CURSOR_STALE")
+
     def test_progress_rejects_cross_project_scans_and_rebuilds_only_current_scan(self):
         service = self.runtime.project_service
 

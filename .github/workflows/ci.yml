@@ -380,13 +380,77 @@ jobs:
           assert migration['collations']['target']['collation'] == 'utf8mb4_general_ci'
           assert migration['checks']['collation_independent_semantic_hash'] is True
           assert migration['checks']['data_version_mutation_changes_semantic_hash'] is True
+          migration_ready = migration['checks']['file_state_ready_gate']
+          for run in ('first_run', 'second_run'):
+              for project in ('fixture-a', 'fixture-b'):
+                  project_ready = migration_ready[run][project]
+                  assert project_ready['status'] == 'PASSED'
+                  assert project_ready['data_version'] == project_ready['file_state_version']
+                  assert project_ready['gate']['status'] == 'PASSED'
+                  assert project_ready['gate']['completeness']['status'] == 'PASSED'
+                  assert project_ready['gate']['pending_conservation']['status'] == 'PASSED'
+                  assert project_ready['gate']['reconciliation']['status'] == 'PASSED'
+                  aggregate = project_ready['aggregate']
+                  assert aggregate['pending_total'] == aggregate['ordinary_pending_total'] + aggregate['inherited_pending_total'] + aggregate['manual_draft_pending_total']
+          assert evidence['checks']['schema_applied'] is True
+          assert evidence['checks']['bulk_scan_ingest_and_seal'] is True
+          assert evidence['checks']['bulk_analysis_upsert'] is True
+          assert evidence['checks']['sql_progress_aggregate'] is True
+          assert evidence['checks']['real_http_transport'] is True
+          assert evidence['checks']['transaction_rollback'] is True
+          ready = evidence['checks']['file_state_ready_gate']
+          for phase in ('after_ingest', 'after_analysis', 'after_explicit_rebuild'):
+              assert ready[phase]['status'] == 'PASSED'
+              assert ready[phase]['data_version'] == ready[phase]['file_state_version']
+              assert ready[phase]['gate']['completeness']['status'] == 'PASSED'
+              assert ready[phase]['gate']['pending_conservation']['status'] == 'PASSED'
+              assert ready[phase]['gate']['reconciliation']['status'] == 'PASSED'
+          pages = evidence['checks']['file_state_paged_reads']
+          assert pages['files']['status'] == 200
+          assert pages['files']['rows'] == 1
+          assert pages['pending']['status'] == 200
+          assert pages['pending']['total'] == 1
+          assert pages['pending']['rows'] == 1
+          assert pages['incremental']['status'] == 200
+          assert pages['incremental']['rows'] == 1
+          PY
+      - name: Run MariaDB 5.5 rehearsal under Python 3.6
+        run: |
+          set -o pipefail
+          docker run --rm --network host -i \
+            -v "$PWD:/workspace" -w /workspace python@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc \
+            bash -s <<'PY' 2>&1 | tee .artifacts/mariadb55_py36_compatibility.json
+          set -e
+          python -m pip install --no-cache-dir -r requirements-py36.txt >/dev/null 2>&1
+          python -c "import pymysql; assert pymysql.__version__ == '0.10.1', pymysql.__version__"
+          python scripts/diagnostics/mysql_vnext_integration.py \
+            --create-disposable --host 127.0.0.1 --port 3306 \
+            --user root --password root --require-version-prefix 5.5 \
+            --migration-rehearsal \
+            --migration-lines 20000 --migration-analyses 10000 \
+            --migration-jobs 1
+          PY
+      - name: Verify MariaDB 5.5 and Python 3.6 evidence identity
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          evidence = json.loads(Path('.artifacts/mariadb55_py36_compatibility.json').read_text())
+          assert evidence['status'] == 'PASSED'
+          assert evidence['python_runtime'].startswith('3.6')
+          assert evidence['database_version'].startswith('5.5')
+          assert evidence['required_version_prefix'] == '5.5'
+          assert evidence['checks']['file_state_ready_gate']['first_run']['fixture-a']['status'] == 'PASSED'
+          assert evidence['checks']['file_state_ready_gate']['second_run']['fixture-b']['status'] == 'PASSED'
           PY
       - name: Upload MariaDB 5.5 compatibility evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
         with:
           name: mariadb55-compatibility-evidence
-          path: .artifacts/mariadb55_compatibility.json
+          path: |
+            .artifacts/mariadb55_compatibility.json
+            .artifacts/mariadb55_py36_compatibility.json
           if-no-files-found: error
 
   verified-production-mariadb55:
@@ -419,7 +483,8 @@ jobs:
             --backup-manifest "$BACKUP_MANIFEST" \
             --require-version-prefix 5.5 \
             --create-disposable \
-            --output .artifacts/verified-production-mariadb55/rehearsal.json
+            --output .artifacts/verified-production-mariadb55/rehearsal.json \
+            --manifest-output .artifacts/verified-production-mariadb55/evidence-manifest-v2.json
       - name: Verify exact-SHA production rehearsal evidence
         env:
           EXPECTED_SHA: ${{ github.sha }}
@@ -441,14 +506,38 @@ jobs:
           assert evidence['semantic_mismatch_components'] == []
           assert evidence['checks']['authoritative_semantic_match'] is True
           assert evidence['checks']['migration_idempotent'] is True
+          file_state = evidence['checks']['file_state_ready_gate']
+          for run in ('first_run', 'second_run'):
+              assert file_state[run]['status'] == 'PASSED'
+              assert file_state[run]['project_count'] > 0
+              for project in file_state[run]['projects'].values():
+                  assert project['status'] == 'PASSED'
+                  assert project['data_version'] == project['file_state_version']
+                  assert project['gate']['completeness']['status'] == 'PASSED'
+                  assert project['gate']['pending_conservation']['status'] == 'PASSED'
+                  assert project['gate']['reconciliation']['status'] == 'PASSED'
           assert evidence['checks']['source_collation']['collation'] == 'utf8mb4_unicode_ci'
           assert evidence['checks']['target_collation']['collation'] == 'utf8mb4_general_ci'
+          manifest = json.loads(Path(
+              '.artifacts/verified-production-mariadb55/evidence-manifest-v2.json'
+          ).read_text(encoding='utf-8'))
+          assert manifest['evidence_schema_version'] == 2
+          assert manifest['gate'] == 'gate-a'
+          assert manifest['candidate_revision'] == os.environ['EXPECTED_SHA']
+          assert manifest['release_identity']['commit_sha'] == os.environ['EXPECTED_SHA']
+          assert manifest['database_runtime_identity']['version'].startswith('5.5')
+          records = manifest['evidence']
+          assert len(records) == 1
+          assert records[0]['status'] == 'PASSED'
+          assert records[0]['database_runtime_identity']['version'].startswith('5.5')
       - name: Upload verified production rehearsal evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
         with:
           name: verified-production-mariadb55-${{ github.sha }}
-          path: .artifacts/verified-production-mariadb55/rehearsal.json
+          path: |
+            .artifacts/verified-production-mariadb55/rehearsal.json
+            .artifacts/verified-production-mariadb55/evidence-manifest-v2.json
           if-no-files-found: error
 
   py36-compat:
@@ -483,7 +572,13 @@ jobs:
             tests.vnext.test_migration_runner \
             tests.vnext.test_runtime_config \
             tests.vnext.test_vnext_runtime \
-            tests.vnext.test_legacy_runtime_adapter -v
+            tests.vnext.test_legacy_runtime_adapter \
+            tests.vnext.test_reliability_repairs \
+            tests.release.test_gate_matrix \
+            tests.release.test_immutable_release_publication \
+            tests.release.test_legacy_background_serialization \
+            tests.release.test_validation_session \
+            tests.release.test_verified_backup_rehearsal -v
           python - <<'PY_EVIDENCE'
           import json
           import pymysql
@@ -525,7 +620,13 @@ jobs:
             tests.vnext.test_migration_runner \
             tests.vnext.test_runtime_config \
             tests.vnext.test_vnext_runtime \
-            tests.vnext.test_legacy_runtime_adapter; do
+            tests.vnext.test_legacy_runtime_adapter \
+            tests.vnext.test_reliability_repairs \
+            tests.release.test_gate_matrix \
+            tests.release.test_immutable_release_publication \
+            tests.release.test_legacy_background_serialization \
+            tests.release.test_validation_session \
+            tests.release.test_verified_backup_rehearsal; do
             python -m unittest "$test_module" -v
             status=$?
             if [ "$status" -ne 0 ]; then

@@ -2,6 +2,8 @@ import subprocess
 import sys
 import unittest
 import importlib
+import os
+import tempfile
 from unittest import mock
 
 from app.compat import legacy_runtime_adapter
@@ -99,6 +101,24 @@ class LegacyRuntimeAdapterTest(unittest.TestCase):
             legacy.CoverageHTTPRequestHandler,
             previous.CoverageHTTPRequestHandler,
         )
+
+    def test_legacy_progress_page_does_not_load_vnext_cursor_endpoints(self):
+        previous = importlib.import_module(
+            "app.compat.legacy_runtime_previous_release"
+        )
+        with tempfile.TemporaryDirectory(prefix="legacy-progress-page-") as root:
+            output_dir = os.path.join(root, "output")
+            os.makedirs(output_dir)
+            previous.write_progress_page_targets(output_dir, output_dir)
+            with open(
+                os.path.join(output_dir, "coverage_progress.html"),
+                encoding="utf-8",
+            ) as stream:
+                contents = stream.read()
+        self.assertIn("/progress?project=", contents)
+        self.assertNotIn("/progress/files", contents)
+        self.assertNotIn("/progress/details", contents)
+        self.assertNotIn('src="coverage_progress.js', contents)
 
 
 if __name__ == "__main__":

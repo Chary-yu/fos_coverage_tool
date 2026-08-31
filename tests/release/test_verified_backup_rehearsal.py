@@ -2,15 +2,21 @@ import gzip
 import hashlib
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 
 from scripts.upgrade.run_verified_backup_rehearsal import (
     _load_expected_sha,
     _load_backup_provenance_manifest,
+    _migrated_file_state_ready_evidence,
     _safe_database_name,
     _validate_dump,
 )
+from scripts.upgrade.legacy_fixture import (
+    create_legacy_fixture_schema, seed_legacy_fixture,
+)
+from scripts.upgrade.migration_runner import create_sqlite_schema, migrate_legacy
 
 
 class TestVerifiedBackupRehearsal(unittest.TestCase):
@@ -129,6 +135,29 @@ class TestVerifiedBackupRehearsal(unittest.TestCase):
                     manifest_path, dump, dump_sha, self.repo_root, [],
                 )
             self.assertIn("SHA256", str(mismatch.exception))
+
+    def test_migrated_file_state_ready_evidence_checks_all_projects(self):
+        source = sqlite3.connect(":memory:")
+        target = sqlite3.connect(":memory:")
+        source.row_factory = sqlite3.Row
+        target.row_factory = sqlite3.Row
+        self.addCleanup(source.close)
+        self.addCleanup(target.close)
+        create_legacy_fixture_schema(source)
+        seed_legacy_fixture(
+            source, project_name="verified-fixture", line_count=8,
+            analysis_count=5, draft_stride=2,
+        )
+        create_sqlite_schema(target)
+        result = migrate_legacy(source, target, release_sha="verified-fixture")
+        self.assertEqual(result["status"], "PASSED")
+        evidence = _migrated_file_state_ready_evidence(target)
+        self.assertEqual(evidence["status"], "PASSED")
+        self.assertEqual(evidence["project_count"], 1)
+        project = evidence["projects"]["verified-fixture"]
+        self.assertEqual(project["status"], "PASSED")
+        self.assertEqual(project["data_version"], project["file_state_version"])
+        self.assertEqual(project["gate"]["pending_conservation"]["status"], "PASSED")
 
 
 if __name__ == "__main__":

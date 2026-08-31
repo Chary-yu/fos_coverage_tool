@@ -80,6 +80,9 @@ class ScanImportService(object):
                 report_root=report_root,
                 scan_id=scan["id"],
                 source_signature=report.get("source_signature", ""),
+                asset_identity=report.get("asset_identity", ""),
+                sidecar_schema=report.get("sidecar_schema", 0),
+                report_mode=report.get("report_mode"),
             )
         return {
             "scan": scan, "files": int(stats["files"]),

@@ -5,8 +5,9 @@ from app.services.project_service import ProjectService
 from app.services.progress_service import ProgressService
 from app.services.export_service import ExportService
 from app.services.incremental_service import IncrementalReportService
+from app.services.file_state_service import FileStateService
 
 __all__ = [
     "AnalysisService", "ProjectService", "ProgressService", "ExportService",
-    "IncrementalReportService",
+    "IncrementalReportService", "FileStateService",
 ]

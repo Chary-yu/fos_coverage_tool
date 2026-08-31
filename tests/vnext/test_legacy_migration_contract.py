@@ -53,6 +53,42 @@ class LegacyMigrationContractTest(unittest.TestCase):
             "SELECT COUNT(*) FROM coverage_scans"
         ).fetchone()[0], 1)
 
+    def test_mixed_legacy_confirmed_and_draft_facts_preserve_pending_partitions(self):
+        source = self._source(line_count=10, analysis_count=6, draft_stride=3)
+        target = sqlite3.connect(":memory:")
+        target.row_factory = sqlite3.Row
+        create_sqlite_schema(target)
+        self.addCleanup(target.close)
+
+        result = migrate_legacy(source, target, release_sha="mixed-fixture")
+        self.assertEqual(result["status"], "PASSED")
+        row = target.execute("""
+            SELECT fs.pending_total, fs.ordinary_pending_total,
+                   fs.inherited_pending_total, fs.manual_draft_pending_total,
+                   ps.data_version, ps.file_state_version,
+                   ps.current_scan_id, s.id
+            FROM coverage_file_state fs
+            JOIN coverage_scans s ON s.id = fs.scan_id
+            JOIN coverage_project_state ps ON ps.project_id = s.project_id
+            WHERE s.project_id = (
+                SELECT id FROM coverage_projects WHERE project_name=?
+            )
+        """, ("fixture",)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(int(row["pending_total"]), 6)
+        self.assertEqual(int(row["ordinary_pending_total"]), 4)
+        self.assertEqual(int(row["inherited_pending_total"]), 0)
+        self.assertEqual(int(row["manual_draft_pending_total"]), 2)
+        self.assertEqual(
+            int(row["pending_total"]),
+            int(row["ordinary_pending_total"])
+            + int(row["inherited_pending_total"])
+            + int(row["manual_draft_pending_total"]),
+        )
+        self.assertEqual(int(row["data_version"]), 7)
+        self.assertEqual(int(row["file_state_version"]), 7)
+        self.assertEqual(int(row["current_scan_id"]), int(row["id"]))
+
     def test_schema_apply_records_stage_ledger_and_rejects_checksum_drift(self):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row

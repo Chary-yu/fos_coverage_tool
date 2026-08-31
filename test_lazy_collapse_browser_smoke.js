@@ -188,6 +188,88 @@ function createDOMEnvironment(htmlContent, fetchMock) {
 async function runSmokeTests() {
     const jsPath = path.join(__dirname, 'coverage_enhance.js');
     const jsSource = fs.readFileSync(jsPath, 'utf8');
+    const pendingJsPath = path.join(__dirname, 'pending_snapshot.js');
+    const pendingJsSource = fs.readFileSync(pendingJsPath, 'utf8');
+
+    // -------------------------------------------------------------------------
+    // Smoke Test 0: Pending snapshot envelope is strict and identity-safe
+    // -------------------------------------------------------------------------
+    console.log('[Smoke Test 0] Verifying pending snapshot rejects malformed pages...');
+    function createPendingContext(fetchMock) {
+        const pendingWindow = { fetch: fetchMock };
+        const pendingContext = vm.createContext({
+            window: pendingWindow,
+            fetch: fetchMock,
+            URLSearchParams,
+        });
+        vm.runInContext(pendingJsSource, pendingContext);
+        return pendingContext;
+    }
+
+    async function expectPendingError(fetchMock, expectedCode, options) {
+        const pendingContext = createPendingContext(fetchMock);
+        try {
+            await pendingContext.window.CoveragePendingSnapshot.fetchComplete(Object.assign({
+                apiBase: 'http://pending.test/api/coverage',
+                projectName: 'PendingFixture',
+                pageSize: 'not-a-number',
+            }, options || {}));
+            assert.fail(`Expected pending snapshot error ${expectedCode}`);
+        } catch (error) {
+            assert.strictEqual(error.code, expectedCode);
+        }
+    }
+
+    await expectPendingError(async () => ({
+        ok: true,
+        json: async () => ({
+            scan_id: 1, data_version: 1, repository_name: '', files: [],
+            has_more: false, next_cursor: {},
+        }),
+    }), 'PENDING_SNAPSHOT_CONTRACT_ERROR');
+
+    await expectPendingError(async () => ({
+        ok: true,
+        json: async () => ({
+            scan_id: 8, data_version: 1, repository_name: '', files: [],
+            has_more: false, next_cursor: null,
+        }),
+    }), 'PENDING_SNAPSHOT_STALE', { scanId: '7' });
+
+    let duplicatePage = 0;
+    await expectPendingError(async () => {
+        duplicatePage += 1;
+        return {
+            ok: true,
+            json: async () => duplicatePage === 1 ? {
+                scan_id: 1, data_version: 1, repository_name: '',
+                files: [{ repository_name: 'repo-a', file_path: 'src/a.c', unanalyzed: 1 }],
+                has_more: true, next_cursor: 'opaque-next',
+            } : {
+                scan_id: 1, data_version: 1, repository_name: '',
+                files: [{ repository_name: 'repo-a', file_path: 'src/a.c', unanalyzed: 1 }],
+                has_more: false, next_cursor: null,
+            },
+        };
+    }, 'PENDING_SNAPSHOT_CONTRACT_ERROR');
+
+    let mixedIdentityPage = 0;
+    await expectPendingError(async () => {
+        mixedIdentityPage += 1;
+        return {
+            ok: true,
+            json: async () => mixedIdentityPage === 1 ? {
+                scan_id: 1, data_version: 1, repository_name: '',
+                files: [{ file_path: 'src/a.c', unanalyzed: 1 }],
+                has_more: true, next_cursor: 'opaque-next',
+            } : {
+                scan_id: 1, data_version: 1, repository_name: '',
+                files: [{ repository_name: 'repo-a', file_path: 'src/a.c', unanalyzed: 1 }],
+                has_more: false, next_cursor: null,
+            },
+        };
+    }, 'PENDING_SNAPSHOT_AMBIGUOUS_IDENTITY');
+    console.log('✔ [Smoke Test 0 Passed] Pending snapshot malformed envelopes fail closed.');
 
     // -------------------------------------------------------------------------
     // Test 1: Chunk Failure & Retry does NOT duplicate DOM code lines
@@ -236,6 +318,7 @@ async function runSmokeTests() {
 
     const mockHtml = `<!DOCTYPE html><html><head>
 <meta name="coverage-project" content="SmokeProj">
+<meta name="coverage-report-mode" content="VNEXT_ARTIFACT_READY">
 <meta name="coverage-report-id" content="report_smoke_1">
 <meta name="coverage-scan-id" content="scan_smoke_1">
 <meta name="coverage-file-path" content="src/smoke_test.c">
