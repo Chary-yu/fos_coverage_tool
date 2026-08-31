@@ -73,7 +73,8 @@ class AnalysisService(object):
             next_state = self.states.advance(conn, project["id"])
             next_state = self.file_state_service.rebuild_validate_and_mark_ready_in_transaction(
                 conn, project["id"], int(scan_id),
-                int(next_state["data_version"])
+                int(next_state["data_version"]),
+                affected_file_ids=affected_file_ids,
             )
         return {"saved": saved, "data_version": next_state["data_version"]}
 

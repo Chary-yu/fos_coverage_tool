@@ -374,6 +374,44 @@
       + `<span class="${asNumber(ownership.unmatched_files) ? 'unmatched' : 'matched'}">未匹配 ${asNumber(ownership.unmatched_files)} 个文件</span>。`;
   }
 
+  function hasOwn(value, key) {
+    return value != null && Object.prototype.hasOwnProperty.call(value, key);
+  }
+
+  function setHidden(id, hidden) {
+    const element = document.getElementById(id);
+    if (element) element.hidden = Boolean(hidden);
+  }
+
+  function renderOptionalAggregates(data) {
+    const ownership = hasOwn(data, 'ownership') && data.ownership &&
+      typeof data.ownership === 'object' && !Array.isArray(data.ownership)
+      ? data.ownership : null;
+    const ownershipMetricsAvailable = ownership &&
+      Number.isFinite(Number(ownership.matched_files)) &&
+      Number.isFinite(Number(ownership.unmatched_files));
+    setHidden('ownershipMatchedCard', !ownershipMetricsAvailable);
+    setHidden('ownershipUnmatchedCard', !ownershipMetricsAvailable);
+    setHidden('ownershipStatus', !ownership);
+    if (ownership) {
+      if (ownershipMetricsAvailable) {
+        renderOwnershipStatus(ownership);
+      } else {
+        document.getElementById('ownershipStatus').innerHTML =
+          `<span class="warning">${escapeHtml(ownership.warning ||
+            'VNext Progress API 未提供完整归属统计。')}</span>`;
+      }
+    }
+
+    const teamsAvailable = hasOwn(data, 'teams') && Array.isArray(data.teams);
+    setHidden('teamProgressSection', !teamsAvailable);
+    if (teamsAvailable) renderTeamTable(data.teams);
+
+    const dirsAvailable = hasOwn(data, 'dirs') && Array.isArray(data.dirs);
+    setHidden('directoryProgressSection', !dirsAvailable);
+    if (dirsAvailable) renderTable('dirTable', data.dirs, 'dir_path');
+  }
+
   function normalizeApiBase(value) {
     return String(value || '').replace(/\/+$/, '');
   }
@@ -570,9 +608,7 @@
     metric('filledTotal', canonicalNumber(projectRow, 'filled_total'));
     metric('fillRate', canonicalRate(projectRow, 'filled_total'));
     metric('confirmedRate', canonicalRate(projectRow, 'confirmed_total'));
-    renderOwnershipStatus(data.ownership || { available: false, warning: 'VNext 汇总不提供旧版目录归属表。' });
-    renderTeamTable(data.teams || []);
-    renderTable('dirTable', data.dirs || [], 'dir_path');
+    renderOptionalAggregates(data);
     if (Array.isArray(data.files)) renderFileTable(data.files);
     if (projectRows.length === 0) {
       statusEl.innerHTML = `<span class="warning">未找到项目“${escapeHtml(project)}”的审查行索引。请在数据库可连接时重新执行 incremental 或 inject。</span>`;

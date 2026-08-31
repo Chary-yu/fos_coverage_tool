@@ -391,7 +391,11 @@ jobs:
                   assert project_ready['gate']['pending_conservation']['status'] == 'PASSED'
                   assert project_ready['gate']['reconciliation']['status'] == 'PASSED'
                   aggregate = project_ready['aggregate']
-                  assert aggregate['pending_total'] == aggregate['ordinary_pending_total'] + aggregate['inherited_pending_total'] + aggregate['manual_draft_pending_total']
+                  assert int(aggregate['pending_total']) == (
+                      int(aggregate['ordinary_pending_total']) +
+                      int(aggregate['inherited_pending_total']) +
+                      int(aggregate['manual_draft_pending_total'])
+                  )
           assert evidence['checks']['schema_applied'] is True
           assert evidence['checks']['bulk_scan_ingest_and_seal'] is True
           assert evidence['checks']['bulk_analysis_upsert'] is True

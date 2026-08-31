@@ -4879,6 +4879,10 @@ class CoverageHTTPRequestHandler(BaseHTTPRequestHandler):
                     {
                         "file_path": fpath,
                         "unanalyzed": int(counts_map.get(fpath, 0) or 0),
+                        # The Legacy query materializes the complete pending
+                        # line set in one pass, so its bounded VNext-compatible
+                        # envelope can explicitly declare the list complete.
+                        "pending_line_numbers_complete": True,
                         "pending_line_numbers": sorted(set(
                             int(line) for line in (pending_lines_map.get(fpath) or [])
                             if int(line) > 0

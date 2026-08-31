@@ -87,6 +87,7 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
   let currentTaskPendingLines = taskPendingLines;
   let currentTaskPendingFiles = taskPendingFiles;
   let pendingPageRequests = 0;
+  let pendingFileLineRequests = 0;
   let pendingRequestSequence = 0;
   let inheritanceRejected = false;
   let inheritanceRevision = 1;
@@ -196,15 +197,68 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
     if (pathname === '/coverage_enhance.js') return sendStatic(CLIENT_JS, 'text/javascript');
     if (pathname === '/coverage_enhance.css') return sendStatic(CLIENT_CSS, 'text/css');
 
+    const pendingFileSource = () => {
+      return currentTaskPendingFiles !== null
+        ? currentTaskPendingFiles
+        : [{ file_id: 42, file_path: 'src/fixture.c', unanalyzed: currentTaskPendingLines.length,
+          pending_line_numbers: currentTaskPendingLines }];
+    };
+    const pendingFilesForResponse = () => {
+      const source = pendingFileSource();
+      return source.map((file, index) => {
+        const next = { ...file };
+        const count = Number(next.unanalyzed);
+        const actualCount = Number.isFinite(count) ? count
+          : (Array.isArray(next.pending_line_numbers) ? next.pending_line_numbers.length : 0);
+        if (!Object.prototype.hasOwnProperty.call(next, 'pending_line_numbers_complete')) {
+          next.pending_line_numbers_complete = actualCount <= 200 &&
+            Array.isArray(next.pending_line_numbers) &&
+            next.pending_line_numbers.length === actualCount;
+        }
+        if (!next.pending_line_numbers_complete) {
+          if (next.file_id == null) next.file_id = 42 + index;
+          next.pending_line_numbers = [];
+        }
+        return next;
+      });
+    };
+
+    const pendingFileMatch = pathname.match(
+      /^\/api\/coverage\/scans\/1\/files\/(\d+)\/pending-lines$/
+    );
+    if (pendingFileMatch) {
+      const fileId = Number(pendingFileMatch[1]);
+      const pendingFiles = pendingFileSource();
+      const target = pendingFiles.find(file => Number(file.file_id) === fileId);
+      if (!target) return json(404, { status: 'error', message: 'pending file not found' });
+      pendingFileLineRequests += 1;
+      const lines = Array.isArray(target.pending_line_numbers)
+        ? target.pending_line_numbers : [];
+      const pageSize = Math.min(500, Math.max(1,
+        Number(parsed.searchParams.get('page_size') || 200)));
+      const rawCursor = parsed.searchParams.get('cursor');
+      const offset = rawCursor === null ? 0 : Number(rawCursor);
+      if (!Number.isInteger(offset) || offset < 0 || offset > lines.length) {
+        return json(409, { status: 'error', error: 'PAGINATION_CURSOR_STALE' });
+      }
+      const page = lines.slice(offset, offset + pageSize);
+      const nextOffset = offset + page.length;
+      const hasMore = nextOffset < lines.length;
+      return json(200, {
+        project_name: 'TaskFixture', scan_id: 1, file_id: fileId,
+        data_version: 1, repository_name: target.repository_name || '',
+        file_path: target.file_path, page_size: pageSize, total: lines.length,
+        pending_line_numbers: page, has_more: hasMore,
+        next_cursor: hasMore ? String(nextOffset) : null,
+      });
+    }
+
     if (pathname === '/api/coverage/incremental/unanalyzed') {
       if (currentTaskPendingLines === null && currentTaskPendingFiles === null) {
         return json(404, { status: 'error', message: 'task fixture disabled' });
       }
       pendingPageRequests += 1;
-      const pendingFiles = currentTaskPendingFiles !== null
-        ? currentTaskPendingFiles
-        : [{ file_path: 'src/fixture.c', unanalyzed: currentTaskPendingLines.length,
-          pending_line_numbers: currentTaskPendingLines }];
+      const pendingFiles = pendingFilesForResponse();
       const requestSequence = ++pendingRequestSequence;
       const pageSize = Math.min(200, Math.max(1,
         Number(parsed.searchParams.get('page_size') || 200)));
@@ -337,6 +391,7 @@ function createHarness({ large = false, failOnce = false, taskPendingLines = nul
     get maxConcurrent() { return maxConcurrent; },
     get failureUsed() { return failureUsed; },
     get pendingPageRequests() { return pendingPageRequests; },
+    get pendingFileLineRequests() { return pendingFileLineRequests; },
     setTaskPendingLines(lines) { currentTaskPendingLines = lines; },
     setTaskPendingFiles(files) { currentTaskPendingFiles = files; },
   };
@@ -621,6 +676,23 @@ test('real Chromium developer task consumes the complete paginated pending snaps
     await expect.poll(() => harness.pendingPageRequests).toBe(3);
     await expect(page.locator('tr[data-owner-specific="true"] .js-task-unanalyzed')).toHaveText('1');
     await expect(page.locator('.js-dev-uncovered-lines')).toHaveText('1');
+  } finally {
+    await stopHarness(harness);
+  }
+});
+
+test('real Chromium developer task hydrates owner lines when one file has more than 200 pending lines', async ({ page, browserName }) => {
+  expect(browserName).toBe('chromium');
+  const largePendingLines = Array.from({ length: 401 }, (_, index) => index + 1);
+  const harness = await startHarness({ taskPendingLines: largePendingLines });
+  try {
+    await page.goto(`${harness.baseUrl}/tasks.html`, { waitUntil: 'networkidle' });
+    const row = page.locator('tr[data-owner-specific="true"]');
+    await expect(row.locator('.js-task-unanalyzed')).toHaveText('2');
+    await expect(page.locator('.js-dev-uncovered-lines')).toHaveText('2');
+    await expect(page.locator('.js-summary-uncovered-lines')).toHaveText('2');
+    expect(harness.pendingFileLineRequests).toBe(3);
+    await expect(row.locator('.js-task-action')).toContainText('填写 2 行');
   } finally {
     await stopHarness(harness);
   }

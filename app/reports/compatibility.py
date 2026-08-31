@@ -5,7 +5,7 @@ import hashlib
 
 # Keep this value in lockstep with docs/api_contract.json. It identifies the
 # DTO/route contract a generated report expects; it is not a release number.
-REPORT_API_CONTRACT_VERSION = "vnext-api-20260826.1"
+REPORT_API_CONTRACT_VERSION = "vnext-api-20260831.1"
 REPORT_COMPATIBILITY_VERSION = 1
 _RELEASE_FIELDS = (
     "version", "commit_sha", "build_id", "asset_hash", "schema_version",

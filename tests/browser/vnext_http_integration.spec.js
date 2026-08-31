@@ -253,6 +253,25 @@ test('Progress page derives canonical non-zero rates without legacy DTO fields',
   }
 });
 
+test('Progress page hides unsupported ownership, team, and directory aggregates', async ({ page, browserName }) => {
+  test.setTimeout(60000);
+  expect(browserName).toBe('chromium');
+  const fixture = await startFixture();
+  try {
+    await page.goto(
+      `${fixture.info.base_url}/coverage_progress.html?project=HttpFixture&repository_name=repo-a`,
+      { waitUntil: 'networkidle' },
+    );
+    await expect(page.locator('#ownershipMatchedCard')).toBeHidden();
+    await expect(page.locator('#ownershipUnmatchedCard')).toBeHidden();
+    await expect(page.locator('#ownershipStatus')).toBeHidden();
+    await expect(page.locator('#teamProgressSection')).toBeHidden();
+    await expect(page.locator('#directoryProgressSection')).toBeHidden();
+  } finally {
+    await stopFixture(fixture);
+  }
+});
+
 test('Progress page visibly reports a missing canonical field instead of rendering zero', async ({ page, browserName }) => {
   test.setTimeout(60000);
   expect(browserName).toBe('chromium');

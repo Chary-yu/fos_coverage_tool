@@ -259,6 +259,59 @@ class ProgressReadyGateTest(unittest.TestCase):
         state = self.states.get(self.connection, self.project["id"])
         self.assertEqual(int(state["file_state_version"]), 0)
 
+    def test_partial_rebuild_rebases_unchanged_files_and_keeps_full_ready_gate(self):
+        other_file = self.projects.ensure_file(
+            self.connection, self.scan["id"], "repo", "g" * 32,
+            "src/other-ready-gate.c", "other-ready-gate.c",
+        )
+        self.lines.upsert_lines(self.connection, other_file["id"], [{
+            "line_number": 1, "line_text": "return 1;",
+            "coverage_state": "uncovered",
+        }])
+        self.file_states.rebuild_scan(
+            self.connection, self.scan["id"], 1, None
+        )
+        self.states.mark_ready(self.connection, self.project["id"], 1)
+        self.connection.commit()
+
+        self.connection.execute(
+            "UPDATE coverage_lines SET coverage_state='covered' "
+            "WHERE file_id=? AND line_number=1",
+            (self.file["id"],),
+        )
+        next_state = self.states.advance(self.connection, self.project["id"])
+        service = FileStateService(
+            file_state_repo=self.file_states,
+            state_repo=self.states,
+        )
+        with mock.patch.object(
+                self.file_states, "rebase_scan_version",
+                wraps=self.file_states.rebase_scan_version) as rebase, \
+                mock.patch.object(
+                    self.file_states, "rebuild_scan",
+                    wraps=self.file_states.rebuild_scan) as rebuild:
+            ready = service.rebuild_validate_and_mark_ready_in_transaction(
+                self.connection, self.project["id"], self.scan["id"],
+                int(next_state["data_version"]),
+                affected_file_ids=[self.file["id"]],
+            )
+        self.assertEqual(int(ready["file_state_version"]), 2)
+        self.assertEqual(rebase.call_count, 1)
+        self.assertEqual(
+            rebuild.call_args.kwargs["file_ids"], [self.file["id"]]
+        )
+        first_state = self.file_states.get(
+            self.connection, self.scan["id"], self.file["id"]
+        )
+        other_state = self.file_states.get(
+            self.connection, self.scan["id"], other_file["id"]
+        )
+        self.assertEqual(int(first_state["total_uncovered"]), 0)
+        self.assertEqual(int(first_state["pending_total"]), 0)
+        self.assertEqual(int(other_state["total_uncovered"]), 1)
+        self.assertEqual(int(other_state["pending_total"]), 1)
+        self.assertEqual(int(other_state["data_version"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

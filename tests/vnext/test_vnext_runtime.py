@@ -164,6 +164,7 @@ class VNextRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(pending["files"][0]["pending_line_numbers"], [10, 11])
+        self.assertTrue(pending["files"][0]["pending_line_numbers_complete"])
 
         status, pending_window = self.application.dispatch(
             "GET", "/api/coverage/progress/pending",
@@ -270,8 +271,103 @@ class VNextRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(status, 200)
         self.assertEqual(
-            release["api_contract_version"], "vnext-api-20260826.1"
+            release["api_contract_version"], "vnext-api-20260831.1"
         )
+
+    def test_large_pending_file_exposes_incomplete_preview_and_paged_line_api(self):
+        lines = [
+            {"line_number": number, "line_text": "line-{}();".format(number),
+             "coverage_state": "uncovered"}
+            for number in range(1, 206)
+        ]
+        scan = self.runtime.project_service.create_scan_and_ingest(
+            self.connection, "large-pending-file", [{
+                "repository_name": "repo-large",
+                "file_path": "src/large.c",
+                "file_path_hash": "l" * 32,
+                "lines": lines,
+            }], info_sha256="large-pending-file-info",
+        )
+        status, pending = self.application.dispatch(
+            "GET", "/api/coverage/incremental/unanalyzed",
+            query={"project": "large-pending-file"},
+        )
+        self.assertEqual(status, 200)
+        row = pending["files"][0]
+        self.assertEqual(row["unanalyzed"], 205)
+        self.assertEqual(row["pending_line_numbers"], [])
+        self.assertFalse(row["pending_line_numbers_complete"])
+        file_id = row["file_id"]
+
+        status, first = self.application.dispatch(
+            "GET", "/api/coverage/scans/{}/files/{}/pending-lines".format(
+                scan["id"], file_id
+            ),
+            query={
+                "project": "large-pending-file", "repository_name": "repo-large",
+                "page_size": "100",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(first["scan_id"], scan["id"])
+        self.assertEqual(first["file_id"], file_id)
+        self.assertEqual(first["data_version"], pending["data_version"])
+        self.assertEqual(first["total"], 205)
+        self.assertEqual(first["pending_line_numbers"], list(range(1, 101)))
+        self.assertTrue(first["has_more"])
+        self.assertTrue(first["next_cursor"])
+
+        status, _ = self.application.dispatch(
+            "GET", "/api/coverage/scans/{}/files/{}/pending-lines".format(
+                scan["id"], file_id
+            ),
+            query={
+                "project": "large-pending-file", "repository_name": "repo-other",
+                "page_size": "100",
+            },
+        )
+        self.assertEqual(status, 409)
+
+        status, second = self.application.dispatch(
+            "GET", "/api/coverage/scans/{}/files/{}/pending-lines".format(
+                scan["id"], file_id
+            ),
+            query={
+                "project": "large-pending-file", "repository_name": "repo-large",
+                "page_size": "100", "cursor": first["next_cursor"],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(second["pending_line_numbers"], list(range(101, 201)))
+        self.assertTrue(second["has_more"])
+
+        status, third = self.application.dispatch(
+            "GET", "/api/coverage/scans/{}/files/{}/pending-lines".format(
+                scan["id"], file_id
+            ),
+            query={
+                "project": "large-pending-file", "repository_name": "repo-large",
+                "page_size": "100", "cursor": second["next_cursor"],
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(third["pending_line_numbers"], list(range(201, 206)))
+        self.assertFalse(third["has_more"])
+        self.assertIsNone(third["next_cursor"])
+
+        self.runtime.states.advance(self.connection, scan["project_id"])
+        self.connection.commit()
+        status, stale = self.application.dispatch(
+            "GET", "/api/coverage/scans/{}/files/{}/pending-lines".format(
+                scan["id"], file_id
+            ),
+            query={
+                "project": "large-pending-file", "repository_name": "repo-large",
+                "page_size": "100", "cursor": first["next_cursor"],
+            },
+        )
+        self.assertEqual(status, 409)
+        self.assertEqual(stale["error"], "PAGINATION_CURSOR_STALE")
 
     def test_progress_files_uses_bounded_keyset_windows(self):
         status, body = self.application.dispatch(

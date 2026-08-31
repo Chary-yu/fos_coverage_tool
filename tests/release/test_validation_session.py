@@ -88,7 +88,10 @@ class ValidationSessionTest(unittest.TestCase):
             self.assertEqual(loaded.data["baseline_sha"], "b" * 40)
             self.assertEqual(loaded.data["ports"], [19528])
 
-            evidence = loaded.teardown(evidence_path=evidence_path, timeout=0)
+            with mock.patch(
+                    "scripts.upgrade.validation_session._port_listeners",
+                    return_value=[]):
+                evidence = loaded.teardown(evidence_path=evidence_path, timeout=0)
             self.assertEqual(evidence["status"], "PASSED")
             self.assertFalse(evidence["p1"])
             with open(evidence_path, encoding="utf-8") as stream:

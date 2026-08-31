@@ -113,17 +113,56 @@ class FileStateRepository(object):
             cursor.close()
         return self.get(connection, scan_id, file_id)
 
-    def rebuild_scan(self, connection, scan_id: int, data_version: int, file_rows):
-        """Rebuild all file states with one grouped INSERT/UPDATE statement."""
+    def rebase_scan_version(self, connection, scan_id: int, data_version: int):
+        """Move unchanged derived rows to a new authoritative version.
+
+        A mutation already knows which physical files it changed.  Reusing
+        the aggregate for every other file avoids rerunning the full line
+        aggregation while the Ready gate still checks every row and every
+        total before publication.
+        """
+        cursor = execute(connection, """
+            UPDATE coverage_file_state
+            SET data_version = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE scan_id = ?
+        """, (int(data_version), int(scan_id)))
+        count = int(getattr(cursor, "rowcount", 0) or 0)
+        cursor.close()
+        return count
+
+    def rebuild_scan(self, connection, scan_id: int, data_version: int,
+                     file_rows, file_ids=None):
+        """Rebuild all or selected file states with one grouped statement.
+
+        ``file_rows`` is retained for compatibility with older callers.  A
+        non-``None`` ``file_ids`` value limits the grouped aggregation to the
+        known affected files; callers must rebase unchanged rows first.
+        """
         # ``file_rows`` was part of the original per-file implementation. Keep
         # the argument for callers that still pass it, but derive the complete
         # file set in SQL so the caller does not need to materialize or loop it.
         del file_rows
+        selected_file_ids = None if file_ids is None else sorted({
+            int(file_id) for file_id in file_ids
+            if int(file_id) > 0
+        })
+        if selected_file_ids == []:
+            return {
+                "scan_id": int(scan_id), "data_version": int(data_version),
+                "status": "REBUILT", "file_count": 0,
+            }
         uncovered = self._UNCOVERED_SQL
         confirmed = self._CONFIRMED_SQL
         ordinary = self._ORDINARY_PENDING_SQL
         inherited = self._INHERITED_PENDING_SQL
         manual_draft = self._MANUAL_DRAFT_PENDING_SQL
+        file_filter = ""
+        file_filter_params = ()
+        if selected_file_ids is not None:
+            file_filter = " AND f.id IN ({})".format(
+                ",".join("?" for _ in selected_file_ids)
+            )
+            file_filter_params = tuple(selected_file_ids)
         grouped_select = """
             SELECT f.scan_id, f.id,
                    COUNT(l.id),
@@ -142,11 +181,12 @@ class FileStateRepository(object):
             LEFT JOIN coverage_analysis_line_links q
               ON q.scan_id = f.scan_id AND q.line_id = l.id AND q.is_active = 1
             LEFT JOIN coverage_analysis_records r ON r.id = q.analysis_record_id
-            WHERE f.scan_id = ?
+            WHERE f.scan_id = ?{file_filter}
             GROUP BY f.scan_id, f.id
         """.format(uncovered=uncovered, status=self._STATUS_SQL,
                    draft=self._DRAFT_SQL, confirmed=confirmed, ordinary=ordinary,
-                   inherited=inherited, manual_draft=manual_draft)
+                   inherited=inherited, manual_draft=manual_draft,
+                   file_filter=file_filter)
         if is_sqlite(connection):
             upsert_suffix = """
                 ON CONFLICT(scan_id, file_id) DO UPDATE SET
@@ -187,21 +227,27 @@ class FileStateRepository(object):
         """ + grouped_select + upsert_suffix
         cursor = connection.cursor()
         try:
-            cursor.execute(adapt_sql(connection, insert_sql), (int(data_version), int(scan_id)))
-            cursor.execute(adapt_sql(connection, """
-                DELETE FROM coverage_file_state
-                WHERE scan_id = ?
-                  AND NOT EXISTS (
-                      SELECT 1 FROM coverage_files f
-                      WHERE f.id = coverage_file_state.file_id AND f.scan_id = ?
-                  )
-            """), (int(scan_id), int(scan_id)))
+            cursor.execute(
+                adapt_sql(connection, insert_sql),
+                (int(data_version), int(scan_id)) + file_filter_params,
+            )
+            if selected_file_ids is None:
+                cursor.execute(adapt_sql(connection, """
+                    DELETE FROM coverage_file_state
+                    WHERE scan_id = ?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM coverage_files f
+                          WHERE f.id = coverage_file_state.file_id AND f.scan_id = ?
+                      )
+                """), (int(scan_id), int(scan_id)))
         finally:
             cursor.close()
         return {
             "scan_id": int(scan_id),
             "data_version": int(data_version),
             "status": "REBUILT",
+            "file_count": (None if selected_file_ids is None
+                            else len(selected_file_ids)),
         }
 
     def scan_aggregate(self, connection, scan_id: int):
@@ -513,12 +559,16 @@ class FileStateRepository(object):
             item["repository_name"] = item.get("repository_name") or ""
             item["file_path"] = item.get("file_path") or ""
             item["unanalyzed"] = int(item.get("pending_total") or 0)
-            # The legacy field remains present but deliberately empty: the
-            # homepage must never materialize a large physical pending list.
+            # The legacy field remains bounded.  An empty list for a large
+            # file is not a claim that there are no pending lines, therefore
+            # the explicit completeness bit is part of the canonical DTO.
+            item["pending_line_numbers_complete"] = bool(
+                pending_only and item["unanalyzed"] <= 200
+            )
             item["pending_line_numbers"] = (
                 self.pending_line_numbers_for_file(
                     connection, int(scan_id), item["file_id"], limit=200
-                ) if pending_only and item["unanalyzed"] <= 200 else []
+                ) if item["pending_line_numbers_complete"] else []
             )
             result.append(item)
         next_cursor = (
@@ -535,6 +585,78 @@ class FileStateRepository(object):
             repository_name=repository_name, data_version=data_version,
             derived_ready=derived_ready,
         )
+
+    def pending_line_page(self, connection, scan_id, file_id, limit=200,
+                          cursor=None):
+        """Return one complete-able keyset page of a file's pending lines."""
+        uncovered = self._UNCOVERED_SQL
+        confirmed = self._CONFIRMED_SQL
+        total_row = fetchone(connection, """
+            SELECT COUNT(*) AS total
+            FROM coverage_files f
+            JOIN coverage_lines l ON l.file_id = f.id
+            LEFT JOIN coverage_analyses a ON a.line_id = l.id
+            LEFT JOIN coverage_analysis_line_links q
+              ON q.scan_id = f.scan_id AND q.line_id = l.id AND q.is_active = 1
+            LEFT JOIN coverage_analysis_records r ON r.id = q.analysis_record_id
+            WHERE f.scan_id = ? AND f.id = ?
+              AND {uncovered} AND NOT ({confirmed})
+        """.format(uncovered=uncovered, confirmed=confirmed),
+            (int(scan_id), int(file_id))) or {}
+        page_limit = min(500, max(1, int(limit or 200)))
+        sql = """
+            SELECT l.id AS line_id, l.line_number
+            FROM coverage_files f
+            JOIN coverage_lines l ON l.file_id = f.id
+            LEFT JOIN coverage_analyses a ON a.line_id = l.id
+            LEFT JOIN coverage_analysis_line_links q
+              ON q.scan_id = f.scan_id AND q.line_id = l.id AND q.is_active = 1
+            LEFT JOIN coverage_analysis_records r ON r.id = q.analysis_record_id
+            WHERE f.scan_id = ? AND f.id = ?
+              AND {uncovered} AND NOT ({confirmed})
+        """.format(uncovered=uncovered, confirmed=confirmed)
+        params = [int(scan_id), int(file_id)]
+        if cursor:
+            try:
+                line_number = int(cursor["line_number"])
+                line_id = int(cursor["line_id"])
+            except (KeyError, TypeError, ValueError):
+                raise ValueError("PAGINATION_CURSOR_STALE")
+            sql += " AND (l.line_number > ? OR (l.line_number = ? AND l.id > ?))"
+            params.extend((line_number, line_number, line_id))
+        sql += " ORDER BY l.line_number, l.id LIMIT ?"
+        params.append(page_limit + 1)
+        rows = fetchall(connection, sql, params)
+        has_more = len(rows) > page_limit
+        rows = rows[:page_limit]
+        next_cursor = None
+        if has_more and rows:
+            last = rows[-1]
+            next_cursor = {
+                "line_number": int(last["line_number"]),
+                "line_id": int(last["line_id"]),
+            }
+        return {
+            "total": int(total_row.get("total") or 0),
+            "rows": [int(row["line_number"]) for row in rows],
+            "has_more": has_more,
+            "next_cursor": next_cursor,
+        }
+
+    def file_ids_for_lines(self, connection, scan_id, line_ids):
+        """Resolve affected physical files for a bounded line mutation."""
+        ids = sorted({int(line_id) for line_id in (line_ids or [])
+                      if int(line_id) > 0})
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        rows = fetchall(connection, """
+            SELECT DISTINCT f.id AS file_id
+            FROM coverage_files f
+            JOIN coverage_lines l ON l.file_id = f.id
+            WHERE f.scan_id = ? AND l.id IN ({})
+        """.format(placeholders), (int(scan_id),) + tuple(ids))
+        return sorted({int(row["file_id"]) for row in rows})
 
     def pending_line_numbers_for_file(self, connection, scan_id, file_id, limit=200):
         uncovered = self._UNCOVERED_SQL

@@ -298,11 +298,11 @@
       <div class="card"><div class="label">已填写</div><div id="filledTotal" class="value">-</div></div>
       <div class="card"><div class="label">填写率</div><div id="fillRate" class="value">-</div></div>
       <div class="card"><div class="label">确认率</div><div id="confirmedRate" class="value">-</div></div>
-      <div class="card"><div class="label">归属已匹配文件</div><div id="matchedFiles" class="value">-</div></div>
-      <div class="card"><div class="label">归属未匹配文件</div><div id="unmatchedFiles" class="value">-</div></div>
+      <div id="ownershipMatchedCard" class="card" hidden><div class="label">归属已匹配文件</div><div id="matchedFiles" class="value">-</div></div>
+      <div id="ownershipUnmatchedCard" class="card" hidden><div class="label">归属未匹配文件</div><div id="unmatchedFiles" class="value">-</div></div>
     </div>
-    <div id="ownershipStatus" class="ownership-status"></div>
-    <section class="section">
+    <div id="ownershipStatus" class="ownership-status" hidden></div>
+    <section id="teamProgressSection" class="section" hidden>
       <div class="section-header-flex">
         <h2>小组 / 组长填写进度（支持展开模块明细）</h2>
         <div>
@@ -312,7 +312,7 @@
       </div>
       <div class="table-wrap"><table id="teamTable"></table></div>
     </section>
-    <section class="section">
+    <section id="directoryProgressSection" class="section" hidden>
       <h2>目录进度</h2>
       <div class="table-wrap"><table id="dirTable"></table></div>
     </section>

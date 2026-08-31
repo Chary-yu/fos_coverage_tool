@@ -70,6 +70,193 @@
         return error;
     }
 
+    function fetchFileComplete(options) {
+        options = options || {};
+        var base = String(options.apiBase || "").replace(/\/+$/, "");
+        var project = String(options.projectName || "");
+        var requestedScan = snapshotNumber(options.scanId);
+        var requestedVersion = snapshotNumber(options.dataVersion);
+        var requestedFile = snapshotNumber(options.fileId);
+        var repositoryName = options.repositoryName == null ? "" :
+            String(options.repositoryName);
+        var filePath = String(options.filePath || "").replace(/\\/g, "/")
+            .replace(/^\.\//, "");
+        var pageSize = boundedInteger(options.pageSize, 200, 500);
+        var endpoint = options.endpoint ||
+            "/scans/" + encodeURIComponent(requestedScan || "") +
+            "/files/" + encodeURIComponent(requestedFile || "") +
+            "/pending-lines";
+        var maxRestarts = nonNegativeInteger(options.maxRestarts, 2);
+        var token = options.requestToken;
+
+        if (requestedScan === null || requestedVersion === null ||
+                requestedFile === null) {
+            return Promise.reject(contractError(
+                "pending file snapshot identity is invalid"
+            ));
+        }
+
+        function attempt(restarts) {
+            if (!tokenIsCurrent(token)) {
+                var cancelled = new Error("已取消过期的 pending file snapshot");
+                cancelled.code = "REQUEST_GENERATION_STALE";
+                return Promise.reject(cancelled);
+            }
+            var lines = [];
+            var seenLines = Object.create(null);
+            var cursor = null;
+            var pages = 0;
+            var expectedTotal = null;
+            var seenCursors = Object.create(null);
+
+            function consume() {
+                if (!tokenIsCurrent(token)) {
+                    var cancelled = new Error("已取消过期的 pending file snapshot");
+                    cancelled.code = "REQUEST_GENERATION_STALE";
+                    return Promise.reject(cancelled);
+                }
+                if (pages > 100000) {
+                    return Promise.reject(staleError(
+                        "pending file snapshot is too large"
+                    ));
+                }
+                var params = new URLSearchParams();
+                params.set("project", project);
+                params.set("page_size", String(pageSize));
+                if (repositoryName) params.set("repository_name", repositoryName);
+                if (cursor) params.set("cursor", cursor);
+                return requestPage(base + endpoint + "?" + params.toString())
+                    .then(function(payload) {
+                        if (!tokenIsCurrent(token)) {
+                            var cancelled = new Error(
+                                "已取消过期的 pending file snapshot"
+                            );
+                            cancelled.code = "REQUEST_GENERATION_STALE";
+                            throw cancelled;
+                        }
+                        pages += 1;
+                        var pageScan = snapshotNumber(payload.scan_id);
+                        var pageVersion = snapshotNumber(payload.data_version);
+                        var pageFile = snapshotNumber(payload.file_id);
+                        var pageTotal = snapshotNumber(payload.total);
+                        var required = [
+                            "project_name", "scan_id", "file_id", "data_version",
+                            "repository_name", "file_path", "page_size", "total",
+                            "pending_line_numbers", "has_more", "next_cursor",
+                        ];
+                        required.forEach(function(field) {
+                            if (!Object.prototype.hasOwnProperty.call(payload, field)) {
+                                throw contractError(
+                                    "pending file snapshot field is missing: " + field
+                                );
+                            }
+                        });
+                        if (String(payload.project_name || "") !== project ||
+                                pageScan !== requestedScan ||
+                                pageVersion !== requestedVersion ||
+                                pageFile !== requestedFile) {
+                            throw staleError(
+                                "pending file snapshot identity changed"
+                            );
+                        }
+                        if (pageTotal === null ||
+                                typeof payload.has_more !== "boolean" ||
+                                !Array.isArray(payload.pending_line_numbers)) {
+                            throw contractError(
+                                "pending file snapshot envelope is invalid"
+                            );
+                        }
+                        var pageRepository = payload.repository_name == null
+                            ? "" : String(payload.repository_name);
+                        var pagePath = String(payload.file_path || "")
+                            .replace(/\\/g, "/").replace(/^\.\//, "");
+                        if (pageRepository !== repositoryName ||
+                                (filePath && pagePath !== filePath)) {
+                            throw staleError(
+                                "pending file snapshot path identity changed"
+                            );
+                        }
+                        if (expectedTotal === null) {
+                            expectedTotal = Number(pageTotal);
+                        } else if (expectedTotal !== Number(pageTotal)) {
+                            throw staleError(
+                                "pending file snapshot total changed"
+                            );
+                        }
+                        payload.pending_line_numbers.forEach(function(value) {
+                            var number = Number(value);
+                            if (!Number.isSafeInteger(number) || number <= 0 ||
+                                    seenLines[number]) {
+                                throw contractError(
+                                    "pending file snapshot line numbers are invalid"
+                                );
+                            }
+                            seenLines[number] = true;
+                            lines.push(number);
+                        });
+                        var next = payload.next_cursor;
+                        if (next !== null &&
+                                (typeof next !== "string" || !next)) {
+                            throw contractError(
+                                "pending file snapshot cursor is invalid"
+                            );
+                        }
+                        if (payload.has_more && !next) {
+                            throw contractError(
+                                "pending file snapshot cursor is missing"
+                            );
+                        }
+                        if (!payload.has_more && next) {
+                            throw contractError(
+                                "pending file snapshot has an unexpected cursor"
+                            );
+                        }
+                        if (!payload.has_more) {
+                            if (lines.length !== expectedTotal) {
+                                throw contractError(
+                                    "pending file snapshot is incomplete"
+                                );
+                            }
+                            lines.sort(function(left, right) { return left - right; });
+                            return {
+                                scan_id: Number(requestedScan),
+                                data_version: Number(requestedVersion),
+                                file_id: Number(requestedFile),
+                                repository_name: pageRepository,
+                                file_path: pagePath,
+                                total: expectedTotal,
+                                pending_line_numbers: lines,
+                                pages: pages,
+                                restarts: restarts,
+                            };
+                        }
+                        if (seenCursors[next]) {
+                            throw staleError("pending file cursor repeated");
+                        }
+                        seenCursors[next] = true;
+                        cursor = next;
+                        return consume();
+                    });
+            }
+
+            return consume().catch(function(error) {
+                if (error && error.code === "PAGINATION_CURSOR_STALE" &&
+                        restarts < maxRestarts) {
+                    return attempt(restarts + 1);
+                }
+                if (error && error.code === "PAGINATION_CURSOR_STALE" &&
+                        restarts >= maxRestarts) {
+                    var closed = new Error("数据正在变化，请稍后刷新");
+                    closed.code = "PENDING_SNAPSHOT_STALE";
+                    throw closed;
+                }
+                throw error;
+            });
+        }
+
+        return attempt(0);
+    }
+
     function fetchComplete(options) {
         options = options || {};
         var base = String(options.apiBase || "").replace(/\/+$/, "");
@@ -178,9 +365,40 @@
                                 throw contractError("pending snapshot line numbers are invalid");
                             }
                         }
+                        if (!Object.prototype.hasOwnProperty.call(
+                                file, "pending_line_numbers_complete") ||
+                                typeof file.pending_line_numbers_complete !== "boolean") {
+                            throw contractError(
+                                "pending snapshot line completeness is invalid"
+                            );
+                        }
                         var count = file.unanalyzed == null ? pending.length : Number(file.unanalyzed);
                         if (!Number.isSafeInteger(count) || count < 0) {
                             throw contractError("pending snapshot count is invalid");
+                        }
+                        if (file.pending_line_numbers_complete &&
+                                pending.length !== count) {
+                            throw contractError(
+                                "pending snapshot complete line count does not match"
+                            );
+                        }
+                        if (!file.pending_line_numbers_complete && pending.length) {
+                            throw contractError(
+                                "pending snapshot partial line list is ambiguous"
+                            );
+                        }
+                        var fileId = null;
+                        if (Object.prototype.hasOwnProperty.call(file, "file_id") &&
+                                file.file_id != null) {
+                            fileId = snapshotNumber(file.file_id);
+                            if (fileId === null) {
+                                throw contractError("pending snapshot file id is invalid");
+                            }
+                        }
+                        if (!file.pending_line_numbers_complete && fileId === null) {
+                            throw contractError(
+                                "large pending snapshot file id is missing"
+                            );
                         }
                         if (!key) {
                             throw contractError("pending snapshot file identity is missing");
@@ -212,6 +430,9 @@
                         map[key] = {
                             key: key, repository_name: fileRepository,
                             file_path: normalizedPath, unanalyzed: count,
+                            file_id: fileId,
+                            pending_line_numbers_complete:
+                                file.pending_line_numbers_complete,
                         };
                         pendingLineMap[key] = pending;
                         if (!fileRepository) {
@@ -267,5 +488,6 @@
     root.CoveragePendingSnapshot = {
         fileKey: fileKey,
         fetchComplete: fetchComplete,
+        fetchFileComplete: fetchFileComplete,
     };
 }(window));

@@ -39,6 +39,9 @@ class InheritanceReviewService(object):
         expected_map = expected_relation_revisions or {}
         with transaction(connection) as conn:
             self._assert_current(conn, project_id, scan_id)
+            affected_file_ids = self.file_state_service.file_states.file_ids_for_lines(
+                conn, int(scan_id), selected
+            )
             results = []
             for line_id in selected:
                 expected = int(expected_map.get(str(line_id), expected_map.get(
@@ -74,7 +77,8 @@ class InheritanceReviewService(object):
                 })
             state = self.states.advance(conn, int(project_id))
             self.file_state_service.rebuild_validate_and_mark_ready_in_transaction(
-                conn, int(project_id), int(scan_id), int(state["data_version"])
+                conn, int(project_id), int(scan_id), int(state["data_version"]),
+                affected_file_ids=affected_file_ids,
             )
         return {"scan_id": int(scan_id), "items": results,
                 "reviewed_by": reviewer or ""}

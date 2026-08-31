@@ -29,6 +29,9 @@ class InheritanceRejectionService(object):
                 raise ValueError("INHERITANCE_RELATION_NOT_ACTIVE")
             if int(relation.get("relation_revision") or 0) != int(expected_relation_revision):
                 raise ValueError("STALE_RELATION_REVISION")
+            affected_file_ids = self.file_state_service.file_states.file_ids_for_lines(
+                conn, int(scan_id), [line_id]
+            )
             now = utc_sql()
             cursor = execute(conn, """
                 INSERT INTO coverage_inheritance_rejections(
@@ -54,7 +57,8 @@ class InheritanceRejectionService(object):
             cursor.close()
             state = self.states.advance(conn, int(project_id))
             self.file_state_service.rebuild_validate_and_mark_ready_in_transaction(
-                conn, int(project_id), int(scan_id), int(state["data_version"])
+                conn, int(project_id), int(scan_id), int(state["data_version"]),
+                affected_file_ids=affected_file_ids,
             )
             return fetchone(conn, """
                 SELECT * FROM coverage_inheritance_rejections
@@ -78,6 +82,9 @@ class InheritanceRejectionService(object):
             """, (int(rejection["rejected_relation_id"]),))
             if not relation or int(relation.get("relation_revision") or 0) != int(expected_relation_revision):
                 raise ValueError("STALE_RELATION_REVISION")
+            affected_file_ids = self.file_state_service.file_states.file_ids_for_lines(
+                conn, int(scan_id), [line_id]
+            )
             now = utc_sql()
             cursor = execute(conn, """
                 UPDATE coverage_analysis_line_links
@@ -101,7 +108,8 @@ class InheritanceRejectionService(object):
             cursor.close()
             state = self.states.advance(conn, int(project_id))
             self.file_state_service.rebuild_validate_and_mark_ready_in_transaction(
-                conn, int(project_id), int(scan_id), int(state["data_version"])
+                conn, int(project_id), int(scan_id), int(state["data_version"]),
+                affected_file_ids=affected_file_ids,
             )
             return fetchone(conn, """
                 SELECT * FROM coverage_inheritance_rejections WHERE id=?

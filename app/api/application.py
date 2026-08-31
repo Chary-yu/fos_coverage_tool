@@ -81,6 +81,7 @@ class VNextApplication(object):
         self.router.add("GET", r"^/api/coverage/progress/files$", self.progress_files)
         self.router.add("GET", r"^/api/coverage/progress/pending$", self.progress_pending)
         self.router.add("GET", r"^/api/coverage/incremental/unanalyzed$", self.unanalyzed)
+        self.router.add("GET", r"^/api/coverage/scans/([^/]+)/files/([^/]+)/pending-lines$", self.pending_lines)
         self.router.add("POST", r"^/api/coverage/incremental$", self.incremental)
         self.router.add("GET", r"^/api/coverage/incremental$", self.incremental_result)
         self.router.add("GET", r"^/api/coverage/code-layout$", self.code_layout)
@@ -797,6 +798,63 @@ class VNextApplication(object):
             "next_cursor": self._encode_keyset_cursor(
                 next_cursor, effective_scan_id, data_version, filter_key
             ) if next_cursor and effective_scan_id else None,
+        }
+
+    def pending_lines(self, scan_id, file_id, query, body, headers, remote_address):
+        """Return the complete pending-line snapshot for one large file."""
+        project_name = progress_endpoint.project_name(
+            query, self.config.get("project_name") or ""
+        )
+        page_size = min(500, max(1, int(query.get("page_size") or 200)))
+        requested_repository = query.get("repository_name")
+        requested_repository = (
+            None if requested_repository in (None, "")
+            else str(requested_repository)
+        )
+        numeric_scan_id = int(scan_id)
+        numeric_file_id = int(file_id)
+        filter_key = "pending_lines:{}".format(numeric_file_id)
+        with self._read_connection() as connection:
+            project = self.runtime.projects.get_project_by_name(
+                connection, project_name
+            )
+            if not project:
+                raise KeyError("project not found")
+            state = self.runtime.states.get(connection, int(project["id"])) or {}
+            data_version = int(state.get("data_version") or 0)
+            file_row = fetchone(connection, """
+                SELECT id, scan_id, repository_name, file_path
+                FROM coverage_files
+                WHERE id = ? AND scan_id = ?
+            """, (numeric_file_id, numeric_scan_id))
+            if not file_row:
+                raise ValueError("INVALID_SCAN_IDENTITY")
+            actual_repository = str(file_row.get("repository_name") or "")
+            if (requested_repository is not None and
+                    actual_repository != requested_repository):
+                raise ValueError("INVALID_SCAN_IDENTITY")
+            cursor = self._decode_keyset_cursor(
+                query.get("cursor"), numeric_scan_id, data_version, filter_key
+            ) if query.get("cursor") else None
+            page = self.runtime.progress_service.pending_lines_for_file(
+                connection, project_name, numeric_scan_id, numeric_file_id,
+                page_size=page_size, cursor=cursor,
+            )
+        next_cursor = page.get("next_cursor")
+        return 200, {
+            "project_name": project_name,
+            "scan_id": numeric_scan_id,
+            "file_id": numeric_file_id,
+            "data_version": data_version,
+            "repository_name": actual_repository,
+            "file_path": file_row.get("file_path") or "",
+            "page_size": page_size,
+            "total": int(page.get("total") or 0),
+            "pending_line_numbers": page.get("rows") or [],
+            "has_more": bool(page.get("has_more")),
+            "next_cursor": self._encode_keyset_cursor(
+                next_cursor, numeric_scan_id, data_version, filter_key
+            ) if next_cursor else None,
         }
 
     def incremental(self, query, body, headers, remote_address):

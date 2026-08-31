@@ -85,7 +85,8 @@ class FileStateService(object):
         return gate
 
     def rebuild_validate_and_mark_ready_in_transaction(
-            self, connection, project_id, scan_id, data_version):
+            self, connection, project_id, scan_id, data_version,
+            affected_file_ids=None):
         """Run the complete gate inside a caller-owned transaction."""
         project_id = int(project_id)
         scan_id = int(scan_id)
@@ -94,7 +95,23 @@ class FileStateService(object):
         # gate error and commits its surrounding transaction, the state still
         # advertises that the projection is stale.
         self.states.invalidate(connection, project_id)
-        self.file_states.rebuild_scan(connection, scan_id, data_version, None)
+        if affected_file_ids is None:
+            self.file_states.rebuild_scan(
+                connection, scan_id, data_version, None
+            )
+        else:
+            # The mutation boundary supplies the exact files whose facts
+            # changed. Rebase unchanged rows to the new version, then
+            # recompute only that bounded file set. The complete Ready gate
+            # below remains mandatory, so this is a performance optimization
+            # rather than a weaker correctness condition.
+            self.file_states.rebase_scan_version(
+                connection, scan_id, data_version
+            )
+            self.file_states.rebuild_scan(
+                connection, scan_id, data_version, None,
+                file_ids=affected_file_ids,
+            )
         gate = self.validate_rebuilt(
             connection, project_id, scan_id, data_version
         )

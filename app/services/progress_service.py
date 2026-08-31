@@ -195,6 +195,21 @@ class ProgressService(object):
         )
         return page
 
+    def pending_lines_for_file(self, connection, project_name, scan_id,
+                               file_id, page_size=200, cursor=None):
+        """Return a keyset page for one file's complete pending-line set."""
+        project = self._project(connection, project_name)
+        state = self.states.get(connection, project["id"]) or {}
+        resolved_scan_id = self._resolve_scan_for_project(
+            connection, project, state, scan_id=scan_id,
+        )
+        if not resolved_scan_id or int(resolved_scan_id) != int(scan_id):
+            raise ValueError("INVALID_SCAN_IDENTITY")
+        return self.file_states.pending_line_page(
+            connection, int(resolved_scan_id), int(file_id),
+            limit=page_size, cursor=cursor,
+        )
+
     def files_page(self, connection, project_name, scan_id=None,
                    page_size=200, cursor=None, repository_name=None):
         project = self._project(connection, project_name)

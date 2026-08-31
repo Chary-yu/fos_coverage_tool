@@ -52,6 +52,62 @@
         return count;
     }
 
+    function hydrateLargePendingLines(snapshot, generation) {
+        var requests = Object.create(null);
+        var keys = [];
+        var sections = document.querySelectorAll("section[id]");
+        for (var s = 0; s < sections.length; s++) {
+            var rows = sections[s].querySelectorAll("tbody tr[data-file-key]");
+            for (var r = 0; r < rows.length; r++) {
+                var row = rows[r];
+                if (row.getAttribute("data-owner-specific") !== "true") continue;
+                var rowFileKey = row.getAttribute("data-file-key");
+                var entry = snapshot.map && snapshot.map[rowFileKey];
+                if (!entry || entry.pending_line_numbers_complete !== false) continue;
+                if (!entry.file_id) {
+                    var missingId = new Error(
+                        "large pending snapshot file identity is missing"
+                    );
+                    missingId.code = "PENDING_SNAPSHOT_CONTRACT_ERROR";
+                    return Promise.reject(missingId);
+                }
+                if (!Object.prototype.hasOwnProperty.call(requests, rowFileKey)) {
+                    requests[rowFileKey] =
+                        window.CoveragePendingSnapshot.fetchFileComplete({
+                            apiBase: resolvedApiBase || "/api/coverage",
+                            projectName: projectName,
+                            scanId: snapshot.scan_id,
+                            dataVersion: snapshot.data_version,
+                            fileId: entry.file_id,
+                            filePath: entry.file_path,
+                            repositoryName: entry.repository_name,
+                            pageSize: 200,
+                            requestToken: function() {
+                                return generation === refreshGeneration;
+                            },
+                        });
+                    keys.push(rowFileKey);
+                }
+            }
+        }
+        return Promise.all(keys.map(function(key) {
+            return requests[key].then(function(result) {
+                return { key: key, result: result };
+            });
+        })).then(function(results) {
+            for (var i = 0; i < results.length; i++) {
+                var item = results[i];
+                snapshot.pendingLineMap[item.key] =
+                    item.result.pending_line_numbers;
+                if (snapshot.map[item.key]) {
+                    snapshot.map[item.key].pending_line_numbers_complete = true;
+                    snapshot.map[item.key].unanalyzed = item.result.total;
+                }
+            }
+            return snapshot;
+        });
+    }
+
     function refreshDeveloperTasks() {
         if (!projectName) return;
         var now = Date.now();
@@ -85,8 +141,10 @@
         tryCandidate(0)
             .then(function(snapshot) {
                 if (generation !== refreshGeneration) return;
-                var unanalyzedMap = snapshot.map || {};
-                var pendingLineMap = snapshot.pendingLineMap || {};
+                return hydrateLargePendingLines(snapshot, generation).then(function(snapshot) {
+                    if (generation !== refreshGeneration) return;
+                    var unanalyzedMap = snapshot.map || {};
+                    var pendingLineMap = snapshot.pendingLineMap || {};
 
                 var devSections = document.querySelectorAll("section[id]");
                 for (var s = 0; s < devSections.length; s++) {
@@ -176,7 +234,8 @@
                             sumUncoveredLines.textContent = devTotalUncovered;
                         }
                     }
-                }
+                    }
+                });
             })
             .catch(function(err) {
                 if (generation !== refreshGeneration) return;

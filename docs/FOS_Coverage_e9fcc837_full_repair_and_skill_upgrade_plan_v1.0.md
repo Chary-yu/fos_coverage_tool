@@ -768,3 +768,11 @@ Gate A 的 production-rehearsal CI workflow 现同时生成并上传 `evidence-m
 随后修复了 Gate Task Status 的依赖阻断诊断：上游任务阻断信息现在报告实际依赖 ID（例如 `A-03`），不再错误重复当前任务 ID；相关 Gate Task/Matrix/Release Governance 回归 33 项通过，并重新生成了当前状态快照。
 
 修复后于 2026-08-31 16:10（Asia/Shanghai）再次执行严格警告全量回归，574 个测试仍为 `OK (skipped=1)`（111.628 秒）；Gate Matrix、Task Status、DoD、Release Readiness、Python 3.6 grammar、编译、YAML 和 diff 检查均重新执行，结果保持可追溯且未产生新的失败。
+
+2026-08-31 17:28（Asia/Shanghai）根据新增审计关闭了大文件 Developer Tasks 的 P1 遗漏：`/api/coverage/incremental/unanalyzed` 的文件行 DTO 现在明确携带 `pending_line_numbers_complete`，当 pending 行超过预览上限时返回空预览但不再表达“无待分析行”；新增 `GET /api/coverage/scans/{scan_id}/files/{file_id}/pending-lines`，其分页 cursor 绑定 Scan、data version 和 file identity，前端只有在完整分页快照成功后才计算 owner-specific 交集，旧请求或 stale cursor 仍 fail-closed。新增 VNext runtime、API cursor/repository identity 和真实 Chromium 大文件 owner-specific 回归；浏览器专项最终 19/19 通过。新增公共 DTO 后 API contract 版本更新为 `vnext-api-20260831.1`，并同步更新报告兼容性 identity。
+
+同一轮修复了 Progress 页面 DTO 语义：canonical VNext summary 未提供 `ownership`、`teams`、`dirs` 时，归属卡片、归属状态、小组表和目录表全部隐藏；只有响应显式提供对应字段时才渲染，避免把字段缺失误解为 0 或“暂无数据”。MariaDB 5.5 CI evidence assertion 已将字符串数值显式转换为 `int`；Python 3.6 ValidationSession 单元测试 mock `_port_listeners` 固定无 listener 的单元环境，production fail-closed 规则保持不变。
+
+FileState mutation 路径已使用已知 `affected_file_ids`：先将未受影响的 derived rows rebase 到新版本，再只聚合受影响文件，之后继续执行完整 completeness、pending conservation 和 authoritative reconciliation Ready Gate；新建 Scan Import 仍全量构建，因为其整个 Scan 都是新事实。新增局部/全量 Ready Gate 合成基准脚本 `scripts/diagnostics/file_state_rebuild_benchmark.py` 和回归，当前本机小型 SQLite 试跑（20 文件 × 50 行、2 次）局部路径中位数约为全量的 0.70 倍；该结果明确标为 synthetic、`release_eligible=false`，不能替代发布前 MariaDB 等价性能门禁。
+
+上述修复已完成后端与发布专项、真实 Chromium 19 场景、API contract/JS/Python 静态检查；严格警告全量回归已通过 577 个测试（`OK (skipped=1)`），当前只剩最终 exact commit 推送。GitHub `main` 分支保护、required Candidate checks、真实 MariaDB/生产 Served Root/候选性能与完整 release evidence 仍属于外部待办，不能由本地测试替代。

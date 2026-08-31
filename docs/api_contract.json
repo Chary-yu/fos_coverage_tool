@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "contract_version": "vnext-api-20260826.1",
+  "contract_version": "vnext-api-20260831.1",
   "contract_id": "vnext-inheritance-api-v1",
   "runtime": "vnext",
   "routes": {
@@ -17,7 +17,8 @@
     "progress_details": "GET /api/coverage/progress/details",
     "progress_files": "GET /api/coverage/progress/files",
     "progress_pending": "GET /api/coverage/progress/pending",
-    "pending_files": "GET /api/coverage/incremental/unanalyzed"
+    "pending_files": "GET /api/coverage/incremental/unanalyzed",
+    "pending_file_lines": "GET /api/coverage/scans/{scan_id}/files/{file_id}/pending-lines"
   },
   "pagination": {
     "default_limit": 100,
@@ -27,6 +28,7 @@
     "progress_files_envelope": ["project_name", "scan_id", "data_version", "repository_name", "files", "page_size", "has_more", "next_cursor"],
     "progress_pending_envelope": ["scan_id", "page_size", "total", "rows", "has_more", "next_cursor"],
     "pending_files_envelope": ["project_name", "scan_id", "data_version", "repository_name", "files", "page_size", "has_more", "next_cursor"],
+    "pending_file_lines_envelope": ["project_name", "scan_id", "file_id", "data_version", "repository_name", "file_path", "page_size", "total", "pending_line_numbers", "has_more", "next_cursor"],
     "progress_files_identity": {
       "scan_id": "integer or null only when the project has no current Scan",
       "data_version": "non-negative integer",
@@ -36,6 +38,18 @@
       "scan_id": "integer or null only when the project has no current Scan",
       "data_version": "non-negative integer",
       "request_scan_id_echo": true
+    },
+    "pending_file_lines_identity": {
+      "scan_id": "integer",
+      "file_id": "integer bound to scan_id",
+      "data_version": "non-negative integer",
+      "cursor_binding": ["scan_id", "data_version", "file_id"],
+      "request_scan_id_echo": true,
+      "request_file_id_echo": true
+    },
+    "pending_file_fields": {
+      "pending_line_numbers_complete": "boolean; true means pending_line_numbers is complete, false means the list is intentionally omitted and must be loaded from pending_file_lines",
+      "pending_line_numbers": "complete list only when pending_line_numbers_complete is true; otherwise an empty list has no zero-pending meaning"
     }
   },
   "progress_summary": {
@@ -65,7 +79,13 @@
       "redundant_total",
       "fill_rate",
       "confirmed_rate"
-    ]
+    ],
+    "optional_dimensions": {
+      "ownership": "not included in the canonical VNext summary unless explicitly supplied by a future ownership DTO",
+      "teams": "not included in the canonical VNext summary unless explicitly supplied by a future team DTO",
+      "dirs": "not included in the canonical VNext summary unless explicitly supplied by a future directory DTO",
+      "client_rendering": "clients must hide unsupported optional dimensions; missing fields must not be rendered as zero or an empty-data result"
+    }
   },
   "mutation_identity": [
     "project",

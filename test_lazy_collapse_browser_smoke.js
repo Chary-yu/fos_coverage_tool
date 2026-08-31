@@ -243,11 +243,13 @@ async function runSmokeTests() {
             ok: true,
             json: async () => duplicatePage === 1 ? {
                 scan_id: 1, data_version: 1, repository_name: '',
-                files: [{ repository_name: 'repo-a', file_path: 'src/a.c', unanalyzed: 1 }],
+                files: [{ repository_name: 'repo-a', file_path: 'src/a.c', unanalyzed: 1,
+                    pending_line_numbers: [1], pending_line_numbers_complete: true }],
                 has_more: true, next_cursor: 'opaque-next',
             } : {
                 scan_id: 1, data_version: 1, repository_name: '',
-                files: [{ repository_name: 'repo-a', file_path: 'src/a.c', unanalyzed: 1 }],
+                files: [{ repository_name: 'repo-a', file_path: 'src/a.c', unanalyzed: 1,
+                    pending_line_numbers: [1], pending_line_numbers_complete: true }],
                 has_more: false, next_cursor: null,
             },
         };
@@ -260,11 +262,13 @@ async function runSmokeTests() {
             ok: true,
             json: async () => mixedIdentityPage === 1 ? {
                 scan_id: 1, data_version: 1, repository_name: '',
-                files: [{ file_path: 'src/a.c', unanalyzed: 1 }],
+                files: [{ file_path: 'src/a.c', unanalyzed: 1,
+                    pending_line_numbers: [1], pending_line_numbers_complete: true }],
                 has_more: true, next_cursor: 'opaque-next',
             } : {
                 scan_id: 1, data_version: 1, repository_name: '',
-                files: [{ repository_name: 'repo-a', file_path: 'src/a.c', unanalyzed: 1 }],
+                files: [{ repository_name: 'repo-a', file_path: 'src/a.c', unanalyzed: 1,
+                    pending_line_numbers: [1], pending_line_numbers_complete: true }],
                 has_more: false, next_cursor: null,
             },
         };

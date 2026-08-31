@@ -91,6 +91,10 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("test -s .artifacts/py36-runtime-evidence.json", workflow)
         self.assertIn("grep -q '\"tests_executed\": true' .artifacts/py36-runtime-evidence.json", workflow)
         self.assertIn("grep -q '\"pymysql\": \"0.10.1\"' .artifacts/py36-runtime-evidence.json", workflow)
+        self.assertIn("assert int(aggregate['pending_total']) == (", workflow)
+        self.assertIn("int(aggregate['ordinary_pending_total'])", workflow)
+        self.assertIn("int(aggregate['inherited_pending_total'])", workflow)
+        self.assertIn("int(aggregate['manual_draft_pending_total'])", workflow)
 
     def test_perf_benchmark_help_is_side_effect_free(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -102,6 +106,22 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
                     "--help",
                     "--output",
                     output,
+                ],
+                cwd=os.getcwd(), stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, universal_newlines=True,
+            )
+            self.assertEqual(completed.returncode, 0)
+            self.assertIn("--output", completed.stdout)
+            self.assertFalse(os.path.exists(output))
+
+    def test_file_state_rebuild_benchmark_help_is_side_effect_free(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "file-state.json")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/diagnostics/file_state_rebuild_benchmark.py",
+                    "--help", "--output", output,
                 ],
                 cwd=os.getcwd(), stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, universal_newlines=True,
