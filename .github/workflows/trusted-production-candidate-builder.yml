@@ -214,6 +214,7 @@ jobs:
           set -eu
           PYTHONPATH="$GITHUB_WORKSPACE/builder" python - <<'PY'
           import json
+          import os
 
           from app.candidate_artifact import CandidateArtifactManifest
           from app.candidate_build_receipt import verify_candidate_build_receipt

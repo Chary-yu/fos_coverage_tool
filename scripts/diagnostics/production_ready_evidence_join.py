@@ -233,16 +233,25 @@ def main(argv=None):
     parser.add_argument("--kind", choices=("browser", "performance", "backup"))
     parser.add_argument("--path", help="source evidence JSON for --kind")
     parser.add_argument("--github-output", action="store_true")
-    parser.add_argument("--candidate-build-commit", default="")
-    parser.add_argument("--candidate-build-artifact", default="")
     parser.add_argument(
-        "--candidate-build-role", default=PRODUCTION_RELEASE_ARTIFACT_ROLE
+        "--production-candidate-commit", "--candidate-build-commit",
+        dest="production_candidate_commit", default="",
     )
     parser.add_argument(
-        "--candidate-build-publishable", default="true"
+        "--production-candidate-artifact", "--candidate-build-artifact",
+        dest="production_candidate_artifact", default="",
     )
     parser.add_argument(
-        "--candidate-build-project", default=PRODUCTION_PROJECT_NAME
+        "--production-candidate-role", "--candidate-build-role",
+        dest="production_candidate_role", default=PRODUCTION_RELEASE_ARTIFACT_ROLE,
+    )
+    parser.add_argument(
+        "--production-candidate-publishable", "--candidate-build-publishable",
+        dest="production_candidate_publishable", default="true",
+    )
+    parser.add_argument(
+        "--production-candidate-project", "--candidate-build-project",
+        dest="production_candidate_project", default=PRODUCTION_PROJECT_NAME,
     )
     parser.add_argument("--browser-commit", default="")
     parser.add_argument("--browser-artifact", default="")
@@ -263,12 +272,12 @@ def main(argv=None):
             return 0
         result = join_identities(
             candidate_build_identity(
-                args.candidate_build_commit, args.candidate_build_artifact,
-                artifact_role=args.candidate_build_role,
+                args.production_candidate_commit, args.production_candidate_artifact,
+                artifact_role=args.production_candidate_role,
                 production_publishable=(
-                    str(args.candidate_build_publishable).lower() == "true"
+                    str(args.production_candidate_publishable).lower() == "true"
                 ),
-                project_name=args.candidate_build_project,
+                project_name=args.production_candidate_project,
             ),
             {
                 "commit_sha": _require_commit(args.browser_commit, "browser commit_sha"),

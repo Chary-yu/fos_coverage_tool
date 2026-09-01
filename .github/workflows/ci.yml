@@ -36,10 +36,19 @@ on:
         required: false
         type: string
       candidate_build:
-        description: 'Run the protected exact-checkout Candidate Build + attestation lane'
+        description: 'Run the protected validation-fixture build + attestation lane'
         required: false
         type: boolean
         default: false
+      production_candidate_build:
+        description: 'Run the protected production Candidate build from the real Served Root'
+        required: false
+        type: boolean
+        default: false
+      production_served_root:
+        description: 'Absolute path to the real FOS_V6R2 Served Root on the protected builder runner'
+        required: false
+        type: string
   pull_request:
     paths:
       - '**.py'
@@ -685,7 +694,7 @@ jobs:
           if-no-files-found: error
 
   candidate-build:
-    name: Trusted Candidate Build (manual protected lane)
+    name: Trusted Validation Candidate Build (manual protected lane)
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_build == true }}
     permissions:
       contents: read
@@ -696,6 +705,22 @@ jobs:
     with:
       source_sha: ${{ github.sha }}
       builder_workflow_sha: 750e1182eb263dad9bf64ad890bc282874b97d9c
+    secrets: inherit
+
+  production-candidate-build:
+    name: Trusted Production Candidate Build (manual protected lane)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.production_candidate_build == true }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    uses: Chary-yu/fos_coverage_tool/.github/workflows/trusted-production-candidate-builder.yml@b7490f1c01daec539dfe41cb9d0a7d50e1701edd
+    with:
+      source_sha: ${{ github.sha }}
+      builder_workflow_sha: b7490f1c01daec539dfe41cb9d0a7d50e1701edd
+      served_root: ${{ inputs.production_served_root }}
+      attestation_repository: Chary-yu/fos_coverage_tool
     secrets: inherit
 
   candidate-source-gate:
@@ -935,12 +960,12 @@ jobs:
     # This gate is intentionally absent from ordinary push/PR status.  It is
     # the explicit aggregator for production backup, real Candidate browser,
     # and release-eligible cross-layer performance evidence.  The
-    # candidate-build job is a validation fixture lane; its role is checked
-    # below so it can never silently certify Production READY.
+    # Production READY uses the independently built production Candidate.  The
+    # validation-fixture lane above is deliberately not a dependency here.
     if: ${{ always() && github.event_name == 'workflow_dispatch' }}
     needs:
       - candidate-source-gate
-      - candidate-build
+      - production-candidate-build
       - verified-production-mariadb55
       - real-browser-candidate
       - cross-layer-performance
@@ -952,15 +977,15 @@ jobs:
       - name: Require all Production READY evidence lanes to pass
         env:
           SOURCE_RESULT: ${{ needs.candidate-source-gate.result }}
-          CANDIDATE_BUILD_RESULT: ${{ needs.candidate-build.result }}
+          PRODUCTION_CANDIDATE_BUILD_RESULT: ${{ needs.production-candidate-build.result }}
           BACKUP_RESULT: ${{ needs.verified-production-mariadb55.result }}
           BROWSER_RESULT: ${{ needs.real-browser-candidate.result }}
           PERFORMANCE_RESULT: ${{ needs.cross-layer-performance.result }}
-          CANDIDATE_BUILD_COMMIT_SHA: ${{ needs.candidate-build.outputs.candidate_commit_sha }}
-          CANDIDATE_BUILD_ARTIFACT_SHA256: ${{ needs.candidate-build.outputs.candidate_artifact_sha256 }}
-          CANDIDATE_BUILD_ROLE: ${{ needs.candidate-build.outputs.artifact_role }}
-          CANDIDATE_BUILD_PUBLISHABLE: ${{ needs.candidate-build.outputs.production_publishable }}
-          CANDIDATE_BUILD_PROJECT: ${{ needs.candidate-build.outputs.project_name }}
+          PRODUCTION_CANDIDATE_BUILD_COMMIT_SHA: ${{ needs.production-candidate-build.outputs.candidate_commit_sha }}
+          PRODUCTION_CANDIDATE_BUILD_ARTIFACT_SHA256: ${{ needs.production-candidate-build.outputs.candidate_artifact_sha256 }}
+          PRODUCTION_CANDIDATE_BUILD_ROLE: ${{ needs.production-candidate-build.outputs.artifact_role }}
+          PRODUCTION_CANDIDATE_BUILD_PUBLISHABLE: ${{ needs.production-candidate-build.outputs.production_publishable }}
+          PRODUCTION_CANDIDATE_BUILD_PROJECT: ${{ needs.production-candidate-build.outputs.project_name }}
           BACKUP_COMMIT_SHA: ${{ needs.verified-production-mariadb55.outputs.candidate_commit_sha }}
           BROWSER_COMMIT_SHA: ${{ needs.real-browser-candidate.outputs.candidate_commit_sha }}
           BROWSER_ARTIFACT_SHA256: ${{ needs.real-browser-candidate.outputs.candidate_artifact_sha256 }}
@@ -974,7 +999,7 @@ jobs:
           set -eu
           for result in \
             "candidate-source-gate=$SOURCE_RESULT" \
-            "candidate-build=$CANDIDATE_BUILD_RESULT" \
+            "production-candidate-build=$PRODUCTION_CANDIDATE_BUILD_RESULT" \
             "verified-production-mariadb55=$BACKUP_RESULT" \
             "real-browser-candidate=$BROWSER_RESULT" \
             "cross-layer-performance=$PERFORMANCE_RESULT"; do
@@ -985,11 +1010,11 @@ jobs:
           done
           mkdir -p .artifacts/production-ready
           python scripts/diagnostics/production_ready_evidence_join.py \
-            --candidate-build-commit "$CANDIDATE_BUILD_COMMIT_SHA" \
-            --candidate-build-artifact "$CANDIDATE_BUILD_ARTIFACT_SHA256" \
-            --candidate-build-role "$CANDIDATE_BUILD_ROLE" \
-            --candidate-build-publishable "$CANDIDATE_BUILD_PUBLISHABLE" \
-            --candidate-build-project "$CANDIDATE_BUILD_PROJECT" \
+            --production-candidate-commit "$PRODUCTION_CANDIDATE_BUILD_COMMIT_SHA" \
+            --production-candidate-artifact "$PRODUCTION_CANDIDATE_BUILD_ARTIFACT_SHA256" \
+            --production-candidate-role "$PRODUCTION_CANDIDATE_BUILD_ROLE" \
+            --production-candidate-publishable "$PRODUCTION_CANDIDATE_BUILD_PUBLISHABLE" \
+            --production-candidate-project "$PRODUCTION_CANDIDATE_BUILD_PROJECT" \
             --browser-commit "$BROWSER_COMMIT_SHA" \
             --browser-artifact "$BROWSER_ARTIFACT_SHA256" \
             --browser-served-root "$BROWSER_SERVED_ROOT_SHA256" \

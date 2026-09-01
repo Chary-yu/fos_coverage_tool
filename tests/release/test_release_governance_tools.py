@@ -133,9 +133,12 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
                 encoding="utf-8") as stream:
             workflow = stream.read()
         self.assertIn("production_ready_evidence_join.py", workflow)
-        self.assertIn("needs.candidate-build.outputs.candidate_artifact_sha256", workflow)
-        self.assertIn("CANDIDATE_BUILD_ROLE", workflow)
-        self.assertIn("--candidate-build-role", workflow)
+        self.assertIn(
+            "needs.production-candidate-build.outputs.candidate_artifact_sha256",
+            workflow,
+        )
+        self.assertIn("PRODUCTION_CANDIDATE_BUILD_ROLE", workflow)
+        self.assertIn("--production-candidate-role", workflow)
         self.assertIn("needs.real-browser-candidate.outputs.served_root_sha256", workflow)
         self.assertIn("needs.cross-layer-performance.outputs.release_validation_session_id", workflow)
         with open(
@@ -195,8 +198,12 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("Trusted Production Candidate Builder", production_workflow)
         self.assertIn("runs-on: [self-hosted, coverage-production-builder]", production_workflow)
         self.assertIn("trusted-production-candidate-builder", production_workflow)
+        self.assertIn("workflow_call:", production_workflow)
         self.assertIn("build_production_candidate_artifact.py", production_workflow)
         self.assertIn("PRODUCTION_PROJECT_NAME", production_workflow)
+        self.assertIn("production-candidate-build:", caller)
+        self.assertIn("production_candidate_build:", caller)
+        self.assertIn("production_served_root:", caller)
         self.assertEqual(
             config["upgrade"]["production_candidate_builder_workflow_identity"],
             "github-actions/trusted-production-candidate-builder",
