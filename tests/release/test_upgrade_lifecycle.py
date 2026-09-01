@@ -1,7 +1,9 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest import mock
 
 from app.upgrade.lifecycle import UpgradeLifecycle
@@ -34,51 +36,91 @@ class UpgradeLifecycleServingTest(unittest.TestCase):
             config, state_path = self._config(root)
             previous = {"commit_sha": "b" * 40, "_published_session_id": "release-b"}
 
-            # First transition A -> B starts from the explicit legacy fallback.
-            first = UpgradeLifecycle(root, config, "staging", previous)
-            first_results = []
-            with mock.patch.object(
-                    first, "_run_command",
-                    side_effect=lambda name, **kwargs: (
-                        first_results.append(name) or self._result(name))):
-                self.assertEqual(first.stop_current_api()["managed_serving_before_stop"], False)
-                first.active = True
-                first.start_validation_api()
-                first.stop_validation_api()
-                first.start_serving_api()
-            self.assertEqual(
-                first_results,
-                ["stop_current_api", "start_validation_api", "stop_validation_api",
-                 "start_serving_api"],
+            requested_paths = []
+
+            class Handler(BaseHTTPRequestHandler):
+                def do_GET(self):
+                    requested_paths.append(self.path)
+                    if self.path == "/serving":
+                        payload = {"release": {"commit_sha": previous["commit_sha"]}}
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        self.wfile.write(json.dumps(payload).encode("utf-8"))
+                    else:
+                        self.send_response(404)
+                        self.end_headers()
+
+                def log_message(self, *_args):
+                    pass
+
+            try:
+                server = HTTPServer(("127.0.0.1", 0), Handler)
+            except PermissionError:
+                self.skipTest("the test environment does not permit local TCP sockets")
+            thread = threading.Thread(target=server.serve_forever)
+            thread.daemon = True
+            thread.start()
+            config["upgrade"]["release_endpoint"] = (
+                "http://127.0.0.1:{}/serving".format(server.server_port)
+            )
+            config["upgrade"]["previous_release_endpoint"] = (
+                "http://127.0.0.1:{}/previous".format(server.server_port)
             )
 
-            # B is now the stable CURRENT serving owner.  A C attempt must not
-            # fall back to the old 9528/start_previous_api lifecycle.
-            with open(state_path, "w", encoding="utf-8") as stream:
-                json.dump({
-                    "schema_version": 1,
-                    "role": "production_serving",
-                    "status": "ACTIVE",
-                    "session_id": "current-serving",
-                    "pid_file": os.path.join(root, "serving-api.pid"),
-                }, stream)
-            second = UpgradeLifecycle(root, config, "staging", previous)
-            second_results = []
-            with mock.patch.object(
-                    second, "_run_command",
-                    side_effect=lambda name, **kwargs: (
-                        second_results.append(name) or self._result(name))):
-                self.assertEqual(second.stop_current_api()["managed_serving_before_stop"], True)
-                second.active = True
-                second.api_started = True
-                rollback = second.abort()
+            try:
+                # First transition A -> B starts from the explicit legacy fallback.
+                first = UpgradeLifecycle(root, config, "staging", previous)
+                first_results = []
+                with mock.patch.object(
+                        first, "_run_command",
+                        side_effect=lambda name, **kwargs: (
+                            first_results.append(name) or self._result(name))):
+                    self.assertEqual(first.stop_current_api()["managed_serving_before_stop"], False)
+                    first.active = True
+                    first.start_validation_api()
+                    first.stop_validation_api()
+                    first.start_serving_api()
+                self.assertEqual(
+                    first_results,
+                    ["stop_current_api", "start_validation_api", "stop_validation_api",
+                     "start_serving_api"],
+                )
 
-            self.assertEqual(
-                second_results,
-                ["stop_current_api", "stop_validation_api", "start_serving_api"],
-            )
-            self.assertEqual(rollback["status"], "PASSED")
-            self.assertNotIn("start_previous_api", second_results)
+                # B is now the stable CURRENT serving owner.  A C attempt must not
+                # fall back to the old 9528/start_previous_api lifecycle.
+                with open(state_path, "w", encoding="utf-8") as stream:
+                    json.dump({
+                        "schema_version": 1,
+                        "role": "production_serving",
+                        "status": "ACTIVE",
+                        "session_id": "current-serving",
+                        "pid_file": os.path.join(root, "serving-api.pid"),
+                    }, stream)
+                second = UpgradeLifecycle(root, config, "staging", previous)
+                second_results = []
+                with mock.patch.object(
+                        second, "_run_command",
+                        side_effect=lambda name, **kwargs: (
+                            second_results.append(name) or self._result(name))):
+                    self.assertEqual(second.stop_current_api()["managed_serving_before_stop"], True)
+                    second.active = True
+                    second.api_started = True
+                    rollback = second.abort()
+
+                self.assertEqual(
+                    second_results,
+                    ["stop_current_api", "stop_validation_api", "start_serving_api"],
+                )
+                self.assertEqual(rollback["status"], "PASSED")
+                self.assertEqual(rollback["restore_endpoint_key"], "release_endpoint")
+                self.assertEqual(rollback["restore_endpoint"], config["upgrade"]["release_endpoint"])
+                self.assertEqual(requested_paths, ["/serving"])
+                self.assertNotIn("start_previous_api", second_results)
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join(timeout=5)
 
 
 if __name__ == "__main__":

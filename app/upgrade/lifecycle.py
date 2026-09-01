@@ -280,7 +280,13 @@ class UpgradeLifecycle:
         if previous_result["status"] != "PASSED":
             raise RuntimeError("previous API start failed during rollback")
 
-        endpoint = (self.config.get("upgrade") or {}).get("previous_release_endpoint")
+        # A managed CURRENT is restored by start_serving_api on the serving
+        # endpoint (the standard staging port is 19528).  Only a legacy
+        # fallback started by start_previous_api belongs on the previous
+        # release endpoint (the standard baseline port is 9528).
+        endpoint_key = "release_endpoint" if restore_managed_serving \
+            else "previous_release_endpoint"
+        endpoint = (self.config.get("upgrade") or {}).get(endpoint_key)
         if endpoint:
             if not self.previous_release:
                 raise RuntimeError("previous release identity is required for rollback endpoint verification")
@@ -288,13 +294,13 @@ class UpgradeLifecycle:
                 payload = json.loads(response.read().decode("utf-8"))
             actual = payload.get("release") if isinstance(payload, dict) else None
             if not isinstance(actual, dict):
-                raise RuntimeError("previous release endpoint returned no release identity")
+                raise RuntimeError("{} returned no release identity".format(endpoint_key))
             for key in (
                     "version", "commit_sha", "build_id", "asset_hash", "schema_version",
                     "asset_manifest_version", "asset_count", "asset_manifest_hash",
                     "asset_manifest"):
                 if actual.get(key) != self.previous_release.get(key):
-                    raise RuntimeError("previous release endpoint mismatch: {}".format(key))
+                    raise RuntimeError("{} mismatch: {}".format(endpoint_key, key))
 
         try:
             os.remove(self.marker)
@@ -307,4 +313,6 @@ class UpgradeLifecycle:
             "command": results,
             "exit_code": 0,
             "previous_release_verified": bool(endpoint),
+            "restore_endpoint": endpoint,
+            "restore_endpoint_key": endpoint_key,
         }
