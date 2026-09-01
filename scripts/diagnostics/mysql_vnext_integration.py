@@ -1037,6 +1037,7 @@ def run(args):
             "database_engine": "MariaDB",
             "database_version": observed_database_version or _database_version(args),
             "required_version_prefix": required_version_prefix,
+            "python_runtime": platform.python_version(),
             "synthetic": True,
             "synthetic_reason": "generated disposable input/report; real database runtime only",
             "candidate_revision": _revision(),

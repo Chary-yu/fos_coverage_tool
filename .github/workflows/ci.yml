@@ -423,7 +423,7 @@ jobs:
           set -o pipefail
           docker run --rm --network host -i \
             -v "$PWD:/workspace" -w /workspace python@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc \
-            bash -s <<'PY' 2>&1 | tee .artifacts/mariadb55_py36_compatibility.json
+            bash -s <<'PY' 2> .artifacts/mariadb55_py36_compatibility.stderr | tee .artifacts/mariadb55_py36_compatibility.json
           set -e
           python -m pip install --no-cache-dir -r requirements-py36.txt >/dev/null 2>&1
           python -c "import pymysql; assert pymysql.__version__ == '0.10.1', pymysql.__version__"
@@ -444,8 +444,12 @@ jobs:
           assert evidence['python_runtime'].startswith('3.6')
           assert evidence['database_version'].startswith('5.5')
           assert evidence['required_version_prefix'] == '5.5'
-          assert evidence['checks']['file_state_ready_gate']['first_run']['fixture-a']['status'] == 'PASSED'
-          assert evidence['checks']['file_state_ready_gate']['second_run']['fixture-b']['status'] == 'PASSED'
+          migration = evidence['checks']['legacy_to_vnext_migration_rehearsal']
+          assert migration['status'] == 'PASSED'
+          migration_ready = migration['checks']['file_state_ready_gate']
+          for run in ('first_run', 'second_run'):
+              for project in ('fixture-a', 'fixture-b'):
+                  assert migration_ready[run][project]['status'] == 'PASSED'
           PY
       - name: Upload MariaDB 5.5 compatibility evidence
         if: ${{ always() }}
@@ -455,6 +459,7 @@ jobs:
           path: |
             .artifacts/mariadb55_compatibility.json
             .artifacts/mariadb55_py36_compatibility.json
+            .artifacts/mariadb55_py36_compatibility.stderr
           if-no-files-found: error
 
   verified-production-mariadb55:

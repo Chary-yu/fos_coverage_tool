@@ -64,6 +64,20 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("Run MariaDB 5.5 rehearsal under Python 3.6", workflow)
         self.assertIn("mariadb55_py36_compatibility.json", workflow)
         self.assertIn("evidence['python_runtime'].startswith('3.6')", workflow)
+        self.assertIn(
+            "migration_ready = migration['checks']['file_state_ready_gate']",
+            workflow,
+        )
+        self.assertIn(
+            "2> .artifacts/mariadb55_py36_compatibility.stderr | tee "
+            ".artifacts/mariadb55_py36_compatibility.json",
+            workflow,
+        )
+        self.assertNotIn(
+            "bash -s <<'PY' 2>&1 | tee "
+            ".artifacts/mariadb55_py36_compatibility.json",
+            workflow,
+        )
         self.assertIn("file_state = evidence['checks']['file_state_ready_gate']", workflow)
         self.assertIn("for project in file_state[run]['projects'].values()", workflow)
         self.assertIn(

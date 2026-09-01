@@ -297,8 +297,9 @@ class ProgressReadyGateTest(unittest.TestCase):
             )
         self.assertEqual(int(ready["file_state_version"]), 2)
         self.assertEqual(rebase.call_count, 1)
+        args, kwargs = rebuild.call_args
         self.assertEqual(
-            rebuild.call_args.kwargs["file_ids"], [self.file["id"]]
+            kwargs["file_ids"], [self.file["id"]]
         )
         first_state = self.file_states.get(
             self.connection, self.scan["id"], self.file["id"]
