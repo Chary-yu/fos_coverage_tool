@@ -9,7 +9,8 @@ from app.candidate_artifact import (
     identity_manifest_sha256,
 )
 from app.release_publication import (
-    ImmutableReleasePublisher, normalize_candidate_artifact,
+    ImmutableReleasePublisher, current_publication_identity,
+    normalize_candidate_artifact,
     validate_release_manifest,
 )
 
@@ -92,6 +93,16 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 )["status"],
                 "PASSED",
             )
+            publication = current_publication_identity(os.path.join(root, "publish"))
+            self.assertEqual(publication["release_validation_session_id"], "candidate-session")
+            self.assertEqual(
+                publication["candidate_artifact_sha256"],
+                manifest["candidate_artifact_manifest"]["artifact_sha256"],
+            )
+            self.assertEqual(
+                publication["served_root_sha256"], manifest["served_root"]["sha256"]
+            )
+            self.assertEqual(publication["commit_sha"], identity["commit_sha"])
 
     def test_vnext_report_missing_sidecar_fails_closed(self):
         with tempfile.TemporaryDirectory(prefix="release-publication-invalid-") as root:

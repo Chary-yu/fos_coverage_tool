@@ -86,6 +86,11 @@ function isSha(value) {
   return /^[0-9a-f]{40}$/i.test(normalized) && !/^0{40}$/i.test(normalized);
 }
 
+function isSha256(value) {
+  const normalized = String(value || '');
+  return /^[0-9a-f]{64}$/i.test(normalized) && !/^0{64}$/i.test(normalized);
+}
+
 function now() {
   return new Date().toISOString();
 }
@@ -182,6 +187,51 @@ function normalizeRelease(payload) {
     return payload.data.release;
   }
   return payload;
+}
+
+function normalizePublication(payload) {
+  if (!payload || typeof payload !== 'object') return {};
+  if (payload.publication && typeof payload.publication === 'object') {
+    return payload.publication;
+  }
+  if (payload.data && payload.data.publication &&
+      typeof payload.data.publication === 'object') {
+    return payload.data.publication;
+  }
+  return {};
+}
+
+function publicationSnapshot(publication) {
+  const value = publication && typeof publication === 'object' ? publication : {};
+  return {
+    release_validation_session_id: String(value.release_validation_session_id || ''),
+    candidate_artifact_sha256: String(value.candidate_artifact_sha256 || ''),
+    served_root_sha256: String(value.served_root_sha256 || ''),
+    commit_sha: String(value.commit_sha || ''),
+  };
+}
+
+function publicationMismatch(expected, observed) {
+  const errors = [];
+  if (!observed.release_validation_session_id) {
+    errors.push('release endpoint did not expose publication release-validation session');
+  } else if (observed.release_validation_session_id !== expected.release_validation_session_id) {
+    errors.push('publication release-validation session does not match expected attempt');
+  }
+  if (!isSha256(observed.candidate_artifact_sha256)) {
+    errors.push('release endpoint publication candidate artifact SHA256 is missing or invalid');
+  } else if (observed.candidate_artifact_sha256 !== expected.candidate_artifact_sha256) {
+    errors.push('publication candidate artifact SHA256 does not match expected artifact');
+  }
+  if (!isSha256(observed.served_root_sha256)) {
+    errors.push('release endpoint publication Served Root SHA256 is missing or invalid');
+  } else if (observed.served_root_sha256 !== expected.served_root_sha256) {
+    errors.push('publication Served Root SHA256 does not match expected publication');
+  }
+  if (observed.commit_sha && observed.commit_sha !== expected.commit_sha) {
+    errors.push('publication commit SHA does not match expected revision');
+  }
+  return errors;
 }
 
 async function fetchJson(page, urlPath) {
@@ -296,6 +346,12 @@ function buildFailure(args, startedAt, message, details = {}) {
     candidate_artifact_sha256: args.candidate_artifact_sha256 || '',
     served_root_sha256: args.served_root_sha256 || '',
     release_identity: {},
+    expected_publication: {
+      release_validation_session_id: args.release_validation_session_id || '',
+      candidate_artifact_sha256: args.candidate_artifact_sha256 || '',
+      served_root_sha256: args.served_root_sha256 || '',
+    },
+    observed_publication: details.observed_publication || {},
     host_identity: hostIdentity(),
     command_or_action: safeCommand(process.argv.slice(2)),
     started_at: startedAt,
@@ -309,6 +365,17 @@ function buildFailure(args, startedAt, message, details = {}) {
 
 function buildEnvelope(report, reportPath, args) {
   const absoluteReport = path.resolve(reportPath);
+  const observed = report.observed_publication || {};
+  const successfulObservation = report.status === 'PASSED' &&
+    observed.release_validation_session_id &&
+    observed.candidate_artifact_sha256 && observed.served_root_sha256;
+  const binding = successfulObservation ? observed : {
+    release_validation_session_id: report.release_validation_session_id ||
+      args.release_validation_session_id || '',
+    candidate_artifact_sha256: report.candidate_artifact_sha256 ||
+      args.candidate_artifact_sha256 || '',
+    served_root_sha256: report.served_root_sha256 || args.served_root_sha256 || '',
+  };
   return {
     ...report,
     evidence_id: 'gate-e-real-browser',
@@ -319,9 +386,13 @@ function buildEnvelope(report, reportPath, args) {
     report_artifact_sha256: sha256File(absoluteReport),
     command_or_action: safeCommand(process.argv.slice(2)),
     page_url: safeUrl(args.url || ''),
-    release_validation_session_id: args.release_validation_session_id || '',
-    candidate_artifact_sha256: args.candidate_artifact_sha256 || '',
-    served_root_sha256: args.served_root_sha256 || '',
+    release_validation_session_id: binding.release_validation_session_id,
+    candidate_artifact_sha256: binding.candidate_artifact_sha256,
+    served_root_sha256: binding.served_root_sha256,
+    expected_release_validation_session_id: args.release_validation_session_id || '',
+    expected_candidate_artifact_sha256: args.candidate_artifact_sha256 || '',
+    expected_served_root_sha256: args.served_root_sha256 || '',
+    observed_publication: observed,
   };
 }
 
@@ -352,6 +423,7 @@ async function collect(args, startedAt) {
   let maxResponseBytes = 0;
   let browser;
   let report;
+  let observedPublication = {};
 
   try {
     const target = new URL(args.url);
@@ -404,11 +476,22 @@ async function collect(args, startedAt) {
 
     const releaseResponse = await fetchJson(page, `${API_PREFIX}/release`);
     const releaseIdentity = normalizeRelease(releaseResponse.payload);
+    observedPublication = publicationSnapshot(normalizePublication(releaseResponse.payload));
     if (!releaseResponse.ok || !isSha(releaseIdentity.commit_sha) ||
         releaseIdentity.commit_sha !== args.expected_revision) {
       throw new Error(
         `release identity mismatch: expected ${args.expected_revision}, observed ${releaseIdentity.commit_sha || '<missing>'}`
       );
+    }
+    if (!localFixture) {
+      const expectedPublication = {
+        release_validation_session_id: args.release_validation_session_id,
+        candidate_artifact_sha256: args.candidate_artifact_sha256,
+        served_root_sha256: args.served_root_sha256,
+        commit_sha: args.expected_revision,
+      };
+      const publicationErrors = publicationMismatch(expectedPublication, observedPublication);
+      if (publicationErrors.length) throw new Error(publicationErrors.join('; '));
     }
 
     await page.waitForFunction(() => Boolean(window.__COVERAGE_ENHANCE_INTERNALS__), null, { timeout });
@@ -455,9 +538,10 @@ async function collect(args, startedAt) {
       release_eligible: !localFixture && browserStatus && crossLayerReady,
       comparison_type: localFixture ? 'single_disposable_fixture' : 'single_live_candidate',
       candidate_revision: args.expected_revision,
-      release_validation_session_id: args.release_validation_session_id || '',
-      candidate_artifact_sha256: args.candidate_artifact_sha256 || '',
-      served_root_sha256: args.served_root_sha256 || '',
+      release_validation_session_id: observedPublication.release_validation_session_id,
+      candidate_artifact_sha256: observedPublication.candidate_artifact_sha256,
+      served_root_sha256: observedPublication.served_root_sha256,
+      observed_publication: observedPublication,
       environment_identity: {
         browser: await page.evaluate(() => navigator.userAgent),
         browser_name: 'chromium',
@@ -487,6 +571,12 @@ async function collect(args, startedAt) {
       release_eligible: !localFixture && browserStatus && crossLayerReady,
       candidate_revision: args.expected_revision,
       release_identity: releaseIdentity,
+      expected_publication: {
+        release_validation_session_id: args.release_validation_session_id || '',
+        candidate_artifact_sha256: args.candidate_artifact_sha256 || '',
+        served_root_sha256: args.served_root_sha256 || '',
+      },
+      observed_publication: observedPublication,
       host_identity: hostIdentity(),
       command_or_action: safeCommand(process.argv.slice(2)),
       started_at: startedAt,
@@ -515,6 +605,7 @@ async function collect(args, startedAt) {
       failed_requests: failedRequests,
       console_errors: consoleErrors,
       page_errors: pageErrors,
+      observed_publication: observedPublication,
       coverage_virtual_scroll_100k: {
         status: 'INCOMPLETE',
         evidence_class: 'real_http_chromium_performance',
@@ -583,6 +674,16 @@ async function main() {
   if (args.timeout_ms !== undefined &&
       (!Number.isFinite(Number(args.timeout_ms)) || Number(args.timeout_ms) < 1000)) {
     process.stderr.write('--timeout-ms must be at least 1000\n');
+    process.exitCode = 2;
+    return;
+  }
+  if (args.candidate_artifact_sha256 && !isSha256(args.candidate_artifact_sha256)) {
+    process.stderr.write('--candidate-artifact-sha256 must be an exact non-zero SHA256\n');
+    process.exitCode = 2;
+    return;
+  }
+  if (args.served_root_sha256 && !isSha256(args.served_root_sha256)) {
+    process.stderr.write('--served-root-sha256 must be an exact non-zero SHA256\n');
     process.exitCode = 2;
     return;
   }

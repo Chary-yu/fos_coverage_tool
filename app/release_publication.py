@@ -610,6 +610,53 @@ def validate_release_manifest(release_root, manifest=None, expected_session_id="
     }
 
 
+def current_publication_identity(publish_root):
+    """Read the immutable identity currently selected by ``CURRENT``.
+
+    The API release endpoint is intentionally a read-only projection of this
+    state.  A missing, malformed, or invalid CURRENT pointer produces an
+    empty result so production evidence cannot accidentally bind to values
+    supplied by the browser command line.
+    """
+    publish_root = _real(publish_root)
+    current_path = os.path.join(publish_root, "CURRENT")
+    if not os.path.islink(current_path):
+        return {}
+    release_root = _real(current_path)
+    releases_root = _real(os.path.join(publish_root, "releases"))
+    if not _inside(releases_root, release_root) or not os.path.isdir(release_root):
+        return {}
+    manifest_path = os.path.join(release_root, "release_manifest.json")
+    try:
+        manifest = _load_json(manifest_path)
+        checked = validate_release_manifest(
+            release_root, manifest,
+            expected_session_id=os.path.basename(release_root),
+        )
+    except (OSError, ValueError, TypeError):
+        return {}
+    if checked.get("status") != "PASSED":
+        return {}
+    candidate = manifest.get("candidate_artifact_manifest") or {}
+    served = manifest.get("served_root") or {}
+    session_id = str(manifest.get("release_validation_session_id") or "")
+    candidate_sha = str(
+        candidate.get("candidate_artifact_sha256") or
+        candidate.get("artifact_sha256") or ""
+    )
+    served_sha = str(served.get("sha256") or "")
+    if not session_id or not _SESSION_RE.fullmatch(session_id) or \
+            not re.fullmatch(r"[0-9a-fA-F]{64}", candidate_sha) or \
+            not re.fullmatch(r"[0-9a-fA-F]{64}", served_sha):
+        return {}
+    return {
+        "release_validation_session_id": session_id,
+        "candidate_artifact_sha256": candidate_sha,
+        "served_root_sha256": served_sha,
+        "commit_sha": str(manifest.get("commit_sha") or ""),
+    }
+
+
 class ImmutableReleasePublisher(object):
     """Prepare immutable releases and atomically switch/rollback CURRENT."""
 
