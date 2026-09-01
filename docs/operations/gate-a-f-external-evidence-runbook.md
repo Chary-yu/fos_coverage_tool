@@ -213,6 +213,14 @@ Secret 中配置 `COVERAGE_BROWSER_USER`；job 会上传三个 exact-SHA JSON ar
 未提供 Candidate URL 时该 lane 不运行，普通 CI 仍只保留明确标记为 synthetic 的
 fixture/browser evidence。
 
+CI 的 `cross-layer-performance` job 不再接收或读取一个来自其他主机的本地路径。
+`real-browser-candidate` 会先把本次 run/attempt 的完整 evidence package 上传为
+不可变 artifact，并输出 `performance-evidence.json` 的 SHA256；下游 performance
+job 按同一个 run/attempt 下载该 artifact，先校验 SHA256，再对下载后的原始 evidence
+执行 `--require-cross-layer --require-release-eligible` 审计。这样 Hosted Runner
+之间传递的是本次 Candidate 实际产生的 evidence，而不是 checkout 内或操作员临时
+准备的同名文件。
+
 `run_upgrade.py` 对这两类证据也采用同一口径：`npm run test:browser` 只写入
 `browser_fixture_regression`，不能写入生产 Browser Gate。正式升级必须在配置中
 提供 `candidate_browser_url` 和外部 `candidate_browser_evidence_path`；该文件必须

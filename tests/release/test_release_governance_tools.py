@@ -171,6 +171,32 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("workflow_call:", builder)
         self.assertIn("value: ${{ jobs.build.outputs.candidate_artifact_sha256 }}", builder)
 
+    def test_cross_layer_performance_consumes_browser_artifact(self):
+        with open(
+                os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
+                encoding="utf-8") as stream:
+            workflow = stream.read()
+        self.assertNotIn("inputs.cross_layer_evidence", workflow)
+        self.assertIn(
+            "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+            workflow,
+        )
+        self.assertIn("needs:\n      - real-browser-candidate", workflow)
+        self.assertIn(
+            "real-browser-candidate-evidence-${{ github.run_id }}-${{ github.run_attempt }}",
+            workflow,
+        )
+        self.assertIn(
+            "needs.real-browser-candidate.outputs.performance_evidence_sha256",
+            workflow,
+        )
+        self.assertIn("sha256sum", workflow)
+        self.assertIn("transfer-manifest.json", workflow)
+        self.assertIn(
+            "--path .artifacts/real-browser-candidate/performance-evidence.json",
+            workflow,
+        )
+
     def test_candidate_manifest_helper_only_builds_manifest(self):
         completed = subprocess.run(
             [

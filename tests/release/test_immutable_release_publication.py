@@ -627,6 +627,32 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                         "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
                         "a" * 40, "b" * 40, "123", "1",
                     )
+            wrong_attempt_output = json.dumps([{
+                "verificationResult": {
+                    "statement": {
+                        "subject": [{"digest": {"sha256": subject_sha}}],
+                        "predicate": {
+                            "runDetails": {
+                                "metadata": {
+                                    "invocationId": (
+                                        "https://github.com/Chary-yu/fos_coverage_tool/"
+                                        "actions/runs/123/attempts/2"
+                                    ),
+                                },
+                            },
+                        },
+                    },
+                },
+            }]).encode("utf-8")
+            with mock.patch.object(
+                    candidate_build_receipt.subprocess, "check_output",
+                    return_value=wrong_attempt_output):
+                with self.assertRaisesRegex(ValueError, "exact Candidate build run ID"):
+                    verify_github_artifact_attestation(
+                        subject, bundle, "Chary-yu/fos_coverage_tool",
+                        "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
+                        "a" * 40, "b" * 40, "123", "1",
+                    )
             try:
                 os.symlink(subject, os.path.join(root, "subject-link.json"))
             except OSError:

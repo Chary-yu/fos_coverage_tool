@@ -3,10 +3,6 @@ name: CI
 on:
   workflow_dispatch:
     inputs:
-      cross_layer_evidence:
-        description: 'Path to an instrumented browser/server performance JSON'
-        required: false
-        type: string
       real_browser_url:
         description: 'Exact Candidate HTML URL for real HTTP + Chromium Gate E evidence'
         required: false
@@ -781,8 +777,13 @@ jobs:
           if-no-files-found: error
 
   cross-layer-performance:
-    name: Cross-layer performance release evidence (manual)
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.cross_layer_evidence != '' }}
+    name: Cross-layer performance release evidence (browser artifact)
+    # The producer is the real Candidate browser job below.  Hosted runners
+    # are disposable, so this consumer must download the producer's immutable
+    # evidence artifact rather than read an operator path from another host.
+    needs:
+      - real-browser-candidate
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.real_browser_url != '' }}
     runs-on: ubuntu-latest
     outputs:
       candidate_commit_sha: ${{ steps.production_identity.outputs.candidate_commit_sha }}
@@ -796,29 +797,65 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
-      - name: Require cross-layer metrics
+      - name: Download browser-produced immutable evidence package
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: real-browser-candidate-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .artifacts/real-browser-candidate
+      - name: Verify producer artifact digest
+        env:
+          EXPECTED_PERFORMANCE_EVIDENCE_SHA256: ${{ needs.real-browser-candidate.outputs.performance_evidence_sha256 }}
+        run: |
+          set -eu
+          evidence=.artifacts/real-browser-candidate/performance-evidence.json
+          test -s "$evidence"
+          observed="$(sha256sum "$evidence" | awk '{print $1}')"
+          test -n "$EXPECTED_PERFORMANCE_EVIDENCE_SHA256"
+          test "$observed" = "$EXPECTED_PERFORMANCE_EVIDENCE_SHA256"
+          EXPECTED_PERFORMANCE_EVIDENCE_SHA256="$EXPECTED_PERFORMANCE_EVIDENCE_SHA256" \
+            OBSERVED_PERFORMANCE_EVIDENCE_SHA256="$observed" \
+            python - <<'PY'
+          import json
+          import os
+          with open('.artifacts/real-browser-candidate/transfer-manifest.json', 'w') as stream:
+              json.dump({
+                  'status': 'PASSED',
+                  'producer_job': 'real-browser-candidate',
+                  'artifact_name': 'real-browser-candidate-evidence-{}-{}'.format(
+                      os.environ['GITHUB_RUN_ID'], os.environ['GITHUB_RUN_ATTEMPT']),
+                  'expected_performance_evidence_sha256': os.environ[
+                      'EXPECTED_PERFORMANCE_EVIDENCE_SHA256'],
+                  'observed_performance_evidence_sha256': os.environ[
+                      'OBSERVED_PERFORMANCE_EVIDENCE_SHA256'],
+              }, stream, indent=2, sort_keys=True)
+              stream.write('\\n')
+          PY
+      - name: Require downloaded cross-layer metrics
         run: |
           set -o pipefail
-          mkdir -p .artifacts
+          mkdir -p .artifacts/cross-layer-performance
           python scripts/diagnostics/performance_evidence_audit.py \
-            "${{ inputs.cross_layer_evidence }}" --require-cross-layer \
+            .artifacts/real-browser-candidate/performance-evidence.json \
+            --require-cross-layer \
             --require-release-eligible \
-            | tee .artifacts/cross_layer_performance.json
+            | tee .artifacts/cross-layer-performance/cross_layer_performance.json
       - name: Expose exact cross-layer publication identity
         id: production_identity
-        env:
-          CROSS_LAYER_EVIDENCE: ${{ inputs.cross_layer_evidence }}
         run: |
           python scripts/diagnostics/production_ready_evidence_join.py \
-            --kind performance --path "$CROSS_LAYER_EVIDENCE" \
+            --kind performance \
+            --path .artifacts/real-browser-candidate/performance-evidence.json \
             --github-output >> "$GITHUB_OUTPUT"
       - name: Upload cross-layer performance evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
         with:
-          name: cross-layer-performance-evidence
-          path: .artifacts/cross_layer_performance.json
-          if-no-files-found: error
+          name: cross-layer-performance-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .artifacts/cross-layer-performance/cross_layer_performance.json
+            .artifacts/real-browser-candidate/performance-evidence.json
+            .artifacts/real-browser-candidate/transfer-manifest.json
+          if-no-files-found: warn
 
   real-browser-candidate:
     name: Real Candidate browser evidence
@@ -829,6 +866,7 @@ jobs:
       candidate_artifact_sha256: ${{ steps.production_identity.outputs.candidate_artifact_sha256 }}
       served_root_sha256: ${{ steps.production_identity.outputs.served_root_sha256 }}
       release_validation_session_id: ${{ steps.production_identity.outputs.release_validation_session_id }}
+      performance_evidence_sha256: ${{ steps.performance_artifact.outputs.sha256 }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -863,6 +901,15 @@ jobs:
             --output .artifacts/real-browser-candidate/workload.json \
             --browser-evidence-output .artifacts/real-browser-candidate/browser-evidence.json \
             --evidence-output .artifacts/real-browser-candidate/performance-evidence.json
+      - name: Record immutable browser performance evidence digest
+        id: performance_artifact
+        run: |
+          set -eu
+          evidence=.artifacts/real-browser-candidate/performance-evidence.json
+          test -s "$evidence"
+          echo "sha256=$(sha256sum "$evidence" | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+      - name: Audit browser-produced cross-layer evidence
+        run: |
           python scripts/diagnostics/performance_evidence_audit.py \
             .artifacts/real-browser-candidate/performance-evidence.json \
             --require-cross-layer --require-release-eligible
@@ -877,7 +924,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
         with:
-          name: real-browser-candidate-evidence
+          name: real-browser-candidate-evidence-${{ github.run_id }}-${{ github.run_attempt }}
           path: .artifacts/real-browser-candidate
           if-no-files-found: error
 
