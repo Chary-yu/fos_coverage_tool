@@ -35,7 +35,7 @@ class RuntimeConfigTest(unittest.TestCase):
         self.assertEqual(config["schema_version"], 1)
         self.assertEqual(config["server"]["host"], "127.0.0.1")
 
-    def test_candidate_rollback_endpoint_and_start_command_are_distinct(self):
+    def test_candidate_lifecycle_commands_and_rollback_are_distinct(self):
         config = load_application_config(
             os.path.join(os.getcwd(), "config/coverage_config.staging.example.json"),
             base_dir=os.getcwd(),
@@ -45,14 +45,29 @@ class RuntimeConfigTest(unittest.TestCase):
             upgrade["release_endpoint"], upgrade["previous_release_endpoint"]
         )
         self.assertNotEqual(
-            upgrade["commands"]["start_api"],
+            upgrade["commands"]["start_validation_api"],
             upgrade["commands"]["start_previous_api"],
+        )
+        self.assertNotEqual(
+            upgrade["commands"]["stop_current_api"],
+            upgrade["commands"]["stop_validation_api"],
+        )
+        self.assertNotEqual(
+            upgrade["commands"]["start_validation_api"],
+            upgrade["commands"]["start_serving_api"],
+        )
+        self.assertNotEqual(
+            upgrade["commands"]["stop_validation_api"],
+            upgrade["commands"]["stop_serving_api"],
         )
         self.assertTrue(upgrade["candidate_root"])
         self.assertTrue(upgrade["publish_root"])
         self.assertNotEqual(upgrade["candidate_root"], upgrade["publish_root"])
         self.assertTrue(upgrade["validation_session_manifest"])
         self.assertTrue(upgrade["validation_teardown_evidence_path"])
+        self.assertEqual(upgrade["serving_session_id"], "current-serving")
+        self.assertTrue(upgrade["serving_session_manifest"])
+        self.assertTrue(upgrade["current_serving_state_path"])
         self.assertEqual(upgrade["validation_ports"], [19528])
 
     def test_candidate_roots_are_resolved_relative_to_their_declared_base(self):

@@ -41,18 +41,28 @@ def audit(repo_root=ROOT):
     if not upgrade.get("candidate_browser_evidence_path"):
         violations.append("Candidate candidate_browser_evidence_path is missing")
     commands = upgrade.get("commands") or {}
-    if commands.get("start_previous_api") == commands.get("start_api"):
-        violations.append("start_previous_api must not reuse the Candidate start command")
-    for command_name in ("start_serving_api", "stop_serving_api"):
+    for command_name in (
+            "stop_current_api", "stop_validation_api", "start_validation_api",
+            "start_serving_api", "stop_serving_api", "start_previous_api"):
         if not commands.get(command_name):
-            violations.append("{} must be configured for the final serving process".format(command_name))
-    if commands.get("start_serving_api") == commands.get("start_api"):
+            violations.append("{} must be configured as an independent lifecycle command".format(command_name))
+    if commands.get("stop_current_api") == commands.get("stop_validation_api"):
+        violations.append("stop_current_api must be distinct from stop_validation_api")
+    if commands.get("start_validation_api") == commands.get("start_serving_api"):
+        violations.append("start_validation_api must be distinct from start_serving_api")
+    if commands.get("stop_validation_api") == commands.get("stop_serving_api"):
+        violations.append("stop_validation_api must be distinct from stop_serving_api")
+    if commands.get("start_previous_api") == commands.get("start_validation_api"):
+        violations.append("start_previous_api must not reuse the validation start command")
+    if commands.get("start_serving_api") == commands.get("start_validation_api"):
         violations.append("start_serving_api must be a distinct lifecycle command")
-    if commands.get("stop_serving_api") == commands.get("stop_api"):
+    if commands.get("stop_serving_api") == commands.get("stop_validation_api"):
         violations.append("stop_serving_api must be a distinct lifecycle command")
     for field in (
-            "candidate_root", "candidate_artifact_manifest", "publish_root", "validation_session_manifest",
-            "validation_teardown_evidence_path"):
+            "candidate_root", "candidate_artifact_manifest", "publish_root",
+            "validation_session_manifest", "validation_teardown_evidence_path",
+            "serving_session_id", "serving_session_manifest",
+            "serving_teardown_evidence_path", "current_serving_state_path"):
         if not upgrade.get(field):
             violations.append("Candidate {} is missing".format(field))
     candidate_root = str(upgrade.get("candidate_root") or "")
@@ -75,6 +85,11 @@ def audit(repo_root=ROOT):
         violations.append("validation_session_manifest must be attempt-scoped with {attempt_id}")
     if teardown_evidence and "{attempt_id}" not in teardown_evidence:
         violations.append("validation_teardown_evidence_path must be attempt-scoped with {attempt_id}")
+    for field in (
+            "candidate_browser_evidence_path", "rollback_evidence_path",
+            "performance_evidence_path"):
+        if upgrade.get(field) and "{attempt_id}" not in str(upgrade.get(field)):
+            violations.append("{} must be attempt-scoped with {{attempt_id}}".format(field))
     if session_manifest and teardown_evidence:
         session_path = session_manifest if os.path.isabs(session_manifest) else os.path.join(repo_root, session_manifest)
         teardown_path = teardown_evidence if os.path.isabs(teardown_evidence) else os.path.join(repo_root, teardown_evidence)
@@ -113,7 +128,12 @@ def audit(repo_root=ROOT):
             "{attempt_id}" in teardown_evidence
         ),
         "validation_ports": list(validation_ports),
-        "rollback_command_distinct": commands.get("start_previous_api") != commands.get("start_api"),
+        "current_stop_command_distinct": commands.get("stop_current_api") != commands.get("stop_validation_api"),
+        "validation_serving_commands_distinct": (
+            commands.get("start_validation_api") != commands.get("start_serving_api") and
+            commands.get("stop_validation_api") != commands.get("stop_serving_api")
+        ),
+        "rollback_command_distinct": commands.get("start_previous_api") != commands.get("start_validation_api"),
         "violations": violations,
     })
 

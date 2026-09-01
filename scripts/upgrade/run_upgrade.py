@@ -367,6 +367,7 @@ class UpgradeOrchestrator:
         self.validation_teardown_evidence_path = ""
         self.serving_session_manifest_path = ""
         self.serving_teardown_evidence_path = ""
+        self.serving_state_path = ""
         self.serving_session_id = ""
         self.release_validation_session_id = ""
         self.previous_published_session_id = ""
@@ -376,6 +377,7 @@ class UpgradeOrchestrator:
         self._validation_teardown_result = None
         self.logs: List[str] = []
         self._publication_switched = False
+        self._previous_release_identity = {}
 
     def _configure_backup_root(self, configured_root: Optional[str]):
         resolved = resolve_backup_root(self.repo_root, configured_root)
@@ -435,6 +437,7 @@ class UpgradeOrchestrator:
         except ValueError as exc:
             raise RuntimeError("validation session id is invalid: {}".format(exc))
         self.release_validation_session_id = session_id
+        self._previous_release_identity = dict(previous_release)
 
         self.validation_session_manifest_path = _resolve_attempt_path(
             self.repo_root,
@@ -514,6 +517,68 @@ class UpgradeOrchestrator:
         )
         os.environ["COVERAGE_VALIDATION_TEARDOWN_EVIDENCE"] = \
             self.validation_teardown_evidence_path
+        self._configure_serving_session(upgrade_config, previous_release)
+
+    def _configure_serving_session(self, upgrade_config: Dict[str, Any],
+                                   previous_release: Dict[str, Any]):
+        """Bind a stable owner for the process behind CURRENT.
+
+        Validation sessions are per-attempt.  The final serving owner is not:
+        its manifest, PID file, and state pointer survive a successful
+        upgrade so the next attempt can stop the actual CURRENT process.
+        """
+        serving_id = str(upgrade_config.get("serving_session_id") or "").strip()
+        if not serving_id:
+            raise RuntimeError("upgrade.serving_session_id is required")
+        serving_manifest = _resolve_upgrade_path(
+            self.repo_root, upgrade_config.get("serving_session_manifest"),
+            "serving_session_manifest",
+        )
+        serving_teardown = _resolve_upgrade_path(
+            self.repo_root,
+            upgrade_config.get("serving_teardown_evidence_path") or
+            (serving_manifest + ".teardown.json"),
+            "serving_teardown_evidence_path",
+        )
+        state_path = _resolve_upgrade_path(
+            self.repo_root, upgrade_config.get("current_serving_state_path"),
+            "current_serving_state_path",
+        )
+        if len(serving_id) > 128:
+            raise RuntimeError("upgrade.serving_session_id is too long")
+        if serving_manifest in (self.validation_session_manifest_path,
+                                self.validation_teardown_evidence_path):
+            raise RuntimeError("serving session manifest must be separate from validation evidence")
+        if serving_teardown in (serving_manifest, self.validation_session_manifest_path,
+                                self.validation_teardown_evidence_path):
+            raise RuntimeError("serving teardown evidence must be a separate artifact")
+        if state_path in (serving_manifest, serving_teardown,
+                          self.validation_session_manifest_path,
+                          self.validation_teardown_evidence_path):
+            raise RuntimeError("current serving state must be a separate artifact")
+
+        if os.path.isfile(serving_manifest):
+            serving_session = ValidationSession.load(serving_manifest)
+            if serving_session.data.get("session_id") != serving_id:
+                raise RuntimeError("serving session id does not match stable manifest")
+
+        self.serving_session_id = serving_id
+        self.serving_session_manifest_path = serving_manifest
+        self.serving_teardown_evidence_path = serving_teardown
+        self.serving_state_path = state_path
+        os.environ["COVERAGE_SERVING_SESSION_MANIFEST"] = serving_manifest
+        os.environ["COVERAGE_SERVING_SESSION_ID"] = serving_id
+        os.environ["COVERAGE_SERVING_CANDIDATE_SHA"] = str(
+            previous_release.get("commit_sha") or ""
+        )
+        os.environ["COVERAGE_SERVING_BASELINE_SHA"] = str(
+            previous_release.get("commit_sha") or ""
+        )
+        os.environ["COVERAGE_SERVING_TEARDOWN_EVIDENCE"] = serving_teardown
+        os.environ["COVERAGE_SERVING_STATE_PATH"] = state_path
+        os.environ["COVERAGE_SERVING_RELEASE_SESSION_ID"] = str(
+            self.previous_published_session_id or ""
+        )
 
     def _teardown_validation_session(self, identity: Dict[str, Any], mode: str):
         if self.validation_session is None:
@@ -580,36 +645,22 @@ class UpgradeOrchestrator:
         if self.validation_session is None:
             raise RuntimeError("validation session is required before final serving")
         validation_id = str(self.validation_session.data.get("session_id") or "")
-        if not validation_id:
+        if not validation_id or not self.serving_session_id:
             raise RuntimeError("validation session identity is missing")
-        serving_id = "serving-{}".format(validation_id)
-        if len(serving_id) > 128:
-            serving_id = "serving-{}".format(
-                hashlib.sha256(validation_id.encode("utf-8")).hexdigest()
-            )
-        serving_manifest = self.validation_session_manifest_path + ".serving.json"
-        serving_teardown = self.validation_teardown_evidence_path + ".serving.json"
-        if os.path.lexists(serving_manifest):
-            raise RuntimeError(
-                "final serving session manifest already exists: {}".format(
-                    serving_manifest
-                )
-            )
-        self.serving_session_id = serving_id
-        self.serving_session_manifest_path = serving_manifest
-        self.serving_teardown_evidence_path = serving_teardown
         # local_staging_control consumes the serving namespace in preference
         # to the validation namespace.  Production supervisors may ignore
         # these values, but the lifecycle command remains explicitly distinct.
-        os.environ["COVERAGE_SERVING_SESSION_MANIFEST"] = serving_manifest
-        os.environ["COVERAGE_SERVING_SESSION_ID"] = serving_id
+        os.environ["COVERAGE_SERVING_SESSION_MANIFEST"] = self.serving_session_manifest_path
+        os.environ["COVERAGE_SERVING_SESSION_ID"] = self.serving_session_id
         os.environ["COVERAGE_SERVING_CANDIDATE_SHA"] = str(
             self.validation_session.data.get("candidate_sha") or ""
         )
         os.environ["COVERAGE_SERVING_BASELINE_SHA"] = str(
             self.validation_session.data.get("baseline_sha") or ""
         )
-        os.environ["COVERAGE_SERVING_TEARDOWN_EVIDENCE"] = serving_teardown
+        os.environ["COVERAGE_SERVING_TEARDOWN_EVIDENCE"] = self.serving_teardown_evidence_path
+        os.environ["COVERAGE_SERVING_STATE_PATH"] = self.serving_state_path
+        os.environ["COVERAGE_SERVING_RELEASE_SESSION_ID"] = self.release_validation_session_id
 
     def log(self, msg: str):
         print(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -819,7 +870,11 @@ class UpgradeOrchestrator:
         except (OSError, RuntimeError, ValueError, TypeError) as exc:
             self.log("❌ Immutable publication/session preflight failed: {}".format(exc))
             return False, "Immutable publication/session preflight failed"
-        lifecycle = UpgradeLifecycle(self.repo_root, runtime_config or {}, mode, previous_release)
+        lifecycle_previous = dict(previous_release)
+        lifecycle_previous["_published_session_id"] = self.previous_published_session_id
+        lifecycle = UpgradeLifecycle(
+            self.repo_root, runtime_config or {}, mode, lifecycle_previous
+        )
         try:
             freeze_evidence = lifecycle.freeze(identity.get("commit_sha", ""))
             freeze_evidence["revision"] = identity.get("commit_sha")
@@ -975,7 +1030,7 @@ class UpgradeOrchestrator:
             return self._fail(lifecycle, "Immutable release publication failed")
 
         try:
-            start_evidence = lifecycle.start_api()
+            start_evidence = lifecycle.start_validation_api()
             start_evidence.update({
                 "revision": identity.get("commit_sha"),
                 "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",

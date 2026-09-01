@@ -218,8 +218,9 @@ def validate_production_config(config: Dict[str, Any],
         if not commands:
             raise RuntimeError("production upgrade lifecycle commands are required")
         for command_name in (
-            "freeze_traffic", "drain_jobs", "stop_api", "start_api",
-            "start_previous_api", "open_traffic",
+            "freeze_traffic", "drain_jobs", "stop_current_api",
+            "stop_validation_api", "start_validation_api", "start_serving_api",
+            "stop_serving_api", "start_previous_api", "open_traffic",
         ):
             if not commands.get(command_name):
                 raise RuntimeError("production upgrade lifecycle command '{}' is required".format(command_name))

@@ -42,13 +42,15 @@ class UpgradeLifecycle:
         self.active = False
         self.api_started = False
         self.serving_api_started = False
+        self.current_serving_managed = False
         self.traffic_opened = False
         self.previous_release = dict(previous_release or {})
 
     def _commands(self) -> Dict[str, Any]:
         return dict((self.config.get("upgrade") or {}).get("commands") or {})
 
-    def _run_command(self, name: str, clear_control_session: bool = False) -> Dict[str, Any]:
+    def _run_command(self, name: str, clear_control_session: bool = False,
+                     extra_env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         command = self._commands().get(name)
         if not command:
             raise RuntimeError("upgrade lifecycle command '{}' is not configured".format(name))
@@ -69,8 +71,13 @@ class UpgradeLifecycle:
                     "COVERAGE_SERVING_CANDIDATE_SHA",
                     "COVERAGE_SERVING_BASELINE_SHA",
                     "COVERAGE_SERVING_TEARDOWN_EVIDENCE",
+                    "COVERAGE_SERVING_RELEASE_SESSION_ID",
+                    "COVERAGE_SERVING_CANDIDATE_ARTIFACT_SHA256",
+                    "COVERAGE_SERVING_SERVED_ROOT_SHA256",
             ):
                 command_env.pop(key, None)
+        if extra_env:
+            command_env.update({str(key): str(value) for key, value in extra_env.items()})
         result = subprocess.run(argv, cwd=self.repo_root, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, check=False, env=command_env)
         return {
@@ -123,27 +130,67 @@ class UpgradeLifecycle:
             time.sleep(0.25)
         raise RuntimeError("background jobs did not drain: {} still active".format(last_count))
 
-    def stop_api(self) -> Dict[str, Any]:
-        result = self._run_command("stop_api")
+    def stop_validation_api(self) -> Dict[str, Any]:
+        result = self._run_command("stop_validation_api")
         if result["status"] != "PASSED":
-            raise RuntimeError("stop_api failed")
+            raise RuntimeError("stop_validation_api failed")
         self.api_started = False
         return result
 
-    def stop_current_api(self) -> Dict[str, Any]:
-        """Stop the pre-upgrade process without touching validation ownership."""
-        result = self._run_command("stop_api", clear_control_session=True)
+    def stop_api(self) -> Dict[str, Any]:
+        """Backward-compatible alias for callers outside the release path."""
+        command = "stop_validation_api" if self._commands().get("stop_validation_api") else "stop_api"
+        result = self._run_command(command)
         if result["status"] != "PASSED":
-            raise RuntimeError("stop_api failed")
+            raise RuntimeError("{} failed".format(command))
+        self.api_started = False
         return result
 
-    def start_api(self) -> Dict[str, Any]:
+    def _has_active_current_serving_state(self) -> bool:
+        configured = (self.config.get("upgrade") or {}).get("current_serving_state_path")
+        if not configured:
+            return False
+        path = str(configured)
+        if not os.path.isabs(path):
+            path = os.path.join(self.repo_root, path)
+        try:
+            with open(os.path.realpath(path), "r", encoding="utf-8") as stream:
+                state = json.load(stream)
+        except (OSError, ValueError, TypeError):
+            return False
+        return bool(
+            isinstance(state, dict) and
+            state.get("status") == "ACTIVE" and
+            state.get("role") == "production_serving" and
+            state.get("session_id") and
+            state.get("pid_file")
+        )
+
+    def stop_current_api(self) -> Dict[str, Any]:
+        """Stop the stable CURRENT serving process, never the validation API."""
+        self.current_serving_managed = self._has_active_current_serving_state()
+        result = self._run_command("stop_current_api", clear_control_session=True)
+        if result["status"] != "PASSED":
+            raise RuntimeError("stop_current_api failed")
+        result["managed_serving_before_stop"] = self.current_serving_managed
+        return result
+
+    def start_validation_api(self) -> Dict[str, Any]:
         # Treat a failed start as potentially partially started; abort must
         # still attempt the stop command rather than leaving a candidate PID.
         self.api_started = True
-        result = self._run_command("start_api")
+        result = self._run_command("start_validation_api")
         if result["status"] != "PASSED":
-            raise RuntimeError("start_api failed")
+            raise RuntimeError("start_validation_api failed")
+        return result
+
+    def start_api(self) -> Dict[str, Any]:
+        """Backward-compatible alias for callers outside the release path."""
+        command = "start_validation_api" if self._commands().get("start_validation_api") else "start_api"
+        self.api_started = True
+        result = self._run_command(command)
+        if result["status"] != "PASSED":
+            raise RuntimeError("{} failed".format(command))
         return result
 
     def start_serving_api(self) -> Dict[str, Any]:
@@ -193,6 +240,8 @@ class UpgradeLifecycle:
                 raise RuntimeError("traffic re-freeze failed during rollback")
             self.traffic_opened = False
 
+        restore_managed_serving = self.serving_api_started or self.current_serving_managed
+
         if self.serving_api_started:
             stop_serving_result = self._run_command("stop_serving_api")
             results.append(stop_serving_result)
@@ -201,15 +250,32 @@ class UpgradeLifecycle:
             self.serving_api_started = False
 
         if self.api_started:
-            stop_result = self._run_command("stop_api")
+            stop_result = self._run_command("stop_validation_api")
             results.append(stop_result)
             if stop_result["status"] != "PASSED":
-                raise RuntimeError("candidate API stop failed during rollback")
+                raise RuntimeError("validation API stop failed during rollback")
             self.api_started = False
 
-        if not self._commands().get("start_previous_api"):
-            raise RuntimeError("upgrade lifecycle command 'start_previous_api' is not configured")
-        previous_result = self._run_command("start_previous_api", clear_control_session=True)
+        if restore_managed_serving:
+            if not self._commands().get("start_serving_api"):
+                raise RuntimeError("upgrade lifecycle command 'start_serving_api' is not configured")
+            restore_env = {}
+            if self.previous_release.get("commit_sha"):
+                restore_env["COVERAGE_SERVING_CANDIDATE_SHA"] = self.previous_release.get("commit_sha")
+                restore_env["COVERAGE_SERVING_BASELINE_SHA"] = self.previous_release.get("commit_sha")
+            if self.previous_release.get("_published_session_id"):
+                restore_env["COVERAGE_SERVING_RELEASE_SESSION_ID"] = self.previous_release.get(
+                    "_published_session_id"
+                )
+            previous_result = self._run_command(
+                "start_serving_api", clear_control_session=True, extra_env=restore_env
+            )
+            previous_result["process_role"] = "production_serving_restored"
+        else:
+            if not self._commands().get("start_previous_api"):
+                raise RuntimeError("upgrade lifecycle command 'start_previous_api' is not configured")
+            previous_result = self._run_command("start_previous_api", clear_control_session=True)
+            previous_result["process_role"] = "previous_release"
         results.append(previous_result)
         if previous_result["status"] != "PASSED":
             raise RuntimeError("previous API start failed during rollback")

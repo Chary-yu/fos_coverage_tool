@@ -30,6 +30,32 @@ def _read_pid(path):
         return int(stream.read().strip())
 
 
+def _atomic_write_json(path, payload):
+    path = os.path.abspath(path)
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    temporary = "{}.tmp-{}-{}".format(path, os.getpid(), uuid.uuid4().hex[:12])
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        try:
+            os.fsync(stream.fileno())
+        except OSError:
+            pass
+    os.replace(temporary, path)
+
+
+def _load_json(path):
+    try:
+        with open(os.path.abspath(path), "r", encoding="utf-8") as stream:
+            value = json.load(stream)
+    except (OSError, ValueError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def _load_server_binding(config_path):
     with open(config_path, "r", encoding="utf-8") as stream:
         config = json.load(stream)
@@ -43,7 +69,8 @@ def _load_server_binding(config_path):
 
 def _get_or_create_session(manifest_path, session_id, candidate_sha,
                            baseline_sha, host, port, allow_non_loopback,
-                           allowlist, temporary_token, expires_at):
+                           allowlist, temporary_token, expires_at,
+                           reset_completed=False):
     bind = validate_bind(
         host, port, allow_non_loopback=allow_non_loopback,
         allowlist=allowlist, temporary_token=temporary_token,
@@ -58,6 +85,12 @@ def _get_or_create_session(manifest_path, session_id, candidate_sha,
         session = ValidationSession.load(manifest_path)
         if session_id and session.data.get("session_id") != session_id:
             raise ValueError("validation session id does not match manifest")
+        if reset_completed and session.data.get("teardown_status") == "PASSED":
+            return ValidationSession.create(
+                manifest_path, session.data.get("session_id") or session_id,
+                candidate_sha=candidate_sha, baseline_sha=baseline_sha,
+                ports=[port], binds=[bind],
+            )
         return session
     resolved_id = str(session_id or "staging-{}-{}".format(
         os.getpid(), uuid.uuid4().hex[:12]
@@ -71,7 +104,7 @@ def _get_or_create_session(manifest_path, session_id, candidate_sha,
 def start(config_path, pid_path, endpoint, session_manifest="",
           session_id="", candidate_sha="", baseline_sha="",
           allow_non_loopback=False, allowlist=None, temporary_token="",
-          expires_at="", serving=False):
+          expires_at="", serving=False, serving_state_path=""):
     host, port = _load_server_binding(config_path)
     session_prefix = "COVERAGE_SERVING" if serving else "COVERAGE_VALIDATION"
     fallback_prefix = "COVERAGE_VALIDATION" if serving else "COVERAGE_SERVING"
@@ -98,8 +131,43 @@ def start(config_path, pid_path, endpoint, session_manifest="",
     session = _get_or_create_session(
         session_manifest, session_id, candidate_sha, baseline_sha,
         host, port, allow_non_loopback, allowlist or [], temporary_token,
-        expires_at,
+        expires_at, reset_completed=serving,
     )
+
+    if serving:
+        serving_state_path = serving_state_path or os.environ.get(
+            "COVERAGE_SERVING_STATE_PATH", ""
+        ) or (pid_path + ".current.json")
+        serving_state_path = os.path.abspath(serving_state_path)
+
+    def record_serving_state(status, pid, **extra):
+        if not serving:
+            return
+        payload = {
+            "schema_version": 1,
+            "role": "production_serving",
+            "status": status,
+            "session_id": session.data.get("session_id", ""),
+            "session_manifest": os.path.abspath(session_manifest),
+            "pid_file": os.path.abspath(pid_path),
+            "pid": int(pid) if pid else None,
+            "port": int(port),
+            "candidate_sha": str(candidate_sha or ""),
+            "baseline_sha": str(baseline_sha or ""),
+            "release_validation_session_id": os.environ.get(
+                "COVERAGE_SERVING_RELEASE_SESSION_ID", ""
+            ),
+            "candidate_artifact_sha256": os.environ.get(
+                "COVERAGE_SERVING_CANDIDATE_ARTIFACT_SHA256", ""
+            ),
+            "served_root_sha256": os.environ.get(
+                "COVERAGE_SERVING_SERVED_ROOT_SHA256", ""
+            ),
+            "updated_at": time.time(),
+        }
+        payload.update(extra)
+        _atomic_write_json(serving_state_path, payload)
+
     if os.path.isfile(pid_path):
         try:
             existing_pid = _read_pid(pid_path)
@@ -110,6 +178,7 @@ def start(config_path, pid_path, endpoint, session_manifest="",
                     raise RuntimeError(
                         "existing staging process is not owned by validation session"
                     )
+                record_serving_state("ACTIVE", existing_pid)
                 return
         except (OSError, ValueError):
             pass
@@ -134,14 +203,19 @@ def start(config_path, pid_path, endpoint, session_manifest="",
         try:
             with urllib.request.urlopen(endpoint, timeout=1) as response:
                 if response.status == 200:
+                    record_serving_state("ACTIVE", process.pid)
                     return
         except Exception:
             time.sleep(0.25)
-    session.teardown(evidence_path=session_manifest + ".teardown.json")
+    teardown = session.teardown(evidence_path=session_manifest + ".teardown.json")
+    record_serving_state(
+        "STOPPED", process.pid, startup_status="FAILED", teardown=teardown
+    )
     raise RuntimeError("staging API did not become ready; see {}".format(log_path))
 
 
-def stop(pid_path, session_manifest="", evidence_path="", serving=False):
+def stop(pid_path, session_manifest="", evidence_path="", serving=False,
+         serving_state_path=""):
     session_prefix = "COVERAGE_SERVING" if serving else "COVERAGE_VALIDATION"
     fallback_prefix = "COVERAGE_VALIDATION" if serving else "COVERAGE_SERVING"
     session_manifest = session_manifest or os.environ.get(
@@ -156,9 +230,31 @@ def stop(pid_path, session_manifest="", evidence_path="", serving=False):
     )
     if os.path.isfile(session_manifest):
         session = ValidationSession.load(session_manifest)
-        return session.teardown(
+        result = session.teardown(
             evidence_path=evidence_path or session_manifest + ".teardown.json"
         )
+        if serving:
+            serving_state_path = serving_state_path or os.environ.get(
+                "COVERAGE_SERVING_STATE_PATH", ""
+            ) or (pid_path + ".current.json")
+            state = _load_json(serving_state_path) or {}
+            if result.get("status") == "PASSED":
+                state.update({
+                    "schema_version": 1,
+                    "role": "production_serving",
+                    "status": "STOPPED",
+                    "session_id": session.data.get("session_id", ""),
+                    "session_manifest": os.path.abspath(session_manifest),
+                    "pid_file": os.path.abspath(pid_path),
+                    "pid": state.get("pid"),
+                    "stopped_at": time.time(),
+                    "teardown": result,
+                })
+                _atomic_write_json(serving_state_path, state)
+            elif state:
+                state.update({"status": "ACTIVE", "stop_failure": result})
+                _atomic_write_json(serving_state_path, state)
+        return result
     if not os.path.isfile(pid_path):
         return {"status": "PASSED", "pids_closed": True, "ports_closed": True}
     # A PID file without a session manifest has no safe ownership proof.  Do
@@ -169,9 +265,49 @@ def stop(pid_path, session_manifest="", evidence_path="", serving=False):
     }
 
 
+def stop_current(state_path, fallback_pid_path, fallback_session_manifest="",
+                 fallback_evidence_path=""):
+    """Stop the stable CURRENT owner or the explicit legacy baseline.
+
+    The fallback is only for the one-time pre-immutable baseline.  Once a
+    serving state exists, an invalid ownership record is a hard failure rather
+    than permission to guess at another PID file.
+    """
+    state_file_exists = bool(state_path and os.path.lexists(os.path.abspath(state_path)))
+    state = _load_json(state_path) if state_file_exists else None
+    if state_file_exists and state is None:
+        return {
+            "status": "FAILED", "pids_closed": False, "ports_closed": False,
+            "reason": "current serving state is not valid JSON",
+        }
+    if state and state.get("status") == "ACTIVE":
+        if state.get("role") != "production_serving" or not state.get("session_id"):
+            return {
+                "status": "FAILED", "pids_closed": False, "ports_closed": False,
+                "reason": "current serving state identity is invalid",
+            }
+        pid_path = state.get("pid_file") or fallback_pid_path
+        manifest_path = state.get("session_manifest") or ""
+        if not manifest_path or not pid_path:
+            return {
+                "status": "FAILED", "pids_closed": False, "ports_closed": False,
+                "reason": "current serving ownership manifest is required",
+            }
+        return stop(
+            pid_path, manifest_path, evidence_path=fallback_evidence_path,
+            serving=True, serving_state_path=state_path,
+        )
+    return stop(
+        fallback_pid_path, fallback_session_manifest,
+        evidence_path=fallback_evidence_path, serving=False,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("start", "stop", "freeze", "drain", "open"))
+    parser.add_argument(
+        "action", choices=("start", "stop", "stop-current", "freeze", "drain", "open")
+    )
     parser.add_argument("--serving", action="store_true")
     parser.add_argument("--config", required=True)
     parser.add_argument("--pid-file", required=True)
@@ -185,6 +321,7 @@ def main():
     parser.add_argument("--temporary-token", default="")
     parser.add_argument("--expires-at", default="")
     parser.add_argument("--evidence", default="")
+    parser.add_argument("--state-file", default="")
     args = parser.parse_args()
     if args.action == "start":
         start(
@@ -198,9 +335,19 @@ def main():
             temporary_token=args.temporary_token,
             expires_at=args.expires_at,
             serving=args.serving,
+            serving_state_path=args.state_file,
         )
     elif args.action == "stop":
-        result = stop(args.pid_file, args.session_manifest, args.evidence, serving=args.serving)
+        result = stop(
+            args.pid_file, args.session_manifest, args.evidence,
+            serving=args.serving, serving_state_path=args.state_file,
+        )
+        if result and result.get("status") != "PASSED":
+            raise SystemExit(1)
+    elif args.action == "stop-current":
+        result = stop_current(
+            args.state_file, args.pid_file, args.session_manifest, args.evidence
+        )
         if result and result.get("status") != "PASSED":
             raise SystemExit(1)
     # freeze/open are enforced by the shared marker in UpgradeLifecycle;
