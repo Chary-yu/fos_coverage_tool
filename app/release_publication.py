@@ -24,6 +24,7 @@ import time
 from app.release_identity import is_valid_commit_sha
 from app.candidate_artifact import (
     CANDIDATE_ARTIFACT_MANIFEST_NAME, CandidateArtifactManifest,
+    verify_git_source_provenance,
 )
 from app.reports.identity import (
     LEGACY_STATIC, SUPPORTED_SIDECAR_SCHEMA_VERSIONS, VNEXT_ARTIFACT_READY,
@@ -506,15 +507,29 @@ def build_release_manifest(release_root, release_identity, session_id,
             "source_provenance": candidate_artifact_manifest.get("source_provenance"),
             "source_commit_sha": candidate_artifact_manifest.get("source_commit_sha"),
             "source_tree_sha": candidate_artifact_manifest.get("source_tree_sha"),
+            "provenance_schema_version": candidate_artifact_manifest.get(
+                "provenance_schema_version"
+            ),
             "build_workflow_identity": candidate_artifact_manifest.get(
                 "build_workflow_identity"
+            ),
+            "build_workflow_run_id": candidate_artifact_manifest.get(
+                "build_workflow_run_id"
+            ),
+            "build_workflow_sha": candidate_artifact_manifest.get(
+                "build_workflow_sha"
             ),
             "source_manifest_sha256": candidate_artifact_manifest.get(
                 "source_manifest_sha256"
             ),
+            "build_input_manifest_sha256": candidate_artifact_manifest.get(
+                "build_input_manifest_sha256"
+            ),
             "candidate_artifact_sha256": candidate_artifact_manifest.get(
                 "candidate_artifact_sha256"
             ),
+            "attestation_path": candidate_artifact_manifest.get("attestation_path"),
+            "attestation_sha256": candidate_artifact_manifest.get("attestation_sha256"),
         }
     return manifest
 
@@ -672,7 +687,7 @@ class ImmutableReleasePublisher(object):
 
     def prepare(self, source_root, release_identity, session_id,
                 api_contract_version="", candidate_sha="",
-                candidate_artifact_manifest=""):
+                candidate_artifact_manifest="", source_repo_root=""):
         session_id = _validate_session_id(session_id)
         final_root = self.release_path(session_id)
         if os.path.lexists(final_root):
@@ -687,7 +702,13 @@ class ImmutableReleasePublisher(object):
         verified_candidate_manifest = CandidateArtifactManifest.verify(
             source_root, release_identity, candidate_sha=candidate_sha,
             manifest_path=candidate_manifest_path,
+            require_trusted_provenance=True,
         )
+        if source_repo_root:
+            verify_git_source_provenance(
+                source_repo_root, release_identity,
+                verified_candidate_manifest.get("source_provenance") or {},
+            )
         staging = tempfile.mkdtemp(prefix=".release-{}-".format(session_id),
                                    dir=self.releases_root)
         try:
@@ -705,8 +726,13 @@ class ImmutableReleasePublisher(object):
                     staging,
                     str(verified_candidate_manifest.get("manifest_path") or
                         CANDIDATE_ARTIFACT_MANIFEST_NAME).replace("/", os.sep),
-                ),
+                ), require_trusted_provenance=True,
             )
+            if source_repo_root:
+                verify_git_source_provenance(
+                    source_repo_root, release_identity,
+                    copied_candidate_manifest.get("source_provenance") or {},
+                )
             if copied_candidate_manifest.get("artifact_sha256") != \
                     verified_candidate_manifest.get("artifact_sha256"):
                 raise ValueError("copied Candidate artifact bytes do not match manifest")

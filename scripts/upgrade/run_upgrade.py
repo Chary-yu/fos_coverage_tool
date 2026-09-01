@@ -1058,6 +1058,7 @@ class UpgradeOrchestrator:
                 candidate_artifact_manifest=upgrade_config.get(
                     "candidate_artifact_manifest", ""
                 ),
+                source_repo_root=self.repo_root,
             )
             switched = self.publisher.switch_current(session_id)
             if switched.get("status") != "PASSED":

@@ -40,6 +40,14 @@ def main(argv=None):
         "--build-workflow-identity", required=True,
         help="immutable CI/build workflow identity for this artifact",
     )
+    parser.add_argument(
+        "--build-workflow-run-id", required=True,
+        help="unique CI/build workflow run identifier",
+    )
+    parser.add_argument(
+        "--build-workflow-sha", required=True,
+        help="exact commit SHA of the trusted build workflow",
+    )
     args = parser.parse_args(argv)
     candidate_root = os.path.abspath(args.candidate_root)
     identity = _load(args.release_identity)
@@ -49,7 +57,9 @@ def main(argv=None):
         )
         identity = observed
         source_provenance = build_git_source_provenance(
-            args.source_repo_root, identity, args.build_workflow_identity
+            args.source_repo_root, identity, args.build_workflow_identity,
+            build_workflow_run_id=args.build_workflow_run_id,
+            build_workflow_sha=args.build_workflow_sha,
         )
         # All deterministic content changes happen before the Candidate
         # manifest is hashed.  ImmutableReleasePublisher only verifies and
@@ -80,8 +90,13 @@ def main(argv=None):
         "source_commit_sha": manifest["source_commit_sha"],
         "source_tree_sha": manifest["source_tree_sha"],
         "build_workflow_identity": manifest["build_workflow_identity"],
+        "build_workflow_run_id": manifest["build_workflow_run_id"],
+        "build_workflow_sha": manifest["build_workflow_sha"],
         "source_manifest_sha256": manifest["source_manifest_sha256"],
+        "build_input_manifest_sha256": manifest["build_input_manifest_sha256"],
         "candidate_artifact_sha256": manifest["candidate_artifact_sha256"],
+        "attestation_path": manifest["attestation_path"],
+        "attestation_sha256": manifest["attestation_sha256"],
     }, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 

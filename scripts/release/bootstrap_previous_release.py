@@ -19,7 +19,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from app.candidate_artifact import CandidateArtifactManifest, identity_manifest_sha256
+from app.candidate_artifact import (
+    CandidateArtifactManifest, build_directory_input_manifest_sha256,
+)
 from app.release_publication import (
     ImmutableReleasePublisher, normalize_candidate_artifact,
     validate_release_manifest,
@@ -172,7 +174,17 @@ def bootstrap(served_root, publish_root, release_identity_path, session_id,
                 "source_tree_sha": _served_root_tree_sha(served_root),
                 "worktree_clean": True,
                 "build_workflow_identity": "bootstrap_previous_release",
-                "source_manifest_sha256": identity_manifest_sha256(expected),
+                "build_workflow_run_id": str(session_id),
+                # Bootstrap is an explicit operator adoption of the exact
+                # baseline identity, not a CI workflow.  Pin the attestation
+                # to that identity while retaining the trusted schema.
+                "build_workflow_sha": expected.get("commit_sha"),
+                "source_manifest_sha256": build_directory_input_manifest_sha256(
+                    served_root
+                ),
+                "build_input_manifest_sha256": build_directory_input_manifest_sha256(
+                    served_root
+                ),
             },
         )
         prepared = publisher.prepare(

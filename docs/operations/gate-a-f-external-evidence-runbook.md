@@ -267,8 +267,27 @@ Served Root SHA 必须全部与当前 attempt 一致；否则 rollback evidence 
 Final Gate。
 
 Candidate 构建的字节流程固定为：`build → normalize → CandidateArtifactManifest →
-verify → immutable publish`。`ImmutableReleasePublisher` 不再在复制后修改 HTML；
-因此 Candidate manifest 与最终发布 artifact 可以做 byte-for-byte 对账。
+build attestation → verify → immutable publish`。构建命令必须绑定一个 verified clean
+Git checkout，并提供 `source_commit_sha`、真实 Git tree inventory 的
+`source_manifest_sha256`、`build_workflow_run_id`、`build_workflow_sha` 和
+`build_input_manifest_sha256`；它会在 Candidate 根生成
+`candidate_build_attestation.json`。例如：
+
+```bash
+python3 scripts/release/build_candidate_artifact_manifest.py \
+  --candidate-root /srv/fos-coverage/candidate \
+  --release-identity /secure/evidence/release-identity.json \
+  --source-repo-root /srv/fos-coverage/source-checkout \
+  --build-workflow-identity github-actions/candidate-build \
+  --build-workflow-run-id "$GITHUB_RUN_ID" \
+  --build-workflow-sha "$BUILD_WORKFLOW_SHA"
+```
+
+`ImmutableReleasePublisher` 只接受 trusted provenance class/version，并重新核对
+attestation、Candidate 文件清单和（正式 upgrade 中）source checkout；
+`test-fixture` 或缺少 source/build provenance 的 manifest 不能发布。Publisher 不再
+在复制后修改 HTML，因此 Candidate manifest 与最终发布 artifact 可以做
+byte-for-byte 对账。
 
 ## Gate F：切换、回滚和 48 小时窗口
 

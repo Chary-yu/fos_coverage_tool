@@ -31,6 +31,10 @@ def main(argv=None):
     parser.add_argument("--session-id")
     parser.add_argument("--api-contract-version", default="")
     parser.add_argument("--candidate-artifact-manifest", default="")
+    parser.add_argument(
+        "--source-repo-root", default="",
+        help="clean Git checkout used to verify trusted Candidate provenance",
+    )
     parser.add_argument("--switch", action="store_true")
     parser.add_argument("--rollback-session")
     parser.add_argument("--validate-current", action="store_true")
@@ -50,6 +54,7 @@ def main(argv=None):
             args.source_root, identity, args.session_id,
             api_contract_version=args.api_contract_version,
             candidate_artifact_manifest=args.candidate_artifact_manifest,
+            source_repo_root=args.source_repo_root,
         )
         result = {
             "status": "PASSED",
