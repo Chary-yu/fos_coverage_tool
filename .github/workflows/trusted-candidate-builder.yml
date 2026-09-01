@@ -14,6 +14,22 @@ on:
     secrets:
       COVERAGE_BUILD_PROVENANCE_HMAC_KEY:
         required: true
+    outputs:
+      candidate_commit_sha:
+        description: Exact commit used by the Candidate build
+        value: ${{ jobs.build.outputs.candidate_commit_sha }}
+      candidate_artifact_sha256:
+        description: Exact Candidate artifact inventory SHA256
+        value: ${{ jobs.build.outputs.candidate_artifact_sha256 }}
+      build_workflow_sha:
+        description: Immutable trusted builder workflow commit
+        value: ${{ jobs.build.outputs.build_workflow_sha }}
+      build_workflow_run_id:
+        description: GitHub Actions workflow run ID
+        value: ${{ jobs.build.outputs.build_workflow_run_id }}
+      build_workflow_run_attempt:
+        description: GitHub Actions workflow run attempt
+        value: ${{ jobs.build.outputs.build_workflow_run_attempt }}
   workflow_dispatch:
     inputs:
       source_sha:
