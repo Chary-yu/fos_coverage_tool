@@ -130,6 +130,13 @@ class UpgradeLifecycle:
         self.api_started = False
         return result
 
+    def stop_current_api(self) -> Dict[str, Any]:
+        """Stop the pre-upgrade process without touching validation ownership."""
+        result = self._run_command("stop_api", clear_control_session=True)
+        if result["status"] != "PASSED":
+            raise RuntimeError("stop_api failed")
+        return result
+
     def start_api(self) -> Dict[str, Any]:
         # Treat a failed start as potentially partially started; abort must
         # still attempt the stop command rather than leaving a candidate PID.

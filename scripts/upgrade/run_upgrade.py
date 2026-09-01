@@ -876,10 +876,11 @@ class UpgradeOrchestrator:
             return self._fail(lifecycle, "Live database connection required")
         pre_snapshot = capture_database_snapshot(connection, identity)
         try:
-            stop_evidence = lifecycle.stop_api()
+            stop_evidence = lifecycle.stop_current_api()
             stop_evidence.update({
                 "revision": identity.get("commit_sha"),
                 "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
+                "process_role": "pre_upgrade_baseline",
             })
             self.manifest.record("api_stop", stop_evidence)
         except Exception as exc:
