@@ -60,9 +60,12 @@ class RuntimeConfigTest(unittest.TestCase):
             upgrade["commands"]["stop_validation_api"],
             upgrade["commands"]["stop_serving_api"],
         )
-        self.assertTrue(upgrade["candidate_root"])
+        self.assertTrue(upgrade["validation_candidate_root"])
+        self.assertTrue(upgrade["production_candidate_root"])
         self.assertTrue(upgrade["publish_root"])
-        self.assertNotEqual(upgrade["candidate_root"], upgrade["publish_root"])
+        self.assertNotEqual(upgrade["production_candidate_root"], upgrade["publish_root"])
+        self.assertNotIn("candidate_root", upgrade)
+        self.assertTrue(upgrade["served_root_path"])
         self.assertTrue(upgrade["validation_session_manifest"])
         self.assertTrue(upgrade["validation_teardown_evidence_path"])
         self.assertEqual(upgrade["serving_session_id"], "current-serving")

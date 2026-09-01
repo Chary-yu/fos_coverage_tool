@@ -79,43 +79,97 @@ def audit(repo_root=ROOT):
     if commands.get("stop_serving_api") == commands.get("stop_validation_api"):
         violations.append("stop_serving_api must be a distinct lifecycle command")
     for field in (
-            "candidate_root", "candidate_artifact_manifest",
-            "candidate_build_receipt", "candidate_build_attestation_bundle",
-            "candidate_build_attestation_repository",
-            "candidate_build_attestation_workflow",
+            "validation_candidate_root", "validation_candidate_artifact_manifest",
+            "production_candidate_root", "production_candidate_artifact_manifest",
+            "production_candidate_build_receipt",
+            "production_candidate_attestation_bundle",
+            "production_candidate_attestation_repository",
+            "production_candidate_attestation_workflow",
             "publish_root",
+            "served_root_path",
             "validation_session_manifest", "validation_teardown_evidence_path",
             "serving_session_id", "serving_session_manifest",
             "serving_teardown_evidence_path", "current_serving_state_path"):
         if not upgrade.get(field):
             violations.append("Candidate {} is missing".format(field))
-    candidate_root = str(upgrade.get("candidate_root") or "")
-    candidate_artifact_manifest = str(upgrade.get("candidate_artifact_manifest") or "")
-    candidate_build_receipt = str(upgrade.get("candidate_build_receipt") or "")
-    candidate_build_attestation_bundle = str(
-        upgrade.get("candidate_build_attestation_bundle") or ""
+    legacy_fields = (
+        "candidate_root", "candidate_artifact_manifest", "candidate_build_receipt",
+        "candidate_build_attestation_bundle", "candidate_build_attestation_repository",
+        "candidate_build_attestation_workflow",
     )
-    candidate_build_attestation_repository = str(
-        upgrade.get("candidate_build_attestation_repository") or ""
+    for field in legacy_fields:
+        if field in upgrade:
+            violations.append(
+                "legacy upgrade.{} is retired; use explicit validation/production candidate fields".format(
+                    field
+                )
+            )
+    validation_candidate_root = str(upgrade.get("validation_candidate_root") or "")
+    validation_candidate_manifest = str(
+        upgrade.get("validation_candidate_artifact_manifest") or ""
     )
-    candidate_build_attestation_workflow = str(
-        upgrade.get("candidate_build_attestation_workflow") or ""
+    production_candidate_root = str(upgrade.get("production_candidate_root") or "")
+    production_candidate_manifest = str(
+        upgrade.get("production_candidate_artifact_manifest") or ""
+    )
+    production_candidate_build_receipt = str(
+        upgrade.get("production_candidate_build_receipt") or ""
+    )
+    production_candidate_attestation_bundle = str(
+        upgrade.get("production_candidate_attestation_bundle") or ""
+    )
+    production_candidate_attestation_repository = str(
+        upgrade.get("production_candidate_attestation_repository") or ""
+    )
+    production_candidate_attestation_workflow = str(
+        upgrade.get("production_candidate_attestation_workflow") or ""
     )
     publish_root = str(upgrade.get("publish_root") or "")
-    if candidate_root and not os.path.isabs(candidate_root):
-        candidate_root = os.path.join(repo_root, candidate_root)
+    served_root_path = str(upgrade.get("served_root_path") or "")
+    if validation_candidate_root and not os.path.isabs(validation_candidate_root):
+        validation_candidate_root = os.path.join(repo_root, validation_candidate_root)
+    if production_candidate_root and not os.path.isabs(production_candidate_root):
+        production_candidate_root = os.path.join(repo_root, production_candidate_root)
     if publish_root and not os.path.isabs(publish_root):
         publish_root = os.path.join(repo_root, publish_root)
-    if candidate_root and publish_root and os.path.realpath(candidate_root) == os.path.realpath(publish_root):
-        violations.append("Candidate publish_root must be separate from candidate_root")
-    if candidate_artifact_manifest and not os.path.isabs(candidate_artifact_manifest):
-        candidate_artifact_manifest = os.path.join(repo_root, candidate_artifact_manifest)
-    if candidate_artifact_manifest and candidate_root:
-        if os.path.commonpath((os.path.realpath(candidate_artifact_manifest), os.path.realpath(candidate_root))) != os.path.realpath(candidate_root):
-            violations.append("candidate_artifact_manifest must be inside candidate_root")
-    if candidate_build_receipt and candidate_root:
-        if os.path.commonpath((os.path.realpath(candidate_build_receipt), os.path.realpath(candidate_root))) != os.path.realpath(candidate_root):
-            violations.append("candidate_build_receipt must be inside candidate_root")
+    if validation_candidate_manifest and not os.path.isabs(validation_candidate_manifest):
+        validation_candidate_manifest = os.path.join(repo_root, validation_candidate_manifest)
+    if production_candidate_manifest and not os.path.isabs(production_candidate_manifest):
+        production_candidate_manifest = os.path.join(repo_root, production_candidate_manifest)
+    if production_candidate_build_receipt and not os.path.isabs(production_candidate_build_receipt):
+        production_candidate_build_receipt = os.path.join(repo_root, production_candidate_build_receipt)
+    if validation_candidate_root and production_candidate_root and \
+            os.path.realpath(validation_candidate_root) == os.path.realpath(production_candidate_root):
+        violations.append("validation and production Candidate roots must be separate")
+    if production_candidate_root and publish_root and (
+            os.path.realpath(production_candidate_root) == os.path.realpath(publish_root) or
+            os.path.commonpath((os.path.realpath(production_candidate_root), os.path.realpath(publish_root))) in (
+                os.path.realpath(production_candidate_root), os.path.realpath(publish_root)
+            )
+    ):
+        violations.append("production_candidate_root and publish_root must be separate")
+    for label, manifest_path, owner in (
+            ("validation_candidate_artifact_manifest", validation_candidate_manifest,
+             validation_candidate_root),
+            ("production_candidate_artifact_manifest", production_candidate_manifest,
+             production_candidate_root),
+            ("production_candidate_build_receipt", production_candidate_build_receipt,
+             production_candidate_root)):
+        if manifest_path and owner:
+            try:
+                if os.path.commonpath((os.path.realpath(manifest_path), os.path.realpath(owner))) != os.path.realpath(owner):
+                    violations.append("{} must be inside its Candidate root".format(label))
+            except ValueError:
+                violations.append("{} must be inside its Candidate root".format(label))
+    if served_root_path and not os.path.isabs(served_root_path):
+        served_root_path = os.path.join(repo_root, served_root_path)
+    expected_served_root_path = os.path.normpath(os.path.abspath(
+        os.path.join(publish_root, "CURRENT", "reports")
+    )) if publish_root else ""
+    if not served_root_path:
+        violations.append("Candidate served_root_path is missing")
+    elif os.path.normpath(os.path.abspath(served_root_path)) != expected_served_root_path:
+        violations.append("Candidate served_root_path must be publish_root/CURRENT/reports")
     session_manifest = str(upgrade.get("validation_session_manifest") or "")
     teardown_evidence = str(upgrade.get("validation_teardown_evidence_path") or "")
     if session_manifest and "{attempt_id}" not in session_manifest:
@@ -157,13 +211,16 @@ def audit(repo_root=ROOT):
         "candidate_previous_release_endpoint": upgrade.get("previous_release_endpoint", ""),
         "trusted_build_workflow_identity": trusted_workflow_identity,
         "trusted_build_workflow_sha": trusted_workflow_sha,
-        "candidate_root": candidate_root,
-        "candidate_artifact_manifest": candidate_artifact_manifest,
-        "candidate_build_receipt": candidate_build_receipt,
-        "candidate_build_attestation_bundle": candidate_build_attestation_bundle,
-        "candidate_build_attestation_repository": candidate_build_attestation_repository,
-        "candidate_build_attestation_workflow": candidate_build_attestation_workflow,
+        "validation_candidate_root": validation_candidate_root,
+        "validation_candidate_artifact_manifest": validation_candidate_manifest,
+        "production_candidate_root": production_candidate_root,
+        "production_candidate_artifact_manifest": production_candidate_manifest,
+        "production_candidate_build_receipt": production_candidate_build_receipt,
+        "production_candidate_attestation_bundle": production_candidate_attestation_bundle,
+        "production_candidate_attestation_repository": production_candidate_attestation_repository,
+        "production_candidate_attestation_workflow": production_candidate_attestation_workflow,
         "candidate_publish_root": publish_root,
+        "served_root_path": served_root_path,
         "validation_session_manifest": upgrade.get("validation_session_manifest", ""),
         "validation_teardown_evidence_path": upgrade.get("validation_teardown_evidence_path", ""),
         "attempt_scoped_validation_paths": bool(

@@ -35,7 +35,10 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from app.release_identity import is_valid_commit_sha, verify_release_identity
-from app.release_publication import ImmutableReleasePublisher
+from app.release_publication import (
+    ImmutableReleasePublisher, PRODUCTION_PROJECT_NAME,
+    PRODUCTION_RELEASE_ARTIFACT_ROLE, validate_production_candidate_content,
+)
 from app.candidate_artifact import (
     CANDIDATE_ARTIFACT_MANIFEST_NAME, CandidateArtifactManifest,
     verify_git_source_provenance, verify_trusted_build_policy,
@@ -78,6 +81,23 @@ def _resolve_upgrade_path(repo_root: str, configured: Optional[str], field: str)
     if not os.path.isabs(value):
         value = os.path.join(repo_root, value)
     return os.path.realpath(os.path.abspath(value))
+
+
+def _resolve_upgrade_literal_path(repo_root: str, configured: Optional[str],
+                                  field: str) -> str:
+    """Resolve a path without dereferencing its final symlink components.
+
+    The Nginx/static contract intentionally requires the literal
+    ``publish_root/CURRENT/reports`` path.  Resolving it with ``realpath``
+    would erase the CURRENT indirection and allow a stale release directory
+    to be configured instead.
+    """
+    if not configured:
+        raise RuntimeError("upgrade.{} is required".format(field))
+    value = str(configured)
+    if not os.path.isabs(value):
+        value = os.path.join(repo_root, value)
+    return os.path.normpath(os.path.abspath(value))
 
 
 def _new_release_validation_session_id(commit_sha: str,
@@ -127,7 +147,8 @@ def _resolve_candidate_manifest_path(repo_root: str, candidate_root: str,
 
 
 def validate_candidate_publication_preflight(
-        repo_root: str, candidate_root: str, release_identity: Dict[str, Any],
+        repo_root: str, production_candidate_root: str,
+        release_identity: Dict[str, Any],
         candidate_manifest_path: Optional[str], trusted_workflow_identity: str,
         trusted_workflow_sha: str, candidate_build_receipt: Optional[str] = "",
         candidate_build_attestation_bundle: Optional[str] = "",
@@ -153,9 +174,11 @@ def validate_candidate_publication_preflight(
         raise RuntimeError(
             "candidate build attestation repository and signer workflow are required"
         )
-    candidate_root = os.path.realpath(os.path.abspath(candidate_root))
+    production_candidate_root = os.path.realpath(
+        os.path.abspath(production_candidate_root)
+    )
     manifest_path = _resolve_candidate_manifest_path(
-        os.path.realpath(os.path.abspath(repo_root)), candidate_root,
+        os.path.realpath(os.path.abspath(repo_root)), production_candidate_root,
         candidate_manifest_path,
     )
     if not os.path.isfile(manifest_path):
@@ -163,10 +186,16 @@ def validate_candidate_publication_preflight(
             "candidate artifact manifest is missing: {}".format(manifest_path)
         )
     manifest = CandidateArtifactManifest.verify(
-        candidate_root, release_identity,
+        production_candidate_root, release_identity,
         candidate_sha=release_identity.get("commit_sha"),
         manifest_path=manifest_path,
         require_trusted_provenance=True,
+        expected_artifact_role=PRODUCTION_RELEASE_ARTIFACT_ROLE,
+        expected_project_name=PRODUCTION_PROJECT_NAME,
+        require_production_publishable=True,
+    )
+    validate_production_candidate_content(
+        production_candidate_root, PRODUCTION_PROJECT_NAME
     )
     provenance = verify_trusted_build_policy(
         manifest.get("source_provenance") or {},
@@ -176,7 +205,7 @@ def validate_candidate_publication_preflight(
         repo_root, release_identity, provenance,
     )
     receipt_path = _resolve_candidate_manifest_path(
-        os.path.realpath(os.path.abspath(repo_root)), candidate_root,
+        os.path.realpath(os.path.abspath(repo_root)), production_candidate_root,
         candidate_build_receipt or manifest.get("receipt_path") or
         "candidate_build_receipt.json",
     )
@@ -191,16 +220,19 @@ def validate_candidate_publication_preflight(
         )
     bundle_path = os.path.realpath(os.path.abspath(bundle_path))
     verify_candidate_build_receipt(
-        candidate_root, release_identity, manifest, bundle_path,
+        production_candidate_root, release_identity, manifest, bundle_path,
         receipt_path=receipt_path,
         attestation_repository=candidate_build_attestation_repository,
         attestation_workflow=candidate_build_attestation_workflow,
     )
     return {
         "status": "PASSED",
-        "candidate_root": candidate_root,
+        "production_candidate_root": production_candidate_root,
         "candidate_manifest_path": manifest_path,
         "candidate_artifact_sha256": manifest.get("artifact_sha256"),
+        "artifact_role": manifest.get("artifact_role"),
+        "production_publishable": manifest.get("production_publishable"),
+        "project_name": manifest.get("project_name"),
         "source_commit_sha": observed_source.get("source_commit_sha"),
         "source_tree_sha": observed_source.get("source_tree_sha"),
         "build_workflow_identity": trusted_workflow_identity,
@@ -496,8 +528,10 @@ class UpgradeOrchestrator:
         self.manifest = ProductionEvidenceManifest(self.repo_root)
         self.backup_dir = resolve_backup_root(self.repo_root, backup_root)
         self.publisher = None
-        self.candidate_root = ""
+        self.production_candidate_root = ""
+        self.validation_candidate_root = ""
         self.publish_root = ""
+        self.served_root_path = ""
         self.validation_session = None
         self.validation_session_manifest_path = ""
         self.validation_teardown_evidence_path = ""
@@ -539,17 +573,43 @@ class UpgradeOrchestrator:
         release operation permitted here is an atomic ``CURRENT`` pointer
         switch performed by ``ImmutableReleasePublisher``.
         """
-        candidate_root = _resolve_upgrade_path(
-            self.repo_root, upgrade_config.get("candidate_root"), "candidate_root"
+        if upgrade_config.get("candidate_root"):
+            raise RuntimeError(
+                "upgrade.candidate_root is retired; use production_candidate_root"
+            )
+        production_candidate_root = _resolve_upgrade_path(
+            self.repo_root, upgrade_config.get("production_candidate_root"),
+            "production_candidate_root"
         )
+        validation_candidate_root = ""
+        if upgrade_config.get("validation_candidate_root"):
+            validation_candidate_root = _resolve_upgrade_path(
+                self.repo_root, upgrade_config.get("validation_candidate_root"),
+                "validation_candidate_root"
+            )
         publish_root = _resolve_upgrade_path(
             self.repo_root, upgrade_config.get("publish_root"), "publish_root"
         )
         if _path_is_within(publish_root, self.repo_root):
             raise RuntimeError("upgrade.publish_root must be outside the active deployment root")
-        if _path_is_within(publish_root, candidate_root) or \
-                _path_is_within(candidate_root, publish_root):
-            raise RuntimeError("upgrade.publish_root and candidate_root must be separate")
+        if _path_is_within(production_candidate_root, self.repo_root):
+            raise RuntimeError(
+                "upgrade.production_candidate_root must be outside the active deployment root"
+            )
+        if _path_is_within(publish_root, production_candidate_root) or \
+                _path_is_within(production_candidate_root, publish_root):
+            raise RuntimeError(
+                "upgrade.publish_root and production_candidate_root must be separate"
+            )
+        if validation_candidate_root and (
+                _path_is_within(validation_candidate_root, self.repo_root) or
+                _path_is_within(publish_root, validation_candidate_root) or
+                _path_is_within(validation_candidate_root, publish_root) or
+                _path_is_within(validation_candidate_root, production_candidate_root) or
+                _path_is_within(production_candidate_root, validation_candidate_root)):
+            raise RuntimeError(
+                "validation_candidate_root must be separate from production and publication roots"
+            )
         trusted_workflow_identity = str(
             upgrade_config.get("trusted_build_workflow_identity") or ""
         ).strip()
@@ -557,17 +617,29 @@ class UpgradeOrchestrator:
             upgrade_config.get("trusted_build_workflow_sha") or ""
         ).strip()
         self.candidate_preflight = validate_candidate_publication_preflight(
-            self.repo_root, candidate_root, identity,
-            upgrade_config.get("candidate_artifact_manifest", ""),
+            self.repo_root, production_candidate_root, identity,
+            upgrade_config.get("production_candidate_artifact_manifest", ""),
             trusted_workflow_identity, trusted_workflow_sha,
-            upgrade_config.get("candidate_build_receipt", ""),
-            upgrade_config.get("candidate_build_attestation_bundle", ""),
-            upgrade_config.get("candidate_build_attestation_repository", ""),
-            upgrade_config.get("candidate_build_attestation_workflow", ""),
+            upgrade_config.get("production_candidate_build_receipt", ""),
+            upgrade_config.get("production_candidate_attestation_bundle", ""),
+            upgrade_config.get("production_candidate_attestation_repository", ""),
+            upgrade_config.get("production_candidate_attestation_workflow", ""),
         )
 
-        self.candidate_root = candidate_root
+        self.production_candidate_root = production_candidate_root
+        self.validation_candidate_root = validation_candidate_root
         self.publish_root = publish_root
+        self.served_root_path = _resolve_upgrade_literal_path(
+            self.repo_root, upgrade_config.get("served_root_path"),
+            "served_root_path",
+        )
+        expected_served_root_path = os.path.normpath(os.path.abspath(
+            os.path.join(publish_root, "CURRENT", "reports")
+        ))
+        if self.served_root_path != expected_served_root_path:
+            raise RuntimeError(
+                "upgrade.served_root_path must be the literal publish_root/CURRENT/reports path"
+            )
         self.publisher = ImmutableReleasePublisher(publish_root)
         current = self.publisher.validate_current()
         if current.get("status") != "PASSED":
@@ -1081,7 +1153,9 @@ class UpgradeOrchestrator:
             backup_db_config.get("deployment_roots") or []
         )
         configured_deploy_roots.append(self.repo_root)
-        for root_key in ("current_root", "candidate_root", "deployment_root"):
+        for root_key in (
+                "current_root", "validation_candidate_root",
+                "production_candidate_root", "deployment_root"):
             if upgrade_config.get(root_key):
                 configured_deploy_roots.append(upgrade_config.get(root_key))
         backup_db_config["deployment_roots"] = configured_deploy_roots
@@ -1181,13 +1255,13 @@ class UpgradeOrchestrator:
         try:
             session_id = self.validation_session.data.get("session_id")
             prepared = self.publisher.prepare(
-                self.candidate_root,
+                self.production_candidate_root,
                 identity,
                 session_id,
                 api_contract_version=upgrade_config.get("api_contract_version", ""),
                 candidate_sha=identity.get("commit_sha"),
                 candidate_artifact_manifest=upgrade_config.get(
-                    "candidate_artifact_manifest", ""
+                    "production_candidate_artifact_manifest", ""
                 ),
                 source_repo_root=self.repo_root,
                 trusted_build_workflow_identity=upgrade_config.get(
@@ -1228,7 +1302,8 @@ class UpgradeOrchestrator:
                 "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
                 "action_count": len(actions),
                 "publication_mode": "immutable_release",
-                "candidate_root": self.candidate_root,
+                "production_candidate_root": self.production_candidate_root,
+                "validation_candidate_root": self.validation_candidate_root,
                 "publish_root": self.publish_root,
                 "release_root": self.publisher.release_path(session_id),
                 "previous_session_id": self.previous_published_session_id,
