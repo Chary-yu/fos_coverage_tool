@@ -687,7 +687,7 @@ jobs:
     env:
       BUILD_WORKFLOW_IDENTITY: github-actions/candidate-build
       BUILD_WORKFLOW_RUN_ID: ${{ github.run_id }}
-      BUILD_WORKFLOW_SHA: ${{ github.sha }}
+      BUILD_WORKFLOW_SHA: ${{ github.workflow_sha }}
       COVERAGE_BUILD_PROVENANCE_HMAC_KEY: ${{ secrets.COVERAGE_BUILD_PROVENANCE_HMAC_KEY }}
       GH_TOKEN: ${{ github.token }}
     steps:
@@ -702,6 +702,9 @@ jobs:
           set -eu
           test -n "$COVERAGE_BUILD_PROVENANCE_HMAC_KEY"
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -n "$BUILD_WORKFLOW_SHA"
+          test "${#BUILD_WORKFLOW_SHA}" = 40
+          git cat-file -e "$BUILD_WORKFLOW_SHA^{commit}"
           mkdir -p .artifacts/candidate-build
           python scripts/release/build_candidate_artifact.py \
             --source-repo-root "$GITHUB_WORKSPACE" \
