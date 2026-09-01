@@ -26,6 +26,7 @@ import time
 from app.release_identity import is_valid_commit_sha
 from app.candidate_artifact import (
     CANDIDATE_ARTIFACT_MANIFEST_NAME, CandidateArtifactManifest,
+    CANDIDATE_BUILD_RECEIPT_NAME,
     SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS, TRUSTED_CI_PROVENANCE_CLASS,
     verify_git_source_provenance, verify_trusted_build_policy,
 )
@@ -540,6 +541,31 @@ def build_release_manifest(release_root, release_identity, session_id,
             "attestation_path": candidate_artifact_manifest.get("attestation_path"),
             "attestation_sha256": candidate_artifact_manifest.get("attestation_sha256"),
         }
+        candidate_provenance = candidate_artifact_manifest.get(
+            "source_provenance"
+        ) or {}
+        if candidate_provenance.get("provenance_class") == TRUSTED_CI_PROVENANCE_CLASS:
+            receipt_relative = str(
+                candidate_artifact_manifest.get("receipt_path") or
+                CANDIDATE_BUILD_RECEIPT_NAME
+            )
+            receipt_path = _real(os.path.join(release_root, receipt_relative))
+            if not _inside(release_root, receipt_path) or not os.path.isfile(receipt_path):
+                raise ValueError("candidate build receipt was not copied into release")
+            manifest["candidate_artifact_manifest"]["receipt_path"] = _safe_relative(
+                release_root, receipt_path
+            )
+            manifest["candidate_artifact_manifest"]["receipt_sha256"] = _sha256(
+                receipt_path
+            )
+            try:
+                receipt = _load_json(receipt_path)
+                receipt_payload = receipt.get("payload") or {}
+                manifest["candidate_artifact_manifest"][
+                    "attestation_bundle_sha256"
+                ] = receipt_payload.get("attestation_bundle_sha256")
+            except (OSError, ValueError, TypeError):
+                raise ValueError("candidate build receipt is unreadable")
     return manifest
 
 
@@ -625,6 +651,16 @@ def validate_release_manifest(release_root, manifest=None, expected_session_id="
             violations.append("candidate artifact manifest is missing from release")
         elif str(candidate_artifact.get("manifest_sha256") or "") != _sha256(candidate_path):
             violations.append("candidate artifact manifest hash changed")
+        candidate_provenance = candidate_artifact.get("source_provenance") or {}
+        if candidate_provenance.get("provenance_class") == TRUSTED_CI_PROVENANCE_CLASS:
+            receipt_relative = str(candidate_artifact.get("receipt_path") or "")
+            receipt_path = _real(os.path.join(release_root, receipt_relative))
+            if not receipt_relative or not _inside(release_root, receipt_path) or \
+                    not os.path.isfile(receipt_path):
+                violations.append("candidate build receipt is missing from release")
+            elif str(candidate_artifact.get("receipt_sha256") or "") != \
+                    _sha256(receipt_path):
+                violations.append("candidate build receipt hash changed")
     return {
         "status": "PASSED" if not violations else "FAILED",
         "release_validation_session_id": session_id,
