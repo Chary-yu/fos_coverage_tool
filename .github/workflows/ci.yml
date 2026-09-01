@@ -486,6 +486,8 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.production_backup_path != '' }}
     runs-on: [self-hosted, production-rehearsal]
     environment: production-rehearsal
+    outputs:
+      candidate_commit_sha: ${{ steps.production_identity.outputs.candidate_commit_sha }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -558,6 +560,13 @@ jobs:
           assert len(records) == 1
           assert records[0]['status'] == 'PASSED'
           assert records[0]['database_runtime_identity']['version'].startswith('5.5')
+      - name: Expose exact backup source identity
+        id: production_identity
+        run: |
+          python scripts/diagnostics/production_ready_evidence_join.py \
+            --kind backup \
+            --path .artifacts/verified-production-mariadb55/rehearsal.json \
+            --github-output >> "$GITHUB_OUTPUT"
       - name: Upload verified production rehearsal evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
@@ -775,6 +784,11 @@ jobs:
     name: Cross-layer performance release evidence (manual)
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.cross_layer_evidence != '' }}
     runs-on: ubuntu-latest
+    outputs:
+      candidate_commit_sha: ${{ steps.production_identity.outputs.candidate_commit_sha }}
+      candidate_artifact_sha256: ${{ steps.production_identity.outputs.candidate_artifact_sha256 }}
+      served_root_sha256: ${{ steps.production_identity.outputs.served_root_sha256 }}
+      release_validation_session_id: ${{ steps.production_identity.outputs.release_validation_session_id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -790,6 +804,14 @@ jobs:
             "${{ inputs.cross_layer_evidence }}" --require-cross-layer \
             --require-release-eligible \
             | tee .artifacts/cross_layer_performance.json
+      - name: Expose exact cross-layer publication identity
+        id: production_identity
+        env:
+          CROSS_LAYER_EVIDENCE: ${{ inputs.cross_layer_evidence }}
+        run: |
+          python scripts/diagnostics/production_ready_evidence_join.py \
+            --kind performance --path "$CROSS_LAYER_EVIDENCE" \
+            --github-output >> "$GITHUB_OUTPUT"
       - name: Upload cross-layer performance evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
@@ -802,6 +824,11 @@ jobs:
     name: Real Candidate browser evidence
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.real_browser_url != '' }}
     runs-on: ubuntu-latest
+    outputs:
+      candidate_commit_sha: ${{ steps.production_identity.outputs.candidate_commit_sha }}
+      candidate_artifact_sha256: ${{ steps.production_identity.outputs.candidate_artifact_sha256 }}
+      served_root_sha256: ${{ steps.production_identity.outputs.served_root_sha256 }}
+      release_validation_session_id: ${{ steps.production_identity.outputs.release_validation_session_id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -839,6 +866,13 @@ jobs:
           python scripts/diagnostics/performance_evidence_audit.py \
             .artifacts/real-browser-candidate/performance-evidence.json \
             --require-cross-layer --require-release-eligible
+      - name: Expose browser-observed publication identity
+        id: production_identity
+        run: |
+          python scripts/diagnostics/production_ready_evidence_join.py \
+            --kind browser \
+            --path .artifacts/real-browser-candidate/performance-evidence.json \
+            --github-output >> "$GITHUB_OUTPUT"
       - name: Upload exact-SHA Candidate browser evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
@@ -861,6 +895,9 @@ jobs:
       - cross-layer-performance
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
       - name: Require all Production READY evidence lanes to pass
         env:
           SOURCE_RESULT: ${{ needs.candidate-source-gate.result }}
@@ -868,6 +905,17 @@ jobs:
           BACKUP_RESULT: ${{ needs.verified-production-mariadb55.result }}
           BROWSER_RESULT: ${{ needs.real-browser-candidate.result }}
           PERFORMANCE_RESULT: ${{ needs.cross-layer-performance.result }}
+          CANDIDATE_BUILD_COMMIT_SHA: ${{ needs.candidate-build.outputs.candidate_commit_sha }}
+          CANDIDATE_BUILD_ARTIFACT_SHA256: ${{ needs.candidate-build.outputs.candidate_artifact_sha256 }}
+          BACKUP_COMMIT_SHA: ${{ needs.verified-production-mariadb55.outputs.candidate_commit_sha }}
+          BROWSER_COMMIT_SHA: ${{ needs.real-browser-candidate.outputs.candidate_commit_sha }}
+          BROWSER_ARTIFACT_SHA256: ${{ needs.real-browser-candidate.outputs.candidate_artifact_sha256 }}
+          BROWSER_SERVED_ROOT_SHA256: ${{ needs.real-browser-candidate.outputs.served_root_sha256 }}
+          BROWSER_SESSION_ID: ${{ needs.real-browser-candidate.outputs.release_validation_session_id }}
+          PERFORMANCE_COMMIT_SHA: ${{ needs.cross-layer-performance.outputs.candidate_commit_sha }}
+          PERFORMANCE_ARTIFACT_SHA256: ${{ needs.cross-layer-performance.outputs.candidate_artifact_sha256 }}
+          PERFORMANCE_SERVED_ROOT_SHA256: ${{ needs.cross-layer-performance.outputs.served_root_sha256 }}
+          PERFORMANCE_SESSION_ID: ${{ needs.cross-layer-performance.outputs.release_validation_session_id }}
         run: |
           set -eu
           for result in \
@@ -881,8 +929,29 @@ jobs:
             echo "$lane: $status"
             test "$status" = success
           done
+          mkdir -p .artifacts/production-ready
+          python scripts/diagnostics/production_ready_evidence_join.py \
+            --candidate-build-commit "$CANDIDATE_BUILD_COMMIT_SHA" \
+            --candidate-build-artifact "$CANDIDATE_BUILD_ARTIFACT_SHA256" \
+            --browser-commit "$BROWSER_COMMIT_SHA" \
+            --browser-artifact "$BROWSER_ARTIFACT_SHA256" \
+            --browser-served-root "$BROWSER_SERVED_ROOT_SHA256" \
+            --browser-session "$BROWSER_SESSION_ID" \
+            --performance-commit "$PERFORMANCE_COMMIT_SHA" \
+            --performance-artifact "$PERFORMANCE_ARTIFACT_SHA256" \
+            --performance-served-root "$PERFORMANCE_SERVED_ROOT_SHA256" \
+            --performance-session "$PERFORMANCE_SESSION_ID" \
+            --backup-commit "$BACKUP_COMMIT_SHA" \
+            --output .artifacts/production-ready/identity-join.json
           {
             echo "## Production READY Gate"
-            echo "PASS — all manual production evidence lanes passed."
+            echo "PASS — all manual evidence lanes passed and identify one exact Candidate publication."
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "Production READY gate: PASS"
+          echo "Production READY gate: PASS (exact Candidate identity join)"
+      - name: Upload Production READY identity join
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: production-ready-identity-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .artifacts/production-ready/identity-join.json
+          if-no-files-found: warn

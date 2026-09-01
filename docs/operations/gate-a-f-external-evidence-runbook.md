@@ -269,7 +269,7 @@ Final Gate。
 Candidate 构建的字节流程固定为：`build → normalize → CandidateArtifactManifest →
 build attestation → verify → immutable publish`。构建命令必须绑定一个 verified clean
 Git checkout，并提供 `source_commit_sha`、真实 Git tree inventory 的
-`source_manifest_sha256`、`build_workflow_run_id`、`build_workflow_sha` 和
+`source_manifest_sha256`、`build_workflow_run_id`、`build_workflow_run_attempt`、`build_workflow_sha` 和
 `build_input_manifest_sha256`；它会在 Candidate 根生成
 `candidate_build_attestation.json`。例如：
 
@@ -278,8 +278,9 @@ python3 scripts/release/build_candidate_artifact_manifest.py \
   --candidate-root /srv/fos-coverage/candidate \
   --release-identity /secure/evidence/release-identity.json \
   --source-repo-root /srv/fos-coverage/source-checkout \
-  --build-workflow-identity github-actions/candidate-build \
+  --build-workflow-identity github-actions/trusted-candidate-builder \
   --build-workflow-run-id "$GITHUB_RUN_ID" \
+  --build-workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
   --build-workflow-sha "$BUILD_WORKFLOW_SHA"
 ```
 
@@ -294,8 +295,9 @@ python3 scripts/release/sign_candidate_build_receipt.py \
   --candidate-root /srv/fos-coverage/candidate \
   --release-identity /secure/evidence/release-identity.json \
   --source-repo-root /srv/fos-coverage/source-checkout \
-  --build-workflow-identity github-actions/candidate-build \
+  --build-workflow-identity github-actions/trusted-candidate-builder \
   --build-workflow-run-id "$GITHUB_RUN_ID" \
+  --build-workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
   --build-workflow-sha "$BUILD_WORKFLOW_SHA" \
   --attestation-bundle /secure/evidence/candidate-build-attestation.bundle.json
 ```
@@ -311,13 +313,13 @@ Candidate manifest 自身推导：
 python3 scripts/release/publish_release.py \
   ... \
   --source-repo-root /srv/fos-coverage/source-checkout \
-  --trusted-build-workflow-identity github-actions/candidate-build \
+  --trusted-build-workflow-identity github-actions/trusted-candidate-builder \
   --trusted-build-workflow-sha "$TRUSTED_BUILD_WORKFLOW_SHA" \
   --candidate-build-receipt /srv/fos-coverage/candidate/candidate_build_receipt.json \
   --candidate-build-attestation-bundle /secure/evidence/candidate-build-attestation.bundle.json \
   --candidate-build-attestation-repository Chary-yu/fos_coverage_tool \
   --candidate-build-attestation-workflow \
-    Chary-yu/fos_coverage_tool/.github/workflows/ci.yml
+    Chary-yu/fos_coverage_tool/.github/workflows/trusted-candidate-builder.yml
 ```
 
 普通 Publisher 会重新验证 clean Git checkout，并要求 Candidate 的 workflow identity

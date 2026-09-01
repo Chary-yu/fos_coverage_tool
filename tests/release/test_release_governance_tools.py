@@ -127,6 +127,48 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
             self.assertIn("- {}".format(lane), workflow)
         self.assertIn("github.event_name == 'workflow_dispatch'", workflow)
 
+    def test_production_ready_joins_exact_candidate_identity_across_lanes(self):
+        with open(
+                os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
+                encoding="utf-8") as stream:
+            workflow = stream.read()
+        self.assertIn("production_ready_evidence_join.py", workflow)
+        self.assertIn("needs.candidate-build.outputs.candidate_artifact_sha256", workflow)
+        self.assertIn("needs.real-browser-candidate.outputs.served_root_sha256", workflow)
+        self.assertIn("needs.cross-layer-performance.outputs.release_validation_session_id", workflow)
+        with open(
+                os.path.join(os.getcwd(), "scripts", "diagnostics",
+                             "production_ready_evidence_join.py"),
+                encoding="utf-8") as stream:
+            self.assertIn("observed_publication", stream.read())
+
+    def test_candidate_build_uses_pinned_independent_builder_workflow(self):
+        with open(
+                os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
+                encoding="utf-8") as stream:
+            caller = stream.read()
+        with open(
+                os.path.join(os.getcwd(), ".github", "workflows",
+                             "trusted-candidate-builder.yml"),
+                encoding="utf-8") as stream:
+            builder = stream.read()
+        with open(
+                os.path.join(os.getcwd(), "config",
+                             "coverage_config.staging.example.json"),
+                encoding="utf-8") as stream:
+            config = json.load(stream)
+        trusted_sha = config["upgrade"]["trusted_build_workflow_sha"]
+        self.assertRegex(trusted_sha, r"^[0-9a-f]{40}$")
+        self.assertIn(
+            "trusted-candidate-builder.yml@{}".format(trusted_sha), caller
+        )
+        self.assertIn(
+            "builder_workflow_sha: {}".format(trusted_sha), caller
+        )
+        self.assertIn("environment: trusted-candidate-build", builder)
+        self.assertIn("actions/attest@", builder)
+        self.assertIn("BUILD_WORKFLOW_RUN_ATTEMPT", builder)
+
     def test_perf_benchmark_help_is_side_effect_free(self):
         with tempfile.TemporaryDirectory() as directory:
             output = os.path.join(directory, "benchmark.json")
