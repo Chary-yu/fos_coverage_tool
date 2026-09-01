@@ -31,7 +31,8 @@ _SUCCESS_STATUS = "UPGRADE_" + "SUCCESS"
 _MATRIX_SECTIONS = ("targeted_tests", "performance_benchmark")
 _REQUIRED_EVIDENCE_SECTIONS = (
     "schema_migration", "backup_evidence", "data_hash_verification",
-    "browser_smoke_suite", "path_mapping_audit", "sidecar_audit",
+    "browser_fixture_regression", "candidate_browser_evidence",
+    "path_mapping_audit", "sidecar_audit",
     "security_audit", "traffic_freeze", "job_drain", "api_stop",
     "api_start", "release_endpoint", "file_cutover",
     "validation_session_manifest", "validation_teardown", "traffic_open",
@@ -338,7 +339,8 @@ class ProductionEvidenceManifest:
             "backup_evidence": {},
             "data_hash_verification": {},
             "targeted_tests": {},
-            "browser_smoke_suite": {},
+            "browser_fixture_regression": {},
+            "candidate_browser_evidence": {},
             "path_mapping_audit": {},
             "sidecar_audit": {},
             "security_audit": {},
@@ -457,10 +459,40 @@ class ProductionEvidenceManifest:
         if not test_records or any(not isinstance(v, dict) or v.get("status") != "PASSED" for v in test_records):
             unmet.append("Targeted unit test matrix is incomplete or contains failures")
             
-        # 3. Browser Smoke Suite
-        bss = self.data.get("browser_smoke_suite", {})
-        if bss.get("status") != "PASSED" or bss.get("evidence_class") != "real_browser":
-            unmet.append("Browser smoke suite did not pass")
+        # 3. Browser evidence has two deliberately separate authorities.
+        # The fixture regression protects test coverage; only the externally
+        # collected exact-Candidate artifact can certify production traffic.
+        fixture = self.data.get("browser_fixture_regression", {})
+        if fixture.get("status") != "PASSED" or \
+                fixture.get("evidence_class") != "browser_fixture_regression":
+            unmet.append("Browser fixture regression did not pass")
+        candidate_browser = self.data.get("candidate_browser_evidence", {})
+        if candidate_browser.get("status") != "PASSED" or \
+                candidate_browser.get("evidence_class") != "real_candidate_browser":
+            unmet.append("Real Candidate browser evidence did not pass")
+        if candidate_browser.get("release_eligible") is not True:
+            unmet.append("Candidate browser evidence is not release eligible")
+        if candidate_browser.get("synthetic") is not False:
+            unmet.append("Synthetic browser evidence cannot pass the production gate")
+        if not candidate_browser.get("candidate_url"):
+            unmet.append("Candidate browser URL is missing")
+        if candidate_browser.get("expected_commit_sha") != revision:
+            unmet.append("Candidate browser expected commit does not match release identity")
+        served_identity = candidate_browser.get("served_release_identity") or {}
+        if not isinstance(served_identity, dict) or \
+                served_identity.get("commit_sha") != revision:
+            unmet.append("Candidate browser served release identity does not match release identity")
+        if candidate_browser.get("real_http") is not True:
+            unmet.append("Candidate browser evidence is not real HTTP")
+        if candidate_browser.get("chromium") is not True:
+            unmet.append("Candidate browser evidence is not Chromium")
+        browser_artifact = candidate_browser.get("browser_artifact_path")
+        browser_artifact_sha = candidate_browser.get("browser_artifact_sha256")
+        if not browser_artifact or not os.path.isabs(str(browser_artifact)) or \
+                not os.path.isfile(str(browser_artifact)):
+            unmet.append("Candidate browser artifact is missing")
+        elif not browser_artifact_sha or _sha256_file(str(browser_artifact)) != str(browser_artifact_sha):
+            unmet.append("Candidate browser artifact SHA256 mismatch")
             
         # 4. Data Hash Verification
         dhv = self.data.get("data_hash_verification", {})

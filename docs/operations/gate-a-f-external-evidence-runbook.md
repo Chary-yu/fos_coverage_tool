@@ -195,6 +195,13 @@ Secret 中配置 `COVERAGE_BROWSER_USER`；job 会上传三个 exact-SHA JSON ar
 未提供 Candidate URL 时该 lane 不运行，普通 CI 仍只保留明确标记为 synthetic 的
 fixture/browser evidence。
 
+`run_upgrade.py` 对这两类证据也采用同一口径：`npm run test:browser` 只写入
+`browser_fixture_regression`，不能写入生产 Browser Gate。正式升级必须在配置中
+提供 `candidate_browser_url` 和外部 `candidate_browser_evidence_path`；该文件必须
+来自 `real_browser_evidence.js --browser-evidence-output`，并绑定 exact commit、
+served release identity、真实 HTTP、Chromium、artifact SHA 和
+`synthetic=false`，否则 Final Gate 保持 `NOT_READY`。
+
 ## Gate F：切换、回滚和 48 小时窗口
 
 正式切换前重新生成 fresh inventory，至少覆盖 process/service、release identity、Current/Candidate roots、DB fingerprint、schema/table counts、jobs、磁盘公式、Nginx/auth boundary 和 backup location。再执行 freeze → final backup → Candidate rehearsal → traffic-closed verification → cutover → forced rollback rehearsal，并保留完整 before/target/rollback release identity。

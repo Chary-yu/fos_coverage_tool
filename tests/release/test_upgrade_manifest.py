@@ -11,6 +11,7 @@ if ROOT not in sys.path:
 
 from scripts.upgrade.build_deployment_manifest import build
 from scripts.upgrade.cutover_controller import CutoverController
+from scripts.upgrade.run_upgrade import _validate_candidate_browser_evidence
 
 
 class TestUpgradeManifest(unittest.TestCase):
@@ -50,6 +51,90 @@ class TestUpgradeManifest(unittest.TestCase):
                                      "backup_required": True}]}
             with self.assertRaises(RuntimeError):
                 CutoverController(root, os.path.join(root, "backup")).apply(manifest["actions"])
+
+    def test_fixture_browser_payload_cannot_be_candidate_evidence(self):
+        identity = {
+            "version": "v-test",
+            "commit_sha": "a" * 40,
+            "build_id": "build-a",
+            "asset_hash": "b" * 64,
+            "schema_version": 2,
+            "asset_manifest_version": 1,
+            "asset_count": 1,
+            "asset_manifest_hash": "c" * 64,
+            "asset_manifest": [{"path": "coverage.js"}],
+        }
+        with tempfile.TemporaryDirectory() as root:
+            artifact = os.path.join(root, "browser-report.json")
+            with open(artifact, "w", encoding="utf-8") as stream:
+                stream.write("report")
+            payload = {
+                "status": "PASSED",
+                "evidence_class": "real_http_chromium_fixture",
+                "release_eligible": False,
+                "synthetic": True,
+                "candidate_revision": identity["commit_sha"],
+                "page_url": "http://127.0.0.1:19528/",
+                "release_identity": identity,
+                "browser_functional": {"status": "PASSED"},
+                "coverage_virtual_scroll_100k": {
+                    "status": "PASSED",
+                    "workload_id": "fixture",
+                    "environment_identity": {"browser_name": "chromium"},
+                },
+                "artifact_path": artifact,
+                "artifact_sha256": hashlib.sha256(b"report").hexdigest(),
+            }
+            errors, normalized = _validate_candidate_browser_evidence(
+                artifact, payload, identity, "http://127.0.0.1:19528/"
+            )
+        self.assertTrue(errors)
+        self.assertEqual(normalized["status"], "FAILED")
+        self.assertFalse(normalized["release_eligible"])
+
+    def test_real_candidate_browser_evidence_binds_url_revision_and_artifact(self):
+        identity = {
+            "version": "v-test",
+            "commit_sha": "a" * 40,
+            "build_id": "build-a",
+            "asset_hash": "b" * 64,
+            "schema_version": 2,
+            "asset_manifest_version": 1,
+            "asset_count": 1,
+            "asset_manifest_hash": "c" * 64,
+            "asset_manifest": [{"path": "coverage.js"}],
+        }
+        with tempfile.TemporaryDirectory() as root:
+            artifact = os.path.join(root, "browser-report.json")
+            with open(artifact, "w", encoding="utf-8") as stream:
+                stream.write("report")
+            artifact_sha = hashlib.sha256(b"report").hexdigest()
+            payload = {
+                "status": "PASSED",
+                "evidence_class": "real_http_chromium_browser",
+                "release_eligible": True,
+                "synthetic": False,
+                "candidate_revision": identity["commit_sha"],
+                "page_url": "https://candidate.example.invalid/report.html",
+                "release_identity": identity,
+                "browser_functional": {"status": "PASSED"},
+                "coverage_virtual_scroll_100k": {
+                    "status": "PASSED",
+                    "workload_id": "real-workload",
+                    "environment_identity": {"browser_name": "chromium"},
+                },
+                "artifact_path": artifact,
+                "artifact_sha256": artifact_sha,
+            }
+            errors, normalized = _validate_candidate_browser_evidence(
+                artifact, payload, identity,
+                "https://candidate.example.invalid/report.html",
+            )
+        self.assertEqual(errors, [])
+        self.assertEqual(normalized["evidence_class"], "real_candidate_browser")
+        self.assertTrue(normalized["real_http"])
+        self.assertTrue(normalized["chromium"])
+        self.assertEqual(normalized["browser_artifact_sha256"], artifact_sha)
 
 
 if __name__ == "__main__":

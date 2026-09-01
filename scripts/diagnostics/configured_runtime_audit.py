@@ -36,6 +36,10 @@ def audit(repo_root=ROOT):
         violations.append("Candidate previous_release_endpoint must differ from release_endpoint")
     if not upgrade.get("health_endpoint"):
         violations.append("Candidate health_endpoint is missing")
+    if not upgrade.get("candidate_browser_url"):
+        violations.append("Candidate candidate_browser_url is missing")
+    if not upgrade.get("candidate_browser_evidence_path"):
+        violations.append("Candidate candidate_browser_evidence_path is missing")
     commands = upgrade.get("commands") or {}
     if commands.get("start_previous_api") == commands.get("start_api"):
         violations.append("start_previous_api must not reuse the Candidate start command")

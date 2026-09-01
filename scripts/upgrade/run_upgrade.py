@@ -220,6 +220,93 @@ def _validate_release_performance_artifact(path: str, payload: Dict[str, Any],
     return errors
 
 
+def _normalize_evidence_url(value: Any) -> str:
+    return str(value or "").strip().rstrip("/")
+
+
+def _validate_candidate_browser_evidence(path: str, payload: Dict[str, Any],
+                                         identity: Dict[str, Any],
+                                         expected_url: str) -> Tuple[List[str], Dict[str, Any]]:
+    """Validate the external real-Candidate browser evidence envelope."""
+    errors = []
+    if not isinstance(payload, dict):
+        return ["Candidate browser evidence is not a JSON object"], {}
+    if payload.get("status") != "PASSED":
+        errors.append("Candidate browser evidence status is not PASSED")
+    if payload.get("evidence_class") != "real_http_chromium_browser":
+        errors.append("Candidate browser evidence is not real_http_chromium_browser")
+    if payload.get("release_eligible") is not True:
+        errors.append("Candidate browser evidence is not release eligible")
+    if payload.get("synthetic") is not False:
+        errors.append("synthetic Candidate browser evidence is forbidden")
+    target_revision = identity.get("commit_sha")
+    if payload.get("candidate_revision") != target_revision:
+        errors.append("Candidate browser revision does not match target release")
+    candidate_url = payload.get("candidate_url") or payload.get("page_url")
+    if not candidate_url:
+        errors.append("Candidate browser evidence URL is missing")
+    elif not _normalize_evidence_url(candidate_url).startswith(("http:", "https:")):
+        errors.append("Candidate browser evidence URL is not HTTP(S)")
+    if not expected_url:
+        errors.append("upgrade.candidate_browser_url is required")
+    elif _normalize_evidence_url(candidate_url) != _normalize_evidence_url(expected_url):
+        errors.append("Candidate browser URL does not match configured candidate_browser_url")
+
+    served_identity = payload.get("release_identity") or {}
+    if not isinstance(served_identity, dict):
+        errors.append("Candidate browser served release identity is missing")
+        served_identity = {}
+    for key in (
+            "version", "commit_sha", "build_id", "asset_hash", "schema_version",
+            "asset_manifest_version", "asset_count", "asset_manifest_hash",
+            "asset_manifest"):
+        if identity.get(key) not in (None, "") and served_identity.get(key) != identity.get(key):
+            errors.append("Candidate browser served release identity mismatch: {}".format(key))
+
+    functional = payload.get("browser_functional") or {}
+    workload = payload.get("coverage_virtual_scroll_100k") or {}
+    environment = workload.get("environment_identity") or {}
+    if functional.get("status") != "PASSED":
+        errors.append("Candidate browser functional HTTP check is not PASSED")
+    if workload.get("status") != "PASSED":
+        errors.append("Candidate browser workload is not PASSED")
+    if environment.get("browser_name") != "chromium":
+        errors.append("Candidate browser evidence does not identify Chromium")
+
+    artifact_path = payload.get("artifact_path") or payload.get("report_artifact_path")
+    artifact_sha = payload.get("artifact_sha256") or payload.get("report_artifact_sha256")
+    if not artifact_path or not os.path.isabs(str(artifact_path)) or \
+            not os.path.isfile(str(artifact_path)):
+        errors.append("Candidate browser workload artifact is missing")
+        artifact_path = ""
+        artifact_sha = ""
+    else:
+        actual_sha = _sha256_file(str(artifact_path))
+        if not artifact_sha or str(artifact_sha) != actual_sha:
+            errors.append("Candidate browser workload artifact SHA256 mismatch")
+            artifact_sha = actual_sha
+
+    normalized = {
+        "status": "PASSED" if not errors else "FAILED",
+        "evidence_class": "real_candidate_browser",
+        "source_evidence_class": payload.get("evidence_class", ""),
+        "candidate_url": candidate_url or "",
+        "expected_commit_sha": target_revision,
+        "served_release_identity": served_identity,
+        "browser_artifact_path": artifact_path,
+        "browser_artifact_sha256": artifact_sha,
+        "real_http": payload.get("evidence_class") == "real_http_chromium_browser" and \
+            _normalize_evidence_url(candidate_url).startswith(("http:", "https:")),
+        "chromium": environment.get("browser_name") == "chromium",
+        "synthetic": payload.get("synthetic"),
+        "release_eligible": payload.get("release_eligible"),
+        "workload_id": workload.get("workload_id", ""),
+        "workload_status": workload.get("status", ""),
+        "violations": errors,
+    }
+    return errors, normalized
+
+
 def connect_live_database(db_config: Dict[str, Any]):
     """Create the live DB-API connection required by a non-dry-run upgrade."""
     try:
@@ -915,22 +1002,87 @@ class UpgradeOrchestrator:
             err_text = b_res.stderr.decode("utf-8", errors="ignore")
             self.log(f"❌ Browser smoke suite failed: {err_text}")
             return self._fail(lifecycle, "Browser smoke suite failed")
-        # This Node suite is a regression test only.  Separately run the
-        # Playwright suite and classify it as real browser evidence only when
-        # Chromium actually exits successfully.
+        # This Playwright suite is a fixture regression only.  It must never
+        # be recorded as evidence of the externally served Candidate.
         browser_cmd = ["npm", "run", "test:browser", "--", "--reporter=line"]
-        real_browser = subprocess.run(browser_cmd, cwd=self.repo_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        browser_status = "PASSED" if real_browser.returncode == 0 else "UNAVAILABLE"
-        self.manifest.record("browser_smoke_suite", {
-            "status": browser_status,
+        browser_fixture = subprocess.run(
+            browser_cmd, cwd=self.repo_root, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        fixture_status = "PASSED" if browser_fixture.returncode == 0 else "FAILED"
+        self.manifest.record("browser_fixture_regression", {
+            "status": fixture_status,
             "revision": identity.get("commit_sha"),
-            "evidence_class": "real_browser" if real_browser.returncode == 0 else "mock_dom",
+            "evidence_class": "browser_fixture_regression",
+            "synthetic": True,
             "suite": "tests/browser/coverage_real_browser.spec.js",
             "command": " ".join(browser_cmd),
-            "exit_code": real_browser.returncode,
-            "artifact_path": os.path.join(os.path.dirname(self.manifest.manifest_path), "browser-playwright-report.json"),
+            "exit_code": browser_fixture.returncode,
         })
-        self.log("✔ Real browser suite passed." if real_browser.returncode == 0 else "⚠ Real browser evidence unavailable.")
+        if browser_fixture.returncode != 0:
+            err_text = browser_fixture.stderr.decode("utf-8", errors="ignore")
+            self.log("❌ Browser fixture regression failed: {}".format(err_text))
+            return self._fail(lifecycle, "Browser fixture regression failed")
+        self.log("✔ Browser fixture regression passed.")
+
+        # Production authority is an external artifact generated by
+        # real_browser_evidence.js against the actual Candidate URL.  The
+        # fixture command above is intentionally not consulted for this gate.
+        self.log("[Step 6b/10] Validating external real Candidate browser evidence...")
+        configured_browser_evidence = upgrade_config.get("candidate_browser_evidence_path")
+        browser_evidence_path = configured_browser_evidence or os.environ.get(
+            "COVERAGE_CANDIDATE_BROWSER_EVIDENCE", ""
+        )
+        if browser_evidence_path and not os.path.isabs(str(browser_evidence_path)):
+            browser_evidence_path = os.path.join(self.repo_root, str(browser_evidence_path))
+        browser_evidence_path = os.path.realpath(str(browser_evidence_path or ""))
+        expected_browser_url = str(upgrade_config.get("candidate_browser_url") or "")
+        browser_payload = {}
+        browser_errors = []
+        if not browser_evidence_path or not os.path.isfile(browser_evidence_path):
+            browser_errors.append(
+                "upgrade.candidate_browser_evidence_path must point to real Candidate evidence"
+            )
+        else:
+            try:
+                with open(browser_evidence_path, "r", encoding="utf-8") as browser_stream:
+                    browser_payload = json.load(browser_stream)
+            except (OSError, ValueError, TypeError) as exc:
+                browser_errors.append("Candidate browser evidence is unreadable: {}".format(exc))
+        if not browser_errors:
+            browser_errors, normalized_browser = _validate_candidate_browser_evidence(
+                browser_evidence_path, browser_payload, identity, expected_browser_url
+            )
+        else:
+            normalized_browser = {
+                "status": "FAILED",
+                "evidence_class": "real_candidate_browser",
+                "candidate_url": expected_browser_url,
+                "expected_commit_sha": identity.get("commit_sha"),
+                "served_release_identity": {},
+                "browser_artifact_path": "",
+                "browser_artifact_sha256": "",
+                "real_http": False,
+                "chromium": False,
+                "synthetic": False,
+                "release_eligible": False,
+                "violations": browser_errors,
+            }
+        normalized_browser.update({
+            "revision": identity.get("commit_sha"),
+            "artifact_path": browser_evidence_path,
+            "command": "validate real_browser_evidence.js --browser-evidence-output",
+            "exit_code": 0 if not browser_errors else 1,
+        })
+        if browser_evidence_path and os.path.isfile(browser_evidence_path):
+            normalized_browser["evidence_artifact_sha256"] = _sha256_file(browser_evidence_path)
+        self.manifest.record("candidate_browser_evidence", normalized_browser)
+        if browser_errors:
+            self.log("❌ Real Candidate browser evidence rejected: {}".format(
+                "; ".join(browser_errors)
+            ))
+            return self._fail(lifecycle, "Real Candidate browser evidence rejected")
+        self.log("✔ Real Candidate browser evidence passed.")
 
         # Step 7: Consume immutable release A/B evidence.  The synthetic DOM
         # benchmark remains a useful diagnostic, but it is not allowed to

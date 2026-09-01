@@ -42,6 +42,8 @@
     "validation_teardown_timeout_sec": 10,
     "release_endpoint": "http://127.0.0.1:19528/api/coverage/release",
     "health_endpoint": "http://127.0.0.1:19528/api/coverage/health",
+    "candidate_browser_url": "https://candidate.example.invalid/",
+    "candidate_browser_evidence_path": ".artifacts/staging/candidate-browser-evidence.json",
     "previous_release_endpoint": "http://127.0.0.1:9528/api/coverage/release",
     "rollback_evidence_path": ".artifacts/staging/rollback-evidence.json",
     "performance_evidence_path": ".artifacts/staging/release-performance-ab.json",
