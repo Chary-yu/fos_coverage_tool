@@ -13,6 +13,7 @@ if ROOT not in sys.path:
 
 from app.candidate_artifact import (
     CANDIDATE_ARTIFACT_MANIFEST_NAME, CandidateArtifactManifest,
+    build_git_source_provenance,
 )
 from app.release_identity import verify_release_identity
 
@@ -31,22 +32,34 @@ def main(argv=None):
     parser.add_argument("--release-identity", required=True)
     parser.add_argument("--output", default="")
     parser.add_argument(
-        "--source-repo-root", default="",
-        help="optional exact checkout used to verify the supplied identity",
+        "--source-repo-root", required=True,
+        help="exact clean checkout used to verify the supplied identity",
+    )
+    parser.add_argument(
+        "--build-workflow-identity", required=True,
+        help="immutable CI/build workflow identity for this artifact",
     )
     args = parser.parse_args(argv)
     candidate_root = os.path.abspath(args.candidate_root)
     identity = _load(args.release_identity)
-    if args.source_repo_root:
+    try:
         observed = verify_release_identity(
             os.path.abspath(args.source_repo_root), identity
         )
         identity = observed
+        source_provenance = build_git_source_provenance(
+            args.source_repo_root, identity, args.build_workflow_identity
+        )
+    except (OSError, RuntimeError, ValueError, TypeError) as exc:
+        parser.error(str(exc))
     output = args.output or os.path.join(
         candidate_root, CANDIDATE_ARTIFACT_MANIFEST_NAME
     )
     try:
-        manifest = CandidateArtifactManifest.build(candidate_root, identity, output)
+        manifest = CandidateArtifactManifest.build(
+            candidate_root, identity, output,
+            source_provenance=source_provenance,
+        )
     except (OSError, RuntimeError, ValueError, TypeError) as exc:
         parser.error(str(exc))
     print(json.dumps({
@@ -59,10 +72,14 @@ def main(argv=None):
         "reports_sha256": manifest["reports_sha256"],
         "assets_sha256": manifest["assets_sha256"],
         "registry_sha256": manifest["registry_sha256"],
+        "source_commit_sha": manifest["source_commit_sha"],
+        "source_tree_sha": manifest["source_tree_sha"],
+        "build_workflow_identity": manifest["build_workflow_identity"],
+        "source_manifest_sha256": manifest["source_manifest_sha256"],
+        "candidate_artifact_sha256": manifest["candidate_artifact_sha256"],
     }, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
-

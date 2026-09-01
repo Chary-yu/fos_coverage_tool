@@ -8,6 +8,7 @@ publication.  Normal upgrades deliberately do not call this module when
 from __future__ import print_function
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -18,7 +19,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
-from app.candidate_artifact import CandidateArtifactManifest
+from app.candidate_artifact import CandidateArtifactManifest, identity_manifest_sha256
 from app.release_publication import (
     ImmutableReleasePublisher, validate_release_manifest,
 )
@@ -95,6 +96,32 @@ def _copy_source_without_following_links(source_root, target_root):
             raise ValueError("unsupported Served Root entry: {}".format(source))
 
 
+def _served_root_tree_sha(root):
+    """Create a deterministic tree identity for a non-Git Served Root."""
+    entries = []
+    root = os.path.realpath(os.path.abspath(root))
+    for directory, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = sorted(dirnames)
+        for name in sorted(filenames):
+            path = os.path.join(directory, name)
+            if os.path.islink(path) or not os.path.isfile(path):
+                raise ValueError("served root contains an unsupported link or file: {}".format(path))
+            digest = hashlib.sha256()
+            with open(path, "rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            entries.append({
+                "path": os.path.relpath(path, root).replace(os.sep, "/"),
+                "size": int(os.path.getsize(path)),
+                "sha256": digest.hexdigest(),
+            })
+    canonical = json.dumps(
+        sorted(entries, key=lambda item: item["path"]),
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha1(canonical).hexdigest()
+
+
 def bootstrap(served_root, publish_root, release_identity_path, session_id,
               served_identity_path="", switch=False, api_contract_version=""):
     served_root = os.path.realpath(os.path.abspath(served_root))
@@ -133,7 +160,17 @@ def bootstrap(served_root, publish_root, release_identity_path, session_id,
 
     with tempfile.TemporaryDirectory(prefix="coverage-bootstrap-") as build_root:
         _copy_source_without_following_links(served_root, build_root)
-        artifact_manifest = CandidateArtifactManifest.build(build_root, expected)
+        artifact_manifest = CandidateArtifactManifest.build(
+            build_root, expected,
+            source_provenance={
+                "provenance_class": "served-root-bootstrap",
+                "source_commit_sha": expected.get("commit_sha"),
+                "source_tree_sha": _served_root_tree_sha(served_root),
+                "worktree_clean": True,
+                "build_workflow_identity": "bootstrap_previous_release",
+                "source_manifest_sha256": identity_manifest_sha256(expected),
+            },
+        )
         prepared = publisher.prepare(
             build_root, expected, session_id,
             api_contract_version=api_contract_version,

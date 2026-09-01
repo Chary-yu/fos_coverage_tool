@@ -497,6 +497,18 @@ def build_release_manifest(release_root, release_identity, session_id,
             "reports_sha256": candidate_artifact_manifest.get("reports_sha256"),
             "assets_sha256": candidate_artifact_manifest.get("assets_sha256"),
             "registry_sha256": candidate_artifact_manifest.get("registry_sha256"),
+            "source_provenance": candidate_artifact_manifest.get("source_provenance"),
+            "source_commit_sha": candidate_artifact_manifest.get("source_commit_sha"),
+            "source_tree_sha": candidate_artifact_manifest.get("source_tree_sha"),
+            "build_workflow_identity": candidate_artifact_manifest.get(
+                "build_workflow_identity"
+            ),
+            "source_manifest_sha256": candidate_artifact_manifest.get(
+                "source_manifest_sha256"
+            ),
+            "candidate_artifact_sha256": candidate_artifact_manifest.get(
+                "candidate_artifact_sha256"
+            ),
         }
     return manifest
 

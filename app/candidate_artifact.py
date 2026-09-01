@@ -13,6 +13,7 @@ from __future__ import print_function
 import hashlib
 import json
 import os
+import re
 import subprocess
 
 from app.release_identity import is_valid_commit_sha
@@ -22,6 +23,8 @@ from app.time_utils import utc_iso
 CANDIDATE_ARTIFACT_MANIFEST_VERSION = 1
 CANDIDATE_ARTIFACT_MANIFEST_NAME = "candidate_artifact_manifest.json"
 ARTIFACT_DIRECTORIES = ("reports", "assets", "registry")
+_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
+_GIT_TREE_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 def _real(path):
@@ -117,6 +120,79 @@ def _identity_snapshot(identity):
     return snapshot
 
 
+def identity_manifest_sha256(identity):
+    """Digest the exact identity fields that a Candidate is allowed to claim."""
+    return _canonical_hash(_identity_snapshot(identity))
+
+
+def _source_provenance(value, require_artifact_sha=False):
+    if not isinstance(value, dict):
+        raise ValueError("candidate artifact source provenance is required")
+    provenance = dict(value)
+    required = (
+        "provenance_class", "source_commit_sha", "source_tree_sha",
+        "build_workflow_identity", "source_manifest_sha256",
+    )
+    missing = [key for key in required if provenance.get(key) in (None, "")]
+    if missing:
+        raise ValueError(
+            "candidate artifact source provenance is missing: " + ", ".join(missing)
+        )
+    if not is_valid_commit_sha(provenance.get("source_commit_sha")):
+        raise ValueError("candidate artifact source_commit_sha must be an exact commit SHA")
+    if not _GIT_TREE_SHA.fullmatch(str(provenance.get("source_tree_sha"))):
+        raise ValueError("candidate artifact source_tree_sha must be an exact Git tree SHA")
+    if not _SHA256.fullmatch(str(provenance.get("source_manifest_sha256"))):
+        raise ValueError("candidate artifact source_manifest_sha256 is invalid")
+    if provenance.get("worktree_clean") is not True:
+        raise ValueError("candidate artifact source worktree must be clean")
+    if require_artifact_sha and not _SHA256.fullmatch(
+            str(provenance.get("candidate_artifact_sha256") or "")):
+        raise ValueError("candidate artifact candidate_artifact_sha256 is invalid")
+    return provenance
+
+
+def build_git_source_provenance(source_repo_root, release_identity,
+                                build_workflow_identity):
+    """Capture immutable source checkout provenance for a packaged artifact."""
+    source_repo_root = _real(source_repo_root)
+    if not os.path.exists(os.path.join(source_repo_root, ".git")):
+        raise ValueError("source-repo-root must contain .git metadata")
+    workflow = str(build_workflow_identity or "").strip()
+    if not workflow:
+        raise ValueError("build_workflow_identity is required")
+    try:
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=source_repo_root,
+            stderr=subprocess.STDOUT,
+        ).decode("ascii", "replace").strip()
+        tree = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=source_repo_root,
+            stderr=subprocess.STDOUT,
+        ).decode("ascii", "replace").strip()
+        status = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=source_repo_root, stderr=subprocess.STDOUT,
+        ).decode("utf-8", "replace")
+    except (OSError, subprocess.CalledProcessError, UnicodeError) as exc:
+        raise ValueError("source Git provenance is unavailable: {}".format(exc))
+    expected_commit = str((release_identity or {}).get("commit_sha") or "").strip()
+    if not is_valid_commit_sha(head) or head.lower() != expected_commit.lower():
+        raise ValueError("source Git HEAD does not match release identity commit_sha")
+    if not _GIT_TREE_SHA.fullmatch(tree):
+        raise ValueError("source Git tree SHA is invalid")
+    if status.strip():
+        raise ValueError("source Git worktree must be clean")
+    return {
+        "provenance_class": "git-checkout",
+        "source_commit_sha": head,
+        "source_tree_sha": tree,
+        "worktree_clean": True,
+        "build_workflow_identity": workflow,
+        "source_manifest_sha256": identity_manifest_sha256(release_identity),
+    }
+
+
 def _verify_checkout_head(candidate_root, commit_sha):
     """Use checkout metadata when an artifact is built from a Git tree."""
     if not os.path.exists(os.path.join(_real(candidate_root), ".git")):
@@ -134,7 +210,7 @@ def _verify_checkout_head(candidate_root, commit_sha):
         )
 
 
-def _build_payload(candidate_root, identity, manifest_path):
+def _build_payload(candidate_root, identity, manifest_path, source_provenance):
     candidate_root = _real(candidate_root)
     identity_snapshot = _identity_snapshot(identity)
     _verify_checkout_head(candidate_root, identity_snapshot["commit_sha"])
@@ -147,6 +223,9 @@ def _build_payload(candidate_root, identity, manifest_path):
         directory: _directory_hash(entries, directory)
         for directory in ARTIFACT_DIRECTORIES
     }
+    artifact_sha = _canonical_hash(entries)
+    provenance = _source_provenance(source_provenance)
+    provenance["candidate_artifact_sha256"] = artifact_sha
     return {
         "artifact_manifest_version": CANDIDATE_ARTIFACT_MANIFEST_VERSION,
         "commit_sha": identity_snapshot["commit_sha"],
@@ -156,7 +235,13 @@ def _build_payload(candidate_root, identity, manifest_path):
         "reports_sha256": directory_hashes["reports"],
         "assets_sha256": directory_hashes["assets"],
         "registry_sha256": directory_hashes["registry"],
-        "artifact_sha256": _canonical_hash(entries),
+        "artifact_sha256": artifact_sha,
+        "source_provenance": provenance,
+        "source_commit_sha": provenance["source_commit_sha"],
+        "source_tree_sha": provenance["source_tree_sha"],
+        "build_workflow_identity": provenance["build_workflow_identity"],
+        "source_manifest_sha256": provenance["source_manifest_sha256"],
+        "candidate_artifact_sha256": artifact_sha,
     }
 
 
@@ -181,16 +266,20 @@ class CandidateArtifactManifest(object):
     """Build and verify the provenance manifest for a candidate artifact."""
 
     @classmethod
-    def build(cls, candidate_root, release_identity, output_path=None):
+    def build(cls, candidate_root, release_identity, output_path=None,
+              source_provenance=None):
         candidate_root = _real(candidate_root)
         manifest_path = _real(output_path or os.path.join(
             candidate_root, CANDIDATE_ARTIFACT_MANIFEST_NAME
         ))
         identity = _identity_snapshot(release_identity)
-        payload = _build_payload(candidate_root, identity, manifest_path)
+        payload = _build_payload(
+            candidate_root, identity, manifest_path, source_provenance
+        )
         result = dict(payload)
         result.update(identity)
         result["release_identity"] = identity
+        result["source_provenance"] = payload["source_provenance"]
         result["generated_at"] = utc_iso()
         result["manifest_path"] = _relative(candidate_root, manifest_path)
         _write_json(manifest_path, result)
@@ -242,11 +331,28 @@ class CandidateArtifactManifest(object):
                 raise ValueError(
                     "candidate artifact release_identity {} does not match".format(key)
                 )
-        observed = _build_payload(candidate_root, expected_snapshot, path)
+        declared_provenance = _source_provenance(
+            manifest.get("source_provenance"), require_artifact_sha=True
+        )
+        if declared_provenance.get("source_commit_sha", "").lower() != \
+                expected_snapshot.get("commit_sha", "").lower():
+            raise ValueError(
+                "candidate artifact source_commit_sha does not match release identity"
+            )
+        if declared_provenance.get("source_manifest_sha256") != \
+                identity_manifest_sha256(expected_snapshot):
+            raise ValueError(
+                "candidate artifact source_manifest_sha256 does not match release identity"
+            )
+        observed = _build_payload(
+            candidate_root, expected_snapshot, path, declared_provenance
+        )
         for key in (
                 "commit_sha", "build_id", "files", "directory_sha256",
                 "reports_sha256", "assets_sha256", "registry_sha256",
-                "artifact_sha256"):
+                "artifact_sha256", "source_provenance", "source_commit_sha",
+                "source_tree_sha", "build_workflow_identity",
+                "source_manifest_sha256", "candidate_artifact_sha256"):
             if manifest.get(key) != observed.get(key):
                 raise ValueError(
                     "candidate artifact manifest {} does not match candidate_root".format(key)

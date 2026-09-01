@@ -1,9 +1,13 @@
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 
-from app.candidate_artifact import CandidateArtifactManifest
+from app.candidate_artifact import (
+    CandidateArtifactManifest, build_git_source_provenance,
+    identity_manifest_sha256,
+)
 from app.release_publication import (
     ImmutableReleasePublisher, validate_release_manifest,
 )
@@ -48,7 +52,17 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             }, stream)
 
     def _prepare(self, publisher, source, identity, session_id, **kwargs):
-        CandidateArtifactManifest.build(source, identity)
+        CandidateArtifactManifest.build(
+            source, identity,
+            source_provenance={
+                "provenance_class": "test-fixture",
+                "source_commit_sha": identity["commit_sha"],
+                "source_tree_sha": "d" * 40,
+                "worktree_clean": True,
+                "build_workflow_identity": "tests.release.test_immutable_release_publication",
+                "source_manifest_sha256": identity_manifest_sha256(identity),
+            },
+        )
         return publisher.prepare(source, identity, session_id, **kwargs)
 
     def test_prepare_switch_validate_and_rollback_are_atomic(self):
@@ -131,7 +145,17 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             source = os.path.join(root, "source")
             self._source(source)
             identity = {"commit_sha": "e" * 40, "build_id": "candidate-e"}
-            CandidateArtifactManifest.build(source, identity)
+            CandidateArtifactManifest.build(
+                source, identity,
+                source_provenance={
+                    "provenance_class": "test-fixture",
+                    "source_commit_sha": identity["commit_sha"],
+                    "source_tree_sha": "d" * 40,
+                    "worktree_clean": True,
+                    "build_workflow_identity": "tests.release.test_immutable_release_publication",
+                    "source_manifest_sha256": identity_manifest_sha256(identity),
+                },
+            )
             nested = os.path.join(source, "assets", "nested-link")
             outside = os.path.join(root, "outside")
             os.makedirs(outside)
@@ -178,12 +202,54 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             source = os.path.join(root, "source")
             self._source(source)
             identity = {"commit_sha": "1" * 40, "build_id": "candidate-1"}
-            CandidateArtifactManifest.build(source, identity)
+            CandidateArtifactManifest.build(
+                source, identity,
+                source_provenance={
+                    "provenance_class": "test-fixture",
+                    "source_commit_sha": identity["commit_sha"],
+                    "source_tree_sha": "d" * 40,
+                    "worktree_clean": True,
+                    "build_workflow_identity": "tests.release.test_immutable_release_publication",
+                    "source_manifest_sha256": identity_manifest_sha256(identity),
+                },
+            )
             with open(os.path.join(source, "assets", "coverage.js"), "a") as stream:
                 stream.write("\ntampered\n")
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
             with self.assertRaisesRegex(ValueError, "candidate_root"):
                 publisher.prepare(source, identity, "tampered-session")
+
+    def test_candidate_manifest_requires_source_provenance(self):
+        with tempfile.TemporaryDirectory(prefix="release-publication-provenance-") as root:
+            source = os.path.join(root, "source")
+            os.makedirs(source)
+            self._source(source)
+            with self.assertRaisesRegex(ValueError, "source provenance"):
+                CandidateArtifactManifest.build(
+                    source,
+                    {"commit_sha": "2" * 40, "build_id": "candidate-2"},
+                )
+
+    def test_git_source_provenance_binds_head_tree_and_clean_worktree(self):
+        with tempfile.TemporaryDirectory(prefix="release-source-provenance-") as root:
+            subprocess.check_call(["git", "init", "-q"], cwd=root)
+            subprocess.check_call(["git", "config", "user.email", "test@example.invalid"], cwd=root)
+            subprocess.check_call(["git", "config", "user.name", "Release Test"], cwd=root)
+            with open(os.path.join(root, "source.txt"), "w", encoding="utf-8") as stream:
+                stream.write("source\n")
+            subprocess.check_call(["git", "add", "source.txt"], cwd=root)
+            subprocess.check_call(["git", "commit", "-q", "-m", "source"], cwd=root)
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=root
+            ).decode("ascii").strip()
+            provenance = build_git_source_provenance(
+                root,
+                {"commit_sha": commit, "build_id": "candidate-source"},
+                "tests.release.test_immutable_release_publication",
+            )
+            self.assertEqual(provenance["source_commit_sha"], commit)
+            self.assertRegex(provenance["source_tree_sha"], r"^[0-9a-f]{40}$")
+            self.assertTrue(provenance["worktree_clean"])
 
 
 if __name__ == "__main__":
