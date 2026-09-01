@@ -679,6 +679,7 @@ jobs:
     name: Trusted Candidate Build (manual protected lane)
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_build == true }}
     runs-on: ubuntu-latest
+    environment: trusted-candidate-build
     permissions:
       contents: read
       id-token: write
