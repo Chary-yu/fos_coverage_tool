@@ -164,11 +164,11 @@ def validate_candidate_publication_preflight(
         )
     if "REPLACE_WITH" in trusted_workflow_sha.upper():
         raise RuntimeError(
-            "trusted_build_workflow_sha is still a placeholder"
+            "production_candidate_builder_workflow_sha is still a placeholder"
         )
     if not is_valid_commit_sha(trusted_workflow_sha):
         raise RuntimeError(
-            "trusted_build_workflow_sha must be an exact commit SHA"
+            "production_candidate_builder_workflow_sha must be an exact commit SHA"
         )
     if not str(candidate_build_attestation_repository or "").strip() or \
             not str(candidate_build_attestation_workflow or "").strip():
@@ -578,6 +578,12 @@ class UpgradeOrchestrator:
             raise RuntimeError(
                 "upgrade.candidate_root is retired; use production_candidate_root"
             )
+        if upgrade_config.get("trusted_build_workflow_identity") or \
+                upgrade_config.get("trusted_build_workflow_sha"):
+            raise RuntimeError(
+                "upgrade.trusted_build_workflow_* is retired; use the explicit "
+                "validation/production Candidate builder policies"
+            )
         production_candidate_root = _resolve_upgrade_path(
             self.repo_root, upgrade_config.get("production_candidate_root"),
             "production_candidate_root"
@@ -612,10 +618,10 @@ class UpgradeOrchestrator:
                 "validation_candidate_root must be separate from production and publication roots"
             )
         trusted_workflow_identity = str(
-            upgrade_config.get("trusted_build_workflow_identity") or ""
+            upgrade_config.get("production_candidate_builder_workflow_identity") or ""
         ).strip()
         trusted_workflow_sha = str(
-            upgrade_config.get("trusted_build_workflow_sha") or ""
+            upgrade_config.get("production_candidate_builder_workflow_sha") or ""
         ).strip()
         self.candidate_preflight = validate_candidate_publication_preflight(
             self.repo_root, production_candidate_root, identity,
@@ -1274,10 +1280,10 @@ class UpgradeOrchestrator:
                 ),
                 source_repo_root=self.repo_root,
                 trusted_build_workflow_identity=upgrade_config.get(
-                    "trusted_build_workflow_identity", ""
+                    "production_candidate_builder_workflow_identity", ""
                 ),
                 trusted_build_workflow_sha=upgrade_config.get(
-                    "trusted_build_workflow_sha", ""
+                    "production_candidate_builder_workflow_sha", ""
                 ),
                 candidate_build_receipt=self.candidate_preflight.get(
                     "candidate_build_receipt", ""

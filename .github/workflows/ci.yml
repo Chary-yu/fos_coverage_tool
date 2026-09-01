@@ -692,10 +692,10 @@ jobs:
       id-token: write
       attestations: write
       artifact-metadata: write
-    uses: Chary-yu/fos_coverage_tool/.github/workflows/trusted-candidate-builder.yml@d8a04e68c227c5623e4983a56be53b7fc10ed93e
+    uses: Chary-yu/fos_coverage_tool/.github/workflows/trusted-candidate-builder.yml@750e1182eb263dad9bf64ad890bc282874b97d9c
     with:
       source_sha: ${{ github.sha }}
-      builder_workflow_sha: d8a04e68c227c5623e4983a56be53b7fc10ed93e
+      builder_workflow_sha: 750e1182eb263dad9bf64ad890bc282874b97d9c
     secrets: inherit
 
   candidate-source-gate:

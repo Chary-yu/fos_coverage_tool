@@ -159,13 +159,19 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
                              "coverage_config.staging.example.json"),
                 encoding="utf-8") as stream:
             config = json.load(stream)
-        trusted_sha = config["upgrade"]["trusted_build_workflow_sha"]
-        self.assertRegex(trusted_sha, r"^[0-9a-f]{40}$")
+        validation_sha = config["upgrade"][
+            "validation_candidate_builder_workflow_sha"
+        ]
+        production_sha = config["upgrade"][
+            "production_candidate_builder_workflow_sha"
+        ]
+        self.assertRegex(validation_sha, r"^[0-9a-f]{40}$")
+        self.assertRegex(production_sha, r"^[0-9a-f]{40}$")
         self.assertIn(
-            "trusted-candidate-builder.yml@{}".format(trusted_sha), caller
+            "trusted-candidate-builder.yml@{}".format(validation_sha), caller
         )
         self.assertIn(
-            "builder_workflow_sha: {}".format(trusted_sha), caller
+            "builder_workflow_sha: {}".format(validation_sha), caller
         )
         self.assertIn("environment: trusted-candidate-build", builder)
         self.assertIn("actions/attest@", builder)
@@ -181,6 +187,24 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("artifact_role", builder)
         self.assertIn("production_publishable", builder)
         self.assertIn("project_name", builder)
+        with open(
+                os.path.join(os.getcwd(), ".github", "workflows",
+                             "trusted-production-candidate-builder.yml"),
+                encoding="utf-8") as stream:
+            production_workflow = stream.read()
+        self.assertIn("Trusted Production Candidate Builder", production_workflow)
+        self.assertIn("runs-on: [self-hosted, coverage-production-builder]", production_workflow)
+        self.assertIn("trusted-production-candidate-builder", production_workflow)
+        self.assertIn("build_production_candidate_artifact.py", production_workflow)
+        self.assertIn("PRODUCTION_PROJECT_NAME", production_workflow)
+        self.assertEqual(
+            config["upgrade"]["production_candidate_builder_workflow_identity"],
+            "github-actions/trusted-production-candidate-builder",
+        )
+        self.assertEqual(
+            config["upgrade"]["production_candidate_builder_workflow_sha"],
+            production_sha,
+        )
         with open(
                 os.path.join(os.getcwd(), "scripts", "release",
                              "build_production_candidate_artifact.py"),

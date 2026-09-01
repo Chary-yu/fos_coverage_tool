@@ -286,6 +286,11 @@ Candidate 必须先按用途分成两个互斥对象。受保护的
 `coverage_enhance.js/css`。构建、normalize 和 manifest 必须在发布前完成；Publisher
 只复制并验证最终字节，不再把验证夹具升级成生产页面：
 
+配置必须同时维护两套不可互换的 Builder policy：
+`validation_candidate_builder_workflow_*` 只对应验证夹具，
+`production_candidate_builder_workflow_*` 只对应生产构建器，并且每个 SHA 必须固定到
+包含相应 workflow 的不可变 Git commit。生产升级只读取后者。
+
 ```bash
 python3 scripts/release/build_production_candidate_artifact.py \
   --served-root /srv/fos-coverage/publish-root/CURRENT \
