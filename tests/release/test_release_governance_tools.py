@@ -168,6 +168,8 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("environment: trusted-candidate-build", builder)
         self.assertIn("actions/attest@", builder)
         self.assertIn("BUILD_WORKFLOW_RUN_ATTEMPT", builder)
+        self.assertIn("workflow_call:", builder)
+        self.assertIn("value: ${{ jobs.build.outputs.candidate_artifact_sha256 }}", builder)
 
     def test_perf_benchmark_help_is_side_effect_free(self):
         with tempfile.TemporaryDirectory() as directory:
