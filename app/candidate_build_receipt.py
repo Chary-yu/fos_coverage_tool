@@ -62,12 +62,23 @@ def _sha256(path):
 
 
 def _require_regular_file(path, label):
-    path = _real(path)
+    # Keep the non-resolved spelling while checking every path component. A
+    # realpath before lstat would turn a symlink into its target and silently
+    # defeat the evidence boundary.
+    path = os.path.abspath(str(path))
+    probe = path
+    while True:
+        if os.path.islink(probe):
+            raise ValueError("{} must not be a symlink: {}".format(label, path))
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
     try:
         file_stat = os.lstat(path)
     except OSError as exc:
         raise ValueError("{} is unavailable: {}".format(label, exc))
-    if os.path.islink(path) or not stat.S_ISREG(file_stat.st_mode):
+    if not stat.S_ISREG(file_stat.st_mode):
         raise ValueError("{} must be a regular file: {}".format(label, path))
     return path
 
@@ -155,7 +166,7 @@ def create_candidate_build_receipt(
     bundle_path = _require_regular_file(
         attestation_bundle_path, "Candidate external attestation bundle"
     )
-    receipt_path = _real(output_path or os.path.join(
+    receipt_path = os.path.abspath(output_path or os.path.join(
         candidate_root, CANDIDATE_BUILD_RECEIPT_NAME
     ))
     if not _inside(candidate_root, receipt_path):
@@ -190,7 +201,7 @@ def verify_candidate_build_receipt(
         (candidate_manifest or {}).get("manifest_path") or
         "candidate_artifact_manifest.json"
     )
-    manifest_path = _real(os.path.join(
+    manifest_path = os.path.abspath(os.path.join(
         candidate_root, manifest_relative.replace("/", os.sep)
     ))
     if not _inside(candidate_root, manifest_path):
@@ -201,7 +212,7 @@ def verify_candidate_build_receipt(
     bundle_path = _require_regular_file(
         attestation_bundle_path, "Candidate external attestation bundle"
     )
-    receipt_path = _real(receipt_path or os.path.join(
+    receipt_path = os.path.abspath(receipt_path or os.path.join(
         candidate_root,
         str((candidate_manifest or {}).get("receipt_path") or
             CANDIDATE_BUILD_RECEIPT_NAME).replace("/", os.sep),

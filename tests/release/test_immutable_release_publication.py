@@ -587,6 +587,17 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                         "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
                         "a" * 40, "b" * 40, "run-123",
                     )
+            try:
+                os.symlink(subject, os.path.join(root, "subject-link.json"))
+            except OSError:
+                self.skipTest("symbolic links are unavailable in this environment")
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                verify_github_artifact_attestation(
+                    os.path.join(root, "subject-link.json"), bundle,
+                    "Chary-yu/fos_coverage_tool",
+                    "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
+                    "a" * 40, "b" * 40, "run-123",
+                )
 
     def test_candidate_build_attestation_tamper_fails_before_publish(self):
         with tempfile.TemporaryDirectory(prefix="release-attestation-tamper-") as root:
