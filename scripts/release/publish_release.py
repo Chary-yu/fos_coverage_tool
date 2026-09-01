@@ -30,6 +30,7 @@ def main(argv=None):
     parser.add_argument("--release-identity")
     parser.add_argument("--session-id")
     parser.add_argument("--api-contract-version", default="")
+    parser.add_argument("--candidate-artifact-manifest", default="")
     parser.add_argument("--switch", action="store_true")
     parser.add_argument("--rollback-session")
     parser.add_argument("--validate-current", action="store_true")
@@ -48,6 +49,7 @@ def main(argv=None):
         manifest = publisher.prepare(
             args.source_root, identity, args.session_id,
             api_contract_version=args.api_contract_version,
+            candidate_artifact_manifest=args.candidate_artifact_manifest,
         )
         result = {
             "status": "PASSED",
@@ -63,4 +65,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
-

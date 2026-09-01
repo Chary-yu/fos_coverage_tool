@@ -22,6 +22,9 @@ import tempfile
 import time
 
 from app.release_identity import is_valid_commit_sha
+from app.candidate_artifact import (
+    CANDIDATE_ARTIFACT_MANIFEST_NAME, CandidateArtifactManifest,
+)
 from app.reports.identity import (
     LEGACY_STATIC, SUPPORTED_SIDECAR_SCHEMA_VERSIONS, VNEXT_ARTIFACT_READY,
     validate_report_id, validate_report_mode,
@@ -426,7 +429,7 @@ def _inventory_hash(entries):
 
 def build_release_manifest(release_root, release_identity, session_id,
                            api_contract_version="", candidate_sha="",
-                           published_root=None):
+                           published_root=None, candidate_artifact_manifest=None):
     """Build and validate the manifest for an already prepared release root."""
     release_root = _real(release_root)
     published_root = _real(published_root or release_root)
@@ -448,7 +451,7 @@ def build_release_manifest(release_root, release_identity, session_id,
     reports = _report_entries(release_root, reports_root)
     shared_assets = _file_manifest(release_root, ("assets",))
     all_files = _file_manifest(release_root, ("reports", "assets", "registry"))
-    return {
+    manifest = {
         "schema_version": RELEASE_MANIFEST_SCHEMA_VERSION,
         "release_validation_session_id": session_id,
         "commit_sha": commit_sha,
@@ -474,6 +477,28 @@ def build_release_manifest(release_root, release_identity, session_id,
         "files": all_files,
         "generated_at": utc_iso(),
     }
+    if candidate_artifact_manifest:
+        artifact_path = os.path.join(
+            release_root,
+            str(candidate_artifact_manifest.get("manifest_path") or
+                CANDIDATE_ARTIFACT_MANIFEST_NAME).replace("/", os.sep),
+        )
+        if not os.path.isfile(artifact_path):
+            raise ValueError("candidate artifact manifest was not copied into release")
+        manifest["candidate_artifact_manifest"] = {
+            "manifest_path": _safe_relative(release_root, artifact_path),
+            "manifest_sha256": _sha256(artifact_path),
+            "artifact_manifest_version": candidate_artifact_manifest.get(
+                "artifact_manifest_version"
+            ),
+            "commit_sha": candidate_artifact_manifest.get("commit_sha"),
+            "build_id": candidate_artifact_manifest.get("build_id"),
+            "artifact_sha256": candidate_artifact_manifest.get("artifact_sha256"),
+            "reports_sha256": candidate_artifact_manifest.get("reports_sha256"),
+            "assets_sha256": candidate_artifact_manifest.get("assets_sha256"),
+            "registry_sha256": candidate_artifact_manifest.get("registry_sha256"),
+        }
+    return manifest
 
 
 def _load_json(path):
@@ -549,6 +574,15 @@ def validate_release_manifest(release_root, manifest=None, expected_session_id="
     ) if observed_files else ""
     if declared_served_hash != observed_served_hash:
         violations.append("actual Served Root hash changed")
+    candidate_artifact = manifest.get("candidate_artifact_manifest") or {}
+    if candidate_artifact:
+        relative = str(candidate_artifact.get("manifest_path") or "")
+        candidate_path = _real(os.path.join(release_root, relative))
+        if not relative or not _inside(release_root, candidate_path) or \
+                not os.path.isfile(candidate_path):
+            violations.append("candidate artifact manifest is missing from release")
+        elif str(candidate_artifact.get("manifest_sha256") or "") != _sha256(candidate_path):
+            violations.append("candidate artifact manifest hash changed")
     return {
         "status": "PASSED" if not violations else "FAILED",
         "release_validation_session_id": session_id,
@@ -572,11 +606,23 @@ class ImmutableReleasePublisher(object):
         return os.path.join(self.releases_root, _validate_session_id(session_id))
 
     def prepare(self, source_root, release_identity, session_id,
-                api_contract_version="", candidate_sha=""):
+                api_contract_version="", candidate_sha="",
+                candidate_artifact_manifest=""):
         session_id = _validate_session_id(session_id)
         final_root = self.release_path(session_id)
         if os.path.lexists(final_root):
             raise ValueError("immutable release already exists: {}".format(session_id))
+        candidate_manifest_path = candidate_artifact_manifest or os.path.join(
+            _real(source_root), CANDIDATE_ARTIFACT_MANIFEST_NAME
+        )
+        if not os.path.isabs(str(candidate_manifest_path)):
+            candidate_manifest_path = os.path.join(
+                _real(source_root), str(candidate_manifest_path)
+            )
+        verified_candidate_manifest = CandidateArtifactManifest.verify(
+            source_root, release_identity, candidate_sha=candidate_sha,
+            manifest_path=candidate_manifest_path,
+        )
         staging = tempfile.mkdtemp(prefix=".release-{}-".format(session_id),
                                    dir=self.releases_root)
         try:
@@ -593,6 +639,7 @@ class ImmutableReleasePublisher(object):
                 api_contract_version=api_contract_version,
                 candidate_sha=candidate_sha,
                 published_root=final_root,
+                candidate_artifact_manifest=verified_candidate_manifest,
             )
             report_manifest = {
                 "schema_version": REPORT_MANIFEST_SCHEMA_VERSION,

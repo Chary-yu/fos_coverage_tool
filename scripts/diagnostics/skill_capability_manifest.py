@@ -78,7 +78,9 @@ SKILL_CAPABILITIES = {
             "atomic CURRENT switch, rollback and teardown evidence",
         ],
         "helpers": [
+            "app/candidate_artifact.py",
             "app/release_publication.py",
+            "scripts/release/build_candidate_artifact_manifest.py",
             "scripts/release/publish_release.py",
             "scripts/upgrade/validation_session.py",
             "scripts/upgrade/local_staging_control.py",
@@ -211,4 +213,3 @@ def main(argv=None):
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

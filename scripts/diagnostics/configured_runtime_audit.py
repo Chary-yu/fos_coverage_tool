@@ -47,11 +47,12 @@ def audit(repo_root=ROOT):
     if commands.get("stop_serving_api") == commands.get("stop_api"):
         violations.append("stop_serving_api must be a distinct lifecycle command")
     for field in (
-            "candidate_root", "publish_root", "validation_session_manifest",
+            "candidate_root", "candidate_artifact_manifest", "publish_root", "validation_session_manifest",
             "validation_teardown_evidence_path"):
         if not upgrade.get(field):
             violations.append("Candidate {} is missing".format(field))
     candidate_root = str(upgrade.get("candidate_root") or "")
+    candidate_artifact_manifest = str(upgrade.get("candidate_artifact_manifest") or "")
     publish_root = str(upgrade.get("publish_root") or "")
     if candidate_root and not os.path.isabs(candidate_root):
         candidate_root = os.path.join(repo_root, candidate_root)
@@ -59,6 +60,11 @@ def audit(repo_root=ROOT):
         publish_root = os.path.join(repo_root, publish_root)
     if candidate_root and publish_root and os.path.realpath(candidate_root) == os.path.realpath(publish_root):
         violations.append("Candidate publish_root must be separate from candidate_root")
+    if candidate_artifact_manifest and not os.path.isabs(candidate_artifact_manifest):
+        candidate_artifact_manifest = os.path.join(repo_root, candidate_artifact_manifest)
+    if candidate_artifact_manifest and candidate_root:
+        if os.path.commonpath((os.path.realpath(candidate_artifact_manifest), os.path.realpath(candidate_root))) != os.path.realpath(candidate_root):
+            violations.append("candidate_artifact_manifest must be inside candidate_root")
     session_manifest = str(upgrade.get("validation_session_manifest") or "")
     teardown_evidence = str(upgrade.get("validation_teardown_evidence_path") or "")
     if session_manifest and teardown_evidence:
@@ -90,6 +96,7 @@ def audit(repo_root=ROOT):
         "candidate_health_endpoint": upgrade.get("health_endpoint", ""),
         "candidate_previous_release_endpoint": upgrade.get("previous_release_endpoint", ""),
         "candidate_root": candidate_root,
+        "candidate_artifact_manifest": candidate_artifact_manifest,
         "candidate_publish_root": publish_root,
         "validation_session_manifest": upgrade.get("validation_session_manifest", ""),
         "validation_teardown_evidence_path": upgrade.get("validation_teardown_evidence_path", ""),

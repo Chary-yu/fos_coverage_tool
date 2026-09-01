@@ -3,6 +3,7 @@ import os
 import tempfile
 import unittest
 
+from app.candidate_artifact import CandidateArtifactManifest
 from app.release_publication import (
     ImmutableReleasePublisher, validate_release_manifest,
 )
@@ -46,6 +47,10 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 "asset_identity": "asset-a",
             }, stream)
 
+    def _prepare(self, publisher, source, identity, session_id, **kwargs):
+        CandidateArtifactManifest.build(source, identity)
+        return publisher.prepare(source, identity, session_id, **kwargs)
+
     def test_prepare_switch_validate_and_rollback_are_atomic(self):
         with tempfile.TemporaryDirectory(prefix="release-publication-") as root:
             source = os.path.join(root, "source")
@@ -53,8 +58,9 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             self._source(source)
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
             identity = {"commit_sha": "a" * 40, "build_id": "candidate-a"}
-            manifest = publisher.prepare(
-                source, identity, "candidate-session", "vnext-api-test"
+            manifest = self._prepare(
+                publisher, source, identity, "candidate-session",
+                api_contract_version="vnext-api-test"
             )
             self.assertEqual(manifest["report_modes"], ["VNEXT_ARTIFACT_READY"])
             self.assertEqual(publisher.validate_current()["status"], "FAILED")
@@ -80,8 +86,10 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             shutil.rmtree(os.path.join(source, "reports", ".source_cache"))
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
             with self.assertRaisesRegex(ValueError, "Sidecar"):
-                publisher.prepare(
-                    source, {"commit_sha": "b" * 40}, "invalid-session"
+                self._prepare(
+                    publisher, source,
+                    {"commit_sha": "b" * 40, "build_id": "candidate-b"},
+                    "invalid-session"
                 )
 
     def test_legacy_report_without_mode_is_explicitly_annotated_in_candidate(self):
@@ -90,8 +98,10 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             os.makedirs(source)
             self._source(source, mode="LEGACY_STATIC", include_mode=False)
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
-            manifest = publisher.prepare(
-                source, {"commit_sha": "c" * 40}, "legacy-session"
+            manifest = self._prepare(
+                publisher, source,
+                {"commit_sha": "c" * 40, "build_id": "candidate-c"},
+                "legacy-session"
             )
             report_path = os.path.join(
                 publisher.release_path("legacy-session"), "reports", "index.html"
@@ -110,14 +120,18 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             self._source(source, include_mode=False)
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
             with self.assertRaisesRegex(ValueError, "explicit report mode"):
-                publisher.prepare(
-                    source, {"commit_sha": "d" * 40}, "missing-mode-session"
+                self._prepare(
+                    publisher, source,
+                    {"commit_sha": "d" * 40, "build_id": "candidate-d"},
+                    "missing-mode-session"
                 )
 
     def test_nested_source_symlink_fails_closed_before_copy(self):
         with tempfile.TemporaryDirectory(prefix="release-publication-symlink-") as root:
             source = os.path.join(root, "source")
             self._source(source)
+            identity = {"commit_sha": "e" * 40, "build_id": "candidate-e"}
+            CandidateArtifactManifest.build(source, identity)
             nested = os.path.join(source, "assets", "nested-link")
             outside = os.path.join(root, "outside")
             os.makedirs(outside)
@@ -129,17 +143,17 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 self.skipTest("symbolic links are unavailable in this environment")
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
             with self.assertRaisesRegex(ValueError, "symlink"):
-                publisher.prepare(
-                    source, {"commit_sha": "e" * 40}, "nested-symlink-session"
-                )
+                publisher.prepare(source, identity, "nested-symlink-session")
 
     def test_nested_published_symlink_fails_current_validation(self):
         with tempfile.TemporaryDirectory(prefix="release-publication-published-link-") as root:
             source = os.path.join(root, "source")
             self._source(source)
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
-            publisher.prepare(
-                source, {"commit_sha": "f" * 40}, "published-link-session"
+            self._prepare(
+                publisher, source,
+                {"commit_sha": "f" * 40, "build_id": "candidate-f"},
+                "published-link-session"
             )
             self.assertEqual(
                 publisher.switch_current("published-link-session")["status"],
@@ -158,6 +172,18 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             result = publisher.validate_current()
             self.assertEqual(result["status"], "FAILED")
             self.assertTrue(any("symlink" in item for item in result["violations"]))
+
+    def test_candidate_artifact_tamper_after_manifest_fails_before_prepare(self):
+        with tempfile.TemporaryDirectory(prefix="release-publication-tamper-") as root:
+            source = os.path.join(root, "source")
+            self._source(source)
+            identity = {"commit_sha": "1" * 40, "build_id": "candidate-1"}
+            CandidateArtifactManifest.build(source, identity)
+            with open(os.path.join(source, "assets", "coverage.js"), "a") as stream:
+                stream.write("\ntampered\n")
+            publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
+            with self.assertRaisesRegex(ValueError, "candidate_root"):
+                publisher.prepare(source, identity, "tampered-session")
 
 
 if __name__ == "__main__":

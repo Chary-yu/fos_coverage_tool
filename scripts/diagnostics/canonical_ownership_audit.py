@@ -74,7 +74,9 @@ def audit_canonical_ownership(repo_root: str) -> Dict[str, Any]:
         "scripts/upgrade/vnext_schema.sql",
         "scripts/upgrade/migration_runner.py",
         "app/db/retry.py",
+        "app/candidate_artifact.py",
         "app/release_publication.py",
+        "scripts/release/build_candidate_artifact_manifest.py",
         "scripts/upgrade/validation_session.py",
     ]
     missing_modules = [

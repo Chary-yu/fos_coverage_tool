@@ -825,6 +825,9 @@ class UpgradeOrchestrator:
                 session_id,
                 api_contract_version=upgrade_config.get("api_contract_version", ""),
                 candidate_sha=identity.get("commit_sha"),
+                candidate_artifact_manifest=upgrade_config.get(
+                    "candidate_artifact_manifest", ""
+                ),
             )
             switched = self.publisher.switch_current(session_id)
             if switched.get("status") != "PASSED":
