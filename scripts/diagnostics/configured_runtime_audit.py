@@ -53,6 +53,14 @@ def audit(repo_root=ROOT):
         violations.append("Candidate previous_release_endpoint must differ from release_endpoint")
     if not upgrade.get("health_endpoint"):
         violations.append("Candidate health_endpoint is missing")
+    if not upgrade.get("served_root_probe_url"):
+        violations.append("Candidate served_root_probe_url is missing")
+    if not upgrade.get("served_root_url_prefix"):
+        violations.append("Candidate served_root_url_prefix is missing")
+    elif not str(upgrade.get("served_root_url_prefix")).startswith("/"):
+        violations.append("Candidate served_root_url_prefix must start with '/'")
+    if not upgrade.get("served_root_probe_relative_path"):
+        violations.append("Candidate served_root_probe_relative_path is missing")
     if not upgrade.get("candidate_browser_url"):
         violations.append("Candidate candidate_browser_url is missing")
     if not upgrade.get("candidate_browser_evidence_path"):
@@ -208,6 +216,11 @@ def audit(repo_root=ROOT):
         "candidate_port": (candidate.get("server") or {}).get("port"),
         "candidate_release_endpoint": upgrade.get("release_endpoint", ""),
         "candidate_health_endpoint": upgrade.get("health_endpoint", ""),
+        "served_root_probe_url": upgrade.get("served_root_probe_url", ""),
+        "served_root_url_prefix": upgrade.get("served_root_url_prefix", ""),
+        "served_root_probe_relative_path": upgrade.get(
+            "served_root_probe_relative_path", ""
+        ),
         "candidate_previous_release_endpoint": upgrade.get("previous_release_endpoint", ""),
         "trusted_build_workflow_identity": trusted_workflow_identity,
         "trusted_build_workflow_sha": trusted_workflow_sha,

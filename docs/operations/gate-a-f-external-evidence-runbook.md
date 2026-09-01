@@ -274,71 +274,59 @@ python3 scripts/upgrade/run_rollback_rehearsal.py \
 Served Root SHA 必须全部与当前 attempt 一致；否则 rollback evidence 不能进入
 Final Gate。
 
-Candidate 构建的字节流程固定为：`build → normalize → CandidateArtifactManifest →
-build attestation → verify → immutable publish`。构建命令必须绑定一个 verified clean
-Git checkout，并提供 `source_commit_sha`、真实 Git tree inventory 的
-`source_manifest_sha256`、`build_workflow_run_id`、`build_workflow_run_attempt`、`build_workflow_sha` 和
-`build_input_manifest_sha256`；它会在 Candidate 根生成
-`candidate_build_attestation.json`。例如：
+Candidate 必须先按用途分成两个互斥对象。受保护的
+`trusted-candidate-builder.yml` 和 `build_candidate_artifact.py` 生成的是
+`validation_candidate_root`：它包含确定性的浏览器/100k 性能夹具，manifest 必须是
+`artifact_role=validation_fixture`、`production_publishable=false`。它可以用于浏览器、
+性能、功能和生命周期验证，但永远不能传给 Publisher，也永远不能成为 `CURRENT`。
+
+正式发布使用独立的 `production_candidate_root`。它必须由真实的
+`FOS_V6R2` Served Root 构建，包含真实 `reports/`、`registry/`、Sidecar 和静态页面，
+再用目标 clean checkout 中的 741af8a（或实际目标 SHA）版本资产刷新
+`coverage_enhance.js/css`。构建、normalize 和 manifest 必须在发布前完成；Publisher
+只复制并验证最终字节，不再把验证夹具升级成生产页面：
 
 ```bash
-python3 scripts/release/build_candidate_artifact_manifest.py \
-  --candidate-root /srv/fos-coverage/candidate \
-  --release-identity /secure/evidence/release-identity.json \
+python3 scripts/release/build_production_candidate_artifact.py \
+  --served-root /srv/fos-coverage/publish-root/CURRENT \
   --source-repo-root /srv/fos-coverage/source-checkout \
-  --build-workflow-identity github-actions/trusted-candidate-builder \
+  --production-candidate-root /srv/fos-coverage/production-candidate \
+  --release-identity-output /secure/evidence/production-release-identity.json \
+  --build-workflow-identity "$PRODUCTION_BUILD_WORKFLOW_IDENTITY" \
   --build-workflow-run-id "$GITHUB_RUN_ID" \
   --build-workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
-  --build-workflow-sha "$BUILD_WORKFLOW_SHA"
+  --build-workflow-sha "$PRODUCTION_BUILD_WORKFLOW_SHA"
 ```
 
-正式 Candidate 不能把 `candidate_root` 当作构建证明。受保护 CI 必须从空目录和
-verified clean checkout 运行 `scripts/release/build_candidate_artifact.py`；该脚本只
-接受自己生成的 Candidate，随后用 GitHub Actions artifact attestation 签署
-`candidate_artifact_manifest.json`。最后由只在受保护 Build job 中可用的
-`COVERAGE_BUILD_PROVENANCE_HMAC_KEY` 生成 detached receipt：
+这里的 `--served-root` 必须指向真实完整 Served Root，而不是
+`validation_candidate_root`；命令输出的 manifest 必须明确为
+`artifact_role=production_release`、`production_publishable=true`、
+`project_name=FOS_V6R2`。之后在受保护 Build job 中为这个 production manifest
+生成 GitHub Actions attestation 和 detached receipt：
 
 ```bash
 python3 scripts/release/sign_candidate_build_receipt.py \
-  --candidate-root /srv/fos-coverage/candidate \
-  --release-identity /secure/evidence/release-identity.json \
+  --candidate-root /srv/fos-coverage/production-candidate \
+  --release-identity /secure/evidence/production-release-identity.json \
   --source-repo-root /srv/fos-coverage/source-checkout \
-  --build-workflow-identity github-actions/trusted-candidate-builder \
+  --build-workflow-identity "$PRODUCTION_BUILD_WORKFLOW_IDENTITY" \
   --build-workflow-run-id "$GITHUB_RUN_ID" \
   --build-workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
-  --build-workflow-sha "$BUILD_WORKFLOW_SHA" \
-  --attestation-bundle /secure/evidence/candidate-build-attestation.bundle.json
+  --build-workflow-sha "$PRODUCTION_BUILD_WORKFLOW_SHA" \
+  --attestation-bundle /secure/evidence/production-candidate-attestation.bundle.json
 ```
 
-Publisher 会用 `gh attestation verify --bundle` 重新验证 OIDC/Sigstore 证明、
-signer workflow、source digest 和 manifest subject digest；缺少 receipt、bundle、
-受信 key 或 verifier 都是硬失败。
-
-正式发布还必须从受信发布配置提供独立的 workflow trust policy；该策略不能从
-Candidate manifest 自身推导：
-
-```bash
-python3 scripts/release/publish_release.py \
-  ... \
-  --source-repo-root /srv/fos-coverage/source-checkout \
-  --trusted-build-workflow-identity github-actions/trusted-candidate-builder \
-  --trusted-build-workflow-sha "$TRUSTED_BUILD_WORKFLOW_SHA" \
-  --candidate-build-receipt /srv/fos-coverage/candidate/candidate_build_receipt.json \
-  --candidate-build-attestation-bundle /secure/evidence/candidate-build-attestation.bundle.json \
-  --candidate-build-attestation-repository Chary-yu/fos_coverage_tool \
-  --candidate-build-attestation-workflow \
-    Chary-yu/fos_coverage_tool/.github/workflows/trusted-candidate-builder.yml
-```
-
-普通 Publisher 会重新验证 clean Git checkout，并要求 Candidate 的 workflow identity
-和 SHA 与这两个独立策略值完全一致；`served-root-bootstrap` 只能由
+Publisher 和 `run_upgrade.py` 只接受 `production_candidate_root`，并重新验证 clean
+source checkout、Candidate manifest、生产项目内容、attestation、receipt 和完整
+文件清单；任何 `validation_fixture`、`Coverage Candidate`、缺少 source/build
+provenance 的输入都硬失败。`served-root-bootstrap` 只能由
 `bootstrap_previous_release.py` 的专用 API 使用。
 
-`ImmutableReleasePublisher` 只接受 trusted provenance class/version，并重新核对
-attestation、Candidate 文件清单和（正式 upgrade 中）source checkout；
-`test-fixture` 或缺少 source/build provenance 的 manifest 不能发布。Publisher 不再
-在复制后修改 HTML，因此 Candidate manifest 与最终发布 artifact 可以做
-byte-for-byte 对账。
+发布后的静态服务也必须遵守同一条路径契约：配置中的
+`served_root_path` 必须是字面量 `publish_root/CURRENT/reports`，不能指向旧的
+`/home/.../onesensor` 或其他脱离 Publisher 的目录。Final Gate 会对真实
+`/coverage/` HTTP 响应及其同源静态资源逐字节核对当前 `CURRENT` release；因此
+Publisher 验证的 release 和浏览器实际访问的 Served Root 必须是同一个对象。
 
 ## Gate F：切换、回滚和 48 小时窗口
 

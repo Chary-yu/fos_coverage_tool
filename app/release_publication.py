@@ -785,16 +785,24 @@ def _publication_identity_from_manifest(manifest):
         candidate.get("artifact_sha256") or ""
     )
     served_sha = str(served.get("sha256") or "")
+    artifact_role = str(candidate.get("artifact_role") or "")
+    project_name = str(candidate.get("project_name") or "")
     if not session_id or not _SESSION_RE.fullmatch(session_id) or \
             not re.fullmatch(r"[0-9a-fA-F]{64}", candidate_sha) or \
             not re.fullmatch(r"[0-9a-fA-F]{64}", served_sha) or \
-            not is_valid_commit_sha(manifest.get("commit_sha")):
+            not is_valid_commit_sha(manifest.get("commit_sha")) or \
+            artifact_role != PRODUCTION_RELEASE_ARTIFACT_ROLE or \
+            candidate.get("production_publishable") is not True or \
+            project_name != PRODUCTION_PROJECT_NAME:
         return {}
     return {
         "release_validation_session_id": session_id,
         "candidate_artifact_sha256": candidate_sha,
         "served_root_sha256": served_sha,
         "commit_sha": str(manifest.get("commit_sha") or ""),
+        "artifact_role": artifact_role,
+        "production_publishable": True,
+        "project_name": project_name,
     }
 
 

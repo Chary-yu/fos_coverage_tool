@@ -932,7 +932,9 @@ jobs:
     name: Production READY gate (manual external evidence)
     # This gate is intentionally absent from ordinary push/PR status.  It is
     # the explicit aggregator for production backup, real Candidate browser,
-    # and release-eligible cross-layer performance evidence.
+    # and release-eligible cross-layer performance evidence.  The
+    # candidate-build job is a validation fixture lane; its role is checked
+    # below so it can never silently certify Production READY.
     if: ${{ always() && github.event_name == 'workflow_dispatch' }}
     needs:
       - candidate-source-gate
@@ -954,6 +956,9 @@ jobs:
           PERFORMANCE_RESULT: ${{ needs.cross-layer-performance.result }}
           CANDIDATE_BUILD_COMMIT_SHA: ${{ needs.candidate-build.outputs.candidate_commit_sha }}
           CANDIDATE_BUILD_ARTIFACT_SHA256: ${{ needs.candidate-build.outputs.candidate_artifact_sha256 }}
+          CANDIDATE_BUILD_ROLE: ${{ needs.candidate-build.outputs.artifact_role }}
+          CANDIDATE_BUILD_PUBLISHABLE: ${{ needs.candidate-build.outputs.production_publishable }}
+          CANDIDATE_BUILD_PROJECT: ${{ needs.candidate-build.outputs.project_name }}
           BACKUP_COMMIT_SHA: ${{ needs.verified-production-mariadb55.outputs.candidate_commit_sha }}
           BROWSER_COMMIT_SHA: ${{ needs.real-browser-candidate.outputs.candidate_commit_sha }}
           BROWSER_ARTIFACT_SHA256: ${{ needs.real-browser-candidate.outputs.candidate_artifact_sha256 }}
@@ -980,6 +985,9 @@ jobs:
           python scripts/diagnostics/production_ready_evidence_join.py \
             --candidate-build-commit "$CANDIDATE_BUILD_COMMIT_SHA" \
             --candidate-build-artifact "$CANDIDATE_BUILD_ARTIFACT_SHA256" \
+            --candidate-build-role "$CANDIDATE_BUILD_ROLE" \
+            --candidate-build-publishable "$CANDIDATE_BUILD_PUBLISHABLE" \
+            --candidate-build-project "$CANDIDATE_BUILD_PROJECT" \
             --browser-commit "$BROWSER_COMMIT_SHA" \
             --browser-artifact "$BROWSER_ARTIFACT_SHA256" \
             --browser-served-root "$BROWSER_SERVED_ROOT_SHA256" \

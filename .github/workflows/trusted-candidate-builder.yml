@@ -34,6 +34,15 @@ on:
       build_workflow_run_attempt:
         description: GitHub Actions workflow run attempt
         value: ${{ jobs.build.outputs.build_workflow_run_attempt }}
+      artifact_role:
+        description: Candidate artifact role; this builder emits validation fixtures only
+        value: ${{ jobs.build.outputs.artifact_role }}
+      production_publishable:
+        description: Whether the Candidate may enter immutable production publication
+        value: ${{ jobs.build.outputs.production_publishable }}
+      project_name:
+        description: Candidate project identity
+        value: ${{ jobs.build.outputs.project_name }}
   workflow_dispatch:
     inputs:
       source_sha:
@@ -64,6 +73,9 @@ jobs:
       build_workflow_sha: ${{ steps.metadata.outputs.build_workflow_sha }}
       build_workflow_run_id: ${{ steps.metadata.outputs.build_workflow_run_id }}
       build_workflow_run_attempt: ${{ steps.metadata.outputs.build_workflow_run_attempt }}
+      artifact_role: ${{ steps.metadata.outputs.artifact_role }}
+      production_publishable: ${{ steps.metadata.outputs.production_publishable }}
+      project_name: ${{ steps.metadata.outputs.project_name }}
     env:
       BUILD_WORKFLOW_IDENTITY: github-actions/trusted-candidate-builder
       BUILD_WORKFLOW_RUN_ID: ${{ github.run_id }}
@@ -249,6 +261,10 @@ jobs:
           print('build_workflow_run_id={}'.format(manifest['build_workflow_run_id']))
           print('build_workflow_run_attempt={}'.format(
               manifest['build_workflow_run_attempt']))
+          print('artifact_role={}'.format(manifest['artifact_role']))
+          print('production_publishable={}'.format(
+              str(manifest['production_publishable']).lower()))
+          print('project_name={}'.format(manifest['project_name']))
           PY
 
       - name: Upload immutable trusted Candidate build evidence

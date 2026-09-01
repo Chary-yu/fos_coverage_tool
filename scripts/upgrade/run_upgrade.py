@@ -53,6 +53,7 @@ from scripts.upgrade.schema_preflight import (
 from scripts.diagnostics.path_mapping_audit import audit_path_mappings, audit_lcov_paths
 from scripts.diagnostics.security_scanner import scan_directory
 from scripts.diagnostics.sidecar_registry_audit import audit_sidecar_and_registry
+from scripts.diagnostics.served_root_identity import verify_http_served_root
 from scripts.maintenance.mysql_backup import perform_database_backup
 from scripts.upgrade.migrate_file_state import backfill_all_projects
 from app.upgrade.lifecycle import UpgradeLifecycle
@@ -1019,6 +1020,13 @@ class UpgradeOrchestrator:
             raise RuntimeError("post-open CURRENT commit does not match target release")
         if current.get("release_validation_session_id") != expected_session:
             raise RuntimeError("post-open CURRENT session does not match target release")
+        served_root_probe = verify_http_served_root(
+            upgrade_config.get("served_root_probe_url"),
+            self.publisher.release_path(expected_session),
+            configured_served_root_path=self.served_root_path,
+            url_prefix=upgrade_config.get("served_root_url_prefix", "/coverage/"),
+            relative_path=upgrade_config.get("served_root_probe_relative_path", ""),
+        )
         return {
             "status": "PASSED",
             "revision": identity.get("commit_sha"),
@@ -1033,7 +1041,8 @@ class UpgradeOrchestrator:
             "current_release_validation_session_id": current.get("release_validation_session_id"),
             "expected_release_validation_session_id": expected_session,
             "publisher_current_validation": current,
-            "command": "GET release + GET health + ImmutableReleasePublisher.validate_current",
+            "served_root_http": served_root_probe,
+            "command": "GET release + GET health + HTTP Served Root byte identity + ImmutableReleasePublisher.validate_current",
             "exit_code": 0,
         }
 
@@ -1727,7 +1736,7 @@ class UpgradeOrchestrator:
                 "revision": identity.get("commit_sha"),
                 "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
                 "process_role": "production_serving",
-                "command": "GET release + GET health + ImmutableReleasePublisher.validate_current",
+                "command": "GET release + GET health + HTTP Served Root byte identity + ImmutableReleasePublisher.validate_current",
                 "exit_code": 1,
                 "violations": [str(exc)],
             })

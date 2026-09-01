@@ -573,6 +573,11 @@ class ProductionEvidenceManifest:
                     not isinstance(health_payload, dict) or \
                     health_payload.get("status") not in ("ok", "healthy", "PASSED"):
                 unmet.append("post_open_serving health check is not healthy")
+            served_root_http = post_open.get("served_root_http") or {}
+            if served_root_http.get("status") != "PASSED":
+                unmet.append("post_open_serving HTTP Served Root identity is not verified")
+            if served_root_http.get("relative_path") in (None, ""):
+                unmet.append("post_open_serving HTTP Served Root probe path is missing")
 
         # Validation processes are owned resources, not an operator reminder.
         # The manifest and its teardown record must describe the same exact

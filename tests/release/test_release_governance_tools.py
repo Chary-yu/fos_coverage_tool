@@ -134,6 +134,8 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
             workflow = stream.read()
         self.assertIn("production_ready_evidence_join.py", workflow)
         self.assertIn("needs.candidate-build.outputs.candidate_artifact_sha256", workflow)
+        self.assertIn("CANDIDATE_BUILD_ROLE", workflow)
+        self.assertIn("--candidate-build-role", workflow)
         self.assertIn("needs.real-browser-candidate.outputs.served_root_sha256", workflow)
         self.assertIn("needs.cross-layer-performance.outputs.release_validation_session_id", workflow)
         with open(
@@ -176,6 +178,17 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("<pre class=\"source\"></pre>", builder)
         self.assertIn("total_lines') or 0) == 100000", builder)
         self.assertIn("function_ranges", builder)
+        self.assertIn("artifact_role", builder)
+        self.assertIn("production_publishable", builder)
+        self.assertIn("project_name", builder)
+        with open(
+                os.path.join(os.getcwd(), "scripts", "release",
+                             "build_production_candidate_artifact.py"),
+                encoding="utf-8") as stream:
+            production_builder = stream.read()
+        self.assertIn("production_candidate_root", production_builder)
+        self.assertIn("PRODUCTION_RELEASE_ARTIFACT_ROLE", production_builder)
+        self.assertIn("validate_production_candidate_content", production_builder)
 
     def test_cross_layer_performance_consumes_browser_artifact(self):
         with open(

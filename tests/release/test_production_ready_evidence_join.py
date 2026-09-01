@@ -60,6 +60,15 @@ class ProductionReadyEvidenceJoinTest(unittest.TestCase):
                 browser, performance, backup_identity(self._backup()),
             )
 
+    def test_validation_fixture_can_never_supply_production_ready_build_identity(self):
+        with self.assertRaisesRegex(ValueError, "validation fixture"):
+            candidate_build_identity(
+                "a" * 40, "b" * 64,
+                artifact_role="validation_fixture",
+                production_publishable=False,
+                project_name="Coverage Candidate",
+            )
+
     def test_browser_identity_requires_observed_not_expected_only_binding(self):
         payload = self._browser()
         payload.pop("observed_publication")

@@ -15,6 +15,14 @@ import os
 import re
 import sys
 
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
+from app.candidate_artifact import (
+    PRODUCTION_PROJECT_NAME, PRODUCTION_RELEASE_ARTIFACT_ROLE,
+)
+
 
 _COMMIT_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -136,12 +144,26 @@ def backup_identity(payload):
     }
 
 
-def candidate_build_identity(commit_sha, artifact_sha256):
+def candidate_build_identity(commit_sha, artifact_sha256,
+                             artifact_role=PRODUCTION_RELEASE_ARTIFACT_ROLE,
+                             production_publishable=True,
+                             project_name=PRODUCTION_PROJECT_NAME):
+    if artifact_role != PRODUCTION_RELEASE_ARTIFACT_ROLE:
+        raise ValueError(
+            "trusted Candidate build is a validation fixture, not a production release"
+        )
+    if production_publishable is not True:
+        raise ValueError("trusted Candidate build is not production_publishable")
+    if project_name != PRODUCTION_PROJECT_NAME:
+        raise ValueError("trusted Candidate build project is not the production project")
     return {
         "commit_sha": _require_commit(commit_sha, "trusted Candidate build commit_sha"),
         "candidate_artifact_sha256": _require_sha256(
             artifact_sha256, "trusted Candidate build candidate_artifact_sha256"
         ),
+        "artifact_role": artifact_role,
+        "production_publishable": production_publishable,
+        "project_name": project_name,
     }
 
 
@@ -213,6 +235,15 @@ def main(argv=None):
     parser.add_argument("--github-output", action="store_true")
     parser.add_argument("--candidate-build-commit", default="")
     parser.add_argument("--candidate-build-artifact", default="")
+    parser.add_argument(
+        "--candidate-build-role", default=PRODUCTION_RELEASE_ARTIFACT_ROLE
+    )
+    parser.add_argument(
+        "--candidate-build-publishable", default="true"
+    )
+    parser.add_argument(
+        "--candidate-build-project", default=PRODUCTION_PROJECT_NAME
+    )
     parser.add_argument("--browser-commit", default="")
     parser.add_argument("--browser-artifact", default="")
     parser.add_argument("--browser-served-root", default="")
@@ -232,7 +263,12 @@ def main(argv=None):
             return 0
         result = join_identities(
             candidate_build_identity(
-                args.candidate_build_commit, args.candidate_build_artifact
+                args.candidate_build_commit, args.candidate_build_artifact,
+                artifact_role=args.candidate_build_role,
+                production_publishable=(
+                    str(args.candidate_build_publishable).lower() == "true"
+                ),
+                project_name=args.candidate_build_project,
             ),
             {
                 "commit_sha": _require_commit(args.browser_commit, "browser commit_sha"),
