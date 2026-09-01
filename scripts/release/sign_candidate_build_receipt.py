@@ -37,6 +37,7 @@ def main(argv=None):
     parser.add_argument("--source-repo-root", required=True)
     parser.add_argument("--build-workflow-identity", required=True)
     parser.add_argument("--build-workflow-run-id", required=True)
+    parser.add_argument("--build-workflow-run-attempt", required=True)
     parser.add_argument("--build-workflow-sha", required=True)
     parser.add_argument("--attestation-bundle", required=True)
     parser.add_argument("--receipt-output", default="")
@@ -72,6 +73,11 @@ def main(argv=None):
         if str(provenance.get("build_workflow_run_id") or "") != \
                 str(args.build_workflow_run_id).strip():
             raise ValueError("Candidate build workflow run ID does not match receipt request")
+        if str(provenance.get("build_workflow_run_attempt") or "") != \
+                str(args.build_workflow_run_attempt).strip():
+            raise ValueError(
+                "Candidate build workflow run attempt does not match receipt request"
+            )
         if str(provenance.get("build_workflow_sha") or "").lower() != \
                 str(args.build_workflow_sha).strip().lower():
             raise ValueError("Candidate build workflow SHA does not match receipt request")
@@ -99,6 +105,9 @@ def main(argv=None):
         "source_tree_sha": receipt["payload"]["source_tree_sha"],
         "build_workflow_identity": receipt["payload"]["build_workflow_identity"],
         "build_workflow_run_id": receipt["payload"]["build_workflow_run_id"],
+        "build_workflow_run_attempt": receipt["payload"][
+            "build_workflow_run_attempt"
+        ],
         "build_workflow_sha": receipt["payload"]["build_workflow_sha"],
     }, ensure_ascii=False, indent=2, sort_keys=True))
     return 0

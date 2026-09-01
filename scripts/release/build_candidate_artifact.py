@@ -125,6 +125,7 @@ def _load_args(argv=None):
     parser.add_argument("--release-identity-output", required=True)
     parser.add_argument("--build-workflow-identity", required=True)
     parser.add_argument("--build-workflow-run-id", required=True)
+    parser.add_argument("--build-workflow-run-attempt", required=True)
     parser.add_argument("--build-workflow-sha", required=True)
     return parser.parse_args(argv)
 
@@ -143,6 +144,7 @@ def main(argv=None):
         provenance = build_git_source_provenance(
             source_root, identity, args.build_workflow_identity,
             build_workflow_run_id=args.build_workflow_run_id,
+            build_workflow_run_attempt=args.build_workflow_run_attempt,
             build_workflow_sha=args.build_workflow_sha,
         )
         manifest = CandidateArtifactManifest.build(
@@ -170,6 +172,7 @@ def main(argv=None):
         "source_tree_sha": manifest["source_tree_sha"],
         "build_workflow_identity": manifest["build_workflow_identity"],
         "build_workflow_run_id": manifest["build_workflow_run_id"],
+        "build_workflow_run_attempt": manifest["build_workflow_run_attempt"],
         "build_workflow_sha": manifest["build_workflow_sha"],
     }, ensure_ascii=False, indent=2, sort_keys=True))
     return 0

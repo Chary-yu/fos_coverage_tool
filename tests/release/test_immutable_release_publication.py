@@ -78,7 +78,8 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             "source_tree_sha": "d" * 40,
             "worktree_clean": True,
             "build_workflow_identity": "tests.release.test_immutable_release_publication",
-            "build_workflow_run_id": "test-run-{}".format(identity["build_id"]),
+            "build_workflow_run_id": "123",
+            "build_workflow_run_attempt": "1",
             "build_workflow_sha": "f" * 40,
             "source_manifest_sha256": "1" * 64,
             "build_input_manifest_sha256": "2" * 64,
@@ -422,7 +423,8 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             self._source(candidate)
             provenance = build_git_source_provenance(
                 source_repo, identity, "trusted-ci",
-                build_workflow_run_id="run-123",
+                build_workflow_run_id="123",
+                build_workflow_run_attempt="1",
                 build_workflow_sha="f" * 40,
             )
             self.assertEqual(provenance["provenance_class"], "trusted-ci-build")
@@ -434,7 +436,8 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             manifest = CandidateArtifactManifest.build(
                 candidate, identity, source_provenance=provenance
             )
-            self.assertEqual(manifest["build_workflow_run_id"], "run-123")
+            self.assertEqual(manifest["build_workflow_run_id"], "123")
+            self.assertEqual(manifest["build_workflow_run_attempt"], "1")
             self.assertEqual(manifest["build_workflow_sha"], "f" * 40)
             self.assertTrue(os.path.isfile(os.path.join(
                 candidate, "candidate_build_attestation.json"
@@ -513,7 +516,8 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             self._source(candidate)
             provenance = build_git_source_provenance(
                 source_repo, identity, "trusted-ci",
-                build_workflow_run_id="run-receipt",
+                build_workflow_run_id="456",
+                build_workflow_run_attempt="1",
                 build_workflow_sha="f" * 40,
             )
             CandidateArtifactManifest.build(
@@ -545,10 +549,15 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                         }}],
                         "predicate": {
                             "runDetails": {
-                                "metadata": {"invocationId": "run-123"},
+                                "metadata": {
+                                    "invocationId": (
+                                        "https://github.com/Chary-yu/fos_coverage_tool/"
+                                        "actions/runs/123/attempts/1"
+                                    ),
                             },
                         },
                     },
+                },
                 },
             }]).encode("utf-8")
             with mock.patch.object(
@@ -557,7 +566,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 result = verify_github_artifact_attestation(
                     subject, bundle, "Chary-yu/fos_coverage_tool",
                     "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
-                    "a" * 40, "b" * 40, "run-123",
+                    "a" * 40, "b" * 40, "123", "1",
                 )
             self.assertEqual(result["status"], "PASSED")
             command = check.call_args[0][0]
@@ -572,10 +581,15 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                         "subject": [{"digest": {"sha256": "0" * 64}}],
                         "predicate": {
                             "runDetails": {
-                                "metadata": {"invocationId": "run-123"},
+                                "metadata": {
+                                    "invocationId": (
+                                        "https://github.com/Chary-yu/fos_coverage_tool/"
+                                        "actions/runs/123/attempts/1"
+                                    ),
                             },
                         },
                     },
+                },
                 },
             }]).encode("utf-8")
             with mock.patch.object(
@@ -585,7 +599,33 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                     verify_github_artifact_attestation(
                         subject, bundle, "Chary-yu/fos_coverage_tool",
                         "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
-                        "a" * 40, "b" * 40, "run-123",
+                        "a" * 40, "b" * 40, "123", "1",
+                    )
+            wrong_run_output = json.dumps([{
+                "verificationResult": {
+                    "statement": {
+                        "subject": [{"digest": {"sha256": subject_sha}}],
+                        "predicate": {
+                            "runDetails": {
+                                "metadata": {
+                                    "invocationId": (
+                                        "https://github.com/Chary-yu/fos_coverage_tool/"
+                                        "actions/runs/91234/attempts/1"
+                                    ),
+                                },
+                            },
+                        },
+                    },
+                },
+            }]).encode("utf-8")
+            with mock.patch.object(
+                    candidate_build_receipt.subprocess, "check_output",
+                    return_value=wrong_run_output):
+                with self.assertRaisesRegex(ValueError, "exact Candidate build run ID"):
+                    verify_github_artifact_attestation(
+                        subject, bundle, "Chary-yu/fos_coverage_tool",
+                        "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
+                        "a" * 40, "b" * 40, "123", "1",
                     )
             try:
                 os.symlink(subject, os.path.join(root, "subject-link.json"))
@@ -596,7 +636,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                     os.path.join(root, "subject-link.json"), bundle,
                     "Chary-yu/fos_coverage_tool",
                     "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
-                    "a" * 40, "b" * 40, "run-123",
+                    "a" * 40, "b" * 40, "123", "1",
                 )
 
     def test_candidate_build_attestation_tamper_fails_before_publish(self):

@@ -35,6 +35,7 @@ TRUSTED_PROVENANCE_CLASSES = (
 ARTIFACT_DIRECTORIES = ("reports", "assets", "registry")
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 _GIT_TREE_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
+_WORKFLOW_RUN_ID = re.compile(r"^[1-9][0-9]*$")
 
 
 def _real(path):
@@ -192,6 +193,7 @@ def _source_provenance(value, require_artifact_sha=False,
     provenance.setdefault(
         "build_workflow_run_id", provenance.get("build_workflow_identity")
     )
+    provenance.setdefault("build_workflow_run_attempt", "1")
     provenance.setdefault("build_workflow_sha", "")
     provenance.setdefault(
         "build_input_manifest_sha256", provenance.get("source_manifest_sha256")
@@ -234,7 +236,7 @@ def _source_provenance(value, require_artifact_sha=False,
             )
         required_trusted = (
             "build_workflow_run_id", "build_workflow_sha",
-            "build_input_manifest_sha256",
+            "build_workflow_run_attempt", "build_input_manifest_sha256",
         )
         missing = [key for key in required_trusted
                    if provenance.get(key) in (None, "")]
@@ -249,6 +251,17 @@ def _source_provenance(value, require_artifact_sha=False,
             raise ValueError(
                 "trusted candidate artifact build_input_manifest_sha256 is invalid"
             )
+        if provenance.get("provenance_class") == TRUSTED_CI_PROVENANCE_CLASS:
+            if not _WORKFLOW_RUN_ID.fullmatch(
+                    str(provenance.get("build_workflow_run_id"))):
+                raise ValueError(
+                    "trusted candidate artifact build_workflow_run_id must be a positive numeric ID"
+                )
+            if not _WORKFLOW_RUN_ID.fullmatch(
+                    str(provenance.get("build_workflow_run_attempt"))):
+                raise ValueError(
+                    "trusted candidate artifact build_workflow_run_attempt must be a positive numeric ID"
+                )
     return provenance
 
 
@@ -282,7 +295,7 @@ def verify_trusted_build_policy(provenance, workflow_identity, workflow_sha):
 
 def build_git_source_provenance(source_repo_root, release_identity,
                                 build_workflow_identity, build_workflow_run_id="",
-                                build_workflow_sha=""):
+                                build_workflow_sha="", build_workflow_run_attempt=""):
     """Capture immutable source checkout provenance for a packaged artifact."""
     source_repo_root = _real(source_repo_root)
     if not os.path.exists(os.path.join(source_repo_root, ".git")):
@@ -291,9 +304,16 @@ def build_git_source_provenance(source_repo_root, release_identity,
     if not workflow:
         raise ValueError("build_workflow_identity is required")
     workflow_run_id = str(build_workflow_run_id or workflow).strip()
+    workflow_run_attempt = str(build_workflow_run_attempt or "1").strip()
     workflow_sha = str(build_workflow_sha or "").strip()
     if workflow_sha and not is_valid_commit_sha(workflow_sha):
         raise ValueError("build_workflow_sha must be an exact commit SHA")
+    if workflow_sha and not _WORKFLOW_RUN_ID.fullmatch(workflow_run_id):
+        raise ValueError("build_workflow_run_id must be a positive numeric ID")
+    if workflow_sha and not _WORKFLOW_RUN_ID.fullmatch(workflow_run_attempt):
+        raise ValueError(
+            "build_workflow_run_attempt must be a positive numeric ID"
+        )
     try:
         head = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=source_repo_root,
@@ -324,6 +344,7 @@ def build_git_source_provenance(source_repo_root, release_identity,
         "source_commit_sha": head,
         "source_tree_sha": tree,
         "build_workflow_run_id": workflow_run_id,
+        "build_workflow_run_attempt": workflow_run_attempt,
         "build_workflow_sha": workflow_sha,
     })
     return {
@@ -336,6 +357,7 @@ def build_git_source_provenance(source_repo_root, release_identity,
         "worktree_clean": True,
         "build_workflow_identity": workflow,
         "build_workflow_run_id": workflow_run_id,
+        "build_workflow_run_attempt": workflow_run_attempt,
         "build_workflow_sha": workflow_sha,
         "source_manifest_sha256": source_manifest_sha,
         "build_input_manifest_sha256": build_input_manifest_sha,
@@ -351,11 +373,13 @@ def verify_git_source_provenance(source_repo_root, release_identity,
         expected["build_workflow_identity"],
         build_workflow_run_id=expected["build_workflow_run_id"],
         build_workflow_sha=expected["build_workflow_sha"],
+        build_workflow_run_attempt=expected["build_workflow_run_attempt"],
     )
     for key in (
             "provenance_class", "provenance_schema_version", "source_commit_sha",
             "source_tree_sha", "worktree_clean", "build_workflow_identity",
-            "build_workflow_run_id", "build_workflow_sha",
+            "build_workflow_run_id", "build_workflow_run_attempt",
+            "build_workflow_sha",
             "source_manifest_sha256", "build_input_manifest_sha256"):
         if expected.get(key) != observed.get(key):
             raise ValueError(
@@ -396,6 +420,7 @@ def _attestation_payload(identity, payload):
         "source_manifest_sha256": provenance["source_manifest_sha256"],
         "build_workflow_identity": provenance["build_workflow_identity"],
         "build_workflow_run_id": provenance["build_workflow_run_id"],
+        "build_workflow_run_attempt": provenance["build_workflow_run_attempt"],
         "build_workflow_sha": provenance["build_workflow_sha"],
         "build_input_manifest_sha256": provenance["build_input_manifest_sha256"],
         "candidate_artifact_sha256": payload["artifact_sha256"],
@@ -450,6 +475,7 @@ def _build_payload(candidate_root, identity, manifest_path, source_provenance,
         "source_tree_sha": provenance["source_tree_sha"],
         "build_workflow_identity": provenance["build_workflow_identity"],
         "build_workflow_run_id": provenance["build_workflow_run_id"],
+        "build_workflow_run_attempt": provenance["build_workflow_run_attempt"],
         "build_workflow_sha": provenance["build_workflow_sha"],
         "source_manifest_sha256": provenance["source_manifest_sha256"],
         "build_input_manifest_sha256": provenance["build_input_manifest_sha256"],
@@ -577,7 +603,8 @@ class CandidateArtifactManifest(object):
                 "artifact_sha256", "source_provenance", "source_commit_sha",
                 "source_tree_sha", "build_workflow_identity",
                 "provenance_schema_version", "build_workflow_run_id",
-                "build_workflow_sha", "source_manifest_sha256",
+                "build_workflow_run_attempt", "build_workflow_sha",
+                "source_manifest_sha256",
                 "build_input_manifest_sha256", "candidate_artifact_sha256",
                 "attestation_path", "receipt_path"):
             if manifest.get(key) != observed.get(key):

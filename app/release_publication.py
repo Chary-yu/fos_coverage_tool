@@ -526,6 +526,9 @@ def build_release_manifest(release_root, release_identity, session_id,
             "build_workflow_run_id": candidate_artifact_manifest.get(
                 "build_workflow_run_id"
             ),
+            "build_workflow_run_attempt": candidate_artifact_manifest.get(
+                "build_workflow_run_attempt"
+            ),
             "build_workflow_sha": candidate_artifact_manifest.get(
                 "build_workflow_sha"
             ),

@@ -17,6 +17,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import stat
 import subprocess
 
@@ -30,6 +31,10 @@ CANDIDATE_BUILD_RECEIPT_TYPE = "protected-ci-build"
 CANDIDATE_BUILD_RECEIPT_SIGNATURE_ALGORITHM = "HMAC-SHA256"
 CANDIDATE_BUILD_RECEIPT_KEY_ENV = "COVERAGE_BUILD_PROVENANCE_HMAC_KEY"
 _MINIMUM_KEY_LENGTH = 32
+_WORKFLOW_RUN_ID = re.compile(r"^[1-9][0-9]*$")
+_INVOCATION_ID = re.compile(
+    r"(?:^|/)actions/runs/([1-9][0-9]*)/attempts/([1-9][0-9]*)(?:$|[/?#])"
+)
 
 
 def _real(path):
@@ -139,6 +144,9 @@ def _receipt_payload(candidate_root, manifest, manifest_path,
         ),
         "build_workflow_identity": provenance.get("build_workflow_identity"),
         "build_workflow_run_id": provenance.get("build_workflow_run_id"),
+        "build_workflow_run_attempt": provenance.get(
+            "build_workflow_run_attempt"
+        ),
         "build_workflow_sha": provenance.get("build_workflow_sha"),
         "attestation_bundle_sha256": _sha256(attestation_bundle_path),
     }
@@ -258,13 +266,45 @@ def verify_candidate_build_receipt(
         attestation_workflow, payload.get("source_commit_sha"),
         payload.get("build_workflow_sha"),
         payload.get("build_workflow_run_id"),
+        payload.get("build_workflow_run_attempt"),
     )
     return receipt
 
 
+def _extract_attestation_invocation_identity(predicate):
+    """Extract the exact GitHub Actions run identity from SLSA metadata.
+
+    The invocation ID is structured data in the SLSA predicate.  It is not
+    safe to search the serialized predicate for a run ID because a short ID
+    can be a substring of a different run, or occur in an unrelated field.
+    """
+    if not isinstance(predicate, dict):
+        return None
+    run_details = predicate.get("runDetails") or predicate.get("run_details") or {}
+    if not isinstance(run_details, dict):
+        return None
+    metadata = run_details.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    invocation_id = metadata.get("invocationId") or metadata.get("invocation_id")
+    if invocation_id:
+        match = _INVOCATION_ID.search(str(invocation_id))
+        if match:
+            return match.group(1), match.group(2)
+    # Keep a strict structured fallback for attestations that expose the
+    # numeric fields directly instead of embedding them in invocationId.
+    for value in (metadata, run_details):
+        run_id = value.get("runId") or value.get("run_id")
+        run_attempt = value.get("runAttempt") or value.get("run_attempt")
+        if _WORKFLOW_RUN_ID.fullmatch(str(run_id or "")) and \
+                _WORKFLOW_RUN_ID.fullmatch(str(run_attempt or "")):
+            return str(run_id), str(run_attempt)
+    return None
+
+
 def verify_github_artifact_attestation(
         subject_path, bundle_path, repository, workflow, source_commit_sha,
-        workflow_sha, workflow_run_id, verifier="gh"):
+        workflow_sha, workflow_run_id, workflow_run_attempt, verifier="gh"):
     """Verify the Sigstore/GitHub attestation and its exact subject digest.
 
     ``gh attestation verify --bundle`` performs the cryptographic certificate,
@@ -276,9 +316,17 @@ def verify_github_artifact_attestation(
     source_commit_sha = str(source_commit_sha or "").strip()
     workflow_sha = str(workflow_sha or "").strip()
     workflow_run_id = str(workflow_run_id or "").strip()
-    if not repository or not workflow or not workflow_run_id:
+    workflow_run_attempt = str(workflow_run_attempt or "").strip()
+    if not repository or not workflow or not workflow_run_id or \
+            not workflow_run_attempt:
         raise ValueError(
-            "GitHub artifact-attestation repository, signer workflow, and run ID are required"
+            "GitHub artifact-attestation repository, signer workflow, run ID, and run attempt are required"
+        )
+    if not _WORKFLOW_RUN_ID.fullmatch(workflow_run_id):
+        raise ValueError("GitHub artifact-attestation run ID must be a positive numeric ID")
+    if not _WORKFLOW_RUN_ID.fullmatch(workflow_run_attempt):
+        raise ValueError(
+            "GitHub artifact-attestation run attempt must be a positive numeric ID"
         )
     subject_path = _require_regular_file(
         subject_path, "Candidate attestation subject"
@@ -335,8 +383,8 @@ def verify_github_artifact_attestation(
                 break
         if found_subject:
             predicate = statement.get("predicate") or {}
-            if workflow_run_id in json.dumps(
-                    predicate, ensure_ascii=False, sort_keys=True):
+            invocation = _extract_attestation_invocation_identity(predicate)
+            if invocation == (workflow_run_id, workflow_run_attempt):
                 found_run = True
             break
     if not found_subject:
@@ -345,7 +393,7 @@ def verify_github_artifact_attestation(
         )
     if not found_run:
         raise ValueError(
-            "GitHub artifact attestation does not contain the Candidate build run ID"
+            "GitHub artifact attestation does not contain the exact Candidate build run ID and attempt"
         )
     return {
         "status": "PASSED",
@@ -355,4 +403,5 @@ def verify_github_artifact_attestation(
         "source_commit_sha": source_commit_sha,
         "signer_workflow_sha": workflow_sha,
         "workflow_run_id": workflow_run_id,
+        "workflow_run_attempt": workflow_run_attempt,
     }

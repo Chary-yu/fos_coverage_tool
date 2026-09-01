@@ -15,7 +15,6 @@ from app.candidate_artifact import (
     CANDIDATE_ARTIFACT_MANIFEST_NAME, CandidateArtifactManifest,
     build_git_source_provenance,
 )
-from app.candidate_build_receipt import create_candidate_build_receipt
 from app.release_identity import verify_release_identity
 from app.release_publication import normalize_candidate_artifact
 
@@ -46,19 +45,12 @@ def main(argv=None):
         help="unique CI/build workflow run identifier",
     )
     parser.add_argument(
+        "--build-workflow-run-attempt", required=True,
+        help="exact CI/build workflow run attempt identifier",
+    )
+    parser.add_argument(
         "--build-workflow-sha", required=True,
         help="exact commit SHA of the trusted build workflow",
-    )
-    parser.add_argument(
-        "--attestation-bundle", default="",
-        help=(
-            "external GitHub artifact-attestation bundle; when supplied, "
-            "also creates the protected Candidate build receipt"
-        ),
-    )
-    parser.add_argument(
-        "--receipt-output", default="",
-        help="protected receipt path inside candidate-root",
     )
     args = parser.parse_args(argv)
     candidate_root = os.path.abspath(args.candidate_root)
@@ -71,6 +63,7 @@ def main(argv=None):
         source_provenance = build_git_source_provenance(
             args.source_repo_root, identity, args.build_workflow_identity,
             build_workflow_run_id=args.build_workflow_run_id,
+            build_workflow_run_attempt=args.build_workflow_run_attempt,
             build_workflow_sha=args.build_workflow_sha,
         )
         # All deterministic content changes happen before the Candidate
@@ -79,16 +72,6 @@ def main(argv=None):
         normalize_candidate_artifact(candidate_root)
     except (OSError, RuntimeError, ValueError, TypeError) as exc:
         parser.error(str(exc))
-    receipt = None
-    if args.attestation_bundle:
-        try:
-            receipt = create_candidate_build_receipt(
-                candidate_root, identity, output,
-                output_path=args.receipt_output or "",
-                attestation_bundle_path=args.attestation_bundle,
-            )
-        except (OSError, RuntimeError, ValueError, TypeError) as exc:
-            parser.error(str(exc))
     output = args.output or os.path.join(
         candidate_root, CANDIDATE_ARTIFACT_MANIFEST_NAME
     )
@@ -113,14 +96,13 @@ def main(argv=None):
         "source_tree_sha": manifest["source_tree_sha"],
         "build_workflow_identity": manifest["build_workflow_identity"],
         "build_workflow_run_id": manifest["build_workflow_run_id"],
+        "build_workflow_run_attempt": manifest["build_workflow_run_attempt"],
         "build_workflow_sha": manifest["build_workflow_sha"],
         "source_manifest_sha256": manifest["source_manifest_sha256"],
         "build_input_manifest_sha256": manifest["build_input_manifest_sha256"],
         "candidate_artifact_sha256": manifest["candidate_artifact_sha256"],
         "attestation_path": manifest["attestation_path"],
         "attestation_sha256": manifest["attestation_sha256"],
-        "receipt_path": manifest.get("receipt_path", ""),
-        "protected_receipt": bool(receipt),
     }, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
