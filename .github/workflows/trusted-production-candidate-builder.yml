@@ -1,6 +1,52 @@
 name: Trusted Production Candidate Builder
 
 on:
+  workflow_call:
+    inputs:
+      source_sha:
+        description: Exact application source commit to build
+        required: true
+        type: string
+      builder_workflow_sha:
+        description: Immutable commit containing this production builder workflow
+        required: true
+        type: string
+      served_root:
+        description: Absolute path to the real FOS_V6R2 Served Root on the protected runner
+        required: true
+        type: string
+      attestation_repository:
+        description: Repository allowed to verify the production Candidate attestation
+        required: true
+        type: string
+    secrets:
+      COVERAGE_BUILD_PROVENANCE_HMAC_KEY:
+        required: false
+    outputs:
+      candidate_commit_sha:
+        description: Exact source commit used by the production Candidate build
+        value: ${{ jobs.build.outputs.candidate_commit_sha }}
+      candidate_artifact_sha256:
+        description: Exact production Candidate artifact inventory SHA256
+        value: ${{ jobs.build.outputs.candidate_artifact_sha256 }}
+      artifact_role:
+        description: Production publication artifact role
+        value: ${{ jobs.build.outputs.artifact_role }}
+      production_publishable:
+        description: Whether the Candidate may enter immutable production publication
+        value: ${{ jobs.build.outputs.production_publishable }}
+      project_name:
+        description: Production project identity
+        value: ${{ jobs.build.outputs.project_name }}
+      build_workflow_sha:
+        description: Immutable production builder workflow commit
+        value: ${{ jobs.build.outputs.build_workflow_sha }}
+      build_workflow_run_id:
+        description: GitHub Actions workflow run ID
+        value: ${{ jobs.build.outputs.build_workflow_run_id }}
+      build_workflow_run_attempt:
+        description: GitHub Actions workflow run attempt
+        value: ${{ jobs.build.outputs.build_workflow_run_attempt }}
   workflow_dispatch:
     inputs:
       source_sha:
@@ -20,9 +66,6 @@ on:
         required: true
         default: Chary-yu/fos_coverage_tool
         type: string
-    secrets:
-      COVERAGE_BUILD_PROVENANCE_HMAC_KEY:
-        required: false
 
 permissions:
   contents: read
@@ -37,6 +80,15 @@ jobs:
       id-token: write
       attestations: write
       artifact-metadata: write
+    outputs:
+      candidate_commit_sha: ${{ steps.metadata.outputs.candidate_commit_sha }}
+      candidate_artifact_sha256: ${{ steps.metadata.outputs.candidate_artifact_sha256 }}
+      artifact_role: ${{ steps.metadata.outputs.artifact_role }}
+      production_publishable: ${{ steps.metadata.outputs.production_publishable }}
+      project_name: ${{ steps.metadata.outputs.project_name }}
+      build_workflow_sha: ${{ steps.metadata.outputs.build_workflow_sha }}
+      build_workflow_run_id: ${{ steps.metadata.outputs.build_workflow_run_id }}
+      build_workflow_run_attempt: ${{ steps.metadata.outputs.build_workflow_run_attempt }}
     env:
       BUILD_WORKFLOW_IDENTITY: github-actions/trusted-production-candidate-builder
       BUILD_WORKFLOW_RUN_ID: ${{ github.run_id }}
