@@ -40,6 +40,9 @@ def audit(repo_root=ROOT):
         violations.append("Candidate candidate_browser_url is missing")
     if not upgrade.get("candidate_browser_evidence_path"):
         violations.append("Candidate candidate_browser_evidence_path is missing")
+    for evidence_field in ("rollback_evidence_path", "performance_evidence_path"):
+        if not upgrade.get(evidence_field):
+            violations.append("Candidate {} is missing".format(evidence_field))
     commands = upgrade.get("commands") or {}
     for command_name in (
             "stop_current_api", "stop_validation_api", "start_validation_api",

@@ -28,6 +28,9 @@ function usage() {
     '    --candidate-commit <sha>',
     '    --workload-hash <hash>',
     '    --output <json>',
+    '    [--release-validation-session-id <attempt-id>]',
+    '    [--candidate-artifact-sha256 <sha256>]',
+    '    [--served-root-sha256 <sha256>]',
     '    [--max-regression-percent <number>]',
     '',
     'Each input must be an independently measured release_performance_revision',
@@ -40,7 +43,8 @@ function parseArgs(argv) {
   const valueArgs = new Set([
     '--baseline-artifact', '--candidate-artifact', '--baseline-commit',
     '--candidate-commit', '--workload-hash', '--output',
-    '--max-regression-percent'
+    '--max-regression-percent', '--release-validation-session-id',
+    '--candidate-artifact-sha256', '--served-root-sha256'
   ]);
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
@@ -210,6 +214,15 @@ function main() {
     process.exitCode = 2;
     return;
   }
+  const bindingFields = [
+    'release_validation_session_id', 'candidate_artifact_sha256', 'served_root_sha256'
+  ];
+  const bindingCount = bindingFields.filter(name => Boolean(args[name])).length;
+  if (bindingCount !== 0 && bindingCount !== bindingFields.length) {
+    failure('attempt publication binding requires all three identity fields', outputPath);
+    process.exitCode = 2;
+    return;
+  }
 
   let baseline;
   let candidate;
@@ -286,6 +299,9 @@ function main() {
     workload_hash: args.workload_hash,
     baseline_commit: args.baseline_commit,
     candidate_commit: args.candidate_commit,
+    release_validation_session_id: args.release_validation_session_id || '',
+    candidate_artifact_sha256: args.candidate_artifact_sha256 || '',
+    served_root_sha256: args.served_root_sha256 || '',
     environment_identity: baseline.artifact.environment_identity,
     baseline_artifact: { path: baseline.path, sha256: baseline.sha256 },
     candidate_artifact: { path: candidate.path, sha256: candidate.sha256 },

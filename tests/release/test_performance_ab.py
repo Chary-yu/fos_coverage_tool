@@ -69,6 +69,9 @@ class TestReleasePerformanceAB(unittest.TestCase):
                 "--baseline-commit", "before-commit",
                 "--candidate-commit", "candidate-commit",
                 "--workload-hash", workload_hash,
+                "--release-validation-session-id", "attempt-candidate",
+                "--candidate-artifact-sha256", "a" * 64,
+                "--served-root-sha256", "b" * 64,
                 "--output", output,
             ], cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8"))
@@ -76,6 +79,9 @@ class TestReleasePerformanceAB(unittest.TestCase):
                 evidence = json.load(stream)
             self.assertEqual(evidence["evidence_class"], "release_performance_ab")
             self.assertEqual(evidence["candidate_commit"], "candidate-commit")
+            self.assertEqual(evidence["release_validation_session_id"], "attempt-candidate")
+            self.assertEqual(evidence["candidate_artifact_sha256"], "a" * 64)
+            self.assertEqual(evidence["served_root_sha256"], "b" * 64)
             self.assertEqual(evidence["Tier_D_100k"]["status"], "PASSED")
             self.assertTrue(os.path.isfile(evidence["source_artifacts"]["baseline"]["path"]))
             with open(baseline, "rb") as baseline_stream:

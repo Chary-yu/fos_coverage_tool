@@ -117,6 +117,9 @@ class TestUpgradeManifest(unittest.TestCase):
                 "evidence_class": "real_http_chromium_browser",
                 "release_eligible": True,
                 "synthetic": False,
+                "release_validation_session_id": "candidate-attempt-1",
+                "candidate_artifact_sha256": "d" * 64,
+                "served_root_sha256": "e" * 64,
                 "candidate_revision": identity["commit_sha"],
                 "page_url": "https://candidate.example.invalid/report.html",
                 "release_identity": identity,
@@ -132,12 +135,46 @@ class TestUpgradeManifest(unittest.TestCase):
             errors, normalized = _validate_candidate_browser_evidence(
                 artifact, payload, identity,
                 "https://candidate.example.invalid/report.html",
+                expected_session_id="candidate-attempt-1",
+                expected_candidate_artifact_sha256="d" * 64,
+                expected_served_root_sha256="e" * 64,
             )
         self.assertEqual(errors, [])
         self.assertEqual(normalized["evidence_class"], "real_candidate_browser")
         self.assertTrue(normalized["real_http"])
         self.assertTrue(normalized["chromium"])
         self.assertEqual(normalized["browser_artifact_sha256"], artifact_sha)
+        self.assertEqual(normalized["release_validation_session_id"], "candidate-attempt-1")
+
+    def test_candidate_browser_evidence_rejects_a_different_attempt(self):
+        identity = {
+            "commit_sha": "a" * 40,
+            "build_id": "build-a",
+        }
+        payload = {
+            "status": "PASSED",
+            "evidence_class": "real_http_chromium_browser",
+            "release_eligible": True,
+            "synthetic": False,
+            "candidate_revision": identity["commit_sha"],
+            "release_validation_session_id": "attempt-a",
+            "candidate_artifact_sha256": "d" * 64,
+            "served_root_sha256": "e" * 64,
+            "page_url": "https://candidate.example.invalid/",
+            "release_identity": identity,
+            "browser_functional": {"status": "PASSED"},
+            "coverage_virtual_scroll_100k": {
+                "status": "PASSED",
+                "environment_identity": {"browser_name": "chromium"},
+            },
+        }
+        errors, _ = _validate_candidate_browser_evidence(
+            "unused.json", payload, identity, "https://candidate.example.invalid/",
+            expected_session_id="attempt-b",
+            expected_candidate_artifact_sha256="d" * 64,
+            expected_served_root_sha256="e" * 64,
+        )
+        self.assertIn("release_validation_session_id", " ".join(errors))
 
     def test_same_candidate_sha_gets_independent_attempt_ids_and_paths(self):
         revision = "a" * 40
@@ -163,6 +200,15 @@ class TestUpgradeManifest(unittest.TestCase):
                     "validation_session_manifest", second,
                 ),
             )
+            fixed_first = _resolve_attempt_path(
+                root, "artifacts/browser.json", "candidate_browser_evidence_path", first
+            )
+            fixed_second = _resolve_attempt_path(
+                root, "artifacts/browser.json", "candidate_browser_evidence_path", second
+            )
+            self.assertIn(first, fixed_first)
+            self.assertIn(second, fixed_second)
+            self.assertNotEqual(fixed_first, fixed_second)
 
 
 if __name__ == "__main__":

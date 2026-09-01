@@ -68,6 +68,13 @@ def audit(path, allow_partial=False, require_cross_layer=False,
             violations.append(
                 "release-eligible performance evidence must explicitly set release_eligible=true"
             )
+        for field in (
+                "release_validation_session_id", "candidate_artifact_sha256",
+                "served_root_sha256"):
+            if not evidence.get(field):
+                violations.append(
+                    "release-eligible performance evidence is missing {}".format(field)
+                )
 
     # A release A/B artifact has a stronger contract than the browser-only
     # functional fixture: two independent exact-revision inputs, one workload

@@ -363,6 +363,9 @@ class ArchitectureAuditTest(unittest.TestCase):
         payload = {
             "synthetic": False,
             "release_eligible": True,
+            "release_validation_session_id": "candidate-attempt-1",
+            "candidate_artifact_sha256": "a" * 64,
+            "served_root_sha256": "b" * 64,
             "coverage_virtual_scroll_100k": {
                 "status": "PASSED", "request_count": 1, "response_bytes": 1,
                 "max_response_bytes": 1, "time_to_first_visible_ms": 1,

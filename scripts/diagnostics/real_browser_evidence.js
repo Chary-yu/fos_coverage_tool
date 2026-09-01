@@ -26,6 +26,9 @@ function usage() {
     '    --url <candidate-html-url>',
     '    --expected-revision <exact-40-char-sha>',
     '    --output <workload-json>',
+    '    [--release-validation-session-id <attempt-id>]',
+    '    [--candidate-artifact-sha256 <sha256>]',
+    '    [--served-root-sha256 <sha256>]',
     '    [--evidence-output <gate-e-performance-json>]',
     '    [--browser-evidence-output <gate-e-browser-json>]',
     '    [--header <name=value>] ...',
@@ -43,7 +46,9 @@ function parseArgs(argv) {
   const args = { headers: [] };
   const valueArgs = new Set([
     '--url', '--expected-revision', '--output', '--evidence-output',
-    '--browser-evidence-output', '--header', '--timeout-ms'
+    '--browser-evidence-output', '--header', '--timeout-ms',
+    '--release-validation-session-id', '--candidate-artifact-sha256',
+    '--served-root-sha256'
   ]);
   const booleanArgs = new Set(['--allow-local-fixture']);
   for (let index = 0; index < argv.length; index += 1) {
@@ -123,6 +128,13 @@ function isLocalFixture(args) {
   } catch (_) {
     return false;
   }
+}
+
+function hasPublicationBinding(args) {
+  return Boolean(
+    args && args.release_validation_session_id &&
+    args.candidate_artifact_sha256 && args.served_root_sha256
+  );
 }
 
 function safeCommand(argv) {
@@ -280,6 +292,9 @@ function buildFailure(args, startedAt, message, details = {}) {
     synthetic: localFixture,
     release_eligible: false,
     candidate_revision: args.expected_revision || '',
+    release_validation_session_id: args.release_validation_session_id || '',
+    candidate_artifact_sha256: args.candidate_artifact_sha256 || '',
+    served_root_sha256: args.served_root_sha256 || '',
     release_identity: {},
     host_identity: hostIdentity(),
     command_or_action: safeCommand(process.argv.slice(2)),
@@ -304,6 +319,9 @@ function buildEnvelope(report, reportPath, args) {
     report_artifact_sha256: sha256File(absoluteReport),
     command_or_action: safeCommand(process.argv.slice(2)),
     page_url: safeUrl(args.url || ''),
+    release_validation_session_id: args.release_validation_session_id || '',
+    candidate_artifact_sha256: args.candidate_artifact_sha256 || '',
+    served_root_sha256: args.served_root_sha256 || '',
   };
 }
 
@@ -342,6 +360,12 @@ async function collect(args, startedAt) {
       throw new Error(
         'loopback Candidate URL is not release evidence; use --allow-local-fixture '
         + 'for synthetic local validation'
+      );
+    }
+    if (!localFixture && !hasPublicationBinding(args)) {
+      throw new Error(
+        'real Candidate evidence requires release-validation session, '
+        + 'candidate artifact SHA256, and Served Root SHA256 bindings'
       );
     }
     browser = await chromium.launch({ headless: true });
@@ -431,6 +455,9 @@ async function collect(args, startedAt) {
       release_eligible: !localFixture && browserStatus && crossLayerReady,
       comparison_type: localFixture ? 'single_disposable_fixture' : 'single_live_candidate',
       candidate_revision: args.expected_revision,
+      release_validation_session_id: args.release_validation_session_id || '',
+      candidate_artifact_sha256: args.candidate_artifact_sha256 || '',
+      served_root_sha256: args.served_root_sha256 || '',
       environment_identity: {
         browser: await page.evaluate(() => navigator.userAgent),
         browser_name: 'chromium',
@@ -525,6 +552,18 @@ async function main() {
   }
   if (!isSha(args.expected_revision)) {
     process.stderr.write('--expected-revision must be an exact 40-character commit SHA\n');
+    process.exitCode = 2;
+    return;
+  }
+  const publicationBinding = [
+    'release_validation_session_id', 'candidate_artifact_sha256', 'served_root_sha256'
+  ];
+  const bindingCount = publicationBinding.filter(name => Boolean(args[name])).length;
+  if (bindingCount !== 0 && bindingCount !== publicationBinding.length) {
+    process.stderr.write(
+      'publication binding requires all of --release-validation-session-id, '
+      + '--candidate-artifact-sha256, and --served-root-sha256\n'
+    );
     process.exitCode = 2;
     return;
   }

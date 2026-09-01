@@ -15,6 +15,18 @@ on:
         description: 'Exact 40-character Candidate commit SHA; defaults to the workflow SHA'
         required: false
         type: string
+      real_browser_release_validation_session_id:
+        description: 'Exact immutable publication/validation attempt ID for the served Candidate'
+        required: false
+        type: string
+      real_browser_candidate_artifact_sha256:
+        description: 'SHA256 of the CandidateArtifactManifest artifact inventory'
+        required: false
+        type: string
+      real_browser_served_root_sha256:
+        description: 'SHA256 of the immutable Served Root inventory'
+        required: false
+        type: string
       production_backup_path:
         description: 'Absolute path to an operator-verified production backup on the production-rehearsal runner'
         required: false
@@ -784,6 +796,9 @@ jobs:
         env:
           REAL_BROWSER_URL: ${{ inputs.real_browser_url }}
           REAL_BROWSER_EXPECTED_REVISION: ${{ inputs.real_browser_expected_revision || github.sha }}
+          REAL_BROWSER_RELEASE_VALIDATION_SESSION_ID: ${{ inputs.real_browser_release_validation_session_id }}
+          REAL_BROWSER_CANDIDATE_ARTIFACT_SHA256: ${{ inputs.real_browser_candidate_artifact_sha256 }}
+          REAL_BROWSER_SERVED_ROOT_SHA256: ${{ inputs.real_browser_served_root_sha256 }}
           COVERAGE_BROWSER_USER: ${{ secrets.COVERAGE_BROWSER_USER }}
           COVERAGE_BROWSER_ROLE: ${{ secrets.COVERAGE_BROWSER_ROLE }}
         run: |
@@ -792,6 +807,9 @@ jobs:
           node scripts/diagnostics/real_browser_evidence.js \
             --url "$REAL_BROWSER_URL" \
             --expected-revision "$REAL_BROWSER_EXPECTED_REVISION" \
+            --release-validation-session-id "$REAL_BROWSER_RELEASE_VALIDATION_SESSION_ID" \
+            --candidate-artifact-sha256 "$REAL_BROWSER_CANDIDATE_ARTIFACT_SHA256" \
+            --served-root-sha256 "$REAL_BROWSER_SERVED_ROOT_SHA256" \
             --header "X-Remote-User=$COVERAGE_BROWSER_USER" \
             --header "X-Remote-Role=${COVERAGE_BROWSER_ROLE:-reviewer}" \
             --output .artifacts/real-browser-candidate/workload.json \

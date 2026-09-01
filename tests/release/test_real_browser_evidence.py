@@ -43,6 +43,9 @@ class TestRealBrowserEvidence(unittest.TestCase):
                     "node", self.script,
                     "--url", "http://127.0.0.1:1/not-running.gcov.html",
                     "--expected-revision", "a" * 40,
+                    "--release-validation-session-id", "attempt-a",
+                    "--candidate-artifact-sha256", "b" * 64,
+                    "--served-root-sha256", "c" * 64,
                     "--header", "X-Remote-User=" + secret,
                     "--output", report_path,
                     "--evidence-output", evidence_path,
@@ -65,6 +68,10 @@ class TestRealBrowserEvidence(unittest.TestCase):
             self.assertFalse(report["synthetic"])
             self.assertEqual(evidence["status"], "INCOMPLETE")
             self.assertEqual(browser["status"], "INCOMPLETE")
+            for payload in (report, evidence, browser):
+                self.assertEqual(payload["release_validation_session_id"], "attempt-a")
+                self.assertEqual(payload["candidate_artifact_sha256"], "b" * 64)
+                self.assertEqual(payload["served_root_sha256"], "c" * 64)
             self.assertNotIn(secret, json.dumps(report))
             self.assertNotIn(secret, json.dumps(evidence))
             self.assertNotIn(secret, json.dumps(browser))

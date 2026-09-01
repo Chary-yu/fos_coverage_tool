@@ -88,14 +88,14 @@ def _new_release_validation_session_id(commit_sha: str,
 
 def _resolve_attempt_path(repo_root: str, configured: Optional[str], field: str,
                           attempt_id: str) -> str:
-    """Resolve an evidence path without reusing a previous attempt file."""
+    """Resolve an evidence path into an identity-specific attempt namespace."""
     if not configured:
         raise RuntimeError("upgrade.{} is required".format(field))
     raw = str(configured)
     if "{attempt_id}" in raw:
         raw = raw.replace("{attempt_id}", str(attempt_id))
     resolved = _resolve_upgrade_path(repo_root, raw, field)
-    if not os.path.lexists(resolved):
+    if "{attempt_id}" in str(configured):
         return resolved
     stem, extension = os.path.splitext(resolved)
     return os.path.realpath("{}.{}{}".format(stem, attempt_id, extension))
@@ -130,7 +130,10 @@ def _sha256_file(path: str) -> str:
 
 
 def _validate_release_performance_artifact(path: str, payload: Dict[str, Any],
-                                           target_revision: str) -> List[str]:
+                                           target_revision: str,
+                                           expected_session_id: str = "",
+                                           expected_candidate_artifact_sha256: str = "",
+                                           expected_served_root_sha256: str = "") -> List[str]:
     """Validate immutable release A/B evidence before the cutover can finish.
 
     The normal synthetic benchmark is intentionally not accepted here.  A
@@ -148,6 +151,12 @@ def _validate_release_performance_artifact(path: str, payload: Dict[str, Any],
         errors.append("performance evidence is not a release revision comparison")
     if payload.get("candidate_commit") != target_revision:
         errors.append("performance candidate_commit does not match target release")
+    if expected_session_id and payload.get("release_validation_session_id") != expected_session_id:
+        errors.append("performance release_validation_session_id does not match attempt")
+    if expected_candidate_artifact_sha256 and payload.get("candidate_artifact_sha256") != expected_candidate_artifact_sha256:
+        errors.append("performance candidate_artifact_sha256 does not match publication")
+    if expected_served_root_sha256 and payload.get("served_root_sha256") != expected_served_root_sha256:
+        errors.append("performance served_root_sha256 does not match publication")
     if not payload.get("baseline_commit") or payload.get("baseline_commit") == target_revision:
         errors.append("performance baseline_commit is missing or equals candidate")
     if not payload.get("workload_id") or not payload.get("workload_hash"):
@@ -253,7 +262,10 @@ def _normalize_evidence_url(value: Any) -> str:
 
 def _validate_candidate_browser_evidence(path: str, payload: Dict[str, Any],
                                          identity: Dict[str, Any],
-                                         expected_url: str) -> Tuple[List[str], Dict[str, Any]]:
+                                         expected_url: str,
+                                         expected_session_id: str = "",
+                                         expected_candidate_artifact_sha256: str = "",
+                                         expected_served_root_sha256: str = "") -> Tuple[List[str], Dict[str, Any]]:
     """Validate the external real-Candidate browser evidence envelope."""
     errors = []
     if not isinstance(payload, dict):
@@ -266,6 +278,12 @@ def _validate_candidate_browser_evidence(path: str, payload: Dict[str, Any],
         errors.append("Candidate browser evidence is not release eligible")
     if payload.get("synthetic") is not False:
         errors.append("synthetic Candidate browser evidence is forbidden")
+    if expected_session_id and payload.get("release_validation_session_id") != expected_session_id:
+        errors.append("Candidate browser release_validation_session_id does not match attempt")
+    if expected_candidate_artifact_sha256 and payload.get("candidate_artifact_sha256") != expected_candidate_artifact_sha256:
+        errors.append("Candidate browser candidate_artifact_sha256 does not match publication")
+    if expected_served_root_sha256 and payload.get("served_root_sha256") != expected_served_root_sha256:
+        errors.append("Candidate browser served_root_sha256 does not match publication")
     target_revision = identity.get("commit_sha")
     if payload.get("candidate_revision") != target_revision:
         errors.append("Candidate browser revision does not match target release")
@@ -317,6 +335,9 @@ def _validate_candidate_browser_evidence(path: str, payload: Dict[str, Any],
         "status": "PASSED" if not errors else "FAILED",
         "evidence_class": "real_candidate_browser",
         "source_evidence_class": payload.get("evidence_class", ""),
+        "release_validation_session_id": payload.get("release_validation_session_id", ""),
+        "candidate_artifact_sha256": payload.get("candidate_artifact_sha256", ""),
+        "served_root_sha256": payload.get("served_root_sha256", ""),
         "candidate_url": candidate_url or "",
         "expected_commit_sha": target_revision,
         "served_release_identity": served_identity,
@@ -371,6 +392,11 @@ class UpgradeOrchestrator:
         self.serving_session_id = ""
         self.release_validation_session_id = ""
         self.previous_published_session_id = ""
+        self.candidate_browser_evidence_path = ""
+        self.rollback_evidence_path = ""
+        self.performance_evidence_path = ""
+        self._candidate_artifact_sha256 = ""
+        self._served_root_sha256 = ""
         self._target_identity = {}
         self._upgrade_mode = ""
         self._runtime_config = {}
@@ -459,6 +485,31 @@ class UpgradeOrchestrator:
             raise RuntimeError(
                 "validation teardown evidence must not overwrite the session manifest"
             )
+
+        self.candidate_browser_evidence_path = _resolve_attempt_path(
+            self.repo_root,
+            upgrade_config.get("candidate_browser_evidence_path") or os.environ.get(
+                "COVERAGE_CANDIDATE_BROWSER_EVIDENCE", ""
+            ),
+            "candidate_browser_evidence_path",
+            session_id,
+        )
+        self.rollback_evidence_path = _resolve_attempt_path(
+            self.repo_root,
+            upgrade_config.get("rollback_evidence_path") or os.environ.get(
+                "COVERAGE_ROLLBACK_EVIDENCE", ""
+            ),
+            "rollback_evidence_path",
+            session_id,
+        )
+        self.performance_evidence_path = _resolve_attempt_path(
+            self.repo_root,
+            upgrade_config.get("performance_evidence_path") or os.environ.get(
+                "COVERAGE_RELEASE_PERFORMANCE_AB", ""
+            ),
+            "performance_evidence_path",
+            session_id,
+        )
 
         if os.path.isfile(self.validation_session_manifest_path):
             session = ValidationSession.load(self.validation_session_manifest_path)
@@ -773,6 +824,9 @@ class UpgradeOrchestrator:
             "release_endpoint": release,
             "health_endpoint": health,
             "served_root": current.get("served_root"),
+            "served_root_sha256": self._served_root_sha256,
+            "release_validation_session_id": expected_session,
+            "candidate_artifact_sha256": self._candidate_artifact_sha256,
             "current_release_validation_session_id": current.get("release_validation_session_id"),
             "expected_release_validation_session_id": expected_session,
             "publisher_current_validation": current,
@@ -1009,6 +1063,15 @@ class UpgradeOrchestrator:
             if switched.get("status") != "PASSED":
                 raise RuntimeError("immutable CURRENT switch did not pass")
             self._publication_switched = True
+            candidate_manifest_summary = prepared.get("candidate_artifact_manifest") or {}
+            self._candidate_artifact_sha256 = str(
+                candidate_manifest_summary.get("artifact_sha256") or ""
+            )
+            self._served_root_sha256 = str(
+                (prepared.get("served_root") or {}).get("sha256") or ""
+            )
+            if not self._candidate_artifact_sha256 or not self._served_root_sha256:
+                raise RuntimeError("immutable publication hashes are incomplete")
             self.manifest.record("file_cutover", {
                 "status": "PASSED",
                 "revision": identity.get("commit_sha"),
@@ -1020,6 +1083,9 @@ class UpgradeOrchestrator:
                 "release_root": self.publisher.release_path(session_id),
                 "previous_session_id": self.previous_published_session_id,
                 "current_session_id": session_id,
+                "release_validation_session_id": session_id,
+                "candidate_artifact_sha256": self._candidate_artifact_sha256,
+                "served_root_sha256": self._served_root_sha256,
                 "release_manifest": prepared,
                 "switch": switched,
                 "command": "ImmutableReleasePublisher.prepare + switch_current",
@@ -1118,13 +1184,7 @@ class UpgradeOrchestrator:
         # real_browser_evidence.js against the actual Candidate URL.  The
         # fixture command above is intentionally not consulted for this gate.
         self.log("[Step 6b/10] Validating external real Candidate browser evidence...")
-        configured_browser_evidence = upgrade_config.get("candidate_browser_evidence_path")
-        browser_evidence_path = configured_browser_evidence or os.environ.get(
-            "COVERAGE_CANDIDATE_BROWSER_EVIDENCE", ""
-        )
-        if browser_evidence_path and not os.path.isabs(str(browser_evidence_path)):
-            browser_evidence_path = os.path.join(self.repo_root, str(browser_evidence_path))
-        browser_evidence_path = os.path.realpath(str(browser_evidence_path or ""))
+        browser_evidence_path = self.candidate_browser_evidence_path
         expected_browser_url = str(upgrade_config.get("candidate_browser_url") or "")
         browser_payload = {}
         browser_errors = []
@@ -1140,7 +1200,10 @@ class UpgradeOrchestrator:
                 browser_errors.append("Candidate browser evidence is unreadable: {}".format(exc))
         if not browser_errors:
             browser_errors, normalized_browser = _validate_candidate_browser_evidence(
-                browser_evidence_path, browser_payload, identity, expected_browser_url
+                browser_evidence_path, browser_payload, identity, expected_browser_url,
+                expected_session_id=self.release_validation_session_id,
+                expected_candidate_artifact_sha256=self._candidate_artifact_sha256,
+                expected_served_root_sha256=self._served_root_sha256,
             )
         else:
             normalized_browser = {
@@ -1148,6 +1211,9 @@ class UpgradeOrchestrator:
                 "evidence_class": "real_candidate_browser",
                 "candidate_url": expected_browser_url,
                 "expected_commit_sha": identity.get("commit_sha"),
+                "release_validation_session_id": self.release_validation_session_id,
+                "candidate_artifact_sha256": self._candidate_artifact_sha256,
+                "served_root_sha256": self._served_root_sha256,
                 "served_release_identity": {},
                 "browser_artifact_path": "",
                 "browser_artifact_sha256": "",
@@ -1177,14 +1243,7 @@ class UpgradeOrchestrator:
         # benchmark remains a useful diagnostic, but it is not allowed to
         # create a production performance claim inside the upgrade runner.
         self.log("[Step 7/10] Validating exact-revision Performance A/B Evidence...")
-        configured_perf = upgrade_config.get("performance_evidence_path")
-        configured_perf = configured_perf or os.environ.get("COVERAGE_RELEASE_PERFORMANCE_AB")
-        perf_artifact = ""
-        if configured_perf:
-            perf_artifact = str(configured_perf)
-            if not os.path.isabs(perf_artifact):
-                perf_artifact = os.path.join(self.repo_root, perf_artifact)
-            perf_artifact = os.path.realpath(perf_artifact)
+        perf_artifact = self.performance_evidence_path
         perf_cmd = "validate release_performance_ab artifact {}".format(perf_artifact or "<missing>")
         perf_res = {}
         perf_errors = []
@@ -1198,7 +1257,10 @@ class UpgradeOrchestrator:
                 perf_errors.append("release performance artifact is unreadable: {}".format(exc))
         if not perf_errors:
             perf_errors.extend(_validate_release_performance_artifact(
-                perf_artifact, perf_res, identity.get("commit_sha")
+                perf_artifact, perf_res, identity.get("commit_sha"),
+                expected_session_id=self.release_validation_session_id,
+                expected_candidate_artifact_sha256=self._candidate_artifact_sha256,
+                expected_served_root_sha256=self._served_root_sha256,
             ))
         if perf_errors:
             invalid_perf = dict(perf_res) if isinstance(perf_res, dict) else {}
@@ -1338,22 +1400,31 @@ class UpgradeOrchestrator:
             return self._fail(lifecycle, "Security audit unresolved findings")
         self.log(f"  ✔ Security Scan passed: Critical={sec_res['critical_count']}, High={sec_res['high_count']}")
 
-        rollback_path = ((runtime_config or {}).get("upgrade") or {}).get("rollback_evidence_path")
-        if rollback_path and not os.path.isabs(rollback_path):
-            rollback_path = os.path.join(self.repo_root, rollback_path)
+        rollback_path = self.rollback_evidence_path
         if rollback_path:
             try:
                 with open(rollback_path, "r", encoding="utf-8") as stream:
                     rollback_evidence = json.load(stream)
                 if rollback_evidence.get("revision") != identity.get("commit_sha"):
                     raise RuntimeError("rollback evidence revision mismatch")
+                if rollback_evidence.get("release_validation_session_id") != \
+                        self.release_validation_session_id:
+                    raise RuntimeError("rollback evidence attempt identity mismatch")
                 before_id = rollback_evidence.get("before_release_id")
                 target_id = rollback_evidence.get("target_release_id")
                 rollback_id = rollback_evidence.get("rollback_release_id")
                 if not before_id or not target_id or not rollback_id:
                     raise RuntimeError("rollback evidence lacks release identities")
+                if target_id != self.release_validation_session_id:
+                    raise RuntimeError("rollback evidence target is not the current attempt")
                 if before_id == target_id or rollback_id != before_id:
                     raise RuntimeError("rollback evidence does not restore the before release")
+                if rollback_evidence.get("candidate_artifact_sha256") != \
+                        self._candidate_artifact_sha256:
+                    raise RuntimeError("rollback evidence Candidate artifact hash mismatch")
+                if rollback_evidence.get("served_root_sha256") != \
+                        self._served_root_sha256:
+                    raise RuntimeError("rollback evidence Served Root hash mismatch")
                 rollback_evidence.setdefault("evidence_class", "staging_cutover" if mode == "staging" else "production_cutover")
                 rollback_evidence.setdefault("command", "run_rollback_rehearsal")
                 rollback_evidence.setdefault("exit_code", 0 if rollback_evidence.get("status") == "PASSED" else 1)

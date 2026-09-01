@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import tempfile
 import sys
@@ -62,6 +63,8 @@ RELEASE_IDENTITY_FIELDS = (
     "asset_manifest",
 )
 
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
 
 def release_identity_matches(observed, expected):
     observed = observed or {}
@@ -72,7 +75,9 @@ def release_identity_matches(observed, expected):
     )
 
 
-def run(output, revision, config_path=None, before_release=None, target_release=None):
+def run(output, revision, config_path=None, before_release=None, target_release=None,
+        release_validation_session_id=None, candidate_artifact_sha256=None,
+        served_root_sha256=None):
     config = {}
     if config_path:
         with open(config_path, "r", encoding="utf-8") as stream:
@@ -87,11 +92,36 @@ def run(output, revision, config_path=None, before_release=None, target_release=
     if not before_release or not target_release:
         raise RuntimeError("real before and target release identity artifacts are required")
     before_release_id = release_identity_id(before_release)
-    target_release_id = release_identity_id(target_release)
-    if before_release_id == target_release_id:
+    target_release_identity_id = release_identity_id(target_release)
+    if before_release_id == target_release_identity_id:
         raise RuntimeError("before and target release identities must differ")
     if str(target_release.get("commit_sha") or "") != str(revision):
         raise RuntimeError("target release commit does not match --revision")
+    attempt_id = str(
+        release_validation_session_id or
+        upgrade_config.get("release_validation_session_id") or
+        os.environ.get("COVERAGE_RELEASE_VALIDATION_SESSION_ID", "")
+    ).strip()
+    if config_path and not attempt_id:
+        raise RuntimeError(
+            "release_validation_session_id is required for configured rollback evidence"
+        )
+    candidate_artifact_sha256 = str(candidate_artifact_sha256 or "").strip()
+    served_root_sha256 = str(served_root_sha256 or "").strip()
+    if config_path and not candidate_artifact_sha256:
+        raise RuntimeError(
+            "candidate_artifact_sha256 is required for configured rollback evidence"
+        )
+    if config_path and not served_root_sha256:
+        raise RuntimeError(
+            "served_root_sha256 is required for configured rollback evidence"
+        )
+    for name, value in (
+            ("candidate_artifact_sha256", candidate_artifact_sha256),
+            ("served_root_sha256", served_root_sha256)):
+        if value and not _SHA256_RE.fullmatch(value):
+            raise RuntimeError("{} must be an exact SHA256".format(name))
+    target_release_id = attempt_id or target_release_identity_id
 
     root = tempfile.mkdtemp(prefix="coverage-rollback-rehearsal-")
     try:
@@ -176,7 +206,11 @@ def run(output, revision, config_path=None, before_release=None, target_release=
             "rollback_control": rollback_control or "not_checked",
             "before_release_id": before_release_id,
             "target_release_id": target_release_id,
+            "target_release_identity_id": target_release_identity_id,
             "rollback_release_id": rollback_release_id,
+            "release_validation_session_id": attempt_id,
+            "candidate_artifact_sha256": candidate_artifact_sha256,
+            "served_root_sha256": served_root_sha256,
             "before_release": before_release,
             "target_release": target_release,
             "authoritative_data_hash_before": (before_db or {}).get("tables", {}).get("coverage_analysis", {}).get("content_hash", "not_checked"),
@@ -201,5 +235,24 @@ if __name__ == "__main__":
     parser.add_argument("--config")
     parser.add_argument("--before-release", help="JSON artifact for the real previous release")
     parser.add_argument("--target-release", help="JSON artifact for the release being tested")
+    parser.add_argument(
+        "--release-validation-session-id",
+        default="",
+        help="immutable publication/validation attempt identity",
+    )
+    parser.add_argument(
+        "--candidate-artifact-sha256",
+        default="",
+        help="SHA256 of the immutable Candidate artifact published in this attempt",
+    )
+    parser.add_argument(
+        "--served-root-sha256",
+        default="",
+        help="SHA256 of the immutable Served Root published in this attempt",
+    )
     args = parser.parse_args()
-    run(args.output, args.revision, args.config, args.before_release, args.target_release)
+    run(
+        args.output, args.revision, args.config, args.before_release,
+        args.target_release, args.release_validation_session_id,
+        args.candidate_artifact_sha256, args.served_root_sha256,
+    )

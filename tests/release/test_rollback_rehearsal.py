@@ -1,8 +1,10 @@
+import os
+import tempfile
 import unittest
 
 from scripts.upgrade.run_rollback_rehearsal import (
     RELEASE_IDENTITY_FIELDS,
-    release_identity_matches,
+    release_identity_matches, run,
 )
 
 
@@ -33,6 +35,27 @@ class RollbackRehearsalContractTest(unittest.TestCase):
         incomplete = dict(self.identity)
         incomplete.pop("asset_hash")
         self.assertFalse(release_identity_matches(incomplete, self.identity))
+
+    def test_configured_rehearsal_requires_attempt_publication_bindings(self):
+        before = dict(self.identity)
+        before.update({
+            "commit_sha": "before",
+            "build_id": "before-build",
+        })
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "rollback.json")
+            config_path = os.path.join(directory, "config.json")
+            with open(config_path, "w", encoding="utf-8") as stream:
+                stream.write("{}")
+            with self.assertRaisesRegex(RuntimeError, "candidate_artifact_sha256"):
+                run(
+                    output,
+                    "target",
+                    config_path=config_path,
+                    before_release=before,
+                    target_release=self.identity,
+                    release_validation_session_id="attempt-target",
+                )
 
 
 if __name__ == "__main__":

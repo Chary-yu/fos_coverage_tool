@@ -478,6 +478,19 @@ class ProductionEvidenceManifest:
             unmet.append("Candidate browser URL is missing")
         if candidate_browser.get("expected_commit_sha") != revision:
             unmet.append("Candidate browser expected commit does not match release identity")
+        validation_session = self.data.get("validation_session_manifest") or {}
+        attempt_id = validation_session.get("session_id")
+        if candidate_browser.get("release_validation_session_id") != attempt_id:
+            unmet.append("Candidate browser evidence is not bound to this validation attempt")
+        file_cutover = self.data.get("file_cutover") or {}
+        expected_candidate_artifact = file_cutover.get("candidate_artifact_sha256")
+        expected_served_root = file_cutover.get("served_root_sha256")
+        if not expected_candidate_artifact or candidate_browser.get(
+                "candidate_artifact_sha256") != expected_candidate_artifact:
+            unmet.append("Candidate browser evidence is not bound to the published Candidate artifact")
+        if not expected_served_root or candidate_browser.get(
+                "served_root_sha256") != expected_served_root:
+            unmet.append("Candidate browser evidence is not bound to the immutable Served Root")
         served_identity = candidate_browser.get("served_release_identity") or {}
         if not isinstance(served_identity, dict) or \
                 served_identity.get("commit_sha") != revision:
@@ -545,6 +558,12 @@ class ProductionEvidenceManifest:
             expected_id = post_open.get("expected_release_validation_session_id")
             if not current_id or current_id != expected_id:
                 unmet.append("post_open_serving CURRENT identity is not exact")
+            if post_open.get("release_validation_session_id") != expected_id:
+                unmet.append("post_open_serving release-validation attempt is not exact")
+            if post_open.get("candidate_artifact_sha256") != expected_candidate_artifact:
+                unmet.append("post_open_serving Candidate artifact hash is not exact")
+            if post_open.get("served_root_sha256") != expected_served_root:
+                unmet.append("post_open_serving Served Root hash is not exact")
             health_check = post_open.get("health_endpoint") or {}
             health_payload = (
                 health_check.get("health")
@@ -595,6 +614,14 @@ class ProductionEvidenceManifest:
             unmet.append("Rollback evidence lacks before/target/rollback release identities")
         elif before_id == target_id or rollback_id != before_id:
             unmet.append("Rollback evidence does not restore the before release identity")
+        if rollback.get("release_validation_session_id") != validation_session.get("session_id"):
+            unmet.append("Rollback evidence is not bound to this validation attempt")
+        if target_id and target_id != validation_session.get("session_id"):
+            unmet.append("Rollback target is not the current validation attempt")
+        if rollback.get("candidate_artifact_sha256") != expected_candidate_artifact:
+            unmet.append("Rollback evidence Candidate artifact hash is not exact")
+        if rollback.get("served_root_sha256") != expected_served_root:
+            unmet.append("Rollback evidence Served Root hash is not exact")
             
         # 7. Security Audit
         sec = self.data.get("security_audit", {})
@@ -612,6 +639,12 @@ class ProductionEvidenceManifest:
             unmet.append("Performance evidence is not an immutable release baseline/candidate A/B run")
         if pb.get("candidate_commit") != revision:
             unmet.append("Performance candidate commit does not match release identity")
+        if pb.get("release_validation_session_id") != validation_session.get("session_id"):
+            unmet.append("Performance evidence is not bound to this validation attempt")
+        if pb.get("candidate_artifact_sha256") != expected_candidate_artifact:
+            unmet.append("Performance evidence Candidate artifact hash is not exact")
+        if pb.get("served_root_sha256") != expected_served_root:
+            unmet.append("Performance evidence Served Root hash is not exact")
         if pb.get("baseline_commit") == pb.get("candidate_commit"):
             unmet.append("Performance baseline and candidate commits must differ")
         source_inputs = pb.get("source_inputs_sha256")
