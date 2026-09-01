@@ -35,6 +35,14 @@ def main(argv=None):
         "--source-repo-root", default="",
         help="clean Git checkout used to verify trusted Candidate provenance",
     )
+    parser.add_argument(
+        "--trusted-build-workflow-identity", default="",
+        help="workflow identity trusted by the release operator",
+    )
+    parser.add_argument(
+        "--trusted-build-workflow-sha", default="",
+        help="exact workflow commit SHA trusted by the release operator",
+    )
     parser.add_argument("--switch", action="store_true")
     parser.add_argument("--rollback-session")
     parser.add_argument("--validate-current", action="store_true")
@@ -49,12 +57,24 @@ def main(argv=None):
             parser.error(
                 "--source-root, --release-identity and --session-id are required"
             )
+        if not args.source_repo_root:
+            parser.error(
+                "--source-repo-root is required for normal trusted-ci-build publication"
+            )
+        if not args.trusted_build_workflow_identity or \
+                not args.trusted_build_workflow_sha:
+            parser.error(
+                "--trusted-build-workflow-identity and "
+                "--trusted-build-workflow-sha are required for normal publication"
+            )
         identity = _load(args.release_identity)
         manifest = publisher.prepare(
             args.source_root, identity, args.session_id,
             api_contract_version=args.api_contract_version,
             candidate_artifact_manifest=args.candidate_artifact_manifest,
             source_repo_root=args.source_repo_root,
+            trusted_build_workflow_identity=args.trusted_build_workflow_identity,
+            trusted_build_workflow_sha=args.trusted_build_workflow_sha,
         )
         result = {
             "status": "PASSED",

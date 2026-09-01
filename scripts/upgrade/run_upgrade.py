@@ -434,6 +434,11 @@ class UpgradeOrchestrator:
         if _path_is_within(publish_root, candidate_root) or \
                 _path_is_within(candidate_root, publish_root):
             raise RuntimeError("upgrade.publish_root and candidate_root must be separate")
+        if not str(upgrade_config.get("trusted_build_workflow_identity") or "").strip() or \
+                not str(upgrade_config.get("trusted_build_workflow_sha") or "").strip():
+            raise RuntimeError(
+                "upgrade trusted build workflow identity and SHA are required"
+            )
 
         self.candidate_root = candidate_root
         self.publish_root = publish_root
@@ -1059,6 +1064,12 @@ class UpgradeOrchestrator:
                     "candidate_artifact_manifest", ""
                 ),
                 source_repo_root=self.repo_root,
+                trusted_build_workflow_identity=upgrade_config.get(
+                    "trusted_build_workflow_identity", ""
+                ),
+                trusted_build_workflow_sha=upgrade_config.get(
+                    "trusted_build_workflow_sha", ""
+                ),
             )
             switched = self.publisher.switch_current(session_id)
             if switched.get("status") != "PASSED":

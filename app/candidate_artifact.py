@@ -25,7 +25,11 @@ CANDIDATE_ARTIFACT_MANIFEST_NAME = "candidate_artifact_manifest.json"
 CANDIDATE_BUILD_ATTESTATION_VERSION = 1
 CANDIDATE_BUILD_ATTESTATION_NAME = "candidate_build_attestation.json"
 PROVENANCE_SCHEMA_VERSION = 1
-TRUSTED_PROVENANCE_CLASSES = ("trusted-ci-build", "served-root-bootstrap")
+TRUSTED_CI_PROVENANCE_CLASS = "trusted-ci-build"
+SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS = "served-root-bootstrap"
+TRUSTED_PROVENANCE_CLASSES = (
+    TRUSTED_CI_PROVENANCE_CLASS, SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS,
+)
 ARTIFACT_DIRECTORIES = ("reports", "assets", "registry")
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 _GIT_TREE_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
@@ -293,7 +297,9 @@ def build_git_source_provenance(source_repo_root, release_identity,
         "build_workflow_sha": workflow_sha,
     })
     return {
-        "provenance_class": "trusted-ci-build" if workflow_sha else "git-checkout",
+        "provenance_class": (
+            TRUSTED_CI_PROVENANCE_CLASS if workflow_sha else "git-checkout"
+        ),
         "provenance_schema_version": PROVENANCE_SCHEMA_VERSION,
         "source_commit_sha": head,
         "source_tree_sha": tree,

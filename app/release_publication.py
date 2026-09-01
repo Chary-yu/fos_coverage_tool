@@ -18,12 +18,15 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
+import threading
 import time
 
 from app.release_identity import is_valid_commit_sha
 from app.candidate_artifact import (
     CANDIDATE_ARTIFACT_MANIFEST_NAME, CandidateArtifactManifest,
+    SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS, TRUSTED_CI_PROVENANCE_CLASS,
     verify_git_source_provenance,
 )
 from app.reports.identity import (
@@ -35,6 +38,8 @@ from app.time_utils import utc_iso
 
 RELEASE_MANIFEST_SCHEMA_VERSION = 1
 REPORT_MANIFEST_SCHEMA_VERSION = 1
+VALIDATED_PUBLICATION_IDENTITY_SCHEMA_VERSION = 1
+VALIDATED_PUBLICATION_IDENTITY_NAME = "validated_publication_identity.json"
 _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _META_RE = re.compile(r"<meta\b([^>]*)>", re.IGNORECASE)
 _ATTR_RE = re.compile(
@@ -51,6 +56,9 @@ _IDENTITY_META = {
     "coverage-sidecar-schema": "sidecar_schema",
     "coverage-api-contract-version": "api_contract_version",
 }
+_PUBLICATION_IDENTITY_CACHE = {}
+_PUBLICATION_IDENTITY_CACHE_LOCK = threading.RLock()
+_PUBLICATION_IDENTITY_CACHE_LIMIT = 32
 
 
 def _real(path):
@@ -625,33 +633,8 @@ def validate_release_manifest(release_root, manifest=None, expected_session_id="
     }
 
 
-def current_publication_identity(publish_root):
-    """Read the immutable identity currently selected by ``CURRENT``.
-
-    The API release endpoint is intentionally a read-only projection of this
-    state.  A missing, malformed, or invalid CURRENT pointer produces an
-    empty result so production evidence cannot accidentally bind to values
-    supplied by the browser command line.
-    """
-    publish_root = _real(publish_root)
-    current_path = os.path.join(publish_root, "CURRENT")
-    if not os.path.islink(current_path):
-        return {}
-    release_root = _real(current_path)
-    releases_root = _real(os.path.join(publish_root, "releases"))
-    if not _inside(releases_root, release_root) or not os.path.isdir(release_root):
-        return {}
-    manifest_path = os.path.join(release_root, "release_manifest.json")
-    try:
-        manifest = _load_json(manifest_path)
-        checked = validate_release_manifest(
-            release_root, manifest,
-            expected_session_id=os.path.basename(release_root),
-        )
-    except (OSError, ValueError, TypeError):
-        return {}
-    if checked.get("status") != "PASSED":
-        return {}
+def _publication_identity_from_manifest(manifest):
+    """Project a validated release manifest to the public identity payload."""
     candidate = manifest.get("candidate_artifact_manifest") or {}
     served = manifest.get("served_root") or {}
     session_id = str(manifest.get("release_validation_session_id") or "")
@@ -662,7 +645,8 @@ def current_publication_identity(publish_root):
     served_sha = str(served.get("sha256") or "")
     if not session_id or not _SESSION_RE.fullmatch(session_id) or \
             not re.fullmatch(r"[0-9a-fA-F]{64}", candidate_sha) or \
-            not re.fullmatch(r"[0-9a-fA-F]{64}", served_sha):
+            not re.fullmatch(r"[0-9a-fA-F]{64}", served_sha) or \
+            not is_valid_commit_sha(manifest.get("commit_sha")):
         return {}
     return {
         "release_validation_session_id": session_id,
@@ -670,6 +654,196 @@ def current_publication_identity(publish_root):
         "served_root_sha256": served_sha,
         "commit_sha": str(manifest.get("commit_sha") or ""),
     }
+
+
+def _publication_manifest_cache_key(publish_root, release_root, manifest_path):
+    """Return an O(1)-sized key for a release manifest's current bytes."""
+    try:
+        file_stat = os.lstat(manifest_path)
+        if not stat.S_ISREG(file_stat.st_mode):
+            return None
+        mtime_ns = getattr(
+            file_stat, "st_mtime_ns", int(file_stat.st_mtime * 1000000000)
+        )
+        return (
+            _real(publish_root), _real(release_root), int(file_stat.st_dev),
+            int(file_stat.st_ino), int(mtime_ns), int(file_stat.st_size),
+            _sha256(manifest_path),
+        )
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _cache_publication_identity(publish_root, release_root, manifest_path,
+                                manifest=None, cache_key=None):
+    """Remember an identity only after a complete manifest validation passed."""
+    try:
+        if manifest is None:
+            manifest = _load_json(manifest_path)
+        identity = _publication_identity_from_manifest(manifest)
+        if not identity:
+            return
+        cache_key = cache_key or _publication_manifest_cache_key(
+            publish_root, release_root, manifest_path
+        )
+        if cache_key is None:
+            return
+        with _PUBLICATION_IDENTITY_CACHE_LOCK:
+            _PUBLICATION_IDENTITY_CACHE[cache_key] = dict(identity)
+            while len(_PUBLICATION_IDENTITY_CACHE) > \
+                    _PUBLICATION_IDENTITY_CACHE_LIMIT:
+                _PUBLICATION_IDENTITY_CACHE.pop(next(iter(_PUBLICATION_IDENTITY_CACHE)))
+    except (OSError, ValueError, TypeError):
+        # The full validation result remains authoritative.  A cache write
+        # failure only means a later API request will perform the safe
+        # fail-closed validation again.
+        return
+
+
+def _invalidate_publication_identity_cache(publish_root, release_root=""):
+    publish_root = _real(publish_root)
+    release_root = _real(release_root) if release_root else ""
+    with _PUBLICATION_IDENTITY_CACHE_LOCK:
+        for key in list(_PUBLICATION_IDENTITY_CACHE):
+            if key[0] == publish_root and (not release_root or key[1] == release_root):
+                del _PUBLICATION_IDENTITY_CACHE[key]
+
+
+def _read_validated_publication_identity(release_root, manifest, manifest_sha):
+    """Read the small validated-identity sidecar without scanning artifacts."""
+    sidecar_path = os.path.join(
+        release_root, VALIDATED_PUBLICATION_IDENTITY_NAME
+    )
+    try:
+        if not stat.S_ISREG(os.lstat(sidecar_path).st_mode):
+            return {}
+        sidecar = _load_json(sidecar_path)
+    except (OSError, ValueError, TypeError):
+        return {}
+    identity = sidecar.get("identity")
+    if int(sidecar.get("schema_version") or 0) != \
+            VALIDATED_PUBLICATION_IDENTITY_SCHEMA_VERSION or \
+            sidecar.get("release_root") != _real(release_root) or \
+            sidecar.get("release_manifest_sha256") != manifest_sha or \
+            not isinstance(identity, dict):
+        return {}
+    expected = _publication_identity_from_manifest(manifest)
+    if not expected or identity != expected:
+        return {}
+    return dict(identity)
+
+
+def _write_validated_publication_identity(publish_root, release_root,
+                                          manifest=None):
+    """Persist the result of a completed release validation for API readers."""
+    release_root = _real(release_root)
+    manifest_path = os.path.join(release_root, "release_manifest.json")
+    try:
+        manifest = manifest if manifest is not None else _load_json(manifest_path)
+        identity = _publication_identity_from_manifest(manifest)
+        manifest_sha = _sha256(manifest_path)
+        if not identity:
+            return
+        _json_write(
+            os.path.join(release_root, VALIDATED_PUBLICATION_IDENTITY_NAME),
+            {
+                "schema_version": VALIDATED_PUBLICATION_IDENTITY_SCHEMA_VERSION,
+                "release_root": release_root,
+                "release_manifest_sha256": manifest_sha,
+                "identity": identity,
+            },
+        )
+        _cache_publication_identity(
+            publish_root, release_root, manifest_path, manifest=manifest,
+        )
+    except (OSError, ValueError, TypeError):
+        return
+
+
+def current_publication_identity(publish_root):
+    """Read the immutable identity currently selected by ``CURRENT``.
+
+    Normal requests read only the CURRENT target, a small release manifest
+    digest, and the validated identity sidecar/cache.  If that validation
+    record is absent or no longer matches the manifest, the function performs
+    the original complete fail-closed release validation before returning an
+    identity.
+    """
+    publish_root = _real(publish_root)
+    current_path = os.path.join(publish_root, "CURRENT")
+    if not os.path.islink(current_path):
+        return {}
+    release_root = _real(current_path)
+    releases_root = _real(os.path.join(publish_root, "releases"))
+    if not _inside(releases_root, release_root) or not os.path.isdir(release_root):
+        return {}
+    manifest_path = os.path.join(release_root, "release_manifest.json")
+    cache_key = _publication_manifest_cache_key(
+        publish_root, release_root, manifest_path
+    )
+    if cache_key is None:
+        return {}
+    with _PUBLICATION_IDENTITY_CACHE_LOCK:
+        cached = _PUBLICATION_IDENTITY_CACHE.get(cache_key)
+    if cached:
+        return dict(cached)
+    try:
+        manifest = _load_json(manifest_path)
+    except (OSError, ValueError, TypeError):
+        return {}
+    manifest_sha = cache_key[-1]
+    sidecar_identity = _read_validated_publication_identity(
+        release_root, manifest, manifest_sha
+    )
+    if sidecar_identity:
+        _cache_publication_identity(
+            publish_root, release_root, manifest_path, manifest=manifest,
+            cache_key=cache_key,
+        )
+        return sidecar_identity
+    try:
+        checked = validate_release_manifest(
+            release_root, manifest,
+            expected_session_id=os.path.basename(release_root),
+        )
+    except (OSError, ValueError, TypeError):
+        return {}
+    if checked.get("status") != "PASSED":
+        return {}
+    identity = _publication_identity_from_manifest(manifest)
+    if not identity:
+        return {}
+    _write_validated_publication_identity(
+        publish_root, release_root, manifest=manifest,
+    )
+    _cache_publication_identity(
+        publish_root, release_root, manifest_path, manifest=manifest,
+        cache_key=cache_key,
+    )
+    return identity
+
+
+def _verify_trusted_build_workflow(provenance, workflow_identity,
+                                   workflow_sha):
+    """Check Candidate workflow claims against an independent trust policy."""
+    trusted_identity = str(workflow_identity or "").strip()
+    trusted_sha = str(workflow_sha or "").strip()
+    if not trusted_identity or not trusted_sha:
+        raise ValueError(
+            "trusted build workflow identity and SHA are required"
+        )
+    if not is_valid_commit_sha(trusted_sha):
+        raise ValueError("trusted build workflow SHA is not an exact commit SHA")
+    if str(provenance.get("build_workflow_identity") or "").strip() != \
+            trusted_identity:
+        raise ValueError(
+            "Candidate build workflow identity does not match trusted build identity"
+        )
+    if str(provenance.get("build_workflow_sha") or "").lower() != \
+            trusted_sha.lower():
+        raise ValueError(
+            "Candidate build workflow SHA does not match trusted build identity"
+        )
 
 
 class ImmutableReleasePublisher(object):
@@ -687,7 +861,52 @@ class ImmutableReleasePublisher(object):
 
     def prepare(self, source_root, release_identity, session_id,
                 api_contract_version="", candidate_sha="",
-                candidate_artifact_manifest="", source_repo_root=""):
+                candidate_artifact_manifest="", source_repo_root="",
+                trusted_build_workflow_identity="",
+                trusted_build_workflow_sha=""):
+        """Prepare a Candidate produced by a verified trusted CI checkout.
+
+        ``source_repo_root`` is deliberately mandatory for this generic
+        publisher.  A Candidate manifest can describe bytes and provenance,
+        but it cannot establish its own trust root.  The publisher therefore
+        re-computes the source provenance from the supplied clean Git checkout
+        before it creates an immutable release.
+        """
+        return self._prepare(
+            source_root, release_identity, session_id,
+            api_contract_version=api_contract_version,
+            candidate_sha=candidate_sha,
+            candidate_artifact_manifest=candidate_artifact_manifest,
+            source_repo_root=source_repo_root,
+            trusted_build_workflow_identity=trusted_build_workflow_identity,
+            trusted_build_workflow_sha=trusted_build_workflow_sha,
+            allow_bootstrap=False,
+        )
+
+    def prepare_bootstrap(self, source_root, release_identity, session_id,
+                          api_contract_version="", candidate_sha="",
+                          candidate_artifact_manifest=""):
+        """Prepare an explicitly adopted legacy Served Root baseline.
+
+        Bootstrap provenance is intentionally reachable only through this
+        dedicated API.  Normal Candidate publication must never be able to
+        turn a ``served-root-bootstrap`` assertion into a release.
+        """
+        return self._prepare(
+            source_root, release_identity, session_id,
+            api_contract_version=api_contract_version,
+            candidate_sha=candidate_sha,
+            candidate_artifact_manifest=candidate_artifact_manifest,
+            source_repo_root="",
+            allow_bootstrap=True,
+        )
+
+    def _prepare(self, source_root, release_identity, session_id,
+                 api_contract_version="", candidate_sha="",
+                 candidate_artifact_manifest="", source_repo_root="",
+                 trusted_build_workflow_identity="",
+                 trusted_build_workflow_sha="",
+                 allow_bootstrap=False):
         session_id = _validate_session_id(session_id)
         final_root = self.release_path(session_id)
         if os.path.lexists(final_root):
@@ -704,10 +923,29 @@ class ImmutableReleasePublisher(object):
             manifest_path=candidate_manifest_path,
             require_trusted_provenance=True,
         )
-        if source_repo_root:
+        provenance = verified_candidate_manifest.get("source_provenance") or {}
+        provenance_class = str(provenance.get("provenance_class") or "")
+        if allow_bootstrap:
+            if provenance_class != SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS:
+                raise ValueError(
+                    "bootstrap publisher requires served-root-bootstrap provenance"
+                )
+        else:
+            if provenance_class != TRUSTED_CI_PROVENANCE_CLASS:
+                raise ValueError(
+                    "generic publisher accepts trusted-ci-build provenance only"
+                )
+            if not source_repo_root:
+                raise ValueError(
+                    "source_repo_root is required for trusted-ci-build publication"
+                )
+            _verify_trusted_build_workflow(
+                provenance, trusted_build_workflow_identity,
+                trusted_build_workflow_sha,
+            )
             verify_git_source_provenance(
                 source_repo_root, release_identity,
-                verified_candidate_manifest.get("source_provenance") or {},
+                provenance,
             )
         staging = tempfile.mkdtemp(prefix=".release-{}-".format(session_id),
                                    dir=self.releases_root)
@@ -728,10 +966,21 @@ class ImmutableReleasePublisher(object):
                         CANDIDATE_ARTIFACT_MANIFEST_NAME).replace("/", os.sep),
                 ), require_trusted_provenance=True,
             )
-            if source_repo_root:
+            copied_provenance = copied_candidate_manifest.get("source_provenance") or {}
+            if allow_bootstrap:
+                if str(copied_provenance.get("provenance_class") or "") != \
+                        SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS:
+                    raise ValueError(
+                        "copied Candidate is not a served-root-bootstrap artifact"
+                    )
+            else:
+                _verify_trusted_build_workflow(
+                    copied_provenance, trusted_build_workflow_identity,
+                    trusted_build_workflow_sha,
+                )
                 verify_git_source_provenance(
                     source_repo_root, release_identity,
-                    copied_candidate_manifest.get("source_provenance") or {},
+                    copied_provenance,
                 )
             if copied_candidate_manifest.get("artifact_sha256") != \
                     verified_candidate_manifest.get("artifact_sha256"):
@@ -761,6 +1010,9 @@ class ImmutableReleasePublisher(object):
                 raise RuntimeError("prepared release failed validation: {}".format(
                     "; ".join(checked["violations"])
                 ))
+            _write_validated_publication_identity(
+                self.publish_root, final_root, manifest=manifest,
+            )
             return manifest
         finally:
             if staging and os.path.isdir(staging):
@@ -779,6 +1031,7 @@ class ImmutableReleasePublisher(object):
         target = self.release_path(session_id)
         checked = validate_release_manifest(target, expected_session_id=session_id)
         if checked["status"] != "PASSED":
+            _invalidate_publication_identity_cache(self.publish_root, target)
             raise RuntimeError("cannot publish invalid release: {}".format(
                 "; ".join(checked["violations"])
             ))
@@ -795,6 +1048,7 @@ class ImmutableReleasePublisher(object):
                 os.remove(temporary)
             except OSError:
                 pass
+        _write_validated_publication_identity(self.publish_root, target)
         return {
             "status": "PASSED",
             "release_validation_session_id": session_id,
@@ -805,9 +1059,17 @@ class ImmutableReleasePublisher(object):
         session_id = self.current_session_id()
         if not session_id:
             return {"status": "FAILED", "violations": ["CURRENT is not a valid release pointer"]}
-        return validate_release_manifest(
-            self.release_path(session_id), expected_session_id=session_id
+        release_root = self.release_path(session_id)
+        result = validate_release_manifest(
+            release_root, expected_session_id=session_id
         )
+        if result.get("status") == "PASSED":
+            _write_validated_publication_identity(
+                self.publish_root, release_root,
+            )
+        else:
+            _invalidate_publication_identity_cache(self.publish_root, release_root)
+        return result
 
     def rollback(self, session_id):
         # Rollback uses the same validation and atomic pointer operation as a

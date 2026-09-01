@@ -283,6 +283,21 @@ python3 scripts/release/build_candidate_artifact_manifest.py \
   --build-workflow-sha "$BUILD_WORKFLOW_SHA"
 ```
 
+正式发布还必须从受信发布配置提供独立的 workflow trust policy；该策略不能从
+Candidate manifest 自身推导：
+
+```bash
+python3 scripts/release/publish_release.py \
+  ... \
+  --source-repo-root /srv/fos-coverage/source-checkout \
+  --trusted-build-workflow-identity github-actions/candidate-build \
+  --trusted-build-workflow-sha "$TRUSTED_BUILD_WORKFLOW_SHA"
+```
+
+普通 Publisher 会重新验证 clean Git checkout，并要求 Candidate 的 workflow identity
+和 SHA 与这两个独立策略值完全一致；`served-root-bootstrap` 只能由
+`bootstrap_previous_release.py` 的专用 API 使用。
+
 `ImmutableReleasePublisher` 只接受 trusted provenance class/version，并重新核对
 attestation、Candidate 文件清单和（正式 upgrade 中）source checkout；
 `test-fixture` 或缺少 source/build provenance 的 manifest 不能发布。Publisher 不再

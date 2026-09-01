@@ -187,7 +187,7 @@ def bootstrap(served_root, publish_root, release_identity_path, session_id,
                 ),
             },
         )
-        prepared = publisher.prepare(
+        prepared = publisher.prepare_bootstrap(
             build_root, expected, session_id,
             api_contract_version=api_contract_version,
         )

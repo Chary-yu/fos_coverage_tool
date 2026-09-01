@@ -3,6 +3,9 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
+
+import app.release_publication as release_publication
 
 from app.candidate_artifact import (
     CandidateArtifactManifest, build_git_source_provenance,
@@ -13,6 +16,7 @@ from app.release_publication import (
     normalize_candidate_artifact,
     validate_release_manifest,
 )
+from scripts.release.publish_release import main as publish_release_main
 
 
 class ImmutableReleasePublicationTest(unittest.TestCase):
@@ -57,9 +61,9 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
         normalize_candidate_artifact(source)
         CandidateArtifactManifest.build(
             source, identity,
-            source_provenance=self._trusted_fixture_provenance(identity),
+            source_provenance=self._bootstrap_fixture_provenance(identity),
         )
-        return publisher.prepare(source, identity, session_id, **kwargs)
+        return publisher.prepare_bootstrap(source, identity, session_id, **kwargs)
 
     @staticmethod
     def _trusted_fixture_provenance(identity):
@@ -75,6 +79,14 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             "source_manifest_sha256": "1" * 64,
             "build_input_manifest_sha256": "2" * 64,
         }
+
+    @staticmethod
+    def _bootstrap_fixture_provenance(identity):
+        provenance = ImmutableReleasePublicationTest._trusted_fixture_provenance(
+            identity
+        )
+        provenance["provenance_class"] = "served-root-bootstrap"
+        return provenance
 
     def test_prepare_switch_validate_and_rollback_are_atomic(self):
         with tempfile.TemporaryDirectory(prefix="release-publication-") as root:
@@ -111,6 +123,30 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 publication["served_root_sha256"], manifest["served_root"]["sha256"]
             )
             self.assertEqual(publication["commit_sha"], identity["commit_sha"])
+
+    def test_release_endpoint_reads_validated_identity_without_rescanning_artifacts(self):
+        with tempfile.TemporaryDirectory(prefix="release-publication-cache-") as root:
+            source = os.path.join(root, "source")
+            os.makedirs(source)
+            self._source(source)
+            publish_root = os.path.join(root, "publish")
+            publisher = ImmutableReleasePublisher(publish_root)
+            self._prepare(
+                publisher, source,
+                {"commit_sha": "7" * 40, "build_id": "candidate-7"},
+                "cached-session",
+            )
+            publisher.switch_current("cached-session")
+            self.assertTrue(os.path.isfile(os.path.join(
+                publisher.release_path("cached-session"),
+                release_publication.VALIDATED_PUBLICATION_IDENTITY_NAME,
+            )))
+            release_publication._PUBLICATION_IDENTITY_CACHE.clear()
+            with mock.patch.object(
+                    release_publication, "validate_release_manifest",
+                    side_effect=AssertionError("unexpected full release scan")):
+                identity = current_publication_identity(publish_root)
+            self.assertEqual(identity["commit_sha"], "7" * 40)
 
     def test_vnext_report_missing_sidecar_fails_closed(self):
         with tempfile.TemporaryDirectory(prefix="release-publication-invalid-") as root:
@@ -159,14 +195,14 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             identity = {"commit_sha": "9" * 40, "build_id": "candidate-9"}
             CandidateArtifactManifest.build(
                 source, identity,
-                source_provenance=self._trusted_fixture_provenance(identity),
+                source_provenance=self._bootstrap_fixture_provenance(identity),
             )
             source_html_path = os.path.join(source, "reports", "index.html")
             with open(source_html_path, "rb") as stream:
                 before = stream.read()
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
             with self.assertRaisesRegex(ValueError, "explicit report mode"):
-                publisher.prepare(source, identity, "no-normalize-session")
+                publisher.prepare_bootstrap(source, identity, "no-normalize-session")
             with open(source_html_path, "rb") as stream:
                 self.assertEqual(stream.read(), before)
 
@@ -190,7 +226,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             identity = {"commit_sha": "e" * 40, "build_id": "candidate-e"}
             CandidateArtifactManifest.build(
                 source, identity,
-                source_provenance=self._trusted_fixture_provenance(identity),
+                source_provenance=self._bootstrap_fixture_provenance(identity),
             )
             nested = os.path.join(source, "assets", "nested-link")
             outside = os.path.join(root, "outside")
@@ -203,7 +239,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 self.skipTest("symbolic links are unavailable in this environment")
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
             with self.assertRaisesRegex(ValueError, "symlink"):
-                publisher.prepare(source, identity, "nested-symlink-session")
+                publisher.prepare_bootstrap(source, identity, "nested-symlink-session")
 
     def test_nested_published_symlink_fails_current_validation(self):
         with tempfile.TemporaryDirectory(prefix="release-publication-published-link-") as root:
@@ -240,13 +276,13 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             identity = {"commit_sha": "1" * 40, "build_id": "candidate-1"}
             CandidateArtifactManifest.build(
                 source, identity,
-                source_provenance=self._trusted_fixture_provenance(identity),
+                source_provenance=self._bootstrap_fixture_provenance(identity),
             )
             with open(os.path.join(source, "assets", "coverage.js"), "a") as stream:
                 stream.write("\ntampered\n")
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
             with self.assertRaisesRegex(ValueError, "candidate_root"):
-                publisher.prepare(source, identity, "tampered-session")
+                publisher.prepare_bootstrap(source, identity, "tampered-session")
 
     def test_candidate_manifest_requires_source_provenance(self):
         with tempfile.TemporaryDirectory(prefix="release-publication-provenance-") as root:
@@ -273,6 +309,58 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 ImmutableReleasePublisher(os.path.join(root, "publish")).prepare(
                     source, identity, "untrusted-session"
                 )
+
+    def test_trusted_ci_publish_requires_source_checkout(self):
+        with tempfile.TemporaryDirectory(prefix="release-missing-source-root-") as root:
+            source = os.path.join(root, "source")
+            self._source(source)
+            identity = {"commit_sha": "5" * 40, "build_id": "candidate-5"}
+            CandidateArtifactManifest.build(
+                source, identity,
+                source_provenance=self._trusted_fixture_provenance(identity),
+            )
+            publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
+            with self.assertRaisesRegex(ValueError, "source_repo_root is required"):
+                publisher.prepare(source, identity, "missing-source-root-session")
+
+    def test_bootstrap_provenance_cannot_use_generic_publisher(self):
+        with tempfile.TemporaryDirectory(prefix="release-bootstrap-boundary-") as root:
+            source = os.path.join(root, "source")
+            self._source(source)
+            identity = {"commit_sha": "6" * 40, "build_id": "candidate-6"}
+            CandidateArtifactManifest.build(
+                source, identity,
+                source_provenance=self._bootstrap_fixture_provenance(identity),
+            )
+            publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
+            with self.assertRaisesRegex(ValueError, "trusted-ci-build"):
+                publisher.prepare(
+                    source, identity, "bootstrap-generic-session",
+                    source_repo_root=root,
+                )
+
+    def test_bootstrap_provenance_cannot_use_normal_publish_cli(self):
+        with tempfile.TemporaryDirectory(prefix="release-bootstrap-cli-boundary-") as root:
+            source = os.path.join(root, "source")
+            self._source(source)
+            identity = {"commit_sha": "8" * 40, "build_id": "candidate-8"}
+            CandidateArtifactManifest.build(
+                source, identity,
+                source_provenance=self._bootstrap_fixture_provenance(identity),
+            )
+            identity_path = os.path.join(root, "identity.json")
+            with open(identity_path, "w", encoding="utf-8") as stream:
+                json.dump(identity, stream)
+            with self.assertRaisesRegex(ValueError, "trusted-ci-build"):
+                publish_release_main([
+                    "--publish-root", os.path.join(root, "publish"),
+                    "--source-root", source,
+                    "--release-identity", identity_path,
+                    "--session-id", "bootstrap-cli-session",
+                    "--source-repo-root", root,
+                    "--trusted-build-workflow-identity", "trusted-ci",
+                    "--trusted-build-workflow-sha", "f" * 40,
+                ])
 
     def test_git_provenance_uses_source_tree_manifest_and_attestation(self):
         with tempfile.TemporaryDirectory(prefix="release-source-attestation-") as root:
@@ -318,8 +406,17 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 candidate, "candidate_build_attestation.json"
             )))
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
+            with self.assertRaisesRegex(ValueError, "workflow SHA"):
+                publisher.prepare(
+                    candidate, identity, "workflow-mismatch-session",
+                    source_repo_root=source_repo,
+                    trusted_build_workflow_identity="trusted-ci",
+                    trusted_build_workflow_sha="e" * 40,
+                )
             prepared = publisher.prepare(
-                candidate, identity, "attested-session", source_repo_root=source_repo
+                candidate, identity, "attested-session", source_repo_root=source_repo,
+                trusted_build_workflow_identity="trusted-ci",
+                trusted_build_workflow_sha="f" * 40,
             )
             self.assertEqual(
                 prepared["release_validation_session_id"], "attested-session"
@@ -332,7 +429,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             identity = {"commit_sha": "4" * 40, "build_id": "candidate-4"}
             CandidateArtifactManifest.build(
                 source, identity,
-                source_provenance=self._trusted_fixture_provenance(identity),
+                source_provenance=self._bootstrap_fixture_provenance(identity),
             )
             attestation_path = os.path.join(source, "candidate_build_attestation.json")
             with open(attestation_path, "r", encoding="utf-8") as stream:
@@ -341,7 +438,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             with open(attestation_path, "w", encoding="utf-8") as stream:
                 json.dump(attestation, stream, sort_keys=True)
             with self.assertRaisesRegex(ValueError, "attestation"):
-                ImmutableReleasePublisher(os.path.join(root, "publish")).prepare(
+                ImmutableReleasePublisher(os.path.join(root, "publish")).prepare_bootstrap(
                     source, identity, "attestation-tamper-session"
                 )
 
