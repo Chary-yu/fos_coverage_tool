@@ -71,19 +71,29 @@ def _get_or_create_session(manifest_path, session_id, candidate_sha,
 def start(config_path, pid_path, endpoint, session_manifest="",
           session_id="", candidate_sha="", baseline_sha="",
           allow_non_loopback=False, allowlist=None, temporary_token="",
-          expires_at=""):
+          expires_at="", serving=False):
     host, port = _load_server_binding(config_path)
+    session_prefix = "COVERAGE_SERVING" if serving else "COVERAGE_VALIDATION"
+    fallback_prefix = "COVERAGE_VALIDATION" if serving else "COVERAGE_SERVING"
     session_manifest = session_manifest or os.environ.get(
-        "COVERAGE_VALIDATION_SESSION_MANIFEST", ""
+        session_prefix + "_SESSION_MANIFEST", ""
+    ) or os.environ.get(
+        fallback_prefix + "_SESSION_MANIFEST", ""
     ) or (pid_path + ".session.json")
     session_id = session_id or os.environ.get(
-        "COVERAGE_VALIDATION_SESSION_ID", ""
+        session_prefix + "_SESSION_ID", ""
+    ) or os.environ.get(
+        fallback_prefix + "_SESSION_ID", ""
     )
     candidate_sha = candidate_sha or os.environ.get(
-        "COVERAGE_VALIDATION_CANDIDATE_SHA", ""
+        session_prefix + "_CANDIDATE_SHA", ""
+    ) or os.environ.get(
+        fallback_prefix + "_CANDIDATE_SHA", ""
     )
     baseline_sha = baseline_sha or os.environ.get(
-        "COVERAGE_VALIDATION_BASELINE_SHA", ""
+        session_prefix + "_BASELINE_SHA", ""
+    ) or os.environ.get(
+        fallback_prefix + "_BASELINE_SHA", ""
     )
     session = _get_or_create_session(
         session_manifest, session_id, candidate_sha, baseline_sha,
@@ -131,12 +141,18 @@ def start(config_path, pid_path, endpoint, session_manifest="",
     raise RuntimeError("staging API did not become ready; see {}".format(log_path))
 
 
-def stop(pid_path, session_manifest="", evidence_path=""):
+def stop(pid_path, session_manifest="", evidence_path="", serving=False):
+    session_prefix = "COVERAGE_SERVING" if serving else "COVERAGE_VALIDATION"
+    fallback_prefix = "COVERAGE_VALIDATION" if serving else "COVERAGE_SERVING"
     session_manifest = session_manifest or os.environ.get(
-        "COVERAGE_VALIDATION_SESSION_MANIFEST", ""
+        session_prefix + "_SESSION_MANIFEST", ""
+    ) or os.environ.get(
+        fallback_prefix + "_SESSION_MANIFEST", ""
     ) or (pid_path + ".session.json")
     evidence_path = evidence_path or os.environ.get(
-        "COVERAGE_VALIDATION_TEARDOWN_EVIDENCE", ""
+        session_prefix + "_TEARDOWN_EVIDENCE", ""
+    ) or os.environ.get(
+        fallback_prefix + "_TEARDOWN_EVIDENCE", ""
     )
     if os.path.isfile(session_manifest):
         session = ValidationSession.load(session_manifest)
@@ -156,6 +172,7 @@ def stop(pid_path, session_manifest="", evidence_path=""):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("action", choices=("start", "stop", "freeze", "drain", "open"))
+    parser.add_argument("--serving", action="store_true")
     parser.add_argument("--config", required=True)
     parser.add_argument("--pid-file", required=True)
     parser.add_argument("--endpoint", default="http://127.0.0.1:19528/api/coverage/release")
@@ -180,9 +197,10 @@ def main():
             allowlist=args.allowlist,
             temporary_token=args.temporary_token,
             expires_at=args.expires_at,
+            serving=args.serving,
         )
     elif args.action == "stop":
-        result = stop(args.pid_file, args.session_manifest, args.evidence)
+        result = stop(args.pid_file, args.session_manifest, args.evidence, serving=args.serving)
         if result and result.get("status") != "PASSED":
             raise SystemExit(1)
     # freeze/open are enforced by the shared marker in UpgradeLifecycle;

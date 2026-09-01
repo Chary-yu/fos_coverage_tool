@@ -251,6 +251,9 @@ class UpgradeOrchestrator:
         self.validation_session = None
         self.validation_session_manifest_path = ""
         self.validation_teardown_evidence_path = ""
+        self.serving_session_manifest_path = ""
+        self.serving_teardown_evidence_path = ""
+        self.serving_session_id = ""
         self.previous_published_session_id = ""
         self._target_identity = {}
         self._upgrade_mode = ""
@@ -452,6 +455,42 @@ class UpgradeOrchestrator:
         self._validation_teardown_result = result
         return result
 
+    def _activate_final_serving_session(self):
+        """Bind the final serving process to a session separate from validation."""
+        if self.validation_session is None:
+            raise RuntimeError("validation session is required before final serving")
+        validation_id = str(self.validation_session.data.get("session_id") or "")
+        if not validation_id:
+            raise RuntimeError("validation session identity is missing")
+        serving_id = "serving-{}".format(validation_id)
+        if len(serving_id) > 128:
+            serving_id = "serving-{}".format(
+                hashlib.sha256(validation_id.encode("utf-8")).hexdigest()
+            )
+        serving_manifest = self.validation_session_manifest_path + ".serving.json"
+        serving_teardown = self.validation_teardown_evidence_path + ".serving.json"
+        if os.path.lexists(serving_manifest):
+            raise RuntimeError(
+                "final serving session manifest already exists: {}".format(
+                    serving_manifest
+                )
+            )
+        self.serving_session_id = serving_id
+        self.serving_session_manifest_path = serving_manifest
+        self.serving_teardown_evidence_path = serving_teardown
+        # local_staging_control consumes the serving namespace in preference
+        # to the validation namespace.  Production supervisors may ignore
+        # these values, but the lifecycle command remains explicitly distinct.
+        os.environ["COVERAGE_SERVING_SESSION_MANIFEST"] = serving_manifest
+        os.environ["COVERAGE_SERVING_SESSION_ID"] = serving_id
+        os.environ["COVERAGE_SERVING_CANDIDATE_SHA"] = str(
+            self.validation_session.data.get("candidate_sha") or ""
+        )
+        os.environ["COVERAGE_SERVING_BASELINE_SHA"] = str(
+            self.validation_session.data.get("baseline_sha") or ""
+        )
+        os.environ["COVERAGE_SERVING_TEARDOWN_EVIDENCE"] = serving_teardown
+
     def log(self, msg: str):
         print(f"[{time.strftime('%H:%M:%S')}] {msg}")
         self.logs.append(msg)
@@ -515,6 +554,59 @@ class UpgradeOrchestrator:
             "status": "PASSED", "evidence_class": "staging_cutover",
             "endpoint": endpoint, "release": actual,
             "command": "GET {}".format(endpoint), "exit_code": 0,
+        }
+
+    def _verify_health_endpoint(self, endpoint: str) -> Dict[str, Any]:
+        if not endpoint:
+            raise RuntimeError("upgrade.health_endpoint is required")
+        with urllib.request.urlopen(endpoint, timeout=10) as response:
+            status = int(getattr(response, "status", 200))
+            payload = json.loads(response.read().decode("utf-8"))
+        if status != 200:
+            raise RuntimeError("health endpoint returned HTTP {}".format(status))
+        if not isinstance(payload, dict) or payload.get("status") not in (
+                "ok", "healthy", "PASSED"):
+            raise RuntimeError("health endpoint did not report a healthy runtime")
+        return {
+            "status": "PASSED", "evidence_class": "staging_cutover",
+            "endpoint": endpoint, "health": payload,
+            "command": "GET {}".format(endpoint), "exit_code": 0,
+        }
+
+    def _verify_post_open_serving(self, identity: Dict[str, Any]) -> Dict[str, Any]:
+        """Verify the process serving traffic after the traffic switch."""
+        upgrade_config = ((self._runtime_config or {}).get("upgrade") or {})
+        release_endpoint = upgrade_config.get("release_endpoint")
+        health_endpoint = upgrade_config.get("health_endpoint")
+        release = self._verify_release_endpoint(release_endpoint, identity)
+        health = self._verify_health_endpoint(health_endpoint)
+        if self.publisher is None or self.validation_session is None:
+            raise RuntimeError("immutable publisher and validation session are required")
+        current = self.publisher.validate_current()
+        if current.get("status") != "PASSED":
+            raise RuntimeError(
+                "CURRENT failed post-open validation: {}".format(
+                    "; ".join(current.get("violations") or [])
+                )
+            )
+        expected_session = self.validation_session.data.get("session_id")
+        if current.get("commit_sha") != identity.get("commit_sha"):
+            raise RuntimeError("post-open CURRENT commit does not match target release")
+        if current.get("release_validation_session_id") != expected_session:
+            raise RuntimeError("post-open CURRENT session does not match target release")
+        return {
+            "status": "PASSED",
+            "revision": identity.get("commit_sha"),
+            "evidence_class": "staging_cutover" if self._upgrade_mode == "staging" else "production_cutover",
+            "process_role": "production_serving",
+            "release_endpoint": release,
+            "health_endpoint": health,
+            "served_root": current.get("served_root"),
+            "current_release_validation_session_id": current.get("release_validation_session_id"),
+            "expected_release_validation_session_id": expected_session,
+            "publisher_current_validation": current,
+            "command": "GET release + GET health + ImmutableReleasePublisher.validate_current",
+            "exit_code": 0,
         }
 
     def execute_upgrade(self, dry_run: bool = False, connection=None, db_config=None,
@@ -763,6 +855,7 @@ class UpgradeOrchestrator:
             start_evidence.update({
                 "revision": identity.get("commit_sha"),
                 "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
+                "process_role": "validation_candidate",
             })
             self.manifest.record("api_start", start_evidence)
             endpoint = ((runtime_config or {}).get("upgrade") or {}).get("release_endpoint")
@@ -1033,9 +1126,40 @@ class UpgradeOrchestrator:
             self.log("❌ Release NOT_READY: validation session teardown is incomplete.")
             return self._fail(lifecycle, "Validation session teardown failed")
 
+        # The validation candidate is now gone by construction.  Start the
+        # final serving process under a different session/command so a later
+        # validation teardown can never kill the process that will receive
+        # production traffic.
+        lifecycle.api_started = False
+        try:
+            self._activate_final_serving_session()
+            serving_start = lifecycle.start_serving_api()
+            serving_start.update({
+                "revision": identity.get("commit_sha"),
+                "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
+                "process_role": "production_serving",
+                "serving_session_id": self.serving_session_id,
+                "serving_session_manifest": self.serving_session_manifest_path,
+            })
+            # api_start and release_endpoint represent the process that will
+            # be served, rather than the already-torn-down validation process.
+            self.manifest.record("api_start", serving_start)
+            endpoint = ((runtime_config or {}).get("upgrade") or {}).get("release_endpoint")
+            endpoint_evidence = self._verify_release_endpoint(endpoint, identity)
+            endpoint_evidence.update({
+                "revision": identity.get("commit_sha"),
+                "process_role": "production_serving",
+            })
+            self.manifest.record("release_endpoint", endpoint_evidence)
+        except Exception as exc:
+            self.log("❌ Final serving API verification failed: {}".format(exc))
+            return self._fail(lifecycle, "Final serving API verification failed")
+
         # Step 10: Validate Final Production Release Governance Gate
         self.log("[Step 10/10] Validating Production Release Governance Gate...")
-        gate_passed, unmet = self.manifest.validate_final_gate(require_traffic_open=False)
+        gate_passed, unmet = self.manifest.validate_final_gate(
+            require_traffic_open=False, require_post_open_serving=False
+        )
         if not gate_passed:
             return self._fail(lifecycle, f"Final gate unmet: {unmet}")
 
@@ -1046,11 +1170,27 @@ class UpgradeOrchestrator:
                 "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
             })
             self.manifest.record("traffic_open", open_evidence)
-            final_open_gate, open_unmet = self.manifest.validate_final_gate(require_traffic_open=True)
+            post_open = self._verify_post_open_serving(identity)
+            self.manifest.record("post_open_serving", post_open)
+            final_open_gate, open_unmet = self.manifest.validate_final_gate(
+                require_traffic_open=True, require_post_open_serving=True
+            )
             if not final_open_gate:
                 self.log("❌ Post-open evidence gate failed: {}".format(open_unmet))
                 return self._fail(lifecycle, "Post-open evidence gate failed")
+            finalized = lifecycle.finalize_traffic_open()
+            open_evidence["finalize"] = finalized
+            self.manifest.record("traffic_open", open_evidence)
         except Exception as exc:
+            self.manifest.record("post_open_serving", {
+                "status": "FAILED",
+                "revision": identity.get("commit_sha"),
+                "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
+                "process_role": "production_serving",
+                "command": "GET release + GET health + ImmutableReleasePublisher.validate_current",
+                "exit_code": 1,
+                "violations": [str(exc)],
+            })
             self.log("❌ Traffic open failed; keeping writes frozen: {}".format(exc))
             return self._fail(lifecycle, "Traffic open failed")
 

@@ -35,7 +35,7 @@ _REQUIRED_EVIDENCE_SECTIONS = (
     "security_audit", "traffic_freeze", "job_drain", "api_stop",
     "api_start", "release_endpoint", "file_cutover",
     "validation_session_manifest", "validation_teardown", "traffic_open",
-    "rollback_evidence",
+    "post_open_serving", "rollback_evidence",
 )
 
 EVIDENCE_MANIFEST_V2_FILENAME = "evidence-manifest-v2.json"
@@ -345,6 +345,7 @@ class ProductionEvidenceManifest:
             "performance_benchmark": {},
             "validation_session_manifest": {},
             "validation_teardown": {},
+            "post_open_serving": {},
             "logs": []
         }
 
@@ -383,12 +384,15 @@ class ProductionEvidenceManifest:
             json.dump(self.data, f, indent=2, ensure_ascii=False)
         os.replace(temp_path, self.manifest_path)
 
-    def validate_final_gate(self, require_traffic_open: bool = True) -> Tuple[bool, List[str]]:
+    def validate_final_gate(self, require_traffic_open: bool = True,
+                            require_post_open_serving: Optional[bool] = None) -> Tuple[bool, List[str]]:
         """
         Validate all strict production gates to prevent false UPGRADE_SUCCESS certifications.
         Returns (is_passed, list_of_unmet_requirements).
         """
         unmet = []
+        if require_post_open_serving is None:
+            require_post_open_serving = require_traffic_open
         
         # 1. Release Identity
         rel = self.data.get("release_identity", {})
@@ -400,6 +404,10 @@ class ProductionEvidenceManifest:
         # revision.  A green boolean without provenance is not release proof.
         matrix_sections = _MATRIX_SECTIONS
         for section in _REQUIRED_EVIDENCE_SECTIONS:
+            if section == "traffic_open" and not require_traffic_open:
+                continue
+            if section == "post_open_serving" and not require_post_open_serving:
+                continue
             payload = self.data.get(section, {})
             if payload.get("status") in ("SKIPPED", "UNAVAILABLE"):
                 unmet.append("{} evidence is {}".format(section, payload.get("status")))
@@ -421,6 +429,8 @@ class ProductionEvidenceManifest:
         provenance_sections = _REQUIRED_EVIDENCE_SECTIONS
         for section in provenance_sections:
             if section == "traffic_open" and not require_traffic_open:
+                continue
+            if section == "post_open_serving" and not require_post_open_serving:
                 continue
             payload = self.data.get(section) or {}
             if not isinstance(payload, dict):
@@ -481,6 +491,37 @@ class ProductionEvidenceManifest:
                 unmet.append("{} lifecycle evidence is not PASSED".format(section))
         if require_traffic_open and (self.data.get("traffic_open") or {}).get("status") != "PASSED":
             unmet.append("traffic_open lifecycle evidence is not PASSED")
+
+        # The process that was validated before teardown is not sufficient
+        # proof of the process serving traffic after the switch.  Require a
+        # fresh release/health probe and an exact immutable CURRENT identity.
+        if require_post_open_serving:
+            post_open = self.data.get("post_open_serving") or {}
+            if post_open.get("status") != "PASSED":
+                unmet.append("post_open_serving lifecycle evidence is not PASSED")
+            if post_open.get("process_role") != "production_serving":
+                unmet.append("post_open_serving must describe the production serving process")
+            release_check = post_open.get("release_endpoint") or {}
+            release_identity = (
+                release_check.get("release")
+                if isinstance(release_check, dict) else {}
+            )
+            if not isinstance(release_identity, dict) or \
+                    release_identity.get("commit_sha") != revision:
+                unmet.append("post_open_serving release identity does not match the target")
+            current_id = post_open.get("current_release_validation_session_id")
+            expected_id = post_open.get("expected_release_validation_session_id")
+            if not current_id or current_id != expected_id:
+                unmet.append("post_open_serving CURRENT identity is not exact")
+            health_check = post_open.get("health_endpoint") or {}
+            health_payload = (
+                health_check.get("health")
+                if isinstance(health_check, dict) else {}
+            )
+            if health_check.get("status") != "PASSED" or \
+                    not isinstance(health_payload, dict) or \
+                    health_payload.get("status") not in ("ok", "healthy", "PASSED"):
+                unmet.append("post_open_serving health check is not healthy")
 
         # Validation processes are owned resources, not an operator reminder.
         # The manifest and its teardown record must describe the same exact

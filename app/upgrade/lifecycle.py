@@ -41,12 +41,14 @@ class UpgradeLifecycle:
         self.marker = freeze_marker_path(self.repo_root, self.config)
         self.active = False
         self.api_started = False
+        self.serving_api_started = False
+        self.traffic_opened = False
         self.previous_release = dict(previous_release or {})
 
     def _commands(self) -> Dict[str, Any]:
         return dict((self.config.get("upgrade") or {}).get("commands") or {})
 
-    def _run_command(self, name: str) -> Dict[str, Any]:
+    def _run_command(self, name: str, clear_control_session: bool = False) -> Dict[str, Any]:
         command = self._commands().get(name)
         if not command:
             raise RuntimeError("upgrade lifecycle command '{}' is not configured".format(name))
@@ -54,8 +56,23 @@ class UpgradeLifecycle:
         if not argv or any(not isinstance(part, str) for part in argv):
             raise RuntimeError("upgrade lifecycle command '{}' is invalid".format(name))
         started = time.time()
+        command_env = dict(os.environ)
+        if clear_control_session:
+            for key in (
+                    "COVERAGE_VALIDATION_SESSION_MANIFEST",
+                    "COVERAGE_VALIDATION_SESSION_ID",
+                    "COVERAGE_VALIDATION_CANDIDATE_SHA",
+                    "COVERAGE_VALIDATION_BASELINE_SHA",
+                    "COVERAGE_VALIDATION_TEARDOWN_EVIDENCE",
+                    "COVERAGE_SERVING_SESSION_MANIFEST",
+                    "COVERAGE_SERVING_SESSION_ID",
+                    "COVERAGE_SERVING_CANDIDATE_SHA",
+                    "COVERAGE_SERVING_BASELINE_SHA",
+                    "COVERAGE_SERVING_TEARDOWN_EVIDENCE",
+            ):
+                command_env.pop(key, None)
         result = subprocess.run(argv, cwd=self.repo_root, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, check=False)
+                                stderr=subprocess.PIPE, check=False, env=command_env)
         return {
             "name": name,
             "command": argv,
@@ -122,23 +139,60 @@ class UpgradeLifecycle:
             raise RuntimeError("start_api failed")
         return result
 
+    def start_serving_api(self) -> Dict[str, Any]:
+        """Start the final serving process outside the validation session."""
+        self.serving_api_started = True
+        result = self._run_command("start_serving_api")
+        if result["status"] != "PASSED":
+            raise RuntimeError("start_serving_api failed")
+        return result
+
     def open_traffic(self) -> Dict[str, Any]:
         result = self._run_command("open_traffic")
         if result["status"] != "PASSED":
             raise RuntimeError("open_traffic failed")
+        # The traffic command may make the release externally reachable, but
+        # the upgrade remains rollback-capable until the post-open liveness,
+        # exact release identity and health checks pass.  The caller must
+        # explicitly finalize the open after that gate.
+        self.traffic_opened = True
+        return result
+
+    def finalize_traffic_open(self) -> Dict[str, Any]:
+        """Commit a traffic open only after all post-open gates pass."""
+        if not self.traffic_opened:
+            raise RuntimeError("traffic has not been opened")
         self.active = False
-        self.api_started = False
         try:
             os.remove(self.marker)
         except FileNotFoundError:
             pass
-        return result
+        return {
+            "status": "PASSED",
+            "evidence_class": "staging_cutover" if self.mode == "staging" else "production_cutover",
+            "command": "UpgradeLifecycle.finalize_traffic_open",
+            "exit_code": 0,
+        }
 
     def abort(self) -> Dict[str, Any]:
         evidence_class = "staging_cutover" if self.mode == "staging" else "production_cutover"
         results = []
         # Keep the marker in place while candidate is stopped and the previous
         # release is restored; removing it first would create a write window.
+        if self.traffic_opened:
+            freeze_result = self._run_command("freeze_traffic")
+            results.append(freeze_result)
+            if freeze_result["status"] != "PASSED":
+                raise RuntimeError("traffic re-freeze failed during rollback")
+            self.traffic_opened = False
+
+        if self.serving_api_started:
+            stop_serving_result = self._run_command("stop_serving_api")
+            results.append(stop_serving_result)
+            if stop_serving_result["status"] != "PASSED":
+                raise RuntimeError("final serving API stop failed during rollback")
+            self.serving_api_started = False
+
         if self.api_started:
             stop_result = self._run_command("stop_api")
             results.append(stop_result)
@@ -148,7 +202,7 @@ class UpgradeLifecycle:
 
         if not self._commands().get("start_previous_api"):
             raise RuntimeError("upgrade lifecycle command 'start_previous_api' is not configured")
-        previous_result = self._run_command("start_previous_api")
+        previous_result = self._run_command("start_previous_api", clear_control_session=True)
         results.append(previous_result)
         if previous_result["status"] != "PASSED":
             raise RuntimeError("previous API start failed during rollback")

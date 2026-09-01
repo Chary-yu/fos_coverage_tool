@@ -34,9 +34,18 @@ def audit(repo_root=ROOT):
         violations.append("Candidate previous_release_endpoint is missing")
     elif upgrade.get("previous_release_endpoint") == upgrade.get("release_endpoint"):
         violations.append("Candidate previous_release_endpoint must differ from release_endpoint")
+    if not upgrade.get("health_endpoint"):
+        violations.append("Candidate health_endpoint is missing")
     commands = upgrade.get("commands") or {}
     if commands.get("start_previous_api") == commands.get("start_api"):
         violations.append("start_previous_api must not reuse the Candidate start command")
+    for command_name in ("start_serving_api", "stop_serving_api"):
+        if not commands.get(command_name):
+            violations.append("{} must be configured for the final serving process".format(command_name))
+    if commands.get("start_serving_api") == commands.get("start_api"):
+        violations.append("start_serving_api must be a distinct lifecycle command")
+    if commands.get("stop_serving_api") == commands.get("stop_api"):
+        violations.append("stop_serving_api must be a distinct lifecycle command")
     for field in (
             "candidate_root", "publish_root", "validation_session_manifest",
             "validation_teardown_evidence_path"):
@@ -78,6 +87,7 @@ def audit(repo_root=ROOT):
         "candidate_database": (candidate.get("mysql") or {}).get("database"),
         "candidate_port": (candidate.get("server") or {}).get("port"),
         "candidate_release_endpoint": upgrade.get("release_endpoint", ""),
+        "candidate_health_endpoint": upgrade.get("health_endpoint", ""),
         "candidate_previous_release_endpoint": upgrade.get("previous_release_endpoint", ""),
         "candidate_root": candidate_root,
         "candidate_publish_root": publish_root,
