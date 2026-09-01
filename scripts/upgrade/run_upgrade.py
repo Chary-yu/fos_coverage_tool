@@ -27,6 +27,7 @@ import re
 import urllib.request
 import shutil
 import tempfile
+import uuid
 from typing import Dict, Any, List, Tuple, Optional
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
@@ -72,6 +73,32 @@ def _resolve_upgrade_path(repo_root: str, configured: Optional[str], field: str)
     if not os.path.isabs(value):
         value = os.path.join(repo_root, value)
     return os.path.realpath(os.path.abspath(value))
+
+
+def _new_release_validation_session_id(commit_sha: str,
+                                       configured: Optional[str] = None) -> str:
+    """Return a unique validation attempt identity for one Candidate SHA."""
+    explicit = str(configured or "").strip()
+    if explicit:
+        return explicit
+    return "candidate-{}-{}".format(
+        str(commit_sha or "").strip(), uuid.uuid4().hex[:16]
+    )
+
+
+def _resolve_attempt_path(repo_root: str, configured: Optional[str], field: str,
+                          attempt_id: str) -> str:
+    """Resolve an evidence path without reusing a previous attempt file."""
+    if not configured:
+        raise RuntimeError("upgrade.{} is required".format(field))
+    raw = str(configured)
+    if "{attempt_id}" in raw:
+        raw = raw.replace("{attempt_id}", str(attempt_id))
+    resolved = _resolve_upgrade_path(repo_root, raw, field)
+    if not os.path.lexists(resolved):
+        return resolved
+    stem, extension = os.path.splitext(resolved)
+    return os.path.realpath("{}.{}{}".format(stem, attempt_id, extension))
 
 
 def resolve_backup_root(repo_root: str, configured_root: Optional[str] = None) -> str:
@@ -341,6 +368,7 @@ class UpgradeOrchestrator:
         self.serving_session_manifest_path = ""
         self.serving_teardown_evidence_path = ""
         self.serving_session_id = ""
+        self.release_validation_session_id = ""
         self.previous_published_session_id = ""
         self._target_identity = {}
         self._upgrade_mode = ""
@@ -397,36 +425,41 @@ class UpgradeOrchestrator:
         if not self.previous_published_session_id:
             raise RuntimeError("CURRENT release-validation session identity is missing")
 
-        self.validation_session_manifest_path = _resolve_upgrade_path(
+        session_id = _new_release_validation_session_id(
+            identity.get("commit_sha"),
+            upgrade_config.get("release_validation_session_id") or
+            upgrade_config.get("validation_session_id"),
+        ).strip()
+        try:
+            self.publisher.release_path(session_id)
+        except ValueError as exc:
+            raise RuntimeError("validation session id is invalid: {}".format(exc))
+        self.release_validation_session_id = session_id
+
+        self.validation_session_manifest_path = _resolve_attempt_path(
             self.repo_root,
             upgrade_config.get("validation_session_manifest"),
             "validation_session_manifest",
+            session_id,
         )
         configured_teardown = upgrade_config.get("validation_teardown_evidence_path")
-        self.validation_teardown_evidence_path = _resolve_upgrade_path(
+        teardown_config = configured_teardown or (
+            self.validation_session_manifest_path + ".teardown.json"
+        )
+        self.validation_teardown_evidence_path = _resolve_attempt_path(
             self.repo_root,
-            configured_teardown or (
-                self.validation_session_manifest_path + ".teardown.json"
-            ),
+            teardown_config,
             "validation_teardown_evidence_path",
+            session_id,
         )
         if self.validation_teardown_evidence_path == self.validation_session_manifest_path:
             raise RuntimeError(
                 "validation teardown evidence must not overwrite the session manifest"
             )
 
-        session_id = str(
-            upgrade_config.get("validation_session_id") or
-            "candidate-{}".format(identity.get("commit_sha"))
-        ).strip()
-        try:
-            self.publisher.release_path(session_id)
-        except ValueError as exc:
-            raise RuntimeError("validation session id is invalid: {}".format(exc))
         if os.path.isfile(self.validation_session_manifest_path):
             session = ValidationSession.load(self.validation_session_manifest_path)
-            if upgrade_config.get("validation_session_id") and \
-                    session.data.get("session_id") != session_id:
+            if session.data.get("session_id") != session_id:
                 raise RuntimeError("validation session id does not match manifest")
         else:
             server = runtime_config.get("server") or {}

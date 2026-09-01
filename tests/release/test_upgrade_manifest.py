@@ -11,7 +11,10 @@ if ROOT not in sys.path:
 
 from scripts.upgrade.build_deployment_manifest import build
 from scripts.upgrade.cutover_controller import CutoverController
-from scripts.upgrade.run_upgrade import _validate_candidate_browser_evidence
+from scripts.upgrade.run_upgrade import (
+    _new_release_validation_session_id, _resolve_attempt_path,
+    _validate_candidate_browser_evidence,
+)
 
 
 class TestUpgradeManifest(unittest.TestCase):
@@ -135,6 +138,31 @@ class TestUpgradeManifest(unittest.TestCase):
         self.assertTrue(normalized["real_http"])
         self.assertTrue(normalized["chromium"])
         self.assertEqual(normalized["browser_artifact_sha256"], artifact_sha)
+
+    def test_same_candidate_sha_gets_independent_attempt_ids_and_paths(self):
+        revision = "a" * 40
+        first = _new_release_validation_session_id(revision)
+        second = _new_release_validation_session_id(revision)
+        self.assertNotEqual(first, second)
+        self.assertTrue(first.startswith("candidate-{}-".format(revision)))
+        self.assertTrue(second.startswith("candidate-{}-".format(revision)))
+        self.assertEqual(
+            _new_release_validation_session_id(revision, "operator-attempt"),
+            "operator-attempt",
+        )
+        with tempfile.TemporaryDirectory() as root:
+            path = _resolve_attempt_path(
+                root, "state/session-{attempt_id}.json",
+                "validation_session_manifest", first,
+            )
+            self.assertIn(first, path)
+            self.assertNotEqual(
+                path,
+                _resolve_attempt_path(
+                    root, "state/session-{attempt_id}.json",
+                    "validation_session_manifest", second,
+                ),
+            )
 
 
 if __name__ == "__main__":

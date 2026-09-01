@@ -71,6 +71,10 @@ def audit(repo_root=ROOT):
             violations.append("candidate_artifact_manifest must be inside candidate_root")
     session_manifest = str(upgrade.get("validation_session_manifest") or "")
     teardown_evidence = str(upgrade.get("validation_teardown_evidence_path") or "")
+    if session_manifest and "{attempt_id}" not in session_manifest:
+        violations.append("validation_session_manifest must be attempt-scoped with {attempt_id}")
+    if teardown_evidence and "{attempt_id}" not in teardown_evidence:
+        violations.append("validation_teardown_evidence_path must be attempt-scoped with {attempt_id}")
     if session_manifest and teardown_evidence:
         session_path = session_manifest if os.path.isabs(session_manifest) else os.path.join(repo_root, session_manifest)
         teardown_path = teardown_evidence if os.path.isabs(teardown_evidence) else os.path.join(repo_root, teardown_evidence)
@@ -104,6 +108,10 @@ def audit(repo_root=ROOT):
         "candidate_publish_root": publish_root,
         "validation_session_manifest": upgrade.get("validation_session_manifest", ""),
         "validation_teardown_evidence_path": upgrade.get("validation_teardown_evidence_path", ""),
+        "attempt_scoped_validation_paths": bool(
+            "{attempt_id}" in session_manifest and
+            "{attempt_id}" in teardown_evidence
+        ),
         "validation_ports": list(validation_ports),
         "rollback_command_distinct": commands.get("start_previous_api") != commands.get("start_api"),
         "violations": violations,

@@ -223,6 +223,12 @@ python3 scripts/release/bootstrap_previous_release.py \
 identity 缺失/不匹配或 artifact hash 失败都会拒绝操作；bootstrap 不属于普通升级
 路径。
 
+同一 Candidate 重试时不要复用旧的 validation session。`run_upgrade.py` 默认生成
+`candidate-<commit-sha>-<attempt-uuid>`，并将 validation session 与 teardown evidence
+写入按 `{attempt_id}` 分隔的路径；旧 attempt 即使已 rollback/teardown，也不会阻塞
+同一 SHA 的新 attempt。只有在审计明确要求时才使用配置中的
+`release_validation_session_id` 固定该次尝试身份。
+
 ## Gate F：切换、回滚和 48 小时窗口
 
 正式切换前重新生成 fresh inventory，至少覆盖 process/service、release identity、Current/Candidate roots、DB fingerprint、schema/table counts、jobs、磁盘公式、Nginx/auth boundary 和 backup location。再执行 freeze → final backup → Candidate rehearsal → traffic-closed verification → cutover → forced rollback rehearsal，并保留完整 before/target/rollback release identity。
