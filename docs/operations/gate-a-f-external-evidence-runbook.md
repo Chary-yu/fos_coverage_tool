@@ -202,6 +202,27 @@ fixture/browser evidence。
 served release identity、真实 HTTP、Chromium、artifact SHA 和
 `synthetic=false`，否则 Final Gate 保持 `NOT_READY`。
 
+## 首次接管：建立 immutable previous baseline
+
+尚未建立合法 `publish_root/CURRENT` 的旧环境必须先执行一次显式 bootstrap；正常
+`run_upgrade.py` 不会在缺少 `CURRENT` 时偷偷创建基线。先从实际 Served Root
+取得完整 release identity JSON（不是仓库 checkout 的猜测值），再执行：
+
+```bash
+python3 scripts/release/bootstrap_previous_release.py \
+  --served-root /srv/fos-coverage/current \
+  --publish-root /srv/fos-coverage/published \
+  --release-identity /secure/evidence/current-release-identity.json \
+  --served-identity /secure/evidence/current-release-identity.json \
+  --session-id previous-<exact-commit-sha> \
+  --switch
+```
+
+工具会读取并核对 Served Root、重新计算 reports/assets/registry 及完整文件清单，
+生成并验证 immutable previous release，然后原子创建 `CURRENT`。已有 `CURRENT`、
+identity 缺失/不匹配或 artifact hash 失败都会拒绝操作；bootstrap 不属于普通升级
+路径。
+
 ## Gate F：切换、回滚和 48 小时窗口
 
 正式切换前重新生成 fresh inventory，至少覆盖 process/service、release identity、Current/Candidate roots、DB fingerprint、schema/table counts、jobs、磁盘公式、Nginx/auth boundary 和 backup location。再执行 freeze → final backup → Candidate rehearsal → traffic-closed verification → cutover → forced rollback rehearsal，并保留完整 before/target/rollback release identity。

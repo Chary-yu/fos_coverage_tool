@@ -77,6 +77,7 @@ def audit_canonical_ownership(repo_root: str) -> Dict[str, Any]:
         "app/candidate_artifact.py",
         "app/release_publication.py",
         "scripts/release/build_candidate_artifact_manifest.py",
+        "scripts/release/bootstrap_previous_release.py",
         "scripts/upgrade/validation_session.py",
     ]
     missing_modules = [

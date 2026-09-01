@@ -81,6 +81,7 @@ SKILL_CAPABILITIES = {
             "app/candidate_artifact.py",
             "app/release_publication.py",
             "scripts/release/build_candidate_artifact_manifest.py",
+            "scripts/release/bootstrap_previous_release.py",
             "scripts/release/publish_release.py",
             "scripts/upgrade/validation_session.py",
             "scripts/upgrade/local_staging_control.py",
