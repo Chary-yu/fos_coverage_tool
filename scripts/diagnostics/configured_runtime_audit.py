@@ -9,6 +9,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from app.config.runtime_config import load_application_config
+from app.release_identity import is_valid_commit_sha
 
 try:
     from scripts.diagnostics.contract import with_contract
@@ -30,6 +31,22 @@ def audit(repo_root=ROOT):
     if int((candidate.get("server") or {}).get("port") or 0) != 19528:
         violations.append("Candidate server port is not 19528")
     upgrade = candidate.get("upgrade") or {}
+    trusted_workflow_identity = str(
+        upgrade.get("trusted_build_workflow_identity") or ""
+    ).strip()
+    trusted_workflow_sha = str(
+        upgrade.get("trusted_build_workflow_sha") or ""
+    ).strip()
+    if not trusted_workflow_identity:
+        violations.append("Candidate trusted_build_workflow_identity is missing")
+    if not trusted_workflow_sha:
+        violations.append("Candidate trusted_build_workflow_sha is missing")
+    elif "REPLACE_WITH" in trusted_workflow_sha.upper():
+        violations.append("Candidate trusted_build_workflow_sha is still a placeholder")
+    elif not is_valid_commit_sha(trusted_workflow_sha):
+        violations.append(
+            "Candidate trusted_build_workflow_sha must be an exact commit SHA"
+        )
     if not upgrade.get("previous_release_endpoint"):
         violations.append("Candidate previous_release_endpoint is missing")
     elif upgrade.get("previous_release_endpoint") == upgrade.get("release_endpoint"):
@@ -121,6 +138,8 @@ def audit(repo_root=ROOT):
         "candidate_release_endpoint": upgrade.get("release_endpoint", ""),
         "candidate_health_endpoint": upgrade.get("health_endpoint", ""),
         "candidate_previous_release_endpoint": upgrade.get("previous_release_endpoint", ""),
+        "trusted_build_workflow_identity": trusted_workflow_identity,
+        "trusted_build_workflow_sha": trusted_workflow_sha,
         "candidate_root": candidate_root,
         "candidate_artifact_manifest": candidate_artifact_manifest,
         "candidate_publish_root": publish_root,

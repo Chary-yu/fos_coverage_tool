@@ -34,8 +34,12 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from app.release_identity import verify_release_identity
+from app.release_identity import is_valid_commit_sha, verify_release_identity
 from app.release_publication import ImmutableReleasePublisher
+from app.candidate_artifact import (
+    CANDIDATE_ARTIFACT_MANIFEST_NAME, CandidateArtifactManifest,
+    verify_git_source_provenance, verify_trusted_build_policy,
+)
 from scripts.diagnostics.data_hash_gate import capture_database_snapshot, verify_data_integrity
 from scripts.upgrade.evidence_manifest import ProductionEvidenceManifest
 from scripts.upgrade.schema_preflight import (
@@ -101,6 +105,77 @@ def _resolve_attempt_path(repo_root: str, configured: Optional[str], field: str,
     return os.path.realpath("{}.{}{}".format(stem, attempt_id, extension))
 
 
+def _resolve_candidate_manifest_path(repo_root: str, candidate_root: str,
+                                     configured: Optional[str]) -> str:
+    """Resolve a Candidate manifest relative to its configured owner.
+
+    Existing staging configurations express the manifest relative to the
+    repository while some operators provide a path relative to candidate_root.
+    Prefer the repository-relative path when it exists and let the manifest
+    verifier enforce that the final path remains inside candidate_root.
+    """
+    if not configured:
+        return os.path.join(candidate_root, CANDIDATE_ARTIFACT_MANIFEST_NAME)
+    configured = str(configured)
+    if os.path.isabs(configured):
+        return os.path.realpath(configured)
+    repo_relative = os.path.realpath(os.path.join(repo_root, configured))
+    if os.path.isfile(repo_relative):
+        return repo_relative
+    return os.path.realpath(os.path.join(candidate_root, configured))
+
+
+def validate_candidate_publication_preflight(
+        repo_root: str, candidate_root: str, release_identity: Dict[str, Any],
+        candidate_manifest_path: Optional[str], trusted_workflow_identity: str,
+        trusted_workflow_sha: str) -> Dict[str, Any]:
+    """Verify all candidate/source/trust inputs before maintenance begins."""
+    trusted_workflow_identity = str(trusted_workflow_identity or "").strip()
+    trusted_workflow_sha = str(trusted_workflow_sha or "").strip()
+    if not trusted_workflow_identity or not trusted_workflow_sha:
+        raise RuntimeError(
+            "trusted build workflow identity and SHA are required"
+        )
+    if "REPLACE_WITH" in trusted_workflow_sha.upper():
+        raise RuntimeError(
+            "trusted_build_workflow_sha is still a placeholder"
+        )
+    if not is_valid_commit_sha(trusted_workflow_sha):
+        raise RuntimeError(
+            "trusted_build_workflow_sha must be an exact commit SHA"
+        )
+    candidate_root = os.path.realpath(os.path.abspath(candidate_root))
+    manifest_path = _resolve_candidate_manifest_path(
+        os.path.realpath(os.path.abspath(repo_root)), candidate_root,
+        candidate_manifest_path,
+    )
+    if not os.path.isfile(manifest_path):
+        raise RuntimeError(
+            "candidate artifact manifest is missing: {}".format(manifest_path)
+        )
+    manifest = CandidateArtifactManifest.verify(
+        candidate_root, release_identity,
+        candidate_sha=release_identity.get("commit_sha"),
+        manifest_path=manifest_path,
+        require_trusted_provenance=True,
+    )
+    provenance = verify_trusted_build_policy(
+        manifest.get("source_provenance") or {},
+        trusted_workflow_identity, trusted_workflow_sha,
+    )
+    observed_source = verify_git_source_provenance(
+        repo_root, release_identity, provenance,
+    )
+    return {
+        "status": "PASSED",
+        "candidate_root": candidate_root,
+        "candidate_manifest_path": manifest_path,
+        "candidate_artifact_sha256": manifest.get("artifact_sha256"),
+        "source_commit_sha": observed_source.get("source_commit_sha"),
+        "source_tree_sha": observed_source.get("source_tree_sha"),
+        "build_workflow_identity": trusted_workflow_identity,
+        "build_workflow_sha": trusted_workflow_sha,
+    }
 def resolve_backup_root(repo_root: str, configured_root: Optional[str] = None) -> str:
     """Resolve a recoverable backup root outside the active deployment tree."""
     raw = configured_root or os.environ.get("COVERAGE_BACKUP_ROOT")
@@ -395,6 +470,7 @@ class UpgradeOrchestrator:
         self.candidate_browser_evidence_path = ""
         self.rollback_evidence_path = ""
         self.performance_evidence_path = ""
+        self.candidate_preflight = {}
         self._candidate_artifact_sha256 = ""
         self._served_root_sha256 = ""
         self._target_identity = {}
@@ -434,11 +510,17 @@ class UpgradeOrchestrator:
         if _path_is_within(publish_root, candidate_root) or \
                 _path_is_within(candidate_root, publish_root):
             raise RuntimeError("upgrade.publish_root and candidate_root must be separate")
-        if not str(upgrade_config.get("trusted_build_workflow_identity") or "").strip() or \
-                not str(upgrade_config.get("trusted_build_workflow_sha") or "").strip():
-            raise RuntimeError(
-                "upgrade trusted build workflow identity and SHA are required"
-            )
+        trusted_workflow_identity = str(
+            upgrade_config.get("trusted_build_workflow_identity") or ""
+        ).strip()
+        trusted_workflow_sha = str(
+            upgrade_config.get("trusted_build_workflow_sha") or ""
+        ).strip()
+        self.candidate_preflight = validate_candidate_publication_preflight(
+            self.repo_root, candidate_root, identity,
+            upgrade_config.get("candidate_artifact_manifest", ""),
+            trusted_workflow_identity, trusted_workflow_sha,
+        )
 
         self.candidate_root = candidate_root
         self.publish_root = publish_root

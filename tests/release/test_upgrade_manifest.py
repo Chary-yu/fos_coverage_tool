@@ -14,10 +14,28 @@ from scripts.upgrade.cutover_controller import CutoverController
 from scripts.upgrade.run_upgrade import (
     _new_release_validation_session_id, _resolve_attempt_path,
     _validate_candidate_browser_evidence,
+    validate_candidate_publication_preflight,
 )
 
 
 class TestUpgradeManifest(unittest.TestCase):
+    def test_candidate_preflight_rejects_workflow_sha_placeholder_before_maintenance(self):
+        with self.assertRaisesRegex(RuntimeError, "still a placeholder"):
+            validate_candidate_publication_preflight(
+                os.getcwd(), os.path.join(os.getcwd(), "missing-candidate"),
+                {"commit_sha": "a" * 40}, "", "github-actions/candidate-build",
+                "REPLACE_WITH_TRUSTED_BUILD_WORKFLOW_COMMIT_SHA",
+            )
+
+    def test_candidate_preflight_rejects_missing_manifest_before_maintenance(self):
+        with tempfile.TemporaryDirectory(prefix="candidate-preflight-") as root:
+            with self.assertRaisesRegex(RuntimeError, "candidate artifact manifest is missing"):
+                validate_candidate_publication_preflight(
+                    os.getcwd(), root,
+                    {"commit_sha": "a" * 40}, "", "github-actions/candidate-build",
+                    "b" * 40,
+                )
+
     def test_production_upgrade_uses_immutable_publication_only(self):
         with open(
                 os.path.join(ROOT, "scripts", "upgrade", "run_upgrade.py"),

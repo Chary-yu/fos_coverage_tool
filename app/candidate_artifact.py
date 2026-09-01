@@ -250,6 +250,34 @@ def _source_provenance(value, require_artifact_sha=False,
     return provenance
 
 
+def verify_trusted_build_policy(provenance, workflow_identity, workflow_sha):
+    """Verify a Candidate against an independently supplied CI trust policy."""
+    normalized = _source_provenance(provenance, require_trusted=True)
+    if normalized.get("provenance_class") != TRUSTED_CI_PROVENANCE_CLASS:
+        raise ValueError(
+            "trusted build policy accepts trusted-ci-build provenance only"
+        )
+    expected_identity = str(workflow_identity or "").strip()
+    expected_sha = str(workflow_sha or "").strip()
+    if not expected_identity or not expected_sha:
+        raise ValueError(
+            "trusted build workflow identity and SHA are required"
+        )
+    if not is_valid_commit_sha(expected_sha):
+        raise ValueError("trusted build workflow SHA is not an exact commit SHA")
+    if str(normalized.get("build_workflow_identity") or "").strip() != \
+            expected_identity:
+        raise ValueError(
+            "Candidate build workflow identity does not match trusted build identity"
+        )
+    if str(normalized.get("build_workflow_sha") or "").lower() != \
+            expected_sha.lower():
+        raise ValueError(
+            "Candidate build workflow SHA does not match trusted build identity"
+        )
+    return normalized
+
+
 def build_git_source_provenance(source_repo_root, release_identity,
                                 build_workflow_identity, build_workflow_run_id="",
                                 build_workflow_sha=""):

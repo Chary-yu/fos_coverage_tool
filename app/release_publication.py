@@ -27,7 +27,7 @@ from app.release_identity import is_valid_commit_sha
 from app.candidate_artifact import (
     CANDIDATE_ARTIFACT_MANIFEST_NAME, CandidateArtifactManifest,
     SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS, TRUSTED_CI_PROVENANCE_CLASS,
-    verify_git_source_provenance,
+    verify_git_source_provenance, verify_trusted_build_policy,
 )
 from app.reports.identity import (
     LEGACY_STATIC, SUPPORTED_SIDECAR_SCHEMA_VERSIONS, VNEXT_ARTIFACT_READY,
@@ -870,24 +870,9 @@ def current_publication_identity(publish_root):
 def _verify_trusted_build_workflow(provenance, workflow_identity,
                                    workflow_sha):
     """Check Candidate workflow claims against an independent trust policy."""
-    trusted_identity = str(workflow_identity or "").strip()
-    trusted_sha = str(workflow_sha or "").strip()
-    if not trusted_identity or not trusted_sha:
-        raise ValueError(
-            "trusted build workflow identity and SHA are required"
-        )
-    if not is_valid_commit_sha(trusted_sha):
-        raise ValueError("trusted build workflow SHA is not an exact commit SHA")
-    if str(provenance.get("build_workflow_identity") or "").strip() != \
-            trusted_identity:
-        raise ValueError(
-            "Candidate build workflow identity does not match trusted build identity"
-        )
-    if str(provenance.get("build_workflow_sha") or "").lower() != \
-            trusted_sha.lower():
-        raise ValueError(
-            "Candidate build workflow SHA does not match trusted build identity"
-        )
+    return verify_trusted_build_policy(
+        provenance, workflow_identity, workflow_sha
+    )
 
 
 class ImmutableReleasePublisher(object):
