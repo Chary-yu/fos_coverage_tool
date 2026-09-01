@@ -56,6 +56,7 @@ on:
       - 'package-lock.json'
       - '.github/workflows/ci.yml'
       - '.github/workflows/trusted-candidate-builder.yml'
+      - '.github/workflows/trusted-production-candidate-builder.yml'
   push:
     paths:
       - '**.py'
@@ -72,6 +73,7 @@ on:
       - 'package-lock.json'
       - '.github/workflows/ci.yml'
       - '.github/workflows/trusted-candidate-builder.yml'
+      - '.github/workflows/trusted-production-candidate-builder.yml'
 
 permissions:
   contents: read

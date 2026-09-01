@@ -1,0 +1,215 @@
+name: Trusted Production Candidate Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact application source commit to build
+        required: true
+        type: string
+      builder_workflow_sha:
+        description: Immutable commit containing this production builder workflow
+        required: true
+        type: string
+      served_root:
+        description: Absolute path to the real FOS_V6R2 Served Root on the protected runner
+        required: true
+        type: string
+      attestation_repository:
+        description: Repository allowed to verify the production Candidate attestation
+        required: true
+        default: Chary-yu/fos_coverage_tool
+        type: string
+    secrets:
+      COVERAGE_BUILD_PROVENANCE_HMAC_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and attest exact production Candidate artifact
+    runs-on: [self-hosted, coverage-production-builder]
+    environment: trusted-production-candidate-build
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      BUILD_WORKFLOW_IDENTITY: github-actions/trusted-production-candidate-builder
+      BUILD_WORKFLOW_RUN_ID: ${{ github.run_id }}
+      BUILD_WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+      BUILD_WORKFLOW_SHA: ${{ inputs.builder_workflow_sha }}
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      SERVED_ROOT: ${{ inputs.served_root }}
+      ATTESTATION_REPOSITORY: ${{ inputs.attestation_repository }}
+      COVERAGE_BUILD_PROVENANCE_HMAC_KEY: ${{ secrets.COVERAGE_BUILD_PROVENANCE_HMAC_KEY }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout exact application source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          path: source
+
+      - name: Checkout immutable production builder workflow revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.builder_workflow_sha }}
+          fetch-depth: 0
+          path: builder
+
+      - name: Set up builder Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify exact source and production builder checkouts
+        run: |
+          set -eu
+          test -n "$SOURCE_SHA"
+          test "$(git -C "$GITHUB_WORKSPACE/source" rev-parse HEAD)" = "$SOURCE_SHA"
+          test -z "$(git -C "$GITHUB_WORKSPACE/source" status --porcelain --untracked-files=all)"
+          test -n "$BUILD_WORKFLOW_SHA"
+          test "${#BUILD_WORKFLOW_SHA}" = 40
+          test "$(git -C "$GITHUB_WORKSPACE/builder" rev-parse HEAD)" = "$BUILD_WORKFLOW_SHA"
+          test -z "$(git -C "$GITHUB_WORKSPACE/builder" status --porcelain --untracked-files=all)"
+          test -f "$GITHUB_WORKSPACE/builder/.github/workflows/trusted-production-candidate-builder.yml"
+          test -n "$BUILD_WORKFLOW_RUN_ID"
+          test -n "$BUILD_WORKFLOW_RUN_ATTEMPT"
+          test -n "$SERVED_ROOT"
+          test -d "$SERVED_ROOT"
+
+      - name: Build production Candidate from real Served Root
+        run: |
+          set -o pipefail
+          test -n "$COVERAGE_BUILD_PROVENANCE_HMAC_KEY"
+          mkdir -p "$GITHUB_WORKSPACE/.artifacts/production-candidate"
+          python "$GITHUB_WORKSPACE/builder/scripts/release/build_production_candidate_artifact.py" \
+            --served-root "$SERVED_ROOT" \
+            --source-repo-root "$GITHUB_WORKSPACE/source" \
+            --production-candidate-root "$GITHUB_WORKSPACE/.artifacts/production-candidate/candidate" \
+            --release-identity-output "$GITHUB_WORKSPACE/.artifacts/production-candidate/release_identity.json" \
+            --build-workflow-identity "$BUILD_WORKFLOW_IDENTITY" \
+            --build-workflow-run-id "$BUILD_WORKFLOW_RUN_ID" \
+            --build-workflow-run-attempt "$BUILD_WORKFLOW_RUN_ATTEMPT" \
+            --build-workflow-sha "$BUILD_WORKFLOW_SHA" \
+            | tee "$GITHUB_WORKSPACE/.artifacts/production-candidate/build.json"
+
+      - name: Verify production publication role and real project content
+        run: |
+          set -eu
+          PYTHONPATH="$GITHUB_WORKSPACE/builder" python - <<'PY'
+          import json
+          import os
+
+          from app.candidate_artifact import (
+              CandidateArtifactManifest, PRODUCTION_PROJECT_NAME,
+              PRODUCTION_RELEASE_ARTIFACT_ROLE,
+          )
+          from app.release_publication import validate_production_candidate_content
+
+          root = '.artifacts/production-candidate/candidate'
+          with open('.artifacts/production-candidate/release_identity.json') as stream:
+              identity = json.load(stream)
+          manifest = CandidateArtifactManifest.verify(
+              root, identity, candidate_sha=identity['commit_sha'],
+              require_trusted_provenance=True,
+              expected_artifact_role=PRODUCTION_RELEASE_ARTIFACT_ROLE,
+              expected_project_name=PRODUCTION_PROJECT_NAME,
+              require_production_publishable=True,
+          )
+          validate_production_candidate_content(root, PRODUCTION_PROJECT_NAME)
+          assert manifest['artifact_role'] == 'production_release'
+          assert manifest['production_publishable'] is True
+          assert manifest['project_name'] == 'FOS_V6R2'
+          PY
+
+      - name: Create GitHub artifact attestation for production manifest
+        id: production_attestation
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: .artifacts/production-candidate/candidate/candidate_artifact_manifest.json
+
+      - name: Persist external production attestation bundle
+        run: |
+          set -eu
+          test -n "${{ steps.production_attestation.outputs.bundle-path }}"
+          test -s "${{ steps.production_attestation.outputs.bundle-path }}"
+          cp "${{ steps.production_attestation.outputs.bundle-path }}" \
+            "$GITHUB_WORKSPACE/.artifacts/production-candidate/candidate_build_attestation.bundle.json"
+
+      - name: Sign protected production Candidate receipt
+        run: |
+          set -o pipefail
+          python "$GITHUB_WORKSPACE/builder/scripts/release/sign_candidate_build_receipt.py" \
+            --candidate-root "$GITHUB_WORKSPACE/.artifacts/production-candidate/candidate" \
+            --release-identity "$GITHUB_WORKSPACE/.artifacts/production-candidate/release_identity.json" \
+            --source-repo-root "$GITHUB_WORKSPACE/source" \
+            --build-workflow-identity "$BUILD_WORKFLOW_IDENTITY" \
+            --build-workflow-run-id "$BUILD_WORKFLOW_RUN_ID" \
+            --build-workflow-run-attempt "$BUILD_WORKFLOW_RUN_ATTEMPT" \
+            --build-workflow-sha "$BUILD_WORKFLOW_SHA" \
+            --attestation-bundle "$GITHUB_WORKSPACE/.artifacts/production-candidate/candidate_build_attestation.bundle.json" \
+            --receipt-output "$GITHUB_WORKSPACE/.artifacts/production-candidate/candidate/candidate_build_receipt.json" \
+            | tee "$GITHUB_WORKSPACE/.artifacts/production-candidate/receipt.json"
+
+      - name: Verify attestation, receipt, and exact source binding
+        run: |
+          set -eu
+          PYTHONPATH="$GITHUB_WORKSPACE/builder" python - <<'PY'
+          import json
+
+          from app.candidate_artifact import CandidateArtifactManifest
+          from app.candidate_build_receipt import verify_candidate_build_receipt
+
+          root = '.artifacts/production-candidate/candidate'
+          with open('.artifacts/production-candidate/release_identity.json') as stream:
+              identity = json.load(stream)
+          manifest = CandidateArtifactManifest.verify(
+              root, identity, candidate_sha=identity['commit_sha'],
+              require_trusted_provenance=True,
+          )
+          result = verify_candidate_build_receipt(
+              root, identity, manifest,
+              '.artifacts/production-candidate/candidate_build_attestation.bundle.json',
+              attestation_repository=os.environ['ATTESTATION_REPOSITORY'],
+              attestation_workflow=(
+                  os.environ['ATTESTATION_REPOSITORY']
+                  + '/.github/workflows/trusted-production-candidate-builder.yml'
+              ),
+          )
+          assert result['status'] == 'PASSED'
+          assert result['workflow_run_id'] == manifest['build_workflow_run_id']
+          assert result['workflow_run_attempt'] == manifest['build_workflow_run_attempt']
+          PY
+
+      - name: Expose exact production Candidate identity
+        id: metadata
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          with open('.artifacts/production-candidate/candidate/candidate_artifact_manifest.json') as stream:
+              manifest = json.load(stream)
+          print('candidate_commit_sha={}'.format(manifest['commit_sha']))
+          print('candidate_artifact_sha256={}'.format(manifest['artifact_sha256']))
+          print('artifact_role={}'.format(manifest['artifact_role']))
+          print('production_publishable={}'.format(
+              str(manifest['production_publishable']).lower()))
+          print('project_name={}'.format(manifest['project_name']))
+          print('build_workflow_sha={}'.format(manifest['build_workflow_sha']))
+          print('build_workflow_run_id={}'.format(manifest['build_workflow_run_id']))
+          print('build_workflow_run_attempt={}'.format(
+              manifest['build_workflow_run_attempt']))
+          PY
+
+      - name: Upload immutable production Candidate build evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: trusted-production-candidate-${{ inputs.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .artifacts/production-candidate
+          if-no-files-found: error
