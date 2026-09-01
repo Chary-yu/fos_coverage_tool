@@ -22,7 +22,7 @@ from app.time_utils import utc_iso
 
 CANDIDATE_ARTIFACT_MANIFEST_VERSION = 2
 CANDIDATE_ARTIFACT_MANIFEST_NAME = "candidate_artifact_manifest.json"
-CANDIDATE_BUILD_ATTESTATION_VERSION = 1
+CANDIDATE_BUILD_ATTESTATION_VERSION = 2
 CANDIDATE_BUILD_ATTESTATION_NAME = "candidate_build_attestation.json"
 CANDIDATE_BUILD_RECEIPT_VERSION = 1
 CANDIDATE_BUILD_RECEIPT_NAME = "candidate_build_receipt.json"
@@ -31,6 +31,12 @@ TRUSTED_CI_PROVENANCE_CLASS = "trusted-ci-build"
 SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS = "served-root-bootstrap"
 TRUSTED_PROVENANCE_CLASSES = (
     TRUSTED_CI_PROVENANCE_CLASS, SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS,
+)
+VALIDATION_FIXTURE_ARTIFACT_ROLE = "validation_fixture"
+PRODUCTION_RELEASE_ARTIFACT_ROLE = "production_release"
+PRODUCTION_PROJECT_NAME = "FOS_V6R2"
+ARTIFACT_ROLES = (
+    VALIDATION_FIXTURE_ARTIFACT_ROLE, PRODUCTION_RELEASE_ARTIFACT_ROLE,
 )
 ARTIFACT_DIRECTORIES = ("reports", "assets", "registry")
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -137,6 +143,38 @@ def _identity_snapshot(identity):
     snapshot["commit_sha"] = commit_sha
     snapshot["build_id"] = build_id
     return snapshot
+
+
+def _artifact_descriptor(artifact_role, production_publishable, project_name):
+    """Normalize the publication role carried by a candidate manifest.
+
+    The role is part of the signed manifest/attestation contract.  A
+    validation fixture may exercise the browser and performance lanes, but it
+    can never be described as a production release.  Conversely, a normal
+    production release must explicitly opt in to publication.
+    """
+    role = str(artifact_role or "").strip()
+    if role not in ARTIFACT_ROLES:
+        raise ValueError(
+            "candidate artifact role must be one of: {}".format(
+                ", ".join(ARTIFACT_ROLES)
+            )
+        )
+    if not isinstance(production_publishable, bool):
+        raise ValueError("candidate artifact production_publishable must be boolean")
+    expected_publishable = role == PRODUCTION_RELEASE_ARTIFACT_ROLE
+    if production_publishable != expected_publishable:
+        raise ValueError(
+            "candidate artifact production_publishable does not match artifact_role"
+        )
+    project = str(project_name or "").strip()
+    if not project:
+        raise ValueError("candidate artifact project_name is required")
+    return {
+        "artifact_role": role,
+        "production_publishable": production_publishable,
+        "project_name": project,
+    }
 
 
 def identity_manifest_sha256(identity):
@@ -425,10 +463,14 @@ def _attestation_payload(identity, payload):
         "build_input_manifest_sha256": provenance["build_input_manifest_sha256"],
         "candidate_artifact_sha256": payload["artifact_sha256"],
         "release_identity_sha256": identity_manifest_sha256(identity),
+        "artifact_role": payload["artifact_role"],
+        "production_publishable": payload["production_publishable"],
+        "project_name": payload["project_name"],
     }
 
 
 def _build_payload(candidate_root, identity, manifest_path, source_provenance,
+                   artifact_role, production_publishable, project_name,
                    attestation_path=None):
     candidate_root = _real(candidate_root)
     identity_snapshot = _identity_snapshot(identity)
@@ -459,6 +501,9 @@ def _build_payload(candidate_root, identity, manifest_path, source_provenance,
     artifact_sha = _canonical_hash(entries)
     provenance = _source_provenance(source_provenance)
     provenance["candidate_artifact_sha256"] = artifact_sha
+    descriptor = _artifact_descriptor(
+        artifact_role, production_publishable, project_name
+    )
     return {
         "artifact_manifest_version": CANDIDATE_ARTIFACT_MANIFEST_VERSION,
         "commit_sha": identity_snapshot["commit_sha"],
@@ -480,6 +525,9 @@ def _build_payload(candidate_root, identity, manifest_path, source_provenance,
         "source_manifest_sha256": provenance["source_manifest_sha256"],
         "build_input_manifest_sha256": provenance["build_input_manifest_sha256"],
         "candidate_artifact_sha256": artifact_sha,
+        "artifact_role": descriptor["artifact_role"],
+        "production_publishable": descriptor["production_publishable"],
+        "project_name": descriptor["project_name"],
         "attestation_path": _relative(candidate_root, attestation_path),
         "receipt_path": _relative(candidate_root, receipt_path),
     }
@@ -507,14 +555,18 @@ class CandidateArtifactManifest(object):
 
     @classmethod
     def build(cls, candidate_root, release_identity, output_path=None,
-              source_provenance=None):
+              source_provenance=None,
+              artifact_role=PRODUCTION_RELEASE_ARTIFACT_ROLE,
+              production_publishable=True,
+              project_name=PRODUCTION_PROJECT_NAME):
         candidate_root = _real(candidate_root)
         manifest_path = _real(output_path or os.path.join(
             candidate_root, CANDIDATE_ARTIFACT_MANIFEST_NAME
         ))
         identity = _identity_snapshot(release_identity)
         payload = _build_payload(
-            candidate_root, identity, manifest_path, source_provenance
+            candidate_root, identity, manifest_path, source_provenance,
+            artifact_role, production_publishable, project_name,
         )
         result = dict(payload)
         result.update(identity)
@@ -552,7 +604,9 @@ class CandidateArtifactManifest(object):
 
     @classmethod
     def verify(cls, candidate_root, release_identity, candidate_sha="",
-               manifest_path=None, require_trusted_provenance=False):
+               manifest_path=None, require_trusted_provenance=False,
+               expected_artifact_role="", expected_project_name="",
+               require_production_publishable=False):
         candidate_root = _real(candidate_root)
         manifest, path = cls.load(candidate_root, manifest_path)
         if int(manifest.get("artifact_manifest_version") or 0) != \
@@ -586,6 +640,25 @@ class CandidateArtifactManifest(object):
             raise ValueError(
                 "candidate artifact source_commit_sha does not match release identity"
             )
+        descriptor = _artifact_descriptor(
+            manifest.get("artifact_role"),
+            manifest.get("production_publishable"),
+            manifest.get("project_name"),
+        )
+        if expected_artifact_role and descriptor["artifact_role"] != \
+                str(expected_artifact_role).strip():
+            raise ValueError(
+                "candidate artifact role does not match required publication role"
+            )
+        if expected_project_name and descriptor["project_name"] != \
+                str(expected_project_name).strip():
+            raise ValueError(
+                "candidate artifact project_name does not match required project"
+            )
+        if require_production_publishable and not descriptor["production_publishable"]:
+            raise ValueError(
+                "candidate artifact is not production_publishable"
+            )
         attestation_relative = str(
             manifest.get("attestation_path") or CANDIDATE_BUILD_ATTESTATION_NAME
         )
@@ -595,6 +668,8 @@ class CandidateArtifactManifest(object):
             raise ValueError("candidate build attestation is missing or invalid")
         observed = _build_payload(
             candidate_root, expected_snapshot, path, declared_provenance,
+            descriptor["artifact_role"], descriptor["production_publishable"],
+            descriptor["project_name"],
             attestation_path=attestation_path,
         )
         for key in (
@@ -606,6 +681,7 @@ class CandidateArtifactManifest(object):
                 "build_workflow_run_attempt", "build_workflow_sha",
                 "source_manifest_sha256",
                 "build_input_manifest_sha256", "candidate_artifact_sha256",
+                "artifact_role", "production_publishable", "project_name",
                 "attestation_path", "receipt_path"):
             if manifest.get(key) != observed.get(key):
                 raise ValueError(

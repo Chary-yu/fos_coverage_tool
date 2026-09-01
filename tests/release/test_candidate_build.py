@@ -4,7 +4,9 @@ import subprocess
 import tempfile
 import unittest
 
-from app.candidate_artifact import CandidateArtifactManifest
+from app.candidate_artifact import (
+    CandidateArtifactManifest, VALIDATION_FIXTURE_ARTIFACT_ROLE,
+)
 from app.release_publication import (
     build_release_manifest, normalize_candidate_artifact,
     validate_release_manifest,
@@ -57,16 +59,18 @@ class CandidateBuildTest(unittest.TestCase):
             manifest = CandidateArtifactManifest.build(
                 candidate, identity,
                 source_provenance=self._bootstrap_provenance(identity),
+                artifact_role=VALIDATION_FIXTURE_ARTIFACT_ROLE,
+                production_publishable=False,
+                project_name=CANDIDATE_PROJECT,
             )
-            release_manifest = build_release_manifest(
-                candidate, identity, "candidate-build-test-session",
-                candidate_sha=identity["commit_sha"],
-                candidate_artifact_manifest=manifest,
-            )
-            checked = validate_release_manifest(
-                candidate, release_manifest, "candidate-build-test-session"
-            )
-            self.assertEqual(checked["status"], "PASSED")
+            self.assertEqual(manifest["artifact_role"], "validation_fixture")
+            self.assertFalse(manifest["production_publishable"])
+            with self.assertRaisesRegex(ValueError, "validation_fixture"):
+                build_release_manifest(
+                    candidate, identity, "candidate-build-test-session",
+                    candidate_sha=identity["commit_sha"],
+                    candidate_artifact_manifest=manifest,
+                )
             self.assertEqual(details["project_name"], CANDIDATE_PROJECT)
             self.assertEqual(details["repository_name"], CANDIDATE_REPOSITORY)
             self.assertEqual(details["file_path"], CANDIDATE_FILE_PATH)

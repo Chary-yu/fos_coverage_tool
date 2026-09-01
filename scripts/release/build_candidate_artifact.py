@@ -19,7 +19,8 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from app.candidate_artifact import (
-    CandidateArtifactManifest, build_git_source_provenance,
+    CandidateArtifactManifest, VALIDATION_FIXTURE_ARTIFACT_ROLE,
+    build_git_source_provenance,
 )
 from app.code_detail.code_region import FunctionRange
 from app.code_detail.sidecar_store import SidecarStore
@@ -240,7 +241,10 @@ def main(argv=None):
             build_workflow_sha=args.build_workflow_sha,
         )
         manifest = CandidateArtifactManifest.build(
-            candidate_root, identity, source_provenance=provenance
+            candidate_root, identity, source_provenance=provenance,
+            artifact_role=VALIDATION_FIXTURE_ARTIFACT_ROLE,
+            production_publishable=False,
+            project_name=CANDIDATE_PROJECT,
         )
         _ensure_parent(identity_output)
         save_release_manifest(identity_output, identity)
@@ -257,6 +261,9 @@ def main(argv=None):
             candidate_root, "candidate_build_attestation.json"
         ),
         "receipt_required": True,
+        "artifact_role": manifest["artifact_role"],
+        "production_publishable": manifest["production_publishable"],
+        "project_name": manifest["project_name"],
         "commit_sha": manifest["commit_sha"],
         "build_id": manifest["build_id"],
         "artifact_sha256": manifest["artifact_sha256"],

@@ -20,7 +20,8 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from app.candidate_artifact import (
-    CandidateArtifactManifest, build_directory_input_manifest_sha256,
+    CandidateArtifactManifest, PRODUCTION_RELEASE_ARTIFACT_ROLE,
+    PRODUCTION_PROJECT_NAME, build_directory_input_manifest_sha256,
 )
 from app.release_publication import (
     ImmutableReleasePublisher, normalize_candidate_artifact,
@@ -186,6 +187,9 @@ def bootstrap(served_root, publish_root, release_identity_path, session_id,
                     served_root
                 ),
             },
+            artifact_role=PRODUCTION_RELEASE_ARTIFACT_ROLE,
+            production_publishable=True,
+            project_name=PRODUCTION_PROJECT_NAME,
         )
         prepared = publisher.prepare_bootstrap(
             build_root, expected, session_id,

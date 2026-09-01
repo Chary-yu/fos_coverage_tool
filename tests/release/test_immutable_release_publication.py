@@ -10,6 +10,7 @@ import app.candidate_build_receipt as candidate_build_receipt
 
 from app.candidate_artifact import (
     CandidateArtifactManifest, build_git_source_provenance,
+    VALIDATION_FIXTURE_ARTIFACT_ROLE,
     identity_manifest_sha256,
 )
 from app.candidate_build_receipt import (
@@ -36,6 +37,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
         with open(html, "w", encoding="utf-8") as stream:
             stream.write(
                 "<html><head>\n" + report_mode_meta +
+                '<meta name="coverage-project" content="FOS_V6R2">\n'
                 '<meta name="coverage-report-id" content="{}">\n'
                 '<meta name="coverage-scan-id" content="7">\n'
                 '<meta name="coverage-repository-name" content="repo-a">\n'
@@ -59,6 +61,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 "report_root": "reports",
                 "sidecar_schema": 1,
                 "asset_identity": "asset-a",
+                "project_name": "FOS_V6R2",
             }, stream)
 
     def _prepare(self, publisher, source, identity, session_id, **kwargs):
@@ -333,6 +336,23 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "trusted provenance class"):
                 ImmutableReleasePublisher(os.path.join(root, "publish")).prepare(
                     source, identity, "untrusted-session"
+                )
+
+    def test_validation_fixture_can_never_enter_immutable_publication(self):
+        with tempfile.TemporaryDirectory(prefix="release-validation-fixture-") as root:
+            source = os.path.join(root, "source")
+            self._source(source)
+            identity = {"commit_sha": "4" * 40, "build_id": "validation-fixture"}
+            CandidateArtifactManifest.build(
+                source, identity,
+                source_provenance=self._bootstrap_fixture_provenance(identity),
+                artifact_role=VALIDATION_FIXTURE_ARTIFACT_ROLE,
+                production_publishable=False,
+                project_name="Coverage Candidate",
+            )
+            with self.assertRaisesRegex(ValueError, "publication role"):
+                ImmutableReleasePublisher(os.path.join(root, "publish")).prepare_bootstrap(
+                    source, identity, "validation-fixture-session"
                 )
 
     def test_trusted_ci_publish_requires_source_checkout(self):

@@ -27,6 +27,7 @@ from app.release_identity import is_valid_commit_sha
 from app.candidate_artifact import (
     CANDIDATE_ARTIFACT_MANIFEST_NAME, CandidateArtifactManifest,
     CANDIDATE_BUILD_RECEIPT_NAME,
+    PRODUCTION_PROJECT_NAME, PRODUCTION_RELEASE_ARTIFACT_ROLE,
     SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS, TRUSTED_CI_PROVENANCE_CLASS,
     verify_git_source_provenance, verify_trusted_build_policy,
 )
@@ -49,6 +50,7 @@ _ATTR_RE = re.compile(
     re.IGNORECASE,
 )
 _IDENTITY_META = {
+    "coverage-project": "project_name",
     "coverage-report-mode": "report_mode",
     "coverage-report-id": "report_id",
     "coverage-scan-id": "scan_id",
@@ -177,6 +179,61 @@ def _html_metadata(path):
         if key:
             values[key] = str(attributes.get("content") or "")
     return values
+
+
+def validate_production_candidate_content(release_root,
+                                          expected_project=PRODUCTION_PROJECT_NAME):
+    """Require a candidate to contain the real production project identity.
+
+    Artifact role metadata prevents a validation fixture from entering the
+    publication API.  This content check prevents a production-role manifest
+    from merely relabelling an unrelated fixture: every report and registry
+    entry must identify the production project before the bytes can become a
+    release.
+    """
+    release_root = _real(release_root)
+    expected_project = str(expected_project or "").strip()
+    if not expected_project:
+        raise ValueError("production candidate project identity is required")
+    reports_root = os.path.join(release_root, "reports")
+    registry_root = os.path.join(release_root, "registry")
+    html_paths = [
+        path for path in _walk_regular_files(reports_root)
+        if path.lower().endswith((".html", ".htm"))
+    ]
+    if not html_paths:
+        raise ValueError("production candidate has no report HTML")
+    for path in html_paths:
+        metadata = _html_metadata(path)
+        if metadata.get("project_name") != expected_project:
+            raise ValueError(
+                "production report project does not match {}: {}".format(
+                    expected_project, path
+                )
+            )
+    registry_paths = _walk_regular_files(registry_root)
+    if not registry_paths:
+        raise ValueError("production candidate has no report registry")
+    for path in registry_paths:
+        if not path.lower().endswith(".json"):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                value = json.load(stream)
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError("production registry is unreadable: {}".format(path))
+        if not isinstance(value, dict) or value.get("project_name") != expected_project:
+            raise ValueError(
+                "production registry project does not match {}: {}".format(
+                    expected_project, path
+                )
+            )
+    return {
+        "status": "PASSED",
+        "project_name": expected_project,
+        "report_count": len(html_paths),
+        "registry_count": len(registry_paths),
+    }
 
 
 def normalize_candidate_artifact(release_root):
@@ -495,6 +552,21 @@ def build_release_manifest(release_root, release_identity, session_id,
         "generated_at": utc_iso(),
     }
     if candidate_artifact_manifest:
+        artifact_role = str(
+            candidate_artifact_manifest.get("artifact_role") or ""
+        ).strip()
+        if artifact_role != PRODUCTION_RELEASE_ARTIFACT_ROLE or \
+                candidate_artifact_manifest.get("production_publishable") is not True:
+            raise ValueError(
+                "validation_fixture artifacts cannot become immutable releases"
+            )
+        if str(candidate_artifact_manifest.get("project_name") or "").strip() != \
+                PRODUCTION_PROJECT_NAME:
+            raise ValueError(
+                "immutable release requires the {} production project".format(
+                    PRODUCTION_PROJECT_NAME
+                )
+            )
         artifact_path = os.path.join(
             release_root,
             str(candidate_artifact_manifest.get("manifest_path") or
@@ -508,6 +580,11 @@ def build_release_manifest(release_root, release_identity, session_id,
             "artifact_manifest_version": candidate_artifact_manifest.get(
                 "artifact_manifest_version"
             ),
+            "artifact_role": artifact_role,
+            "production_publishable": candidate_artifact_manifest.get(
+                "production_publishable"
+            ),
+            "project_name": candidate_artifact_manifest.get("project_name"),
             "commit_sha": candidate_artifact_manifest.get("commit_sha"),
             "build_id": candidate_artifact_manifest.get("build_id"),
             "artifact_sha256": candidate_artifact_manifest.get("artifact_sha256"),
@@ -647,6 +724,13 @@ def validate_release_manifest(release_root, manifest=None, expected_session_id="
         violations.append("actual Served Root hash changed")
     candidate_artifact = manifest.get("candidate_artifact_manifest") or {}
     if candidate_artifact:
+        if candidate_artifact.get("artifact_role") != \
+                PRODUCTION_RELEASE_ARTIFACT_ROLE:
+            violations.append("validation_fixture cannot be selected as CURRENT")
+        if candidate_artifact.get("production_publishable") is not True:
+            violations.append("release candidate is not production_publishable")
+        if candidate_artifact.get("project_name") != PRODUCTION_PROJECT_NAME:
+            violations.append("release candidate project does not match production project")
         relative = str(candidate_artifact.get("manifest_path") or "")
         candidate_path = _real(os.path.join(release_root, relative))
         if not relative or not _inside(release_root, candidate_path) or \
@@ -654,6 +738,24 @@ def validate_release_manifest(release_root, manifest=None, expected_session_id="
             violations.append("candidate artifact manifest is missing from release")
         elif str(candidate_artifact.get("manifest_sha256") or "") != _sha256(candidate_path):
             violations.append("candidate artifact manifest hash changed")
+        elif os.path.isfile(candidate_path):
+            try:
+                persisted_candidate = _load_json(candidate_path)
+                if persisted_candidate.get("artifact_role") != \
+                        PRODUCTION_RELEASE_ARTIFACT_ROLE or \
+                        persisted_candidate.get("production_publishable") is not True:
+                    violations.append(
+                        "validation_fixture cannot be selected as CURRENT"
+                    )
+                if persisted_candidate.get("project_name") != PRODUCTION_PROJECT_NAME:
+                    violations.append(
+                        "release candidate project does not match production project"
+                    )
+                if persisted_candidate.get("artifact_sha256") != \
+                        candidate_artifact.get("artifact_sha256"):
+                    violations.append("candidate artifact hash does not match release manifest")
+            except (OSError, ValueError, TypeError):
+                violations.append("candidate artifact manifest is unreadable")
         candidate_provenance = candidate_artifact.get("source_provenance") or {}
         if candidate_provenance.get("provenance_class") == TRUSTED_CI_PROVENANCE_CLASS:
             receipt_relative = str(candidate_artifact.get("receipt_path") or "")
@@ -1002,7 +1104,12 @@ class ImmutableReleasePublisher(object):
             source_root, release_identity, candidate_sha=candidate_sha,
             manifest_path=candidate_manifest_path,
             require_trusted_provenance=True,
+            expected_artifact_role=PRODUCTION_RELEASE_ARTIFACT_ROLE,
+            expected_project_name=PRODUCTION_PROJECT_NAME,
+            require_production_publishable=True,
         )
+        if not allow_bootstrap:
+            validate_production_candidate_content(source_root)
         provenance = verified_candidate_manifest.get("source_provenance") or {}
         provenance_class = str(provenance.get("provenance_class") or "")
         if allow_bootstrap:
@@ -1061,7 +1168,12 @@ class ImmutableReleasePublisher(object):
                     str(verified_candidate_manifest.get("manifest_path") or
                         CANDIDATE_ARTIFACT_MANIFEST_NAME).replace("/", os.sep),
                 ), require_trusted_provenance=True,
+                expected_artifact_role=PRODUCTION_RELEASE_ARTIFACT_ROLE,
+                expected_project_name=PRODUCTION_PROJECT_NAME,
+                require_production_publishable=True,
             )
+            if not allow_bootstrap:
+                validate_production_candidate_content(staging)
             copied_provenance = copied_candidate_manifest.get("source_provenance") or {}
             if allow_bootstrap:
                 if str(copied_provenance.get("provenance_class") or "") != \

@@ -120,7 +120,7 @@ jobs:
             --build-workflow-sha "$BUILD_WORKFLOW_SHA" \
             | tee "$GITHUB_WORKSPACE/.artifacts/candidate-build/build.json"
 
-      - name: Verify publishable VNext Candidate contract
+      - name: Verify non-publishable validation Candidate contract
         run: |
           set -eu
           PYTHONPATH="$GITHUB_WORKSPACE/builder" python - <<'PY'
@@ -138,13 +138,16 @@ jobs:
               require_trusted_provenance=True,
           )
           assert manifest['artifact_sha256']
+          assert manifest['artifact_role'] == 'validation_fixture'
+          assert manifest['production_publishable'] is False
+          assert manifest['project_name'] == 'Coverage Candidate'
 
           reports = []
           for directory, _, filenames in os.walk(os.path.join(root, 'reports')):
               for name in filenames:
                   if name.lower().endswith(('.html', '.htm')):
                       reports.append(os.path.join(directory, name))
-          assert reports, 'Candidate must contain a Coverage report HTML file'
+          assert reports, 'validation Candidate must contain a Coverage report HTML file'
           vnext_reports = []
           for path in reports:
               with open(path, encoding='utf-8') as stream:
@@ -155,7 +158,7 @@ jobs:
                       and 'href="coverage_enhance.css"' in html):
                   vnext_reports.append(path)
           assert vnext_reports, (
-              'Candidate must contain a VNext report with the canonical browser shell'
+              'validation Candidate must contain a VNext report with the canonical browser shell'
           )
 
           sidecar_meta = []
@@ -173,7 +176,7 @@ jobs:
                   for item in (meta.get('function_ranges') or [])
               )
               for meta in sidecar_meta
-          ), 'Candidate must contain the 100000-line VNext code region'
+          ), 'validation Candidate must contain the 100000-line VNext code region'
           PY
 
       - name: Create GitHub artifact attestation for Candidate manifest
