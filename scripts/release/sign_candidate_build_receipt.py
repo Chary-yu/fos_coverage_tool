@@ -16,7 +16,7 @@ from app.candidate_artifact import (
     verify_trusted_build_policy,
 )
 from app.candidate_build_receipt import create_candidate_build_receipt
-from app.release_identity import verify_release_identity
+from app.release_identity import generate_release_identity
 
 
 def _load(path, label):
@@ -44,9 +44,20 @@ def main(argv=None):
     candidate_root = os.path.abspath(args.candidate_root)
     source_root = os.path.abspath(args.source_repo_root)
     try:
-        identity = verify_release_identity(source_root, _load(
-            args.release_identity, "release identity"
-        ))
+        identity = _load(args.release_identity, "release identity")
+        observed_identity = generate_release_identity(
+            source_root, build_provenance="release-build"
+        )
+        for key in (
+                "version", "commit_sha", "build_id", "asset_hash",
+                "schema_version", "asset_manifest_version", "asset_count",
+                "asset_manifest_hash", "asset_manifest"):
+            if identity.get(key) != observed_identity.get(key):
+                raise ValueError(
+                    "release identity {} does not match the clean source checkout".format(
+                        key
+                    )
+                )
         manifest, manifest_path = CandidateArtifactManifest.load(candidate_root)
         verified = CandidateArtifactManifest.verify(
             candidate_root, identity,

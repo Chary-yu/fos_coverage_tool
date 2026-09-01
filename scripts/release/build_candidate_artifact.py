@@ -63,6 +63,12 @@ def _prepare_empty_root(path):
     return path
 
 
+def _ensure_parent(path):
+    directory = os.path.dirname(os.path.abspath(path))
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+
+
 def _build_candidate_tree(source_root, candidate_root, identity):
     report_id = "candidate_build_{}".format(identity["commit_sha"][:12])
     asset_identity = "source-assets-{}".format(identity["asset_hash"][:16])
@@ -142,6 +148,7 @@ def main(argv=None):
         manifest = CandidateArtifactManifest.build(
             candidate_root, identity, source_provenance=provenance
         )
+        _ensure_parent(identity_output)
         save_release_manifest(identity_output, identity)
     except (OSError, RuntimeError, ValueError, TypeError) as exc:
         raise SystemExit("trusted Candidate build failed: {}".format(exc))
