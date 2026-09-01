@@ -170,6 +170,10 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("BUILD_WORKFLOW_RUN_ATTEMPT", builder)
         self.assertIn("workflow_call:", builder)
         self.assertIn("value: ${{ jobs.build.outputs.candidate_artifact_sha256 }}", builder)
+        self.assertIn("Verify publishable VNext Candidate contract", builder)
+        self.assertIn("<pre class=\"source\"></pre>", builder)
+        self.assertIn("total_lines') or 0) == 100000", builder)
+        self.assertIn("function_ranges", builder)
 
     def test_cross_layer_performance_consumes_browser_artifact(self):
         with open(

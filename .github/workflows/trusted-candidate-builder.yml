@@ -120,6 +120,62 @@ jobs:
             --build-workflow-sha "$BUILD_WORKFLOW_SHA" \
             | tee "$GITHUB_WORKSPACE/.artifacts/candidate-build/build.json"
 
+      - name: Verify publishable VNext Candidate contract
+        run: |
+          set -eu
+          PYTHONPATH="$GITHUB_WORKSPACE/builder" python - <<'PY'
+          import glob
+          import json
+          import os
+
+          from app.candidate_artifact import CandidateArtifactManifest
+
+          root = '.artifacts/candidate-build/candidate'
+          with open('.artifacts/candidate-build/release_identity.json') as stream:
+              identity = json.load(stream)
+          manifest = CandidateArtifactManifest.verify(
+              root, identity, candidate_sha=identity['commit_sha'],
+              require_trusted_provenance=True,
+          )
+          assert manifest['artifact_sha256']
+
+          reports = []
+          for directory, _, filenames in os.walk(os.path.join(root, 'reports')):
+              for name in filenames:
+                  if name.lower().endswith(('.html', '.htm')):
+                      reports.append(os.path.join(directory, name))
+          assert reports, 'Candidate must contain a Coverage report HTML file'
+          vnext_reports = []
+          for path in reports:
+              with open(path, encoding='utf-8') as stream:
+                  html = stream.read()
+              if ('coverage-report-mode" content="VNEXT_ARTIFACT_READY"' in html
+                      and '<pre class="source"></pre>' in html
+                      and 'src="coverage_enhance.js"' in html
+                      and 'href="coverage_enhance.css"' in html):
+                  vnext_reports.append(path)
+          assert vnext_reports, (
+              'Candidate must contain a VNext report with the canonical browser shell'
+          )
+
+          sidecar_meta = []
+          for path in glob.glob(
+                  os.path.join(root, 'reports', '.source_cache', '**', 'meta.json'),
+                  recursive=True):
+              with open(path, encoding='utf-8') as stream:
+                  sidecar_meta.append(json.load(stream))
+          assert any(
+              int(meta.get('schema_version') or 0) == 2
+              and int(meta.get('total_lines') or 0) == 100000
+              and any(
+                  int(item.get('start_line') or 0) == 1
+                  and int(item.get('end_line') or 0) == 100000
+                  for item in (meta.get('function_ranges') or [])
+              )
+              for meta in sidecar_meta
+          ), 'Candidate must contain the 100000-line VNext code region'
+          PY
+
       - name: Create GitHub artifact attestation for Candidate manifest
         id: candidate_attestation
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
