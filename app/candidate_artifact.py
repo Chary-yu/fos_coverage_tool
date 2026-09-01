@@ -24,6 +24,8 @@ CANDIDATE_ARTIFACT_MANIFEST_VERSION = 2
 CANDIDATE_ARTIFACT_MANIFEST_NAME = "candidate_artifact_manifest.json"
 CANDIDATE_BUILD_ATTESTATION_VERSION = 1
 CANDIDATE_BUILD_ATTESTATION_NAME = "candidate_build_attestation.json"
+CANDIDATE_BUILD_RECEIPT_VERSION = 1
+CANDIDATE_BUILD_RECEIPT_NAME = "candidate_build_receipt.json"
 PROVENANCE_SCHEMA_VERSION = 1
 TRUSTED_CI_PROVENANCE_CLASS = "trusted-ci-build"
 SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS = "served-root-bootstrap"
@@ -410,13 +412,20 @@ def _build_payload(candidate_root, identity, manifest_path, source_provenance,
     attestation_path = _real(attestation_path or os.path.join(
         candidate_root, CANDIDATE_BUILD_ATTESTATION_NAME
     ))
-    if manifest_path == attestation_path:
-        raise ValueError("candidate artifact manifest and attestation paths must differ")
+    receipt_path = _real(os.path.join(
+        candidate_root, CANDIDATE_BUILD_RECEIPT_NAME
+    ))
+    if manifest_path == attestation_path or manifest_path == receipt_path or \
+            attestation_path == receipt_path:
+        raise ValueError(
+            "candidate artifact metadata paths must be distinct"
+        )
     for directory in ARTIFACT_DIRECTORIES:
         if not os.path.isdir(os.path.join(candidate_root, directory)):
             raise ValueError("candidate artifact is missing {}/".format(directory))
     entries = _inventory(
-        candidate_root, manifest_path, excluded_paths=(attestation_path,)
+        candidate_root, manifest_path,
+        excluded_paths=(attestation_path, receipt_path),
     )
     directory_hashes = {
         directory: _directory_hash(entries, directory)
@@ -446,6 +455,7 @@ def _build_payload(candidate_root, identity, manifest_path, source_provenance,
         "build_input_manifest_sha256": provenance["build_input_manifest_sha256"],
         "candidate_artifact_sha256": artifact_sha,
         "attestation_path": _relative(candidate_root, attestation_path),
+        "receipt_path": _relative(candidate_root, receipt_path),
     }
 
 
@@ -569,7 +579,7 @@ class CandidateArtifactManifest(object):
                 "provenance_schema_version", "build_workflow_run_id",
                 "build_workflow_sha", "source_manifest_sha256",
                 "build_input_manifest_sha256", "candidate_artifact_sha256",
-                "attestation_path"):
+                "attestation_path", "receipt_path"):
             if manifest.get(key) != observed.get(key):
                 raise ValueError(
                     "candidate artifact manifest {} does not match candidate_root".format(key)

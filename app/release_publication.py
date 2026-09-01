@@ -29,6 +29,7 @@ from app.candidate_artifact import (
     SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS, TRUSTED_CI_PROVENANCE_CLASS,
     verify_git_source_provenance, verify_trusted_build_policy,
 )
+from app.candidate_build_receipt import verify_candidate_build_receipt
 from app.reports.identity import (
     LEGACY_STATIC, SUPPORTED_SIDECAR_SCHEMA_VERSIONS, VNEXT_ARTIFACT_READY,
     validate_report_id, validate_report_mode,
@@ -892,7 +893,10 @@ class ImmutableReleasePublisher(object):
                 api_contract_version="", candidate_sha="",
                 candidate_artifact_manifest="", source_repo_root="",
                 trusted_build_workflow_identity="",
-                trusted_build_workflow_sha=""):
+                trusted_build_workflow_sha="", candidate_build_receipt="",
+                candidate_build_attestation_bundle="",
+                candidate_build_attestation_repository="",
+                candidate_build_attestation_workflow=""):
         """Prepare a Candidate produced by a verified trusted CI checkout.
 
         ``source_repo_root`` is deliberately mandatory for this generic
@@ -909,6 +913,10 @@ class ImmutableReleasePublisher(object):
             source_repo_root=source_repo_root,
             trusted_build_workflow_identity=trusted_build_workflow_identity,
             trusted_build_workflow_sha=trusted_build_workflow_sha,
+            candidate_build_receipt=candidate_build_receipt,
+            candidate_build_attestation_bundle=candidate_build_attestation_bundle,
+            candidate_build_attestation_repository=candidate_build_attestation_repository,
+            candidate_build_attestation_workflow=candidate_build_attestation_workflow,
             allow_bootstrap=False,
         )
 
@@ -935,6 +943,10 @@ class ImmutableReleasePublisher(object):
                  candidate_artifact_manifest="", source_repo_root="",
                  trusted_build_workflow_identity="",
                  trusted_build_workflow_sha="",
+                 candidate_build_receipt="",
+                 candidate_build_attestation_bundle="",
+                 candidate_build_attestation_repository="",
+                 candidate_build_attestation_workflow="",
                  allow_bootstrap=False):
         session_id = _validate_session_id(session_id)
         final_root = self.release_path(session_id)
@@ -976,6 +988,22 @@ class ImmutableReleasePublisher(object):
                 source_repo_root, release_identity,
                 provenance,
             )
+            receipt_path = candidate_build_receipt or os.path.join(
+                _real(source_root),
+                str(verified_candidate_manifest.get("receipt_path") or
+                    "candidate_build_receipt.json").replace("/", os.sep),
+            )
+            if not candidate_build_attestation_bundle:
+                raise ValueError(
+                    "candidate_build_attestation_bundle is required for trusted publication"
+                )
+            verify_candidate_build_receipt(
+                source_root, release_identity, verified_candidate_manifest,
+                candidate_build_attestation_bundle,
+                receipt_path=receipt_path,
+                attestation_repository=candidate_build_attestation_repository,
+                attestation_workflow=candidate_build_attestation_workflow,
+            )
         staging = tempfile.mkdtemp(prefix=".release-{}-".format(session_id),
                                    dir=self.releases_root)
         try:
@@ -1010,6 +1038,18 @@ class ImmutableReleasePublisher(object):
                 verify_git_source_provenance(
                     source_repo_root, release_identity,
                     copied_provenance,
+                )
+                copied_receipt_path = os.path.join(
+                    staging,
+                    str(copied_candidate_manifest.get("receipt_path") or
+                        "candidate_build_receipt.json").replace("/", os.sep),
+                )
+                verify_candidate_build_receipt(
+                    staging, release_identity, copied_candidate_manifest,
+                    candidate_build_attestation_bundle,
+                    receipt_path=copied_receipt_path,
+                    attestation_repository=candidate_build_attestation_repository,
+                    attestation_workflow=candidate_build_attestation_workflow,
                 )
             if copied_candidate_manifest.get("artifact_sha256") != \
                     verified_candidate_manifest.get("artifact_sha256"):

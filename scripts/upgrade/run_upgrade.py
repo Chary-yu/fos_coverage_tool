@@ -40,6 +40,7 @@ from app.candidate_artifact import (
     CANDIDATE_ARTIFACT_MANIFEST_NAME, CandidateArtifactManifest,
     verify_git_source_provenance, verify_trusted_build_policy,
 )
+from app.candidate_build_receipt import verify_candidate_build_receipt
 from scripts.diagnostics.data_hash_gate import capture_database_snapshot, verify_data_integrity
 from scripts.upgrade.evidence_manifest import ProductionEvidenceManifest
 from scripts.upgrade.schema_preflight import (
@@ -128,7 +129,10 @@ def _resolve_candidate_manifest_path(repo_root: str, candidate_root: str,
 def validate_candidate_publication_preflight(
         repo_root: str, candidate_root: str, release_identity: Dict[str, Any],
         candidate_manifest_path: Optional[str], trusted_workflow_identity: str,
-        trusted_workflow_sha: str) -> Dict[str, Any]:
+        trusted_workflow_sha: str, candidate_build_receipt: Optional[str] = "",
+        candidate_build_attestation_bundle: Optional[str] = "",
+        candidate_build_attestation_repository: Optional[str] = "",
+        candidate_build_attestation_workflow: Optional[str] = "") -> Dict[str, Any]:
     """Verify all candidate/source/trust inputs before maintenance begins."""
     trusted_workflow_identity = str(trusted_workflow_identity or "").strip()
     trusted_workflow_sha = str(trusted_workflow_sha or "").strip()
@@ -143,6 +147,11 @@ def validate_candidate_publication_preflight(
     if not is_valid_commit_sha(trusted_workflow_sha):
         raise RuntimeError(
             "trusted_build_workflow_sha must be an exact commit SHA"
+        )
+    if not str(candidate_build_attestation_repository or "").strip() or \
+            not str(candidate_build_attestation_workflow or "").strip():
+        raise RuntimeError(
+            "candidate build attestation repository and signer workflow are required"
         )
     candidate_root = os.path.realpath(os.path.abspath(candidate_root))
     manifest_path = _resolve_candidate_manifest_path(
@@ -166,6 +175,27 @@ def validate_candidate_publication_preflight(
     observed_source = verify_git_source_provenance(
         repo_root, release_identity, provenance,
     )
+    receipt_path = _resolve_candidate_manifest_path(
+        os.path.realpath(os.path.abspath(repo_root)), candidate_root,
+        candidate_build_receipt or manifest.get("receipt_path") or
+        "candidate_build_receipt.json",
+    )
+    if not candidate_build_attestation_bundle:
+        raise RuntimeError(
+            "candidate_build_attestation_bundle is required before maintenance"
+        )
+    bundle_path = str(candidate_build_attestation_bundle)
+    if not os.path.isabs(bundle_path):
+        bundle_path = os.path.join(
+            os.path.realpath(os.path.abspath(repo_root)), bundle_path
+        )
+    bundle_path = os.path.realpath(os.path.abspath(bundle_path))
+    verify_candidate_build_receipt(
+        candidate_root, release_identity, manifest, bundle_path,
+        receipt_path=receipt_path,
+        attestation_repository=candidate_build_attestation_repository,
+        attestation_workflow=candidate_build_attestation_workflow,
+    )
     return {
         "status": "PASSED",
         "candidate_root": candidate_root,
@@ -175,7 +205,17 @@ def validate_candidate_publication_preflight(
         "source_tree_sha": observed_source.get("source_tree_sha"),
         "build_workflow_identity": trusted_workflow_identity,
         "build_workflow_sha": trusted_workflow_sha,
+        "candidate_build_receipt": receipt_path,
+        "candidate_build_attestation_bundle": bundle_path,
+        "candidate_build_attestation_repository": str(
+            candidate_build_attestation_repository or ""
+        ).strip(),
+        "candidate_build_attestation_workflow": str(
+            candidate_build_attestation_workflow or ""
+        ).strip(),
     }
+
+
 def resolve_backup_root(repo_root: str, configured_root: Optional[str] = None) -> str:
     """Resolve a recoverable backup root outside the active deployment tree."""
     raw = configured_root or os.environ.get("COVERAGE_BACKUP_ROOT")
@@ -520,6 +560,10 @@ class UpgradeOrchestrator:
             self.repo_root, candidate_root, identity,
             upgrade_config.get("candidate_artifact_manifest", ""),
             trusted_workflow_identity, trusted_workflow_sha,
+            upgrade_config.get("candidate_build_receipt", ""),
+            upgrade_config.get("candidate_build_attestation_bundle", ""),
+            upgrade_config.get("candidate_build_attestation_repository", ""),
+            upgrade_config.get("candidate_build_attestation_workflow", ""),
         )
 
         self.candidate_root = candidate_root
@@ -1151,6 +1195,18 @@ class UpgradeOrchestrator:
                 ),
                 trusted_build_workflow_sha=upgrade_config.get(
                     "trusted_build_workflow_sha", ""
+                ),
+                candidate_build_receipt=self.candidate_preflight.get(
+                    "candidate_build_receipt", ""
+                ),
+                candidate_build_attestation_bundle=self.candidate_preflight.get(
+                    "candidate_build_attestation_bundle", ""
+                ),
+                candidate_build_attestation_repository=self.candidate_preflight.get(
+                    "candidate_build_attestation_repository", ""
+                ),
+                candidate_build_attestation_workflow=self.candidate_preflight.get(
+                    "candidate_build_attestation_workflow", ""
                 ),
             )
             switched = self.publisher.switch_current(session_id)

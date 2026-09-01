@@ -43,6 +43,22 @@ def main(argv=None):
         "--trusted-build-workflow-sha", default="",
         help="exact workflow commit SHA trusted by the release operator",
     )
+    parser.add_argument(
+        "--candidate-build-receipt", default="",
+        help="detached protected receipt signed by the Candidate Build job",
+    )
+    parser.add_argument(
+        "--candidate-build-attestation-bundle", default="",
+        help="external GitHub artifact-attestation bundle for the Candidate manifest",
+    )
+    parser.add_argument(
+        "--candidate-build-attestation-repository", default="",
+        help="GitHub repository whose OIDC attestation is trusted",
+    )
+    parser.add_argument(
+        "--candidate-build-attestation-workflow", default="",
+        help="exact GitHub signer workflow path trusted for the Candidate build",
+    )
     parser.add_argument("--switch", action="store_true")
     parser.add_argument("--rollback-session")
     parser.add_argument("--validate-current", action="store_true")
@@ -67,6 +83,18 @@ def main(argv=None):
                 "--trusted-build-workflow-identity and "
                 "--trusted-build-workflow-sha are required for normal publication"
             )
+        if not args.candidate_build_receipt or \
+                not args.candidate_build_attestation_bundle:
+            parser.error(
+                "--candidate-build-receipt and "
+                "--candidate-build-attestation-bundle are required for normal publication"
+            )
+        if not args.candidate_build_attestation_repository or \
+                not args.candidate_build_attestation_workflow:
+            parser.error(
+                "--candidate-build-attestation-repository and "
+                "--candidate-build-attestation-workflow are required for normal publication"
+            )
         identity = _load(args.release_identity)
         manifest = publisher.prepare(
             args.source_root, identity, args.session_id,
@@ -75,6 +103,10 @@ def main(argv=None):
             source_repo_root=args.source_repo_root,
             trusted_build_workflow_identity=args.trusted_build_workflow_identity,
             trusted_build_workflow_sha=args.trusted_build_workflow_sha,
+            candidate_build_receipt=args.candidate_build_receipt,
+            candidate_build_attestation_bundle=args.candidate_build_attestation_bundle,
+            candidate_build_attestation_repository=args.candidate_build_attestation_repository,
+            candidate_build_attestation_workflow=args.candidate_build_attestation_workflow,
         )
         result = {
             "status": "PASSED",

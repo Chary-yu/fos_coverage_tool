@@ -79,7 +79,11 @@ def audit(repo_root=ROOT):
     if commands.get("stop_serving_api") == commands.get("stop_validation_api"):
         violations.append("stop_serving_api must be a distinct lifecycle command")
     for field in (
-            "candidate_root", "candidate_artifact_manifest", "publish_root",
+            "candidate_root", "candidate_artifact_manifest",
+            "candidate_build_receipt", "candidate_build_attestation_bundle",
+            "candidate_build_attestation_repository",
+            "candidate_build_attestation_workflow",
+            "publish_root",
             "validation_session_manifest", "validation_teardown_evidence_path",
             "serving_session_id", "serving_session_manifest",
             "serving_teardown_evidence_path", "current_serving_state_path"):
@@ -87,6 +91,16 @@ def audit(repo_root=ROOT):
             violations.append("Candidate {} is missing".format(field))
     candidate_root = str(upgrade.get("candidate_root") or "")
     candidate_artifact_manifest = str(upgrade.get("candidate_artifact_manifest") or "")
+    candidate_build_receipt = str(upgrade.get("candidate_build_receipt") or "")
+    candidate_build_attestation_bundle = str(
+        upgrade.get("candidate_build_attestation_bundle") or ""
+    )
+    candidate_build_attestation_repository = str(
+        upgrade.get("candidate_build_attestation_repository") or ""
+    )
+    candidate_build_attestation_workflow = str(
+        upgrade.get("candidate_build_attestation_workflow") or ""
+    )
     publish_root = str(upgrade.get("publish_root") or "")
     if candidate_root and not os.path.isabs(candidate_root):
         candidate_root = os.path.join(repo_root, candidate_root)
@@ -99,6 +113,9 @@ def audit(repo_root=ROOT):
     if candidate_artifact_manifest and candidate_root:
         if os.path.commonpath((os.path.realpath(candidate_artifact_manifest), os.path.realpath(candidate_root))) != os.path.realpath(candidate_root):
             violations.append("candidate_artifact_manifest must be inside candidate_root")
+    if candidate_build_receipt and candidate_root:
+        if os.path.commonpath((os.path.realpath(candidate_build_receipt), os.path.realpath(candidate_root))) != os.path.realpath(candidate_root):
+            violations.append("candidate_build_receipt must be inside candidate_root")
     session_manifest = str(upgrade.get("validation_session_manifest") or "")
     teardown_evidence = str(upgrade.get("validation_teardown_evidence_path") or "")
     if session_manifest and "{attempt_id}" not in session_manifest:
@@ -142,6 +159,10 @@ def audit(repo_root=ROOT):
         "trusted_build_workflow_sha": trusted_workflow_sha,
         "candidate_root": candidate_root,
         "candidate_artifact_manifest": candidate_artifact_manifest,
+        "candidate_build_receipt": candidate_build_receipt,
+        "candidate_build_attestation_bundle": candidate_build_attestation_bundle,
+        "candidate_build_attestation_repository": candidate_build_attestation_repository,
+        "candidate_build_attestation_workflow": candidate_build_attestation_workflow,
         "candidate_publish_root": publish_root,
         "validation_session_manifest": upgrade.get("validation_session_manifest", ""),
         "validation_teardown_evidence_path": upgrade.get("validation_teardown_evidence_path", ""),

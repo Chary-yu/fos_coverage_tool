@@ -34,6 +34,8 @@ class TestUpgradeManifest(unittest.TestCase):
                     os.getcwd(), root,
                     {"commit_sha": "a" * 40}, "", "github-actions/candidate-build",
                     "b" * 40,
+                    "", "", "Chary-yu/fos_coverage_tool",
+                    "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
                 )
 
     def test_production_upgrade_uses_immutable_publication_only(self):

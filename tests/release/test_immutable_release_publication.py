@@ -6,10 +6,14 @@ import unittest
 from unittest import mock
 
 import app.release_publication as release_publication
+import app.candidate_build_receipt as candidate_build_receipt
 
 from app.candidate_artifact import (
     CandidateArtifactManifest, build_git_source_provenance,
     identity_manifest_sha256,
+)
+from app.candidate_build_receipt import (
+    create_candidate_build_receipt, verify_github_artifact_attestation,
 )
 from app.release_publication import (
     ImmutableReleasePublisher, current_publication_identity,
@@ -380,6 +384,16 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                     "--source-repo-root", root,
                     "--trusted-build-workflow-identity", "trusted-ci",
                     "--trusted-build-workflow-sha", "f" * 40,
+                    "--candidate-build-receipt", os.path.join(
+                        source, "candidate_build_receipt.json"
+                    ),
+                    "--candidate-build-attestation-bundle", os.path.join(
+                        root, "candidate-build-attestation.bundle.json"
+                    ),
+                    "--candidate-build-attestation-repository",
+                    "Chary-yu/fos_coverage_tool",
+                    "--candidate-build-attestation-workflow",
+                    "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
                 ])
 
     def test_git_provenance_uses_source_tree_manifest_and_attestation(self):
@@ -425,6 +439,20 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(
                 candidate, "candidate_build_attestation.json"
             )))
+            bundle = os.path.join(root, "candidate-build-attestation.bundle.json")
+            with open(bundle, "w", encoding="utf-8") as stream:
+                stream.write("external GitHub attestation bundle\n")
+            receipt_path = os.path.join(candidate, "candidate_build_receipt.json")
+            receipt = create_candidate_build_receipt(
+                candidate, identity,
+                output_path=receipt_path,
+                attestation_bundle_path=bundle,
+                signing_key="test-protected-build-key-1234567890",
+            )
+            self.assertEqual(
+                receipt["payload"]["candidate_artifact_sha256"],
+                manifest["artifact_sha256"],
+            )
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
             with self.assertRaisesRegex(ValueError, "workflow SHA"):
                 publisher.prepare(
@@ -433,14 +461,122 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                     trusted_build_workflow_identity="trusted-ci",
                     trusted_build_workflow_sha="e" * 40,
                 )
-            prepared = publisher.prepare(
-                candidate, identity, "attested-session", source_repo_root=source_repo,
-                trusted_build_workflow_identity="trusted-ci",
-                trusted_build_workflow_sha="f" * 40,
-            )
+            previous_key = os.environ.get("COVERAGE_BUILD_PROVENANCE_HMAC_KEY")
+            os.environ["COVERAGE_BUILD_PROVENANCE_HMAC_KEY"] = \
+                "test-protected-build-key-1234567890"
+            try:
+                with mock.patch(
+                        "app.candidate_build_receipt.verify_github_artifact_attestation"):
+                    prepared = publisher.prepare(
+                        candidate, identity, "attested-session", source_repo_root=source_repo,
+                        trusted_build_workflow_identity="trusted-ci",
+                        trusted_build_workflow_sha="f" * 40,
+                        candidate_build_receipt=receipt_path,
+                        candidate_build_attestation_bundle=bundle,
+                        candidate_build_attestation_repository="Chary-yu/fos_coverage_tool",
+                        candidate_build_attestation_workflow=(
+                            "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml"
+                        ),
+                    )
+            finally:
+                if previous_key is None:
+                    os.environ.pop("COVERAGE_BUILD_PROVENANCE_HMAC_KEY", None)
+                else:
+                    os.environ["COVERAGE_BUILD_PROVENANCE_HMAC_KEY"] = previous_key
             self.assertEqual(
                 prepared["release_validation_session_id"], "attested-session"
             )
+
+    def test_trusted_ci_publish_requires_protected_receipt_and_bundle(self):
+        with tempfile.TemporaryDirectory(prefix="release-receipt-required-") as root:
+            source_repo = os.path.join(root, "source-repo")
+            candidate = os.path.join(root, "candidate")
+            os.makedirs(source_repo)
+            os.makedirs(candidate)
+            subprocess.check_call(["git", "init", "-q"], cwd=source_repo)
+            subprocess.check_call(
+                ["git", "config", "user.email", "test@example.invalid"],
+                cwd=source_repo,
+            )
+            subprocess.check_call(
+                ["git", "config", "user.name", "Release Test"],
+                cwd=source_repo,
+            )
+            with open(os.path.join(source_repo, "source.txt"), "w") as stream:
+                stream.write("source\n")
+            subprocess.check_call(["git", "add", "source.txt"], cwd=source_repo)
+            subprocess.check_call(["git", "commit", "-q", "-m", "source"], cwd=source_repo)
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=source_repo
+            ).decode("ascii").strip()
+            identity = {"commit_sha": commit, "build_id": "candidate-receipt"}
+            self._source(candidate)
+            provenance = build_git_source_provenance(
+                source_repo, identity, "trusted-ci",
+                build_workflow_run_id="run-receipt",
+                build_workflow_sha="f" * 40,
+            )
+            CandidateArtifactManifest.build(
+                candidate, identity, source_provenance=provenance
+            )
+            publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
+            with self.assertRaisesRegex(ValueError, "attestation_bundle"):
+                publisher.prepare(
+                    candidate, identity, "receipt-missing",
+                    source_repo_root=source_repo,
+                    trusted_build_workflow_identity="trusted-ci",
+                    trusted_build_workflow_sha="f" * 40,
+                )
+
+    def test_github_attestation_wrapper_enforces_subject_digest_and_policy(self):
+        with tempfile.TemporaryDirectory(prefix="release-github-attestation-") as root:
+            subject = os.path.join(root, "candidate_artifact_manifest.json")
+            bundle = os.path.join(root, "bundle.json")
+            with open(subject, "w", encoding="utf-8") as stream:
+                stream.write("manifest bytes\n")
+            with open(bundle, "w", encoding="utf-8") as stream:
+                stream.write("bundle bytes\n")
+            subject_sha = candidate_build_receipt._sha256(subject)
+            output = json.dumps([{
+                "verificationResult": {
+                    "statement": {
+                        "subject": [{"name": "manifest", "digest": {
+                            "sha256": subject_sha,
+                        }}],
+                    },
+                },
+            }]).encode("utf-8")
+            with mock.patch.object(
+                    candidate_build_receipt.subprocess, "check_output",
+                    return_value=output) as check:
+                result = verify_github_artifact_attestation(
+                    subject, bundle, "Chary-yu/fos_coverage_tool",
+                    "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
+                    "a" * 40, "b" * 40,
+                )
+            self.assertEqual(result["status"], "PASSED")
+            command = check.call_args[0][0]
+            self.assertIn("--bundle", command)
+            self.assertIn("--signer-workflow", command)
+            self.assertIn("--source-digest", command)
+            self.assertIn("--signer-digest", command)
+
+            bad_output = json.dumps([{
+                "verificationResult": {
+                    "statement": {"subject": [{"digest": {
+                        "sha256": "0" * 64,
+                    }}]},
+                },
+            }]).encode("utf-8")
+            with mock.patch.object(
+                    candidate_build_receipt.subprocess, "check_output",
+                    return_value=bad_output):
+                with self.assertRaisesRegex(ValueError, "does not contain"):
+                    verify_github_artifact_attestation(
+                        subject, bundle, "Chary-yu/fos_coverage_tool",
+                        "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
+                        "a" * 40, "b" * 40,
+                    )
 
     def test_candidate_build_attestation_tamper_fails_before_publish(self):
         with tempfile.TemporaryDirectory(prefix="release-attestation-tamper-") as root:

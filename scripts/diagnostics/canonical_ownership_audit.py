@@ -75,8 +75,11 @@ def audit_canonical_ownership(repo_root: str) -> Dict[str, Any]:
         "scripts/upgrade/migration_runner.py",
         "app/db/retry.py",
         "app/candidate_artifact.py",
+        "app/candidate_build_receipt.py",
         "app/release_publication.py",
+        "scripts/release/build_candidate_artifact.py",
         "scripts/release/build_candidate_artifact_manifest.py",
+        "scripts/release/sign_candidate_build_receipt.py",
         "scripts/release/bootstrap_previous_release.py",
         "scripts/upgrade/validation_session.py",
     ]

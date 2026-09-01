@@ -283,6 +283,27 @@ python3 scripts/release/build_candidate_artifact_manifest.py \
   --build-workflow-sha "$BUILD_WORKFLOW_SHA"
 ```
 
+正式 Candidate 不能把 `candidate_root` 当作构建证明。受保护 CI 必须从空目录和
+verified clean checkout 运行 `scripts/release/build_candidate_artifact.py`；该脚本只
+接受自己生成的 Candidate，随后用 GitHub Actions artifact attestation 签署
+`candidate_artifact_manifest.json`。最后由只在受保护 Build job 中可用的
+`COVERAGE_BUILD_PROVENANCE_HMAC_KEY` 生成 detached receipt：
+
+```bash
+python3 scripts/release/sign_candidate_build_receipt.py \
+  --candidate-root /srv/fos-coverage/candidate \
+  --release-identity /secure/evidence/release-identity.json \
+  --source-repo-root /srv/fos-coverage/source-checkout \
+  --build-workflow-identity github-actions/candidate-build \
+  --build-workflow-run-id "$GITHUB_RUN_ID" \
+  --build-workflow-sha "$BUILD_WORKFLOW_SHA" \
+  --attestation-bundle /secure/evidence/candidate-build-attestation.bundle.json
+```
+
+Publisher 会用 `gh attestation verify --bundle` 重新验证 OIDC/Sigstore 证明、
+signer workflow、source digest 和 manifest subject digest；缺少 receipt、bundle、
+受信 key 或 verifier 都是硬失败。
+
 正式发布还必须从受信发布配置提供独立的 workflow trust policy；该策略不能从
 Candidate manifest 自身推导：
 
@@ -291,7 +312,12 @@ python3 scripts/release/publish_release.py \
   ... \
   --source-repo-root /srv/fos-coverage/source-checkout \
   --trusted-build-workflow-identity github-actions/candidate-build \
-  --trusted-build-workflow-sha "$TRUSTED_BUILD_WORKFLOW_SHA"
+  --trusted-build-workflow-sha "$TRUSTED_BUILD_WORKFLOW_SHA" \
+  --candidate-build-receipt /srv/fos-coverage/candidate/candidate_build_receipt.json \
+  --candidate-build-attestation-bundle /secure/evidence/candidate-build-attestation.bundle.json \
+  --candidate-build-attestation-repository Chary-yu/fos_coverage_tool \
+  --candidate-build-attestation-workflow \
+    Chary-yu/fos_coverage_tool/.github/workflows/ci.yml
 ```
 
 普通 Publisher 会重新验证 clean Git checkout，并要求 Candidate 的 workflow identity
