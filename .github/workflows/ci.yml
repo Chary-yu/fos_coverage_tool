@@ -59,6 +59,7 @@ on:
       - 'package.json'
       - 'package-lock.json'
       - '.github/workflows/ci.yml'
+      - '.github/workflows/trusted-candidate-builder.yml'
   push:
     paths:
       - '**.py'
@@ -74,6 +75,7 @@ on:
       - 'package.json'
       - 'package-lock.json'
       - '.github/workflows/ci.yml'
+      - '.github/workflows/trusted-candidate-builder.yml'
 
 permissions:
   contents: read
@@ -678,97 +680,16 @@ jobs:
   candidate-build:
     name: Trusted Candidate Build (manual protected lane)
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_build == true }}
-    runs-on: ubuntu-latest
-    environment: trusted-candidate-build
     permissions:
       contents: read
       id-token: write
       attestations: write
       artifact-metadata: write
-    env:
-      BUILD_WORKFLOW_IDENTITY: github-actions/candidate-build
-      BUILD_WORKFLOW_RUN_ID: ${{ github.run_id }}
-      BUILD_WORKFLOW_SHA: ${{ github.workflow_sha }}
-      COVERAGE_BUILD_PROVENANCE_HMAC_KEY: ${{ secrets.COVERAGE_BUILD_PROVENANCE_HMAC_KEY }}
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          fetch-depth: 0
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: '3.12'
-      - name: Build Candidate from exact clean checkout
-        run: |
-          set -eu
-          test -n "$COVERAGE_BUILD_PROVENANCE_HMAC_KEY"
-          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          test -n "$BUILD_WORKFLOW_SHA"
-          test "${#BUILD_WORKFLOW_SHA}" = 40
-          git cat-file -e "$BUILD_WORKFLOW_SHA^{commit}"
-          mkdir -p .artifacts/candidate-build
-          python scripts/release/build_candidate_artifact.py \
-            --source-repo-root "$GITHUB_WORKSPACE" \
-            --candidate-root "$GITHUB_WORKSPACE/.artifacts/candidate-build/candidate" \
-            --release-identity-output "$GITHUB_WORKSPACE/.artifacts/candidate-build/release_identity.json" \
-            --build-workflow-identity "$BUILD_WORKFLOW_IDENTITY" \
-            --build-workflow-run-id "$BUILD_WORKFLOW_RUN_ID" \
-            --build-workflow-sha "$BUILD_WORKFLOW_SHA" \
-            | tee .artifacts/candidate-build/build.json
-      - name: Create GitHub artifact attestation for Candidate manifest
-        id: candidate_attestation
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: .artifacts/candidate-build/candidate/candidate_artifact_manifest.json
-      - name: Persist external attestation bundle
-        run: |
-          set -eu
-          test -n "${{ steps.candidate_attestation.outputs.bundle-path }}"
-          test -s "${{ steps.candidate_attestation.outputs.bundle-path }}"
-          cp "${{ steps.candidate_attestation.outputs.bundle-path }}" \
-            .artifacts/candidate-build/candidate_build_attestation.bundle.json
-      - name: Sign protected Candidate build receipt
-        run: |
-          set -eu
-          python scripts/release/sign_candidate_build_receipt.py \
-            --candidate-root .artifacts/candidate-build/candidate \
-            --release-identity .artifacts/candidate-build/release_identity.json \
-            --source-repo-root "$GITHUB_WORKSPACE" \
-            --build-workflow-identity "$BUILD_WORKFLOW_IDENTITY" \
-            --build-workflow-run-id "$BUILD_WORKFLOW_RUN_ID" \
-            --build-workflow-sha "$BUILD_WORKFLOW_SHA" \
-            --attestation-bundle .artifacts/candidate-build/candidate_build_attestation.bundle.json \
-            --receipt-output .artifacts/candidate-build/candidate/candidate_build_receipt.json \
-            | tee .artifacts/candidate-build/receipt.json
-      - name: Verify external attestation, receipt, and source binding
-        run: |
-          python - <<'PY'
-          import json
-          from app.candidate_artifact import CandidateArtifactManifest
-          from app.candidate_build_receipt import verify_candidate_build_receipt
-
-          root = '.artifacts/candidate-build/candidate'
-          with open('.artifacts/candidate-build/release_identity.json') as stream:
-              identity = json.load(stream)
-          manifest = CandidateArtifactManifest.verify(
-              root, identity, candidate_sha=identity['commit_sha'],
-              require_trusted_provenance=True,
-          )
-          result = verify_candidate_build_receipt(
-              root, identity, manifest,
-              '.artifacts/candidate-build/candidate_build_attestation.bundle.json',
-              attestation_repository='Chary-yu/fos_coverage_tool',
-              attestation_workflow='Chary-yu/fos_coverage_tool/.github/workflows/ci.yml',
-          )
-          assert result['status'] == 'PASSED'
-          PY
-      - name: Upload immutable trusted Candidate build evidence
-        if: ${{ always() }}
-        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
-        with:
-          name: trusted-candidate-build-${{ github.sha }}-${{ github.run_id }}
-          path: .artifacts/candidate-build
-          if-no-files-found: error
+    uses: Chary-yu/fos_coverage_tool/.github/workflows/trusted-candidate-builder.yml@a4dd8ffe58da42ce4fd9eec88ca7cd5dde07e47f
+    with:
+      source_sha: ${{ github.sha }}
+      builder_workflow_sha: a4dd8ffe58da42ce4fd9eec88ca7cd5dde07e47f
+    secrets: inherit
 
   candidate-source-gate:
     name: Candidate source gate (required source lanes)
