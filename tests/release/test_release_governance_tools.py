@@ -171,6 +171,21 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("workflow_call:", builder)
         self.assertIn("value: ${{ jobs.build.outputs.candidate_artifact_sha256 }}", builder)
 
+    def test_candidate_manifest_helper_only_builds_manifest(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "scripts/release/build_candidate_artifact_manifest.py",
+                "--help",
+            ],
+            cwd=os.getcwd(), stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, universal_newlines=True,
+        )
+        self.assertEqual(completed.returncode, 0)
+        self.assertIn("--build-workflow-run-attempt", completed.stdout)
+        self.assertNotIn("--attestation-bundle", completed.stdout)
+        self.assertNotIn("--receipt-output", completed.stdout)
+
     def test_perf_benchmark_help_is_side_effect_free(self):
         with tempfile.TemporaryDirectory() as directory:
             output = os.path.join(directory, "benchmark.json")

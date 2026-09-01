@@ -13,7 +13,11 @@ on:
         type: string
     secrets:
       COVERAGE_BUILD_PROVENANCE_HMAC_KEY:
-        required: true
+        # The protected job environment supplies this secret.  Keep the
+        # declaration optional so environment-only secrets work when the
+        # reusable workflow is called; the build step still hard-fails when
+        # the environment secret is absent.
+        required: false
     outputs:
       candidate_commit_sha:
         description: Exact commit used by the Candidate build
