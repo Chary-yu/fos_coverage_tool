@@ -246,13 +246,14 @@ def verify_candidate_build_receipt(
         manifest_path, bundle_path, attestation_repository,
         attestation_workflow, payload.get("source_commit_sha"),
         payload.get("build_workflow_sha"),
+        payload.get("build_workflow_run_id"),
     )
     return receipt
 
 
 def verify_github_artifact_attestation(
         subject_path, bundle_path, repository, workflow, source_commit_sha,
-        workflow_sha, verifier="gh"):
+        workflow_sha, workflow_run_id, verifier="gh"):
     """Verify the Sigstore/GitHub attestation and its exact subject digest.
 
     ``gh attestation verify --bundle`` performs the cryptographic certificate,
@@ -263,9 +264,10 @@ def verify_github_artifact_attestation(
     workflow = str(workflow or "").strip()
     source_commit_sha = str(source_commit_sha or "").strip()
     workflow_sha = str(workflow_sha or "").strip()
-    if not repository or not workflow:
+    workflow_run_id = str(workflow_run_id or "").strip()
+    if not repository or not workflow or not workflow_run_id:
         raise ValueError(
-            "GitHub artifact-attestation repository and signer workflow are required"
+            "GitHub artifact-attestation repository, signer workflow, and run ID are required"
         )
     subject_path = _require_regular_file(
         subject_path, "Candidate attestation subject"
@@ -307,6 +309,7 @@ def verify_github_artifact_attestation(
         raise ValueError("GitHub artifact-attestation verification returned no result")
     subject_sha = _sha256(subject_path)
     found_subject = False
+    found_run = False
     for result in verified:
         if not isinstance(result, dict):
             continue
@@ -320,10 +323,18 @@ def verify_github_artifact_attestation(
                 found_subject = True
                 break
         if found_subject:
+            predicate = statement.get("predicate") or {}
+            if workflow_run_id in json.dumps(
+                    predicate, ensure_ascii=False, sort_keys=True):
+                found_run = True
             break
     if not found_subject:
         raise ValueError(
             "GitHub artifact attestation does not contain the Candidate manifest digest"
+        )
+    if not found_run:
+        raise ValueError(
+            "GitHub artifact attestation does not contain the Candidate build run ID"
         )
     return {
         "status": "PASSED",
@@ -332,4 +343,5 @@ def verify_github_artifact_attestation(
         "signer_workflow": workflow,
         "source_commit_sha": source_commit_sha,
         "signer_workflow_sha": workflow_sha,
+        "workflow_run_id": workflow_run_id,
     }

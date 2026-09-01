@@ -543,6 +543,11 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                         "subject": [{"name": "manifest", "digest": {
                             "sha256": subject_sha,
                         }}],
+                        "predicate": {
+                            "runDetails": {
+                                "metadata": {"invocationId": "run-123"},
+                            },
+                        },
                     },
                 },
             }]).encode("utf-8")
@@ -552,7 +557,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 result = verify_github_artifact_attestation(
                     subject, bundle, "Chary-yu/fos_coverage_tool",
                     "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
-                    "a" * 40, "b" * 40,
+                    "a" * 40, "b" * 40, "run-123",
                 )
             self.assertEqual(result["status"], "PASSED")
             command = check.call_args[0][0]
@@ -563,9 +568,14 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
 
             bad_output = json.dumps([{
                 "verificationResult": {
-                    "statement": {"subject": [{"digest": {
-                        "sha256": "0" * 64,
-                    }}]},
+                    "statement": {
+                        "subject": [{"digest": {"sha256": "0" * 64}}],
+                        "predicate": {
+                            "runDetails": {
+                                "metadata": {"invocationId": "run-123"},
+                            },
+                        },
+                    },
                 },
             }]).encode("utf-8")
             with mock.patch.object(
@@ -575,7 +585,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                     verify_github_artifact_attestation(
                         subject, bundle, "Chary-yu/fos_coverage_tool",
                         "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
-                        "a" * 40, "b" * 40,
+                        "a" * 40, "b" * 40, "run-123",
                     )
 
     def test_candidate_build_attestation_tamper_fails_before_publish(self):
