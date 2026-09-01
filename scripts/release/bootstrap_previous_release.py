@@ -108,6 +108,18 @@ def bootstrap(served_root, publish_root, release_identity_path, session_id,
         served_root, served_identity_path
     )
     observed = _verify_identity(expected, observed_payload)
+    # If the current root already carries the immutable publication manifest,
+    # validate its physical Served Root before using it as the baseline.  A
+    # legacy root may instead expose the identity in a standalone JSON file.
+    if isinstance(observed_payload, dict) and \
+            observed_payload.get("release_validation_session_id"):
+        current_check = validate_release_manifest(served_root, observed_payload)
+        if current_check.get("status") != "PASSED":
+            raise ValueError(
+                "current Served Root immutable manifest is invalid: {}".format(
+                    "; ".join(current_check.get("violations") or [])
+                )
+            )
 
     publisher = ImmutableReleasePublisher(publish_root)
     if os.path.lexists(publisher.current_path):
