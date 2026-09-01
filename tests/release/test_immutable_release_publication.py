@@ -148,6 +148,26 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 identity = current_publication_identity(publish_root)
             self.assertEqual(identity["commit_sha"], "7" * 40)
 
+    def test_runtime_payload_drift_invalidates_publication_identity_cache(self):
+        with tempfile.TemporaryDirectory(prefix="release-publication-drift-") as root:
+            source = os.path.join(root, "source")
+            os.makedirs(source)
+            self._source(source)
+            publish_root = os.path.join(root, "publish")
+            publisher = ImmutableReleasePublisher(publish_root)
+            self._prepare(
+                publisher, source,
+                {"commit_sha": "0a" * 20, "build_id": "candidate-drift"},
+                "drift-session",
+            )
+            publisher.switch_current("drift-session")
+            self.assertTrue(current_publication_identity(publish_root))
+            with open(os.path.join(
+                    publisher.release_path("drift-session"),
+                    "reports", "index.html"), "a", encoding="utf-8") as stream:
+                stream.write("<!-- drift -->\n")
+            self.assertEqual(current_publication_identity(publish_root), {})
+
     def test_vnext_report_missing_sidecar_fails_closed(self):
         with tempfile.TemporaryDirectory(prefix="release-publication-invalid-") as root:
             source = os.path.join(root, "source")

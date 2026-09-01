@@ -656,8 +656,44 @@ def _publication_identity_from_manifest(manifest):
     }
 
 
+def _runtime_inventory_stat_fingerprint(release_root):
+    """Fingerprint runtime files without reading their content.
+
+    This is intentionally a lightweight integrity boundary for the public
+    release endpoint.  A change to a runtime file, an added/removed file, or
+    a replacement inode invalidates the publication identity cache and forces
+    the complete SHA256 release validation.
+    """
+    release_root = _real(release_root)
+    entries = []
+    for directory in ("reports", "assets", "registry"):
+        directory_root = os.path.join(release_root, directory)
+        if os.path.islink(directory_root) or not os.path.isdir(directory_root):
+            raise ValueError("runtime release directory is missing or linked: {}".format(
+                directory
+            ))
+        for path in _walk_regular_files(directory_root):
+            file_stat = os.lstat(path)
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ValueError("runtime release file is not regular: {}".format(path))
+            mtime_ns = getattr(
+                file_stat, "st_mtime_ns", int(file_stat.st_mtime * 1000000000)
+            )
+            ctime_ns = getattr(
+                file_stat, "st_ctime_ns", int(file_stat.st_ctime * 1000000000)
+            )
+            entries.append({
+                "path": _safe_relative(release_root, path),
+                "inode": int(file_stat.st_ino),
+                "size": int(file_stat.st_size),
+                "mtime_ns": int(mtime_ns),
+                "ctime_ns": int(ctime_ns),
+            })
+    return _inventory_hash(sorted(entries, key=lambda item: item["path"]))
+
+
 def _publication_manifest_cache_key(publish_root, release_root, manifest_path):
-    """Return an O(1)-sized key for a release manifest's current bytes."""
+    """Return a key for manifest metadata and runtime file stat state."""
     try:
         file_stat = os.lstat(manifest_path)
         if not stat.S_ISREG(file_stat.st_mode):
@@ -669,6 +705,7 @@ def _publication_manifest_cache_key(publish_root, release_root, manifest_path):
             _real(publish_root), _real(release_root), int(file_stat.st_dev),
             int(file_stat.st_ino), int(mtime_ns), int(file_stat.st_size),
             _sha256(manifest_path),
+            _runtime_inventory_stat_fingerprint(release_root),
         )
     except (OSError, ValueError, TypeError):
         return None
@@ -709,7 +746,8 @@ def _invalidate_publication_identity_cache(publish_root, release_root=""):
                 del _PUBLICATION_IDENTITY_CACHE[key]
 
 
-def _read_validated_publication_identity(release_root, manifest, manifest_sha):
+def _read_validated_publication_identity(release_root, manifest, manifest_sha,
+                                         runtime_fingerprint):
     """Read the small validated-identity sidecar without scanning artifacts."""
     sidecar_path = os.path.join(
         release_root, VALIDATED_PUBLICATION_IDENTITY_NAME
@@ -725,6 +763,8 @@ def _read_validated_publication_identity(release_root, manifest, manifest_sha):
             VALIDATED_PUBLICATION_IDENTITY_SCHEMA_VERSION or \
             sidecar.get("release_root") != _real(release_root) or \
             sidecar.get("release_manifest_sha256") != manifest_sha or \
+            sidecar.get("runtime_inventory_stat_fingerprint") != \
+                runtime_fingerprint or \
             not isinstance(identity, dict):
         return {}
     expected = _publication_identity_from_manifest(manifest)
@@ -742,6 +782,7 @@ def _write_validated_publication_identity(publish_root, release_root,
         manifest = manifest if manifest is not None else _load_json(manifest_path)
         identity = _publication_identity_from_manifest(manifest)
         manifest_sha = _sha256(manifest_path)
+        runtime_fingerprint = _runtime_inventory_stat_fingerprint(release_root)
         if not identity:
             return
         _json_write(
@@ -750,6 +791,7 @@ def _write_validated_publication_identity(publish_root, release_root,
                 "schema_version": VALIDATED_PUBLICATION_IDENTITY_SCHEMA_VERSION,
                 "release_root": release_root,
                 "release_manifest_sha256": manifest_sha,
+                "runtime_inventory_stat_fingerprint": runtime_fingerprint,
                 "identity": identity,
             },
         )
@@ -791,9 +833,10 @@ def current_publication_identity(publish_root):
         manifest = _load_json(manifest_path)
     except (OSError, ValueError, TypeError):
         return {}
-    manifest_sha = cache_key[-1]
+    manifest_sha = cache_key[-2]
+    runtime_fingerprint = cache_key[-1]
     sidecar_identity = _read_validated_publication_identity(
-        release_root, manifest, manifest_sha
+        release_root, manifest, manifest_sha, runtime_fingerprint
     )
     if sidecar_identity:
         _cache_publication_identity(
@@ -809,6 +852,7 @@ def current_publication_identity(publish_root):
     except (OSError, ValueError, TypeError):
         return {}
     if checked.get("status") != "PASSED":
+        _invalidate_publication_identity_cache(publish_root, release_root)
         return {}
     identity = _publication_identity_from_manifest(manifest)
     if not identity:
