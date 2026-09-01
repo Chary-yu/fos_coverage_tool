@@ -2866,12 +2866,17 @@ npm run perf:browser-ab -- \
   --baseline-commit <before-sha> \
   --candidate-commit <candidate-sha> \
   --workload-hash <固定 workload hash> \
+  --release-validation-session-id <current-attempt-id> \
+  --candidate-artifact-sha256 <published-candidate-artifact-sha256> \
+  --served-root-sha256 <published-served-root-sha256> \
   --output <release-performance-ab.json>
 ```
 
 合并器会校验两个源产物的 SHA256、workload/environment identity、A-D 固定
 规模和 100k 虚拟滚动预算；`run_upgrade.py` 只接受该
-`release_performance_ab` 产物。
+`release_performance_ab` 产物，并要求它绑定当前 validation attempt、Candidate
+artifact 和 immutable Served Root。Candidate 发布字节必须先完成 normalize，再生成
+CandidateArtifactManifest；Publisher 只验证和发布，不在复制后改写 artifact。
 
 
 ## 9.17 Gate E 主要修改文件

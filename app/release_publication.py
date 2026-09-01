@@ -168,11 +168,11 @@ def _html_metadata(path):
     return values
 
 
-def _ensure_explicit_report_modes(release_root):
-    """Make Legacy mode explicit in the immutable candidate copy.
+def normalize_candidate_artifact(release_root):
+    """Normalize report mode metadata before a Candidate manifest is built.
 
     Historical HTML may predate the report-mode metadata.  It is safe to
-    annotate such a copy as Legacy, but a registry that already claims a
+    annotate such a Candidate as Legacy, but a registry that already claims a
     VNext artifact must fail closed when its HTML omits the mode: otherwise
     the manifest would say VNext while the browser's safe default stays
     offline in Legacy mode.
@@ -223,6 +223,12 @@ def _ensure_explicit_report_modes(release_root):
             text = text[:head.end()] + insertion + text[head.end():]
         with open(path, "w", encoding="utf-8") as stream:
             stream.write(text)
+
+
+# Kept as a private compatibility alias for callers that imported the old
+# helper.  Publication itself deliberately does not call either name: the
+# Candidate build pipeline must normalize before hashing its manifest.
+_ensure_explicit_report_modes = normalize_candidate_artifact
 
 
 def _safe_relative(root, path):
@@ -643,7 +649,20 @@ class ImmutableReleasePublisher(object):
                 path = os.path.join(staging, directory)
                 if not os.path.isdir(path):
                     raise ValueError("release source is missing {}/".format(directory))
-            _ensure_explicit_report_modes(staging)
+            # Re-verify the copied Candidate before adding publication
+            # metadata.  This keeps the pre-publication manifest as the
+            # byte-level contract for the artifact that will be served.
+            copied_candidate_manifest = CandidateArtifactManifest.verify(
+                staging, release_identity, candidate_sha=candidate_sha,
+                manifest_path=os.path.join(
+                    staging,
+                    str(verified_candidate_manifest.get("manifest_path") or
+                        CANDIDATE_ARTIFACT_MANIFEST_NAME).replace("/", os.sep),
+                ),
+            )
+            if copied_candidate_manifest.get("artifact_sha256") != \
+                    verified_candidate_manifest.get("artifact_sha256"):
+                raise ValueError("copied Candidate artifact bytes do not match manifest")
             # Build against the final path so the persisted Served Root is the
             # path Nginx will actually resolve after the atomic rename.
             manifest = build_release_manifest(

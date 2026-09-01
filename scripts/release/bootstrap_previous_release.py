@@ -21,7 +21,8 @@ if ROOT not in sys.path:
 
 from app.candidate_artifact import CandidateArtifactManifest, identity_manifest_sha256
 from app.release_publication import (
-    ImmutableReleasePublisher, validate_release_manifest,
+    ImmutableReleasePublisher, normalize_candidate_artifact,
+    validate_release_manifest,
 )
 
 
@@ -160,6 +161,9 @@ def bootstrap(served_root, publish_root, release_identity_path, session_id,
 
     with tempfile.TemporaryDirectory(prefix="coverage-bootstrap-") as build_root:
         _copy_source_without_following_links(served_root, build_root)
+        # Bootstrap creates the Candidate bytes that are about to be hashed;
+        # the Publisher must not normalize a different copy later.
+        normalize_candidate_artifact(build_root)
         artifact_manifest = CandidateArtifactManifest.build(
             build_root, expected,
             source_provenance={

@@ -9,7 +9,8 @@ from app.candidate_artifact import (
     identity_manifest_sha256,
 )
 from app.release_publication import (
-    ImmutableReleasePublisher, validate_release_manifest,
+    ImmutableReleasePublisher, normalize_candidate_artifact,
+    validate_release_manifest,
 )
 
 
@@ -52,6 +53,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             }, stream)
 
     def _prepare(self, publisher, source, identity, session_id, **kwargs):
+        normalize_candidate_artifact(source)
         CandidateArtifactManifest.build(
             source, identity,
             source_provenance={
@@ -125,7 +127,36 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             self.assertIn(
                 'name="coverage-report-mode" content="LEGACY_STATIC"', html
             )
+            with open(os.path.join(source, "reports", "index.html"), encoding="utf-8") as stream:
+                source_html = stream.read()
+            self.assertEqual(html, source_html)
             self.assertEqual(manifest["report_modes"], ["LEGACY_STATIC"])
+
+    def test_publisher_does_not_normalize_after_candidate_manifest(self):
+        with tempfile.TemporaryDirectory(prefix="release-publication-no-mutation-") as root:
+            source = os.path.join(root, "source")
+            os.makedirs(source)
+            self._source(source, mode="LEGACY_STATIC", include_mode=False)
+            identity = {"commit_sha": "9" * 40, "build_id": "candidate-9"}
+            CandidateArtifactManifest.build(
+                source, identity,
+                source_provenance={
+                    "provenance_class": "test-fixture",
+                    "source_commit_sha": identity["commit_sha"],
+                    "source_tree_sha": "d" * 40,
+                    "worktree_clean": True,
+                    "build_workflow_identity": "tests.release.test_immutable_release_publication",
+                    "source_manifest_sha256": identity_manifest_sha256(identity),
+                },
+            )
+            source_html_path = os.path.join(source, "reports", "index.html")
+            with open(source_html_path, "rb") as stream:
+                before = stream.read()
+            publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
+            with self.assertRaisesRegex(ValueError, "explicit report mode"):
+                publisher.prepare(source, identity, "no-normalize-session")
+            with open(source_html_path, "rb") as stream:
+                self.assertEqual(stream.read(), before)
 
     def test_vnext_registry_without_html_mode_fails_closed(self):
         with tempfile.TemporaryDirectory(prefix="release-publication-vnext-mode-") as root:

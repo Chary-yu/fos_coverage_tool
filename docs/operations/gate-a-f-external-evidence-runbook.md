@@ -172,8 +172,11 @@ virtual-scroll sweep；release identity 不匹配、HTTP/Chromium 失败或跨�
 ```bash
 npm ci  # 取证主机按既有方式准备 Python/Node 依赖
 node scripts/diagnostics/real_browser_evidence.js \
-  --url 'http://127.0.0.1:19528/<real-report-file>.gcov.html' \
+  --url 'https://<candidate-host>/<real-report-file>.gcov.html' \
   --expected-revision "$(git rev-parse HEAD)" \
+  --release-validation-session-id "$RELEASE_VALIDATION_SESSION_ID" \
+  --candidate-artifact-sha256 "$CANDIDATE_ARTIFACT_SHA256" \
+  --served-root-sha256 "$SERVED_ROOT_SHA256" \
   --header "X-Remote-User=$COVERAGE_BROWSER_USER" \
   --header "X-Remote-Role=reviewer" \
   --output /secure/evidence/gate-e/real-browser-workload.json \
@@ -188,6 +191,21 @@ header value 写入 artifact；但仍应通过环境变量或受控 secret 注�
 mutation；需要 mutation rehearsal 时应使用独立 Candidate 数据库和专门的 API
 回归脚本。
 
+发布性能 A/B 也必须绑定同一个 attempt 和已发布 artifact：
+
+```bash
+node scripts/diagnostics/release_performance_ab.js \
+  --baseline-artifact /secure/evidence/gate-e/baseline.json \
+  --candidate-artifact /secure/evidence/gate-e/candidate.json \
+  --baseline-commit "$PREVIOUS_COMMIT_SHA" \
+  --candidate-commit "$CANDIDATE_COMMIT_SHA" \
+  --workload-hash "$RELEASE_WORKLOAD_HASH" \
+  --release-validation-session-id "$RELEASE_VALIDATION_SESSION_ID" \
+  --candidate-artifact-sha256 "$CANDIDATE_ARTIFACT_SHA256" \
+  --served-root-sha256 "$SERVED_ROOT_SHA256" \
+  --output "/secure/evidence/gate-e/release-performance-ab-${RELEASE_VALIDATION_SESSION_ID}.json"
+```
+
 同一采集器也接入 `.github/workflows/ci.yml` 的手动
 `real-browser-candidate` lane。触发 `workflow_dispatch` 时提供
 `real_browser_url`（可选提供 `real_browser_expected_revision`），并在仓库/环境
@@ -199,8 +217,10 @@ fixture/browser evidence。
 `browser_fixture_regression`，不能写入生产 Browser Gate。正式升级必须在配置中
 提供 `candidate_browser_url` 和外部 `candidate_browser_evidence_path`；该文件必须
 来自 `real_browser_evidence.js --browser-evidence-output`，并绑定 exact commit、
-served release identity、真实 HTTP、Chromium、artifact SHA 和
-`synthetic=false`，否则 Final Gate 保持 `NOT_READY`。
+served release identity、真实 HTTP、Chromium、artifact SHA、当前
+`release_validation_session_id`、Candidate artifact SHA、Served Root SHA 和
+`synthetic=false`，否则 Final Gate 保持 `NOT_READY`。三类外部 evidence 的路径都必须
+按 attempt 隔离；即使两个 attempt 使用同一 Candidate SHA，也不能复用旧 JSON。
 
 ## 首次接管：建立 immutable previous baseline
 
@@ -228,6 +248,27 @@ identity 缺失/不匹配或 artifact hash 失败都会拒绝操作；bootstrap 
 写入按 `{attempt_id}` 分隔的路径；旧 attempt 即使已 rollback/teardown，也不会阻塞
 同一 SHA 的新 attempt。只有在审计明确要求时才使用配置中的
 `release_validation_session_id` 固定该次尝试身份。
+
+Rollback rehearsal 也必须写入同一个 attempt namespace，并绑定本次发布的两个
+artifact hash：
+
+```bash
+python3 scripts/upgrade/run_rollback_rehearsal.py \
+  --output "/secure/evidence/gate-f/rollback-${RELEASE_VALIDATION_SESSION_ID}.json" \
+  --revision "$CANDIDATE_COMMIT_SHA" \
+  --config /srv/fos-coverage/candidate/config/coverage_config.staging.example.json \
+  --release-validation-session-id "$RELEASE_VALIDATION_SESSION_ID" \
+  --candidate-artifact-sha256 "$CANDIDATE_ARTIFACT_SHA256" \
+  --served-root-sha256 "$SERVED_ROOT_SHA256"
+```
+
+`target_release_id`、`release_validation_session_id`、Candidate artifact SHA 和
+Served Root SHA 必须全部与当前 attempt 一致；否则 rollback evidence 不能进入
+Final Gate。
+
+Candidate 构建的字节流程固定为：`build → normalize → CandidateArtifactManifest →
+verify → immutable publish`。`ImmutableReleasePublisher` 不再在复制后修改 HTML；
+因此 Candidate manifest 与最终发布 artifact 可以做 byte-for-byte 对账。
 
 ## Gate F：切换、回滚和 48 小时窗口
 

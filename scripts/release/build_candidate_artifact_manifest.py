@@ -16,6 +16,7 @@ from app.candidate_artifact import (
     build_git_source_provenance,
 )
 from app.release_identity import verify_release_identity
+from app.release_publication import normalize_candidate_artifact
 
 
 def _load(path):
@@ -50,6 +51,10 @@ def main(argv=None):
         source_provenance = build_git_source_provenance(
             args.source_repo_root, identity, args.build_workflow_identity
         )
+        # All deterministic content changes happen before the Candidate
+        # manifest is hashed.  ImmutableReleasePublisher only verifies and
+        # copies these bytes; it must not create a second artifact variant.
+        normalize_candidate_artifact(candidate_root)
     except (OSError, RuntimeError, ValueError, TypeError) as exc:
         parser.error(str(exc))
     output = args.output or os.path.join(
