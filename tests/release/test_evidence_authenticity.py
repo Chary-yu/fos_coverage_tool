@@ -268,6 +268,29 @@ class TestEvidenceAuthenticity(unittest.TestCase):
             self.assertFalse(passed)
             self.assertTrue(any("Browser" in item or "Backup" in item for item in unmet))
 
+    def test_validation_teardown_is_a_hard_not_ready_gate(self):
+        with tempfile.TemporaryDirectory() as root:
+            manifest = ProductionEvidenceManifest(root)
+            revision = "a" * 40
+            manifest.data["release_identity"] = {
+                "version": "v", "commit_sha": revision, "build_id": "b"
+            }
+            manifest.data["validation_session_manifest"] = {
+                "status": "PASSED", "revision": revision,
+                "session_id": "candidate-session",
+                "candidate_sha": revision, "baseline_sha": "b" * 40,
+            }
+            manifest.data["validation_teardown"] = {
+                "status": "PASSED", "revision": revision,
+                "session_id": "candidate-session",
+                "pids_closed": False, "ports_closed": True,
+                "ports_probe_ok": True,
+            }
+            passed, unmet = manifest.validate_final_gate()
+            self.assertFalse(passed)
+            self.assertIn("validation_teardown requires pids_closed=true", unmet)
+            self.assertEqual(manifest.data["release_decision"], "NOT_READY")
+
     def test_evidence_manifest_v2_binds_record_to_revision_and_artifact_sha(self):
         with tempfile.TemporaryDirectory() as root:
             artifact = os.path.join(root, "evidence.json")

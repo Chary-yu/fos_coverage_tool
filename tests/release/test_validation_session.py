@@ -92,11 +92,16 @@ class ValidationSessionTest(unittest.TestCase):
                     "scripts.upgrade.validation_session._port_listeners",
                     return_value=[]):
                 evidence = loaded.teardown(evidence_path=evidence_path, timeout=0)
-            self.assertEqual(evidence["status"], "PASSED")
-            self.assertFalse(evidence["p1"])
+                self.assertEqual(evidence["status"], "PASSED")
+                self.assertTrue(evidence["pids_closed"])
+                self.assertTrue(evidence["ports_closed"])
+                self.assertTrue(evidence["ports_probe_ok"])
+                self.assertFalse(evidence["p1"])
             with open(evidence_path, encoding="utf-8") as stream:
                 persisted = json.load(stream)
             self.assertEqual(persisted["session_id"], "candidate-session")
+            self.assertTrue(persisted["pids_closed"])
+            self.assertTrue(persisted["ports_closed"])
             self.assertEqual(
                 ValidationSession.load(manifest_path).data["teardown_status"],
                 "PASSED",

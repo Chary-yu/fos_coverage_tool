@@ -14,6 +14,17 @@ from scripts.upgrade.cutover_controller import CutoverController
 
 
 class TestUpgradeManifest(unittest.TestCase):
+    def test_production_upgrade_uses_immutable_publication_only(self):
+        with open(
+                os.path.join(ROOT, "scripts", "upgrade", "run_upgrade.py"),
+                encoding="utf-8") as stream:
+            source = stream.read()
+        self.assertIn("ImmutableReleasePublisher", source)
+        self.assertIn("self.publisher.prepare", source)
+        self.assertIn("self.publisher.switch_current", source)
+        self.assertNotIn("from scripts.upgrade.cutover_controller import", source)
+        self.assertNotIn("self.cutover.apply", source)
+
     def test_explicit_manifest_hash_and_rollback(self):
         with tempfile.TemporaryDirectory() as root:
             path = os.path.join(root, "candidate.txt")

@@ -1,4 +1,10 @@
-"""Explicit-file cutover and recoverable rollback primitives."""
+"""Legacy explicit-file primitive reserved for isolated rollback rehearsal.
+
+The production upgrade entrypoint deliberately does not import this module.
+Production publication must use ``ImmutableReleasePublisher`` and its atomic
+``CURRENT`` pointer; this controller remains only for the standalone rehearsal
+tests that exercise legacy file-restore behavior.
+"""
 
 import hashlib
 import os

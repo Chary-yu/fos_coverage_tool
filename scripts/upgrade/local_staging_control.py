@@ -73,7 +73,18 @@ def start(config_path, pid_path, endpoint, session_manifest="",
           allow_non_loopback=False, allowlist=None, temporary_token="",
           expires_at=""):
     host, port = _load_server_binding(config_path)
-    session_manifest = session_manifest or (pid_path + ".session.json")
+    session_manifest = session_manifest or os.environ.get(
+        "COVERAGE_VALIDATION_SESSION_MANIFEST", ""
+    ) or (pid_path + ".session.json")
+    session_id = session_id or os.environ.get(
+        "COVERAGE_VALIDATION_SESSION_ID", ""
+    )
+    candidate_sha = candidate_sha or os.environ.get(
+        "COVERAGE_VALIDATION_CANDIDATE_SHA", ""
+    )
+    baseline_sha = baseline_sha or os.environ.get(
+        "COVERAGE_VALIDATION_BASELINE_SHA", ""
+    )
     session = _get_or_create_session(
         session_manifest, session_id, candidate_sha, baseline_sha,
         host, port, allow_non_loopback, allowlist or [], temporary_token,
@@ -121,7 +132,12 @@ def start(config_path, pid_path, endpoint, session_manifest="",
 
 
 def stop(pid_path, session_manifest="", evidence_path=""):
-    session_manifest = session_manifest or (pid_path + ".session.json")
+    session_manifest = session_manifest or os.environ.get(
+        "COVERAGE_VALIDATION_SESSION_MANIFEST", ""
+    ) or (pid_path + ".session.json")
+    evidence_path = evidence_path or os.environ.get(
+        "COVERAGE_VALIDATION_TEARDOWN_EVIDENCE", ""
+    )
     if os.path.isfile(session_manifest):
         session = ValidationSession.load(session_manifest)
         return session.teardown(

@@ -314,6 +314,13 @@ class ValidationSession(object):
             "session_id": self.data.get("session_id", ""),
             "teardown_at": utc_iso(),
             "status": status,
+            # Keep the hard-gate fields at the top level as well as in the
+            # detailed verification object.  Release evidence consumers must
+            # be able to make a direct, unambiguous decision without knowing
+            # the internal ValidationSession result shape.
+            "pids_closed": verification["pids_closed"],
+            "ports_closed": verification["ports_closed"],
+            "ports_probe_ok": verification["ports_probe_ok"],
             "attempted": attempted,
             "verification": verification,
             "p1": status != "PASSED",

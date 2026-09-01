@@ -34,6 +34,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from app.release_identity import verify_release_identity
+from app.release_publication import ImmutableReleasePublisher
 from scripts.diagnostics.data_hash_gate import capture_database_snapshot, verify_data_integrity
 from scripts.upgrade.evidence_manifest import ProductionEvidenceManifest
 from scripts.upgrade.schema_preflight import (
@@ -45,8 +46,10 @@ from scripts.diagnostics.security_scanner import scan_directory
 from scripts.diagnostics.sidecar_registry_audit import audit_sidecar_and_registry
 from scripts.maintenance.mysql_backup import perform_database_backup
 from scripts.upgrade.migrate_file_state import backfill_all_projects
-from scripts.upgrade.cutover_controller import CutoverController
 from app.upgrade.lifecycle import UpgradeLifecycle
+from scripts.upgrade.validation_session import (
+    SESSION_SCHEMA_VERSION, ValidationSession,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,16 @@ def _path_is_within(path: str, root: str) -> bool:
         ]) == os.path.realpath(os.path.abspath(root))
     except (AttributeError, OSError, ValueError):
         return False
+
+
+def _resolve_upgrade_path(repo_root: str, configured: Optional[str], field: str) -> str:
+    """Resolve a required upgrade control path relative to the checkout."""
+    if not configured:
+        raise RuntimeError("upgrade.{} is required".format(field))
+    value = str(configured)
+    if not os.path.isabs(value):
+        value = os.path.join(repo_root, value)
+    return os.path.realpath(os.path.abspath(value))
 
 
 def resolve_backup_root(repo_root: str, configured_root: Optional[str] = None) -> str:
@@ -229,37 +242,241 @@ def connect_live_database(db_config: Dict[str, Any]):
 class UpgradeOrchestrator:
     def __init__(self, repo_root: Optional[str] = None,
                  backup_root: Optional[str] = None):
-        self.repo_root = repo_root or _REPO_ROOT
+        self.repo_root = os.path.realpath(repo_root or _REPO_ROOT)
         self.manifest = ProductionEvidenceManifest(self.repo_root)
         self.backup_dir = resolve_backup_root(self.repo_root, backup_root)
-        self.cutover = CutoverController(self.repo_root, os.path.join(self.backup_dir, "files"))
+        self.publisher = None
+        self.candidate_root = ""
+        self.publish_root = ""
+        self.validation_session = None
+        self.validation_session_manifest_path = ""
+        self.validation_teardown_evidence_path = ""
+        self.previous_published_session_id = ""
+        self._target_identity = {}
+        self._upgrade_mode = ""
+        self._runtime_config = {}
+        self._validation_teardown_result = None
         self.logs: List[str] = []
-        self._cutover_applied = False
+        self._publication_switched = False
 
     def _configure_backup_root(self, configured_root: Optional[str]):
         resolved = resolve_backup_root(self.repo_root, configured_root)
         if resolved == self.backup_dir:
             return
-        if self._cutover_applied:
+        if self._publication_switched:
             raise RuntimeError("backup root cannot change after file cutover")
         self.backup_dir = resolved
-        self.cutover = CutoverController(
-            self.repo_root, os.path.join(self.backup_dir, "files")
+
+    def _configure_release_controls(self, upgrade_config: Dict[str, Any],
+                                    identity: Dict[str, Any],
+                                    previous_release: Dict[str, Any],
+                                    runtime_config: Dict[str, Any]):
+        """Bind the upgrade to immutable publication and an owned session.
+
+        The active checkout is not a publication target.  The only mutable
+        release operation permitted here is an atomic ``CURRENT`` pointer
+        switch performed by ``ImmutableReleasePublisher``.
+        """
+        candidate_root = _resolve_upgrade_path(
+            self.repo_root, upgrade_config.get("candidate_root"), "candidate_root"
         )
+        publish_root = _resolve_upgrade_path(
+            self.repo_root, upgrade_config.get("publish_root"), "publish_root"
+        )
+        if _path_is_within(publish_root, self.repo_root):
+            raise RuntimeError("upgrade.publish_root must be outside the active deployment root")
+        if _path_is_within(publish_root, candidate_root) or \
+                _path_is_within(candidate_root, publish_root):
+            raise RuntimeError("upgrade.publish_root and candidate_root must be separate")
+
+        self.candidate_root = candidate_root
+        self.publish_root = publish_root
+        self.publisher = ImmutableReleasePublisher(publish_root)
+        current = self.publisher.validate_current()
+        if current.get("status") != "PASSED":
+            raise RuntimeError(
+                "CURRENT does not point to a validated immutable release: {}".format(
+                    "; ".join(current.get("violations") or [])
+                )
+            )
+        if current.get("commit_sha") != previous_release.get("commit_sha"):
+            raise RuntimeError(
+                "CURRENT release does not match previous_release commit_sha"
+            )
+        self.previous_published_session_id = self.publisher.current_session_id()
+        if not self.previous_published_session_id:
+            raise RuntimeError("CURRENT release-validation session identity is missing")
+
+        self.validation_session_manifest_path = _resolve_upgrade_path(
+            self.repo_root,
+            upgrade_config.get("validation_session_manifest"),
+            "validation_session_manifest",
+        )
+        configured_teardown = upgrade_config.get("validation_teardown_evidence_path")
+        self.validation_teardown_evidence_path = _resolve_upgrade_path(
+            self.repo_root,
+            configured_teardown or (
+                self.validation_session_manifest_path + ".teardown.json"
+            ),
+            "validation_teardown_evidence_path",
+        )
+        if self.validation_teardown_evidence_path == self.validation_session_manifest_path:
+            raise RuntimeError(
+                "validation teardown evidence must not overwrite the session manifest"
+            )
+
+        session_id = str(
+            upgrade_config.get("validation_session_id") or
+            "candidate-{}".format(identity.get("commit_sha"))
+        ).strip()
+        try:
+            self.publisher.release_path(session_id)
+        except ValueError as exc:
+            raise RuntimeError("validation session id is invalid: {}".format(exc))
+        if os.path.isfile(self.validation_session_manifest_path):
+            session = ValidationSession.load(self.validation_session_manifest_path)
+            if upgrade_config.get("validation_session_id") and \
+                    session.data.get("session_id") != session_id:
+                raise RuntimeError("validation session id does not match manifest")
+        else:
+            server = runtime_config.get("server") or {}
+            configured_ports = upgrade_config.get("validation_ports")
+            if configured_ports is None:
+                configured_ports = [server.get("port")]
+            if isinstance(configured_ports, (str, int)):
+                configured_ports = [configured_ports]
+            try:
+                ports = sorted(set(int(port) for port in configured_ports if port))
+            except (TypeError, ValueError):
+                raise RuntimeError("upgrade.validation_ports must contain integers")
+            if not ports:
+                raise RuntimeError(
+                    "upgrade.validation_ports must identify at least one owned port"
+                )
+            session = ValidationSession.create(
+                self.validation_session_manifest_path,
+                session_id,
+                candidate_sha=identity.get("commit_sha"),
+                baseline_sha=previous_release.get("commit_sha"),
+                ports=ports,
+                evidence_paths=[self.validation_teardown_evidence_path],
+            )
+
+        if int(session.data.get("schema_version") or 0) != SESSION_SCHEMA_VERSION:
+            raise RuntimeError("validation session schema version is unsupported")
+        if not session.data.get("session_id"):
+            raise RuntimeError("validation session id is missing")
+        if session.data.get("candidate_sha") != identity.get("commit_sha"):
+            raise RuntimeError("validation session candidate SHA mismatches target release")
+        if session.data.get("baseline_sha") != previous_release.get("commit_sha"):
+            raise RuntimeError("validation session baseline SHA mismatches previous release")
+        if session.data.get("teardown_status") == "PASSED":
+            raise RuntimeError("validation session has already been torn down")
+        if not session.data.get("ports"):
+            raise RuntimeError("validation session has no owned validation ports")
+        self.validation_session = session
+
+        # Local staging controls consume these values without allowing a
+        # static command line to accidentally bind the wrong release session.
+        os.environ["COVERAGE_VALIDATION_SESSION_MANIFEST"] = \
+            self.validation_session_manifest_path
+        os.environ["COVERAGE_VALIDATION_SESSION_ID"] = str(
+            session.data.get("session_id")
+        )
+        os.environ["COVERAGE_VALIDATION_CANDIDATE_SHA"] = str(
+            identity.get("commit_sha")
+        )
+        os.environ["COVERAGE_VALIDATION_BASELINE_SHA"] = str(
+            previous_release.get("commit_sha")
+        )
+        os.environ["COVERAGE_VALIDATION_TEARDOWN_EVIDENCE"] = \
+            self.validation_teardown_evidence_path
+
+    def _teardown_validation_session(self, identity: Dict[str, Any], mode: str):
+        if self.validation_session is None:
+            return None
+        if self._validation_teardown_result is not None:
+            return self._validation_teardown_result
+
+        try:
+            result = self.validation_session.teardown(
+                evidence_path=self.validation_teardown_evidence_path,
+                timeout=float(
+                    ((self._runtime_config or {}).get("upgrade") or {}).get(
+                        "validation_teardown_timeout_sec", 10
+                    )
+                ),
+            )
+        except Exception as exc:
+            result = {
+                "schema_version": SESSION_SCHEMA_VERSION,
+                "session_id": self.validation_session.data.get("session_id", ""),
+                "status": "FAILED",
+                "pids_closed": False,
+                "ports_closed": False,
+                "ports_probe_ok": False,
+                "attempted": [],
+                "verification": {},
+                "violations": ["ValidationSession teardown failed: {}".format(exc)],
+                "p1": True,
+            }
+            self.log("❌ Validation session teardown failed: {}".format(exc))
+
+        verification = result.get("verification") or {}
+        result["pids_closed"] = verification.get("pids_closed") is True
+        result["ports_closed"] = verification.get("ports_closed") is True
+        result["ports_probe_ok"] = verification.get("ports_probe_ok") is True
+        result.update({
+            "revision": identity.get("commit_sha"),
+            "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
+            "command": "ValidationSession.teardown",
+            "exit_code": 0 if result.get("status") == "PASSED" else 1,
+            "artifact_path": self.validation_teardown_evidence_path,
+        })
+        self.manifest.record("validation_teardown", result)
+
+        session_record = dict(self.validation_session.data)
+        session_record.update({
+            "status": "PASSED" if (
+                session_record.get("session_id") and
+                session_record.get("candidate_sha") == identity.get("commit_sha") and
+                session_record.get("baseline_sha")
+            ) else "FAILED",
+            "revision": identity.get("commit_sha"),
+            "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
+            "command": "ValidationSession.load",
+            "exit_code": 0,
+            "artifact_path": self.validation_session_manifest_path,
+        })
+        self.manifest.record("validation_session_manifest", session_record)
+        self._validation_teardown_result = result
+        return result
 
     def log(self, msg: str):
         print(f"[{time.strftime('%H:%M:%S')}] {msg}")
         self.logs.append(msg)
         self.manifest.add_log(msg)
 
+    def _mark_not_ready(self):
+        """Make every failed/unfinished execution explicitly NOT_READY."""
+        self.manifest.data["release_decision"] = "NOT_READY"
+        if self.manifest.data.get("status") == "UPGRADE_SUCCESS":
+            self.manifest.data["status"] = "UNMET_GATES"
+        self.manifest.save()
+
     def _fail(self, lifecycle: Optional[UpgradeLifecycle], message: str) -> Tuple[bool, str]:
-        if self._cutover_applied:
+        self._mark_not_ready()
+        if self._publication_switched:
             try:
-                self.cutover.rollback()
-                self._cutover_applied = False
-                self.log("✔ File cutover rolled back before traffic was opened.")
+                if self.publisher is None or not self.previous_published_session_id:
+                    raise RuntimeError("immutable rollback identity is unavailable")
+                rollback = self.publisher.rollback(self.previous_published_session_id)
+                if rollback.get("status") != "PASSED":
+                    raise RuntimeError("immutable rollback did not pass")
+                self._publication_switched = False
+                self.log("✔ Immutable CURRENT pointer rolled back before traffic was opened.")
             except Exception as exc:
-                self.log("❌ DATA_SAFETY_HOLD: file rollback failed: {}".format(exc))
+                self.log("❌ DATA_SAFETY_HOLD: immutable publication rollback failed: {}".format(exc))
         if lifecycle is not None and lifecycle.active:
             try:
                 rollback_result = lifecycle.abort()
@@ -267,6 +484,15 @@ class UpgradeOrchestrator:
                     rollback_result.get("previous_release_verified", False)))
             except Exception as exc:
                 self.log("❌ DATA_SAFETY_HOLD: lifecycle abort failed: {}".format(exc))
+        if self.validation_session is not None:
+            try:
+                teardown = self._teardown_validation_session(
+                    self._target_identity, self._upgrade_mode
+                )
+                if teardown and teardown.get("status") != "PASSED":
+                    self.log("❌ Release NOT_READY: validation session teardown did not pass.")
+            except Exception as exc:
+                self.log("❌ DATA_SAFETY_HOLD: validation session teardown evidence failed: {}".format(exc))
         return False, message
 
     def _verify_release_endpoint(self, endpoint: str, identity: Dict[str, Any]) -> Dict[str, Any]:
@@ -296,6 +522,9 @@ class UpgradeOrchestrator:
                         target_release: Optional[Dict[str, Any]] = None,
                         runtime_config: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
         """Run complete upgrade procedure."""
+        self._runtime_config = dict(runtime_config or {})
+        self._upgrade_mode = mode
+        self._mark_not_ready()
         self.log("=== Starting Manifest-Driven Upgrade Procedure ===")
         if mode not in ("staging", "production"):
             return False, "Invalid upgrade mode"
@@ -337,6 +566,7 @@ class UpgradeOrchestrator:
             "exit_code": 0,
         })
         self.manifest.record("release_identity", identity_evidence)
+        self._target_identity = dict(identity)
         self.log(f"  Target Release: {identity.get('version')} (Build: {identity.get('build_id')})")
 
         # Step 2: Schema Preflight
@@ -370,6 +600,13 @@ class UpgradeOrchestrator:
         if previous_release.get("commit_sha") == identity.get("commit_sha"):
             self.log("❌ previous_release must differ from target release")
             return False, "Previous and target release identities are identical"
+        try:
+            self._configure_release_controls(
+                upgrade_config, identity, previous_release, self._runtime_config
+            )
+        except (OSError, RuntimeError, ValueError, TypeError) as exc:
+            self.log("❌ Immutable publication/session preflight failed: {}".format(exc))
+            return False, "Immutable publication/session preflight failed"
         lifecycle = UpgradeLifecycle(self.repo_root, runtime_config or {}, mode, previous_release)
         try:
             freeze_evidence = lifecycle.freeze(identity.get("commit_sha", ""))
@@ -483,24 +720,43 @@ class UpgradeOrchestrator:
             return self._fail(lifecycle, "Data integrity verification failed")
         self.log("✔ Data integrity verification passed: 0 row decreases, 0 hash mismatches.")
 
-        # Apply only the reviewed, hash-pinned file set.  The controller backs
-        # up existing destinations before copying and can restore them before
-        # traffic is opened if a later gate fails.
-        self.log("[Cutover] Applying explicit hash-pinned deployment manifest...")
+        # The deployment manifest remains a review record, while publication
+        # itself is exclusively an immutable artifact preparation followed by
+        # one atomic CURRENT pointer switch.  The active checkout is never
+        # rewritten by the production upgrade path.
+        self.log("[Cutover] Preparing immutable release and switching CURRENT atomically...")
         try:
-            self._cutover_applied = True
-            self.cutover.apply(actions)
+            session_id = self.validation_session.data.get("session_id")
+            prepared = self.publisher.prepare(
+                self.candidate_root,
+                identity,
+                session_id,
+                api_contract_version=upgrade_config.get("api_contract_version", ""),
+                candidate_sha=identity.get("commit_sha"),
+            )
+            switched = self.publisher.switch_current(session_id)
+            if switched.get("status") != "PASSED":
+                raise RuntimeError("immutable CURRENT switch did not pass")
+            self._publication_switched = True
             self.manifest.record("file_cutover", {
                 "status": "PASSED",
                 "revision": identity.get("commit_sha"),
                 "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
                 "action_count": len(actions),
-                "command": "CutoverController.apply (explicit hash-pinned actions)",
+                "publication_mode": "immutable_release",
+                "candidate_root": self.candidate_root,
+                "publish_root": self.publish_root,
+                "release_root": self.publisher.release_path(session_id),
+                "previous_session_id": self.previous_published_session_id,
+                "current_session_id": session_id,
+                "release_manifest": prepared,
+                "switch": switched,
+                "command": "ImmutableReleasePublisher.prepare + switch_current",
                 "exit_code": 0,
             })
         except Exception as exc:
-            self.log("❌ Explicit file cutover failed: {}".format(exc))
-            return self._fail(lifecycle, "File cutover failed")
+            self.log("❌ Immutable release publication failed: {}".format(exc))
+            return self._fail(lifecycle, "Immutable release publication failed")
 
         try:
             start_evidence = lifecycle.start_api()
@@ -769,23 +1025,18 @@ class UpgradeOrchestrator:
             except Exception as exc:
                 self.log("❌ Rollback rehearsal evidence unavailable: {}".format(exc))
 
+        # Teardown is a hard release prerequisite.  This runs before the
+        # final evidence read and records both the session manifest and the
+        # owned-process/port closure result.
+        teardown = self._teardown_validation_session(identity, mode)
+        if not teardown or teardown.get("status") != "PASSED":
+            self.log("❌ Release NOT_READY: validation session teardown is incomplete.")
+            return self._fail(lifecycle, "Validation session teardown failed")
+
         # Step 10: Validate Final Production Release Governance Gate
         self.log("[Step 10/10] Validating Production Release Governance Gate...")
         gate_passed, unmet = self.manifest.validate_final_gate(require_traffic_open=False)
         if not gate_passed:
-            try:
-                self.cutover.rollback()
-                self._cutover_applied = False
-                self.log("✔ File cutover rolled back before traffic was opened.")
-                self.manifest.record("rollback_evidence", {
-                    "status": "PASSED",
-                    "revision": identity.get("commit_sha"),
-                    "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
-                    "traffic_opened": False,
-                    "file_restore": "verified",
-                })
-            except Exception as rollback_exc:
-                self.log("❌ DATA_SAFETY_HOLD: file rollback failed: {}".format(rollback_exc))
             return self._fail(lifecycle, f"Final gate unmet: {unmet}")
 
         try:

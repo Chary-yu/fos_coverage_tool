@@ -658,8 +658,8 @@ jobs:
             .artifacts/py36-runtime-evidence.json
           if-no-files-found: error
 
-  candidate-release-gate:
-    name: Candidate release gate (required lanes)
+  candidate-source-gate:
+    name: Candidate source gate (required source lanes)
     if: ${{ always() }}
     needs:
       - semantic-migration-regression
@@ -668,7 +668,7 @@ jobs:
       - specialist-regression
     runs-on: ubuntu-latest
     steps:
-      - name: Require all Candidate release lanes to pass
+      - name: Require all Candidate source lanes to pass
         env:
           SEMANTIC_MIGRATION_RESULT: ${{ needs.semantic-migration-regression.result }}
           MYSQL55_RESULT: ${{ needs.mysql55-compatibility.result }}
@@ -686,7 +686,11 @@ jobs:
             echo "$lane: $status"
             test "$status" = success
           done
-          echo "Candidate release gate: PASS"
+          {
+            echo "## Candidate Source Gate"
+            echo "PASS — source lanes are green. This does not certify Production READY."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Candidate source gate: PASS (Production READY requires manual external evidence)"
 
   mock-dom-regression:
     name: Mock DOM regression (not browser evidence)
@@ -701,7 +705,7 @@ jobs:
       - run: node test_lazy_collapse_browser_smoke.js
 
   real-browser-e2e:
-    name: Real browser E2E
+    name: Real browser fixture E2E (not Candidate evidence)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -735,7 +739,7 @@ jobs:
           if-no-files-found: error
 
   cross-layer-performance:
-    name: Cross-layer performance gate (instrumented evidence)
+    name: Cross-layer performance release evidence (manual)
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.cross_layer_evidence != '' }}
     runs-on: ubuntu-latest
     steps:
@@ -803,3 +807,40 @@ jobs:
           name: real-browser-candidate-evidence
           path: .artifacts/real-browser-candidate
           if-no-files-found: error
+
+  production-ready-gate:
+    name: Production READY gate (manual external evidence)
+    # This gate is intentionally absent from ordinary push/PR status.  It is
+    # the explicit aggregator for production backup, real Candidate browser,
+    # and release-eligible cross-layer performance evidence.
+    if: ${{ always() && github.event_name == 'workflow_dispatch' }}
+    needs:
+      - candidate-source-gate
+      - verified-production-mariadb55
+      - real-browser-candidate
+      - cross-layer-performance
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all Production READY evidence lanes to pass
+        env:
+          SOURCE_RESULT: ${{ needs.candidate-source-gate.result }}
+          BACKUP_RESULT: ${{ needs.verified-production-mariadb55.result }}
+          BROWSER_RESULT: ${{ needs.real-browser-candidate.result }}
+          PERFORMANCE_RESULT: ${{ needs.cross-layer-performance.result }}
+        run: |
+          set -eu
+          for result in \
+            "candidate-source-gate=$SOURCE_RESULT" \
+            "verified-production-mariadb55=$BACKUP_RESULT" \
+            "real-browser-candidate=$BROWSER_RESULT" \
+            "cross-layer-performance=$PERFORMANCE_RESULT"; do
+            lane="${result%%=*}"
+            status="${result#*=}"
+            echo "$lane: $status"
+            test "$status" = success
+          done
+          {
+            echo "## Production READY Gate"
+            echo "PASS — all manual production evidence lanes passed."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Production READY gate: PASS"

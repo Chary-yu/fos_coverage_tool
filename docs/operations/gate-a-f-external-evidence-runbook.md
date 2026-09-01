@@ -9,6 +9,14 @@ test -z "$(git status --porcelain)"
 git rev-parse HEAD
 ```
 
+## CI 状态语义
+
+普通 push/PR 的 `Candidate source gate (required source lanes)` 只表示源码候选
+检查通过，不代表 Production READY。真实 Candidate 浏览器、生产备份恢复和
+`release_eligible` 跨层性能证据只由手动 `workflow_dispatch` 的
+`Production READY gate (manual external evidence)` 汇总；其中任一 lane 未运行或
+失败，Production READY 都不成立。
+
 ## 证据文件统一要求
 
 `scripts/diagnostics/gate_matrix.py` 从以下环境变量读取外部证据：

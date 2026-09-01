@@ -33,6 +33,12 @@
   "environment": "candidate",
   "upgrade": {
     "drain_timeout_sec": 30,
+    "candidate_root": "../coverage-candidate-release",
+    "publish_root": "../coverage-published-releases",
+    "validation_session_manifest": ".runtime-state-staging/validation-session.json",
+    "validation_teardown_evidence_path": ".artifacts/staging/validation-teardown.json",
+    "validation_ports": [19528],
+    "validation_teardown_timeout_sec": 10,
     "release_endpoint": "http://127.0.0.1:19528/api/coverage/release",
     "previous_release_endpoint": "http://127.0.0.1:9528/api/coverage/release",
     "rollback_evidence_path": ".artifacts/staging/rollback-evidence.json",

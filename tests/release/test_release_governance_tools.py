@@ -44,7 +44,9 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
                 os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
                 encoding="utf-8") as stream:
             workflow = stream.read()
-        self.assertIn("candidate-release-gate:", workflow)
+        self.assertIn("candidate-source-gate:", workflow)
+        self.assertIn("Candidate source gate (required source lanes)", workflow)
+        self.assertNotIn("candidate-release-gate:", workflow)
         for lane in (
                 "semantic-migration-regression",
                 "mysql55-compatibility",
@@ -109,6 +111,21 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("int(aggregate['ordinary_pending_total'])", workflow)
         self.assertIn("int(aggregate['inherited_pending_total'])", workflow)
         self.assertIn("int(aggregate['manual_draft_pending_total'])", workflow)
+
+    def test_ci_distinguishes_source_candidate_from_production_ready(self):
+        with open(
+                os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
+                encoding="utf-8") as stream:
+            workflow = stream.read()
+        self.assertIn("production-ready-gate:", workflow)
+        self.assertIn("Production READY gate (manual external evidence)", workflow)
+        self.assertIn("Production READY requires manual external evidence", workflow)
+        for lane in (
+                "verified-production-mariadb55",
+                "real-browser-candidate",
+                "cross-layer-performance"):
+            self.assertIn("- {}".format(lane), workflow)
+        self.assertIn("github.event_name == 'workflow_dispatch'", workflow)
 
     def test_perf_benchmark_help_is_side_effect_free(self):
         with tempfile.TemporaryDirectory() as directory:

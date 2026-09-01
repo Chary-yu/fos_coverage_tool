@@ -33,7 +33,8 @@ _REQUIRED_EVIDENCE_SECTIONS = (
     "schema_migration", "backup_evidence", "data_hash_verification",
     "browser_smoke_suite", "path_mapping_audit", "sidecar_audit",
     "security_audit", "traffic_freeze", "job_drain", "api_stop",
-    "api_start", "release_endpoint", "file_cutover", "traffic_open",
+    "api_start", "release_endpoint", "file_cutover",
+    "validation_session_manifest", "validation_teardown", "traffic_open",
     "rollback_evidence",
 )
 
@@ -316,6 +317,8 @@ class ProductionEvidenceManifest:
         os.makedirs(evidence_root, exist_ok=True)
         self.manifest_path = os.path.join(evidence_root, MANIFEST_FILENAME)
         self.data: Dict[str, Any] = self._load_or_init()
+        # A newly created or legacy manifest is never implicitly release-ready.
+        self.data.setdefault("release_decision", "NOT_READY")
 
     def _load_or_init(self) -> Dict[str, Any]:
         if os.path.isfile(self.manifest_path):
@@ -329,6 +332,7 @@ class ProductionEvidenceManifest:
             "created_at": get_utc_iso(),
             "updated_at": get_utc_iso(),
             "status": "INITIALIZED",
+            "release_decision": "NOT_READY",
             "release_identity": {},
             "schema_migration": {},
             "backup_evidence": {},
@@ -339,6 +343,8 @@ class ProductionEvidenceManifest:
             "sidecar_audit": {},
             "security_audit": {},
             "performance_benchmark": {},
+            "validation_session_manifest": {},
+            "validation_teardown": {},
             "logs": []
         }
 
@@ -475,6 +481,37 @@ class ProductionEvidenceManifest:
                 unmet.append("{} lifecycle evidence is not PASSED".format(section))
         if require_traffic_open and (self.data.get("traffic_open") or {}).get("status") != "PASSED":
             unmet.append("traffic_open lifecycle evidence is not PASSED")
+
+        # Validation processes are owned resources, not an operator reminder.
+        # The manifest and its teardown record must describe the same exact
+        # candidate session, and both process and port closure are mandatory
+        # before a release can become READY.
+        validation_session = self.data.get("validation_session_manifest") or {}
+        if validation_session.get("status") != "PASSED":
+            unmet.append("validation_session_manifest is not PASSED")
+        if not validation_session.get("session_id"):
+            unmet.append("validation_session_manifest session_id is missing")
+        if validation_session.get("candidate_sha") != revision:
+            unmet.append("validation_session_manifest candidate SHA mismatches release identity")
+        if not validation_session.get("baseline_sha"):
+            unmet.append("validation_session_manifest baseline SHA is missing")
+        if not validation_session.get("artifact_path") or not validation_session.get("artifact_sha256"):
+            unmet.append("validation_session_manifest artifact hash is missing")
+
+        validation_teardown = self.data.get("validation_teardown") or {}
+        if validation_teardown.get("status") != "PASSED":
+            unmet.append("validation_teardown is not PASSED")
+        if validation_teardown.get("session_id") != validation_session.get("session_id"):
+            unmet.append("validation_teardown session_id does not match validation session")
+        if validation_teardown.get("pids_closed") is not True:
+            unmet.append("validation_teardown requires pids_closed=true")
+        if validation_teardown.get("ports_closed") is not True:
+            unmet.append("validation_teardown requires ports_closed=true")
+        if validation_teardown.get("ports_probe_ok") is not True:
+            unmet.append("validation_teardown requires a successful port probe")
+        if not validation_teardown.get("artifact_path") or not validation_teardown.get("artifact_sha256"):
+            unmet.append("validation_teardown artifact hash is missing")
+
         rollback = self.data.get("rollback_evidence") or {}
         if rollback.get("status") != "PASSED" or not rollback.get("rehearsal_verified"):
             unmet.append("Forced rollback rehearsal evidence is missing")
@@ -550,6 +587,9 @@ class ProductionEvidenceManifest:
             unmet.append("Evidence revision does not match current commit")
         passed = (len(unmet) == 0)
         self.data["status"] = _SUCCESS_STATUS if passed else "UNMET_GATES"
+        # Keep the release decision explicit for downstream tooling.  The
+        # historical ``status`` values remain intact for compatibility.
+        self.data["release_decision"] = "READY" if passed else "NOT_READY"
         self.save()
         return passed, unmet
 

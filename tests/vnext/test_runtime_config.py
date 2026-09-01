@@ -48,6 +48,12 @@ class RuntimeConfigTest(unittest.TestCase):
             upgrade["commands"]["start_api"],
             upgrade["commands"]["start_previous_api"],
         )
+        self.assertTrue(upgrade["candidate_root"])
+        self.assertTrue(upgrade["publish_root"])
+        self.assertNotEqual(upgrade["candidate_root"], upgrade["publish_root"])
+        self.assertTrue(upgrade["validation_session_manifest"])
+        self.assertTrue(upgrade["validation_teardown_evidence_path"])
+        self.assertEqual(upgrade["validation_ports"], [19528])
 
     def test_candidate_roots_are_resolved_relative_to_their_declared_base(self):
         with tempfile.TemporaryDirectory(prefix="vnext-config-") as root:
