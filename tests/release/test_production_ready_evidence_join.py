@@ -8,7 +8,8 @@ from scripts.diagnostics.production_ready_evidence_join import (
 
 class ProductionReadyEvidenceJoinTest(unittest.TestCase):
     def _browser(self, commit="a" * 40, artifact="b" * 64,
-                 served="c" * 64, session="attempt-1"):
+                 served="c" * 64, session="attempt-1",
+                 previous="d" * 40, tree="e" * 64, identity="f" * 64):
         return {
             "status": "PASSED",
             "synthetic": False,
@@ -19,11 +20,15 @@ class ProductionReadyEvidenceJoinTest(unittest.TestCase):
                 "candidate_artifact_sha256": artifact,
                 "served_root_sha256": served,
                 "release_validation_session_id": session,
+                "previous_release_commit_sha": previous,
+                "served_root_tree_sha256": tree,
+                "served_root_identity_sha256": identity,
             },
         }
 
     def _performance(self, commit="a" * 40, artifact="b" * 64,
-                     served="c" * 64, session="attempt-1"):
+                     served="c" * 64, session="attempt-1",
+                     previous="d" * 40, tree="e" * 64, identity="f" * 64):
         return {
             "status": "PASSED",
             "synthetic": False,
@@ -32,6 +37,9 @@ class ProductionReadyEvidenceJoinTest(unittest.TestCase):
             "candidate_artifact_sha256": artifact,
             "served_root_sha256": served,
             "release_validation_session_id": session,
+            "previous_release_commit_sha": previous,
+            "served_root_tree_sha256": tree,
+            "served_root_identity_sha256": identity,
         }
 
     def _backup(self, commit="a" * 40):
@@ -45,7 +53,12 @@ class ProductionReadyEvidenceJoinTest(unittest.TestCase):
         browser = browser_identity(self._browser())
         performance = performance_identity(self._performance())
         result = join_identities(
-            candidate_build_identity("a" * 40, "b" * 64),
+            candidate_build_identity(
+                "a" * 40, "b" * 64,
+                previous_release_commit_sha="d" * 40,
+                served_root_tree_sha256="e" * 64,
+                served_root_identity_sha256="f" * 64,
+            ),
             browser, performance, backup_identity(self._backup()),
         )
         self.assertEqual(result["status"], "PASSED")
@@ -56,7 +69,26 @@ class ProductionReadyEvidenceJoinTest(unittest.TestCase):
         performance = performance_identity(self._performance(artifact="d" * 64))
         with self.assertRaisesRegex(ValueError, "candidate_artifact_sha256"):
             join_identities(
-                candidate_build_identity("a" * 40, "b" * 64),
+                candidate_build_identity(
+                    "a" * 40, "b" * 64,
+                    previous_release_commit_sha="d" * 40,
+                    served_root_tree_sha256="e" * 64,
+                    served_root_identity_sha256="f" * 64,
+                ),
+                browser, performance, backup_identity(self._backup()),
+            )
+
+    def test_join_rejects_candidate_from_a_different_current_served_root(self):
+        browser = browser_identity(self._browser())
+        performance = performance_identity(self._performance())
+        with self.assertRaisesRegex(ValueError, "served_root_tree_sha256"):
+            join_identities(
+                candidate_build_identity(
+                    "a" * 40, "b" * 64,
+                    previous_release_commit_sha="d" * 40,
+                    served_root_tree_sha256="1" * 64,
+                    served_root_identity_sha256="f" * 64,
+                ),
                 browser, performance, backup_identity(self._backup()),
             )
 

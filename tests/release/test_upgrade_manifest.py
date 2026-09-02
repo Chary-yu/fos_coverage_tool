@@ -15,6 +15,7 @@ from scripts.upgrade.run_upgrade import (
     _new_release_validation_session_id, _resolve_attempt_path,
     _validate_candidate_browser_evidence,
     validate_candidate_publication_preflight,
+    verify_production_candidate_served_root_binding,
 )
 
 
@@ -37,6 +38,33 @@ class TestUpgradeManifest(unittest.TestCase):
                     "", "", "Chary-yu/fos_coverage_tool",
                     "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
                 )
+
+    def test_candidate_from_current_b_cannot_upgrade_current_a(self):
+        current_a = {
+            "previous_release_commit_sha": "a" * 40,
+            "served_root_tree_sha256": "b" * 64,
+            "served_root_identity_sha256": "c" * 64,
+        }
+        candidate_from_b = {
+            "previous_release_commit_sha": "d" * 40,
+            "served_root_tree_sha256": "e" * 64,
+            "served_root_identity_sha256": "f" * 64,
+        }
+        with self.assertRaisesRegex(RuntimeError, "previous_release_commit_sha"):
+            verify_production_candidate_served_root_binding(
+                candidate_from_b, current_a
+            )
+
+    def test_candidate_binding_matches_current(self):
+        current = {
+            "previous_release_commit_sha": "a" * 40,
+            "served_root_tree_sha256": "b" * 64,
+            "served_root_identity_sha256": "c" * 64,
+        }
+        self.assertEqual(
+            verify_production_candidate_served_root_binding(current, current),
+            current,
+        )
 
     def test_production_upgrade_uses_immutable_publication_only(self):
         with open(

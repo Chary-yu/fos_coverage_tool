@@ -21,6 +21,7 @@ if ROOT not in sys.path:
 
 from app.candidate_artifact import (
     PRODUCTION_PROJECT_NAME, PRODUCTION_RELEASE_ARTIFACT_ROLE,
+    SERVED_ROOT_PROVENANCE_FIELDS,
 )
 
 
@@ -29,7 +30,26 @@ _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 IDENTITY_FIELDS = (
     "commit_sha", "candidate_artifact_sha256", "served_root_sha256",
     "release_validation_session_id",
-)
+) + SERVED_ROOT_PROVENANCE_FIELDS
+
+
+def _served_root_binding(payload, label):
+    """Extract the three source-CURRENT fields from an evidence payload."""
+    observed = payload.get("observed_publication")
+    if not isinstance(observed, dict):
+        observed = {}
+    result = {}
+    for field in SERVED_ROOT_PROVENANCE_FIELDS:
+        value = payload.get(field) or observed.get(field)
+        if field == "previous_release_commit_sha":
+            result[field] = _require_commit(
+                value, "{} {}".format(label, field)
+            )
+        else:
+            result[field] = _require_sha256(
+                value, "{} {}".format(label, field)
+            )
+    return result
 
 
 def _load(path):
@@ -97,6 +117,7 @@ def browser_identity(payload):
             "real browser observed release_validation_session_id",
         ),
     }
+    identity.update(_served_root_binding(payload, "real browser observed"))
     if str(payload.get("candidate_revision") or "").lower() != identity["commit_sha"]:
         raise ValueError("real browser candidate_revision does not match observed commit")
     return identity
@@ -108,7 +129,7 @@ def performance_identity(payload):
     candidate_commit = payload.get("candidate_commit") or payload.get(
         "candidate_revision"
     ) or payload.get("commit_sha")
-    return {
+    result = {
         "commit_sha": _require_commit(
             candidate_commit, "cross-layer performance candidate commit"
         ),
@@ -125,6 +146,8 @@ def performance_identity(payload):
             "cross-layer performance release_validation_session_id",
         ),
     }
+    result.update(_served_root_binding(payload, "cross-layer performance"))
+    return result
 
 
 def backup_identity(payload):
@@ -147,7 +170,10 @@ def backup_identity(payload):
 def candidate_build_identity(commit_sha, artifact_sha256,
                              artifact_role=PRODUCTION_RELEASE_ARTIFACT_ROLE,
                              production_publishable=True,
-                             project_name=PRODUCTION_PROJECT_NAME):
+                             project_name=PRODUCTION_PROJECT_NAME,
+                             previous_release_commit_sha="",
+                             served_root_tree_sha256="",
+                             served_root_identity_sha256=""):
     if artifact_role != PRODUCTION_RELEASE_ARTIFACT_ROLE:
         raise ValueError(
             "trusted Candidate build is a validation fixture, not a production release"
@@ -156,7 +182,7 @@ def candidate_build_identity(commit_sha, artifact_sha256,
         raise ValueError("trusted Candidate build is not production_publishable")
     if project_name != PRODUCTION_PROJECT_NAME:
         raise ValueError("trusted Candidate build project is not the production project")
-    return {
+    result = {
         "commit_sha": _require_commit(commit_sha, "trusted Candidate build commit_sha"),
         "candidate_artifact_sha256": _require_sha256(
             artifact_sha256, "trusted Candidate build candidate_artifact_sha256"
@@ -165,12 +191,24 @@ def candidate_build_identity(commit_sha, artifact_sha256,
         "production_publishable": production_publishable,
         "project_name": project_name,
     }
+    for field, value in (
+            ("previous_release_commit_sha", previous_release_commit_sha),
+            ("served_root_tree_sha256", served_root_tree_sha256),
+            ("served_root_identity_sha256", served_root_identity_sha256)):
+        if field == "previous_release_commit_sha":
+            result[field] = _require_commit(value, "trusted Candidate build {}".format(field))
+        else:
+            result[field] = _require_sha256(value, "trusted Candidate build {}".format(field))
+    return result
 
 
 def join_identities(candidate_build, browser, performance, backup):
     """Fail unless all available lanes identify one exact publication."""
     errors = []
-    for field in ("commit_sha", "candidate_artifact_sha256"):
+    for field in (
+            "commit_sha", "candidate_artifact_sha256",
+            "previous_release_commit_sha", "served_root_tree_sha256",
+            "served_root_identity_sha256"):
         if candidate_build.get(field) != browser.get(field):
             errors.append("trusted Candidate build and browser {} mismatch".format(field))
         if candidate_build.get(field) != performance.get(field):
@@ -194,6 +232,13 @@ def join_identities(candidate_build, browser, performance, backup):
             "commit_sha": browser["commit_sha"],
             "candidate_artifact_sha256": browser["candidate_artifact_sha256"],
             "served_root_sha256": browser["served_root_sha256"],
+            "previous_release_commit_sha": browser[
+                "previous_release_commit_sha"
+            ],
+            "served_root_tree_sha256": browser["served_root_tree_sha256"],
+            "served_root_identity_sha256": browser[
+                "served_root_identity_sha256"
+            ],
             "release_validation_session_id": browser[
                 "release_validation_session_id"
             ],
@@ -209,6 +254,7 @@ def join_identities(candidate_build, browser, performance, backup):
             "candidate_build_artifact_matches_performance": True,
             "browser_matches_performance_publication": True,
             "backup_matches_candidate_commit": True,
+            "candidate_build_matches_source_served_root_binding": True,
         },
     }
 
@@ -253,13 +299,22 @@ def main(argv=None):
         "--production-candidate-project", "--candidate-build-project",
         dest="production_candidate_project", default=PRODUCTION_PROJECT_NAME,
     )
+    parser.add_argument("--production-candidate-previous-release-sha", default="")
+    parser.add_argument("--production-candidate-served-root-tree-sha256", default="")
+    parser.add_argument("--production-candidate-served-root-identity-sha256", default="")
     parser.add_argument("--browser-commit", default="")
     parser.add_argument("--browser-artifact", default="")
     parser.add_argument("--browser-served-root", default="")
+    parser.add_argument("--browser-previous-release-sha", default="")
+    parser.add_argument("--browser-served-root-tree-sha256", default="")
+    parser.add_argument("--browser-served-root-identity-sha256", default="")
     parser.add_argument("--browser-session", default="")
     parser.add_argument("--performance-commit", default="")
     parser.add_argument("--performance-artifact", default="")
     parser.add_argument("--performance-served-root", default="")
+    parser.add_argument("--performance-previous-release-sha", default="")
+    parser.add_argument("--performance-served-root-tree-sha256", default="")
+    parser.add_argument("--performance-served-root-identity-sha256", default="")
     parser.add_argument("--performance-session", default="")
     parser.add_argument("--backup-commit", default="")
     parser.add_argument("--output", default="")
@@ -278,6 +333,9 @@ def main(argv=None):
                     str(args.production_candidate_publishable).lower() == "true"
                 ),
                 project_name=args.production_candidate_project,
+                previous_release_commit_sha=args.production_candidate_previous_release_sha,
+                served_root_tree_sha256=args.production_candidate_served_root_tree_sha256,
+                served_root_identity_sha256=args.production_candidate_served_root_identity_sha256,
             ),
             {
                 "commit_sha": _require_commit(args.browser_commit, "browser commit_sha"),
@@ -289,6 +347,18 @@ def main(argv=None):
                 ),
                 "release_validation_session_id": _require_session(
                     args.browser_session, "browser release_validation_session_id"
+                ),
+                "previous_release_commit_sha": _require_commit(
+                    args.browser_previous_release_sha,
+                    "browser previous_release_commit_sha",
+                ),
+                "served_root_tree_sha256": _require_sha256(
+                    args.browser_served_root_tree_sha256,
+                    "browser served_root_tree_sha256",
+                ),
+                "served_root_identity_sha256": _require_sha256(
+                    args.browser_served_root_identity_sha256,
+                    "browser served_root_identity_sha256",
                 ),
             },
             {
@@ -305,6 +375,18 @@ def main(argv=None):
                 "release_validation_session_id": _require_session(
                     args.performance_session,
                     "performance release_validation_session_id",
+                ),
+                "previous_release_commit_sha": _require_commit(
+                    args.performance_previous_release_sha,
+                    "performance previous_release_commit_sha",
+                ),
+                "served_root_tree_sha256": _require_sha256(
+                    args.performance_served_root_tree_sha256,
+                    "performance served_root_tree_sha256",
+                ),
+                "served_root_identity_sha256": _require_sha256(
+                    args.performance_served_root_identity_sha256,
+                    "performance served_root_identity_sha256",
                 ),
             },
             {

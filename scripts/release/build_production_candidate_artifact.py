@@ -37,7 +37,7 @@ from app.release_identity import (
 )
 from app.release_publication import (
     build_release_manifest, validate_production_candidate_content,
-    validate_release_manifest,
+    current_served_root_binding,
 )
 
 
@@ -199,65 +199,15 @@ def _served_root_binding(served_root):
     A production build must start from the actual ``publish_root/CURRENT``
     pointer, not an operator-selected directory that merely contains a
     plausible report.  The pointer target must be inside ``releases/`` and
-    expose a release identity.  When an immutable release manifest is
-    present, its complete Served Root validation is also performed here.
+    expose a complete, validated release manifest.
     """
-    requested = os.path.abspath(str(served_root))
+    requested = os.path.abspath(str(served_root or ""))
     if os.path.basename(os.path.normpath(requested)) != "CURRENT":
         raise ValueError("production served-root must be the publish_root/CURRENT path")
-    if not os.path.islink(requested):
-        raise ValueError("production served-root must be the immutable CURRENT symlink")
-    publish_root = os.path.dirname(requested)
-    resolved = _real(requested)
-    releases_root = _real(os.path.join(publish_root, "releases"))
-    if not _inside(releases_root, resolved) or resolved == releases_root:
-        raise ValueError("CURRENT must resolve inside publish_root/releases")
-    if not os.path.isdir(resolved):
-        raise ValueError("CURRENT target is not a directory")
-    _assert_no_symlinks(resolved)
-
-    release_manifest_path = os.path.join(resolved, "release_manifest.json")
-    identity_path = release_manifest_path
-    release_manifest = None
-    if os.path.isfile(release_manifest_path):
-        release_manifest = _load_json(
-            release_manifest_path, "CURRENT release manifest"
-        )
-        identity = release_manifest.get("release_identity")
-        if not isinstance(identity, dict):
-            identity = release_manifest
-        checked = validate_release_manifest(resolved, release_manifest)
-        if checked.get("status") != "PASSED":
-            raise ValueError(
-                "CURRENT release manifest is invalid: {}".format(
-                    "; ".join(checked.get("violations") or [])
-                )
-            )
-    else:
-        identity_path = os.path.join(resolved, "release_identity.json")
-        if not os.path.isfile(identity_path):
-            raise ValueError(
-                "CURRENT release identity evidence is missing: release_manifest.json"
-            )
-        identity = _load_json(identity_path, "CURRENT release identity")
-
-    previous_sha = str(identity.get("commit_sha") or "").strip()
-    if not is_valid_commit_sha(previous_sha):
-        raise ValueError("CURRENT release identity has no exact previous release SHA")
-    if release_manifest is not None and str(
-            release_manifest.get("commit_sha") or "").lower() != previous_sha.lower():
-        raise ValueError("CURRENT release manifest and identity commit SHA differ")
-    return {
-        "requested_path": requested,
-        "realpath": resolved,
-        "previous_release_sha": previous_sha,
-        "served_root_tree_sha256": _served_root_tree_sha256(resolved),
-        "current_identity_sha256": _canonical_hash(identity),
-        "current_identity_file_sha256": _sha256(identity_path),
-        "release_validation_session_id": str(
-            (release_manifest or {}).get("release_validation_session_id") or ""
-        ),
-    }
+    binding = current_served_root_binding(os.path.dirname(requested))
+    if os.path.normpath(binding["requested_path"]) != os.path.normpath(requested):
+        raise ValueError("production served-root must be the publish_root/CURRENT path")
+    return binding
 
 
 def _assert_served_root_binding_unchanged(binding):
@@ -423,9 +373,35 @@ def build_production_candidate(
         release_identity_output, build_workflow_identity,
         build_workflow_run_id, build_workflow_run_attempt, build_workflow_sha,
         expected_previous_release_sha="", expected_served_root_tree_sha256="",
-        expected_current_identity_sha256=""):
+        expected_current_identity_sha256="", publish_root=""):
     """Create and validate one production-role Candidate artifact."""
+    if publish_root:
+        publish_root = os.path.abspath(str(publish_root))
+        derived_served_root = os.path.join(publish_root, "CURRENT")
+        if served_root and os.path.normpath(os.path.abspath(str(served_root))) != \
+                os.path.normpath(derived_served_root):
+            raise ValueError(
+                "served-root must be the CURRENT selected by publish_root"
+            )
+        served_root = derived_served_root
+    if not served_root:
+        raise ValueError("served-root or publish-root is required")
     served_root_binding = _served_root_binding(served_root)
+    expected_binding = (
+        ("previous_release_commit_sha", expected_previous_release_sha),
+        ("served_root_tree_sha256", expected_served_root_tree_sha256),
+        ("served_root_identity_sha256", expected_current_identity_sha256),
+    )
+    missing_expected = [
+        field for field, value in expected_binding
+        if not str(value or "").strip()
+    ]
+    if missing_expected:
+        raise ValueError(
+            "expected Served Root binding is required: {}".format(
+                ", ".join(missing_expected)
+            )
+        )
     if expected_previous_release_sha and str(
             expected_previous_release_sha).lower() != served_root_binding[
                 "previous_release_sha"
@@ -508,6 +484,15 @@ def build_production_candidate(
         "project_name": manifest["project_name"],
         "served_root": served_root,
         "served_root_binding": served_root_binding,
+        "served_root_previous_release_sha": served_root_binding[
+            "previous_release_commit_sha"
+        ],
+        "served_root_tree_sha256": served_root_binding[
+            "served_root_tree_sha256"
+        ],
+        "served_root_identity_sha256": served_root_binding[
+            "served_root_identity_sha256"
+        ],
         "production_candidate_root": candidate_root,
         "release_identity": release_identity_output,
         "candidate_artifact_manifest": os.path.join(
@@ -532,7 +517,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(
         prog="build_production_candidate_artifact.py"
     )
-    parser.add_argument("--served-root", required=True)
+    parser.add_argument("--served-root", default="")
+    parser.add_argument(
+        "--publish-root", default="",
+        help="derive the served root from the authoritative publish_root/CURRENT pointer",
+    )
     parser.add_argument("--source-repo-root", required=True)
     parser.add_argument("--production-candidate-root", required=True)
     parser.add_argument("--release-identity-output", required=True)
@@ -540,9 +529,9 @@ def main(argv=None):
     parser.add_argument("--build-workflow-run-id", required=True)
     parser.add_argument("--build-workflow-run-attempt", required=True)
     parser.add_argument("--build-workflow-sha", required=True)
-    parser.add_argument("--expected-previous-release-sha", default="")
-    parser.add_argument("--expected-served-root-tree-sha256", default="")
-    parser.add_argument("--expected-current-identity-sha256", default="")
+    parser.add_argument("--expected-previous-release-sha", required=True)
+    parser.add_argument("--expected-served-root-tree-sha256", required=True)
+    parser.add_argument("--expected-current-identity-sha256", required=True)
     args = parser.parse_args(argv)
     try:
         result = build_production_candidate(
@@ -553,6 +542,7 @@ def main(argv=None):
             expected_previous_release_sha=args.expected_previous_release_sha,
             expected_served_root_tree_sha256=args.expected_served_root_tree_sha256,
             expected_current_identity_sha256=args.expected_current_identity_sha256,
+            publish_root=args.publish_root,
         )
     except (OSError, RuntimeError, ValueError, TypeError) as exc:
         raise SystemExit("production Candidate build failed: {}".format(exc))

@@ -40,6 +40,10 @@ ARTIFACT_ROLES = (
     VALIDATION_FIXTURE_ARTIFACT_ROLE, PRODUCTION_RELEASE_ARTIFACT_ROLE,
 )
 ARTIFACT_DIRECTORIES = ("reports", "assets", "registry")
+SERVED_ROOT_PROVENANCE_FIELDS = (
+    "previous_release_commit_sha", "served_root_tree_sha256",
+    "served_root_identity_sha256",
+)
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 _GIT_TREE_SHA = re.compile(r"^[0-9a-fA-F]{40}$")
 _WORKFLOW_RUN_ID = re.compile(r"^[1-9][0-9]*$")
@@ -369,6 +373,27 @@ def verify_trusted_build_policy(provenance, workflow_identity, workflow_sha):
             "Candidate build workflow SHA does not match trusted build identity"
         )
     return normalized
+
+
+def served_root_provenance_binding(provenance):
+    """Validate and return the production Candidate's CURRENT binding."""
+    if not isinstance(provenance, dict):
+        raise ValueError("production Candidate Served Root provenance is missing")
+    result = {}
+    for field in SERVED_ROOT_PROVENANCE_FIELDS:
+        value = str(provenance.get(field) or "").strip()
+        if field == "previous_release_commit_sha":
+            valid = is_valid_commit_sha(value)
+        else:
+            valid = bool(_SHA256.fullmatch(value)) and value != "0" * 64
+        if not valid:
+            raise ValueError(
+                "production Candidate Served Root provenance {} is invalid".format(
+                    field
+                )
+            )
+        result[field] = value.lower()
+    return result
 
 
 def build_git_source_provenance(source_repo_root, release_identity,

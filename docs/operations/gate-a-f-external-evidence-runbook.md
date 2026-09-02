@@ -295,18 +295,25 @@ Candidate 必须先按用途分成两个互斥对象。受保护的
 
 ```bash
 python3 scripts/release/build_production_candidate_artifact.py \
-  --served-root /srv/fos-coverage/publish-root/CURRENT \
+  --publish-root /srv/fos-coverage/publish-root \
   --source-repo-root /srv/fos-coverage/source-checkout \
   --production-candidate-root /srv/fos-coverage/production-candidate \
   --release-identity-output /secure/evidence/production-release-identity.json \
   --build-workflow-identity "$PRODUCTION_BUILD_WORKFLOW_IDENTITY" \
   --build-workflow-run-id "$GITHUB_RUN_ID" \
   --build-workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
-  --build-workflow-sha "$PRODUCTION_BUILD_WORKFLOW_SHA"
+  --build-workflow-sha "$PRODUCTION_BUILD_WORKFLOW_SHA" \
+  --expected-previous-release-sha "$CURRENT_PREVIOUS_RELEASE_SHA" \
+  --expected-served-root-tree-sha256 "$CURRENT_SERVED_ROOT_TREE_SHA256" \
+  --expected-current-identity-sha256 "$CURRENT_IDENTITY_SHA256"
 ```
 
-这里的 `--served-root` 必须指向真实完整 Served Root，而不是
-`validation_candidate_root`；命令输出的 manifest 必须明确为
+这里的 `--publish-root` 必须是权威 immutable publication root；构建器自行解析
+`publish_root/CURRENT`，不接受人工挑选的旧 release 目录。构建前应使用
+`scripts/diagnostics/production_current_binding.py` 从同一个权威 CURRENT 读取并
+冻结三个 expected binding 值；它们在构建开始时和复制完成后都会重检。CURRENT
+必须有完整且通过 `validate_release_manifest()` 的 `release_manifest.json`，不会再
+降级读取 `release_identity.json`。命令输出的 manifest 必须明确为
 `artifact_role=production_release`、`production_publishable=true`、
 `project_name=FOS_V6R2`。之后在受保护 Build job 中为这个 production manifest
 生成 GitHub Actions attestation 和 detached receipt：
@@ -326,7 +333,10 @@ python3 scripts/release/sign_candidate_build_receipt.py \
 Publisher 和 `run_upgrade.py` 只接受 `production_candidate_root`，并重新验证 clean
 source checkout、Candidate manifest、生产项目内容、attestation、receipt 和完整
 文件清单；任何 `validation_fixture`、`Coverage Candidate`、缺少 source/build
-provenance 的输入都硬失败。`served-root-bootstrap` 只能由
+provenance 或 Served Root binding 的输入都硬失败。Validation Candidate 的
+attestation 强制 `--deny-self-hosted-runners`；Production Candidate 使用受保护的
+`coverage-production-builder` self-hosted lane，但仍强制 exact signer workflow SHA、
+run ID/attempt、HMAC receipt、GitHub attestation 和 source SHA。`served-root-bootstrap` 只能由
 `bootstrap_previous_release.py` 的专用 API 使用。
 
 发布后的静态服务也必须遵守同一条路径契约：配置中的

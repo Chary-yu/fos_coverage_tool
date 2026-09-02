@@ -11,8 +11,8 @@ on:
         description: Immutable commit containing this production builder workflow
         required: true
         type: string
-      served_root:
-        description: Absolute path to the real FOS_V6R2 Served Root on the protected runner
+      publish_root:
+        description: Absolute path to the authoritative immutable production publish root; CURRENT is resolved by the builder
         required: true
         type: string
       attestation_repository:
@@ -66,8 +66,8 @@ on:
         description: Immutable commit containing this production builder workflow
         required: true
         type: string
-      served_root:
-        description: Absolute path to the real FOS_V6R2 Served Root on the protected runner
+      publish_root:
+        description: Absolute path to the authoritative immutable production publish root; CURRENT is resolved by the builder
         required: true
         type: string
       attestation_repository:
@@ -107,7 +107,7 @@ jobs:
       BUILD_WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
       BUILD_WORKFLOW_SHA: ${{ inputs.builder_workflow_sha }}
       SOURCE_SHA: ${{ inputs.source_sha }}
-      SERVED_ROOT: ${{ inputs.served_root }}
+      PRODUCTION_PUBLISH_ROOT: ${{ inputs.publish_root }}
       ATTESTATION_REPOSITORY: ${{ inputs.attestation_repository }}
       COVERAGE_BUILD_PROVENANCE_HMAC_KEY: ${{ secrets.COVERAGE_BUILD_PROVENANCE_HMAC_KEY }}
       GH_TOKEN: ${{ github.token }}
@@ -144,10 +144,37 @@ jobs:
           test -f "$GITHUB_WORKSPACE/builder/.github/workflows/trusted-production-candidate-builder.yml"
           test -n "$BUILD_WORKFLOW_RUN_ID"
           test -n "$BUILD_WORKFLOW_RUN_ATTEMPT"
-          test -n "$SERVED_ROOT"
-          test "$(basename "$SERVED_ROOT")" = "CURRENT"
-          test -L "$SERVED_ROOT"
-          test -d "$SERVED_ROOT"
+          test -n "$PRODUCTION_PUBLISH_ROOT"
+          test -d "$PRODUCTION_PUBLISH_ROOT/releases"
+          test -L "$PRODUCTION_PUBLISH_ROOT/CURRENT"
+          test -d "$PRODUCTION_PUBLISH_ROOT/CURRENT"
+
+      - name: Capture authoritative CURRENT Served Root binding
+        run: |
+          set -eu
+          mkdir -p "$GITHUB_WORKSPACE/.artifacts/production-candidate"
+          PYTHONPATH="$GITHUB_WORKSPACE/builder" python \
+            "$GITHUB_WORKSPACE/builder/scripts/diagnostics/production_current_binding.py" \
+            --publish-root "$PRODUCTION_PUBLISH_ROOT" \
+            --output "$GITHUB_WORKSPACE/.artifacts/production-candidate/served-root-binding.json"
+          BINDING_PATH="$GITHUB_WORKSPACE/.artifacts/production-candidate/served-root-binding.json" \
+            python - <<'PY'
+          import json
+          import os
+
+          with open(os.environ['BINDING_PATH']) as stream:
+              binding = json.load(stream)
+          if binding.get('status') != 'PASSED':
+              raise SystemExit('authoritative CURRENT binding did not pass')
+          exports = {
+              'EXPECTED_PREVIOUS_RELEASE_SHA': binding['previous_release_commit_sha'],
+              'EXPECTED_SERVED_ROOT_TREE_SHA256': binding['served_root_tree_sha256'],
+              'EXPECTED_CURRENT_IDENTITY_SHA256': binding['served_root_identity_sha256'],
+          }
+          with open(os.environ['GITHUB_ENV'], 'a') as stream:
+              for key, value in sorted(exports.items()):
+                  stream.write('{}={}\n'.format(key, value))
+          PY
 
       - name: Build production Candidate from real Served Root
         run: |
@@ -155,7 +182,7 @@ jobs:
           test -n "$COVERAGE_BUILD_PROVENANCE_HMAC_KEY"
           mkdir -p "$GITHUB_WORKSPACE/.artifacts/production-candidate"
           python "$GITHUB_WORKSPACE/builder/scripts/release/build_production_candidate_artifact.py" \
-            --served-root "$SERVED_ROOT" \
+            --publish-root "$PRODUCTION_PUBLISH_ROOT" \
             --source-repo-root "$GITHUB_WORKSPACE/source" \
             --production-candidate-root "$GITHUB_WORKSPACE/.artifacts/production-candidate/candidate" \
             --release-identity-output "$GITHUB_WORKSPACE/.artifacts/production-candidate/release_identity.json" \
@@ -163,6 +190,9 @@ jobs:
             --build-workflow-run-id "$BUILD_WORKFLOW_RUN_ID" \
             --build-workflow-run-attempt "$BUILD_WORKFLOW_RUN_ATTEMPT" \
             --build-workflow-sha "$BUILD_WORKFLOW_SHA" \
+            --expected-previous-release-sha "$EXPECTED_PREVIOUS_RELEASE_SHA" \
+            --expected-served-root-tree-sha256 "$EXPECTED_SERVED_ROOT_TREE_SHA256" \
+            --expected-current-identity-sha256 "$EXPECTED_CURRENT_IDENTITY_SHA256" \
             | tee "$GITHUB_WORKSPACE/.artifacts/production-candidate/build.json"
 
       - name: Verify production publication role and real project content
@@ -231,7 +261,10 @@ jobs:
           import os
 
           from app.candidate_artifact import CandidateArtifactManifest
-          from app.candidate_build_receipt import verify_candidate_build_receipt
+          from app.candidate_build_receipt import (
+              ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
+              verify_candidate_build_receipt,
+          )
 
           root = '.artifacts/production-candidate/candidate'
           with open('.artifacts/production-candidate/release_identity.json') as stream:
@@ -248,6 +281,7 @@ jobs:
                   os.environ['ATTESTATION_REPOSITORY']
                   + '/.github/workflows/trusted-production-candidate-builder.yml'
               ),
+              attestation_runner_policy=ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
           )
           payload = result['payload']
           assert payload['build_workflow_run_id'] == manifest['build_workflow_run_id']

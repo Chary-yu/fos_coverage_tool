@@ -45,8 +45,8 @@ on:
         required: false
         type: boolean
         default: false
-      production_served_root:
-        description: 'Absolute path to the real FOS_V6R2 Served Root on the protected builder runner'
+      production_publish_root:
+        description: 'Absolute path to the authoritative immutable production publish root on the protected builder runner'
         required: false
         type: string
   pull_request:
@@ -719,7 +719,7 @@ jobs:
     with:
       source_sha: ${{ github.sha }}
       builder_workflow_sha: 996637981e4fc1d18020890384013dcf752adf11
-      served_root: ${{ inputs.production_served_root }}
+      publish_root: ${{ inputs.production_publish_root }}
       attestation_repository: Chary-yu/fos_coverage_tool
     secrets: inherit
 
@@ -816,6 +816,9 @@ jobs:
       candidate_commit_sha: ${{ steps.production_identity.outputs.candidate_commit_sha }}
       candidate_artifact_sha256: ${{ steps.production_identity.outputs.candidate_artifact_sha256 }}
       served_root_sha256: ${{ steps.production_identity.outputs.served_root_sha256 }}
+      previous_release_commit_sha: ${{ steps.production_identity.outputs.previous_release_commit_sha }}
+      served_root_tree_sha256: ${{ steps.production_identity.outputs.served_root_tree_sha256 }}
+      served_root_identity_sha256: ${{ steps.production_identity.outputs.served_root_identity_sha256 }}
       release_validation_session_id: ${{ steps.production_identity.outputs.release_validation_session_id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -892,6 +895,9 @@ jobs:
       candidate_commit_sha: ${{ steps.production_identity.outputs.candidate_commit_sha }}
       candidate_artifact_sha256: ${{ steps.production_identity.outputs.candidate_artifact_sha256 }}
       served_root_sha256: ${{ steps.production_identity.outputs.served_root_sha256 }}
+      previous_release_commit_sha: ${{ steps.production_identity.outputs.previous_release_commit_sha }}
+      served_root_tree_sha256: ${{ steps.production_identity.outputs.served_root_tree_sha256 }}
+      served_root_identity_sha256: ${{ steps.production_identity.outputs.served_root_identity_sha256 }}
       release_validation_session_id: ${{ steps.production_identity.outputs.release_validation_session_id }}
       performance_evidence_sha256: ${{ steps.performance_artifact.outputs.sha256 }}
     steps:
@@ -986,14 +992,23 @@ jobs:
           PRODUCTION_CANDIDATE_BUILD_ROLE: ${{ needs.production-candidate-build.outputs.artifact_role }}
           PRODUCTION_CANDIDATE_BUILD_PUBLISHABLE: ${{ needs.production-candidate-build.outputs.production_publishable }}
           PRODUCTION_CANDIDATE_BUILD_PROJECT: ${{ needs.production-candidate-build.outputs.project_name }}
+          PRODUCTION_CANDIDATE_PREVIOUS_RELEASE_SHA: ${{ needs.production-candidate-build.outputs.served_root_previous_release_sha }}
+          PRODUCTION_CANDIDATE_SERVED_ROOT_TREE_SHA256: ${{ needs.production-candidate-build.outputs.served_root_tree_sha256 }}
+          PRODUCTION_CANDIDATE_SERVED_ROOT_IDENTITY_SHA256: ${{ needs.production-candidate-build.outputs.served_root_identity_sha256 }}
           BACKUP_COMMIT_SHA: ${{ needs.verified-production-mariadb55.outputs.candidate_commit_sha }}
           BROWSER_COMMIT_SHA: ${{ needs.real-browser-candidate.outputs.candidate_commit_sha }}
           BROWSER_ARTIFACT_SHA256: ${{ needs.real-browser-candidate.outputs.candidate_artifact_sha256 }}
           BROWSER_SERVED_ROOT_SHA256: ${{ needs.real-browser-candidate.outputs.served_root_sha256 }}
+          BROWSER_PREVIOUS_RELEASE_SHA: ${{ needs.real-browser-candidate.outputs.previous_release_commit_sha }}
+          BROWSER_SERVED_ROOT_TREE_SHA256: ${{ needs.real-browser-candidate.outputs.served_root_tree_sha256 }}
+          BROWSER_SERVED_ROOT_IDENTITY_SHA256: ${{ needs.real-browser-candidate.outputs.served_root_identity_sha256 }}
           BROWSER_SESSION_ID: ${{ needs.real-browser-candidate.outputs.release_validation_session_id }}
           PERFORMANCE_COMMIT_SHA: ${{ needs.cross-layer-performance.outputs.candidate_commit_sha }}
           PERFORMANCE_ARTIFACT_SHA256: ${{ needs.cross-layer-performance.outputs.candidate_artifact_sha256 }}
           PERFORMANCE_SERVED_ROOT_SHA256: ${{ needs.cross-layer-performance.outputs.served_root_sha256 }}
+          PERFORMANCE_PREVIOUS_RELEASE_SHA: ${{ needs.cross-layer-performance.outputs.previous_release_commit_sha }}
+          PERFORMANCE_SERVED_ROOT_TREE_SHA256: ${{ needs.cross-layer-performance.outputs.served_root_tree_sha256 }}
+          PERFORMANCE_SERVED_ROOT_IDENTITY_SHA256: ${{ needs.cross-layer-performance.outputs.served_root_identity_sha256 }}
           PERFORMANCE_SESSION_ID: ${{ needs.cross-layer-performance.outputs.release_validation_session_id }}
         run: |
           set -eu
@@ -1015,13 +1030,22 @@ jobs:
             --production-candidate-role "$PRODUCTION_CANDIDATE_BUILD_ROLE" \
             --production-candidate-publishable "$PRODUCTION_CANDIDATE_BUILD_PUBLISHABLE" \
             --production-candidate-project "$PRODUCTION_CANDIDATE_BUILD_PROJECT" \
+            --production-candidate-previous-release-sha "$PRODUCTION_CANDIDATE_PREVIOUS_RELEASE_SHA" \
+            --production-candidate-served-root-tree-sha256 "$PRODUCTION_CANDIDATE_SERVED_ROOT_TREE_SHA256" \
+            --production-candidate-served-root-identity-sha256 "$PRODUCTION_CANDIDATE_SERVED_ROOT_IDENTITY_SHA256" \
             --browser-commit "$BROWSER_COMMIT_SHA" \
             --browser-artifact "$BROWSER_ARTIFACT_SHA256" \
             --browser-served-root "$BROWSER_SERVED_ROOT_SHA256" \
+            --browser-previous-release-sha "$BROWSER_PREVIOUS_RELEASE_SHA" \
+            --browser-served-root-tree-sha256 "$BROWSER_SERVED_ROOT_TREE_SHA256" \
+            --browser-served-root-identity-sha256 "$BROWSER_SERVED_ROOT_IDENTITY_SHA256" \
             --browser-session "$BROWSER_SESSION_ID" \
             --performance-commit "$PERFORMANCE_COMMIT_SHA" \
             --performance-artifact "$PERFORMANCE_ARTIFACT_SHA256" \
             --performance-served-root "$PERFORMANCE_SERVED_ROOT_SHA256" \
+            --performance-previous-release-sha "$PERFORMANCE_PREVIOUS_RELEASE_SHA" \
+            --performance-served-root-tree-sha256 "$PERFORMANCE_SERVED_ROOT_TREE_SHA256" \
+            --performance-served-root-identity-sha256 "$PERFORMANCE_SERVED_ROOT_IDENTITY_SHA256" \
             --performance-session "$PERFORMANCE_SESSION_ID" \
             --backup-commit "$BACKUP_COMMIT_SHA" \
             --output .artifacts/production-ready/identity-join.json

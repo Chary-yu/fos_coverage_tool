@@ -29,9 +29,13 @@ from app.candidate_artifact import (
     CANDIDATE_BUILD_RECEIPT_NAME,
     PRODUCTION_PROJECT_NAME, PRODUCTION_RELEASE_ARTIFACT_ROLE,
     SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS, TRUSTED_CI_PROVENANCE_CLASS,
-    verify_git_source_provenance, verify_trusted_build_policy,
+    served_root_provenance_binding, verify_git_source_provenance,
+    verify_trusted_build_policy,
 )
-from app.candidate_build_receipt import verify_candidate_build_receipt
+from app.candidate_build_receipt import (
+    ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
+    verify_candidate_build_receipt,
+)
 from app.reports.identity import (
     LEGACY_STATIC, SUPPORTED_SIDECAR_SCHEMA_VERSIONS, VNEXT_ARTIFACT_READY,
     validate_report_id, validate_report_mode,
@@ -89,6 +93,12 @@ def _sha256(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _canonical_hash(value):
+    return hashlib.sha256(json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")).hexdigest()
 
 
 def _json_write(path, value):
@@ -775,10 +785,93 @@ def validate_release_manifest(release_root, manifest=None, expected_session_id="
     }
 
 
+def _served_root_tree_sha256(release_root):
+    """Hash every file in a validated CURRENT tree, including control files."""
+    release_root = _real(release_root)
+    _assert_no_symlinks(
+        release_root, "CURRENT Served Root may not contain symlinks"
+    )
+    entries = []
+    for path in _walk_regular_files(release_root):
+        entries.append({
+            "path": _safe_relative(release_root, path),
+            "size": int(os.path.getsize(path)),
+            "sha256": _sha256(path),
+        })
+    return _inventory_hash(sorted(entries, key=lambda item: item["path"]))
+
+
+def current_served_root_binding(publish_root):
+    """Return the authoritative identity of the immutable ``publish_root/CURRENT``.
+
+    This is intentionally derived from the CURRENT pointer and its complete
+    release manifest.  Callers must not substitute an arbitrary directory
+    that merely resembles a Served Root.
+    """
+    raw_publish_root = str(publish_root or "").strip()
+    if not raw_publish_root:
+        raise ValueError("production publish root is required")
+    publish_root = os.path.abspath(raw_publish_root)
+    current_path = os.path.join(publish_root, "CURRENT")
+    if not os.path.islink(current_path):
+        raise ValueError("production publish root CURRENT must be a symlink")
+    releases_path = os.path.join(publish_root, "releases")
+    if os.path.islink(releases_path) or not os.path.isdir(releases_path):
+        raise ValueError("production publish root releases must be a real directory")
+    releases_root = _real(releases_path)
+    release_root = _real(current_path)
+    if not _inside(releases_root, release_root) or release_root == releases_root:
+        raise ValueError("CURRENT must resolve inside publish_root/releases")
+    if not os.path.isdir(release_root):
+        raise ValueError("CURRENT target is not a directory")
+    manifest_path = os.path.join(release_root, "release_manifest.json")
+    if not os.path.isfile(manifest_path) or os.path.islink(manifest_path):
+        raise ValueError(
+            "CURRENT requires a complete release_manifest.json; legacy identity fallback is forbidden"
+        )
+    manifest = _load_json(manifest_path)
+    checked = validate_release_manifest(
+        release_root, manifest,
+        expected_session_id=os.path.basename(release_root),
+    )
+    if checked.get("status") != "PASSED":
+        raise ValueError(
+            "CURRENT release manifest is invalid: {}".format(
+                "; ".join(checked.get("violations") or [])
+            )
+        )
+    identity = manifest.get("release_identity")
+    if not isinstance(identity, dict):
+        raise ValueError("CURRENT release manifest release_identity is missing")
+    previous_sha = str(identity.get("commit_sha") or "").strip()
+    if not is_valid_commit_sha(previous_sha):
+        raise ValueError("CURRENT release identity has no exact previous release SHA")
+    if str(manifest.get("commit_sha") or "").lower() != previous_sha.lower():
+        raise ValueError("CURRENT release manifest and identity commit SHA differ")
+    identity_sha = _canonical_hash(identity)
+    tree_sha = _served_root_tree_sha256(release_root)
+    return {
+        "publish_root": publish_root,
+        "requested_path": current_path,
+        "realpath": release_root,
+        "previous_release_sha": previous_sha,
+        "previous_release_commit_sha": previous_sha,
+        "served_root_tree_sha256": tree_sha,
+        "current_identity_sha256": identity_sha,
+        "served_root_identity_sha256": identity_sha,
+        "current_identity_file_sha256": _sha256(manifest_path),
+        "served_root_identity_file_sha256": _sha256(manifest_path),
+        "release_validation_session_id": str(
+            manifest.get("release_validation_session_id") or ""
+        ),
+    }
+
+
 def _publication_identity_from_manifest(manifest):
     """Project a validated release manifest to the public identity payload."""
     candidate = manifest.get("candidate_artifact_manifest") or {}
     served = manifest.get("served_root") or {}
+    candidate_provenance = candidate.get("source_provenance") or {}
     session_id = str(manifest.get("release_validation_session_id") or "")
     candidate_sha = str(
         candidate.get("candidate_artifact_sha256") or
@@ -795,7 +888,7 @@ def _publication_identity_from_manifest(manifest):
             candidate.get("production_publishable") is not True or \
             project_name != PRODUCTION_PROJECT_NAME:
         return {}
-    return {
+    result = {
         "release_validation_session_id": session_id,
         "candidate_artifact_sha256": candidate_sha,
         "served_root_sha256": served_sha,
@@ -804,6 +897,15 @@ def _publication_identity_from_manifest(manifest):
         "production_publishable": True,
         "project_name": project_name,
     }
+    # These fields are the source CURRENT binding captured by the production
+    # Candidate builder.  Legacy/bootstrap releases may not have them; they
+    # remain publishable for rollback, but cannot supply new Production READY
+    # evidence until a normal production Candidate carries the full binding.
+    try:
+        result.update(served_root_provenance_binding(candidate_provenance))
+    except ValueError:
+        pass
+    return result
 
 
 def _runtime_inventory_stat_fingerprint(release_root):
@@ -1142,6 +1244,7 @@ class ImmutableReleasePublisher(object):
                 source_repo_root, release_identity,
                 provenance,
             )
+            served_root_provenance_binding(provenance)
             receipt_path = candidate_build_receipt or os.path.join(
                 _real(source_root),
                 str(verified_candidate_manifest.get("receipt_path") or
@@ -1157,6 +1260,7 @@ class ImmutableReleasePublisher(object):
                 receipt_path=receipt_path,
                 attestation_repository=candidate_build_attestation_repository,
                 attestation_workflow=candidate_build_attestation_workflow,
+                attestation_runner_policy=ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
             )
         staging = tempfile.mkdtemp(prefix=".release-{}-".format(session_id),
                                    dir=self.releases_root)
@@ -1198,6 +1302,7 @@ class ImmutableReleasePublisher(object):
                     source_repo_root, release_identity,
                     copied_provenance,
                 )
+                served_root_provenance_binding(copied_provenance)
                 copied_receipt_path = os.path.join(
                     staging,
                     str(copied_candidate_manifest.get("receipt_path") or
@@ -1209,6 +1314,7 @@ class ImmutableReleasePublisher(object):
                     receipt_path=copied_receipt_path,
                     attestation_repository=candidate_build_attestation_repository,
                     attestation_workflow=candidate_build_attestation_workflow,
+                    attestation_runner_policy=ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
                 )
             if copied_candidate_manifest.get("artifact_sha256") != \
                     verified_candidate_manifest.get("artifact_sha256"):

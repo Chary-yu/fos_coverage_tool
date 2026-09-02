@@ -37,13 +37,18 @@ if _REPO_ROOT not in sys.path:
 from app.release_identity import is_valid_commit_sha, verify_release_identity
 from app.release_publication import (
     ImmutableReleasePublisher, PRODUCTION_PROJECT_NAME,
-    PRODUCTION_RELEASE_ARTIFACT_ROLE, validate_production_candidate_content,
+    PRODUCTION_RELEASE_ARTIFACT_ROLE, current_served_root_binding,
+    validate_production_candidate_content,
 )
 from app.candidate_artifact import (
     CANDIDATE_ARTIFACT_MANIFEST_NAME, CandidateArtifactManifest,
-    verify_git_source_provenance, verify_trusted_build_policy,
+    served_root_provenance_binding, verify_git_source_provenance,
+    verify_trusted_build_policy,
 )
-from app.candidate_build_receipt import verify_candidate_build_receipt
+from app.candidate_build_receipt import (
+    ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
+    verify_candidate_build_receipt,
+)
 from scripts.diagnostics.data_hash_gate import capture_database_snapshot, verify_data_integrity
 from scripts.upgrade.evidence_manifest import ProductionEvidenceManifest
 from scripts.upgrade.schema_preflight import (
@@ -225,6 +230,10 @@ def validate_candidate_publication_preflight(
         receipt_path=receipt_path,
         attestation_repository=candidate_build_attestation_repository,
         attestation_workflow=candidate_build_attestation_workflow,
+        attestation_runner_policy=ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
+    )
+    served_root_binding = served_root_provenance_binding(
+        manifest.get("source_provenance") or {}
     )
     return {
         "status": "PASSED",
@@ -234,8 +243,18 @@ def validate_candidate_publication_preflight(
         "artifact_role": manifest.get("artifact_role"),
         "production_publishable": manifest.get("production_publishable"),
         "project_name": manifest.get("project_name"),
+        "source_provenance": dict(manifest.get("source_provenance") or {}),
         "source_commit_sha": observed_source.get("source_commit_sha"),
         "source_tree_sha": observed_source.get("source_tree_sha"),
+        "previous_release_commit_sha": served_root_binding[
+            "previous_release_commit_sha"
+        ],
+        "served_root_tree_sha256": served_root_binding[
+            "served_root_tree_sha256"
+        ],
+        "served_root_identity_sha256": served_root_binding[
+            "served_root_identity_sha256"
+        ],
         "build_workflow_identity": trusted_workflow_identity,
         "build_workflow_sha": trusted_workflow_sha,
         "candidate_build_receipt": receipt_path,
@@ -247,6 +266,26 @@ def validate_candidate_publication_preflight(
             candidate_build_attestation_workflow or ""
         ).strip(),
     }
+
+
+def verify_production_candidate_served_root_binding(
+        candidate_provenance: Dict[str, Any],
+        current_binding: Dict[str, Any]) -> Dict[str, str]:
+    """Join Candidate source CURRENT identity to the actual upgrade CURRENT."""
+    candidate = served_root_provenance_binding(candidate_provenance)
+    errors = []
+    for field in (
+            "previous_release_commit_sha", "served_root_tree_sha256",
+            "served_root_identity_sha256"):
+        actual = str(current_binding.get(field) or "").strip().lower()
+        if candidate[field] != actual:
+            errors.append(field)
+    if errors:
+        raise RuntimeError(
+            "production Candidate Served Root binding {} does not match the "
+            "CURRENT selected for this upgrade".format(", ".join(errors))
+        )
+    return candidate
 
 
 def resolve_backup_root(repo_root: str, configured_root: Optional[str] = None) -> str:
@@ -655,6 +694,29 @@ class UpgradeOrchestrator:
                     "; ".join(current.get("violations") or [])
                 )
             )
+        current_binding = current_served_root_binding(publish_root)
+        candidate_binding = verify_production_candidate_served_root_binding(
+            self.candidate_preflight.get("source_provenance") or {},
+            current_binding,
+        )
+        if str(current.get("commit_sha") or "").lower() != \
+                current_binding["previous_release_commit_sha"]:
+            raise RuntimeError(
+                "publisher.validate_current commit does not match the CURRENT binding"
+            )
+        if current.get("release_validation_session_id") != \
+                current_binding["release_validation_session_id"]:
+            raise RuntimeError(
+                "publisher.validate_current session does not match the CURRENT binding"
+            )
+        expected_served_root = os.path.join(current_binding["realpath"], "reports")
+        if os.path.realpath(str(current.get("served_root") or "")) != \
+                os.path.realpath(expected_served_root):
+            raise RuntimeError(
+                "publisher.validate_current Served Root does not match the CURRENT binding"
+            )
+        self.candidate_preflight["candidate_served_root_binding"] = candidate_binding
+        self.candidate_preflight["current_served_root_binding"] = current_binding
         if current.get("commit_sha") != previous_release.get("commit_sha"):
             raise RuntimeError(
                 "CURRENT release does not match previous_release commit_sha"

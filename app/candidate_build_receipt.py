@@ -23,7 +23,8 @@ import subprocess
 
 from app.candidate_artifact import (
     CANDIDATE_BUILD_RECEIPT_NAME, CANDIDATE_BUILD_RECEIPT_VERSION,
-    CandidateArtifactManifest,
+    CandidateArtifactManifest, PRODUCTION_RELEASE_ARTIFACT_ROLE,
+    VALIDATION_FIXTURE_ARTIFACT_ROLE, served_root_provenance_binding,
 )
 
 
@@ -35,6 +36,13 @@ _WORKFLOW_RUN_ID = re.compile(r"^[1-9][0-9]*$")
 _INVOCATION_ID = re.compile(
     r"(?:^|/)actions/runs/([1-9][0-9]*)/attempts/([1-9][0-9]*)(?:$|[/?#])"
 )
+
+# GitHub's verifier exposes a deny-self-hosted switch, rather than an
+# allow-list switch.  Keep the two release lanes explicit so a production
+# Candidate can use the protected self-hosted builder while a validation
+# fixture remains restricted to GitHub-hosted provenance.
+ATTESTATION_RUNNER_POLICY_GITHUB_HOSTED = "github-hosted-only"
+ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER = "controlled-production-builder"
 
 
 def _real(path):
@@ -202,7 +210,8 @@ def create_candidate_build_receipt(
 def verify_candidate_build_receipt(
         candidate_root, release_identity, candidate_manifest,
         attestation_bundle_path, receipt_path="", verification_key="",
-        attestation_repository="", attestation_workflow=""):
+        attestation_repository="", attestation_workflow="",
+        attestation_runner_policy=""):
     """Verify the protected receipt against the current Candidate bytes."""
     candidate_root = _real(candidate_root)
     manifest_relative = str(
@@ -261,14 +270,41 @@ def verify_candidate_build_receipt(
     if str(payload.get("commit_sha") or "").lower() != \
             str(identity.get("commit_sha") or "").lower():
         raise ValueError("Candidate build receipt commit does not match release identity")
+    runner_policy = _runner_policy_for_manifest(
+        candidate_manifest, attestation_runner_policy
+    )
+    if runner_policy == ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER:
+        served_root_provenance_binding(
+            (candidate_manifest or {}).get("source_provenance") or {}
+        )
     verify_github_artifact_attestation(
         manifest_path, bundle_path, attestation_repository,
         attestation_workflow, payload.get("source_commit_sha"),
         payload.get("build_workflow_sha"),
         payload.get("build_workflow_run_id"),
         payload.get("build_workflow_run_attempt"),
+        attestation_runner_policy=runner_policy,
     )
     return receipt
+
+
+def _runner_policy_for_manifest(candidate_manifest, requested_policy=""):
+    """Resolve the only attestation runner policy valid for this artifact."""
+    role = str((candidate_manifest or {}).get("artifact_role") or "").strip()
+    if role == PRODUCTION_RELEASE_ARTIFACT_ROLE:
+        required = ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER
+    elif role == VALIDATION_FIXTURE_ARTIFACT_ROLE:
+        required = ATTESTATION_RUNNER_POLICY_GITHUB_HOSTED
+    else:
+        raise ValueError("Candidate artifact role has no attestation runner policy")
+    requested = str(requested_policy or "").strip()
+    if requested and requested != required:
+        raise ValueError(
+            "attestation runner policy {} is invalid for {} Candidate".format(
+                requested, role
+            )
+        )
+    return required
 
 
 def _extract_attestation_invocation_identity(predicate):
@@ -304,7 +340,8 @@ def _extract_attestation_invocation_identity(predicate):
 
 def verify_github_artifact_attestation(
         subject_path, bundle_path, repository, workflow, source_commit_sha,
-        workflow_sha, workflow_run_id, workflow_run_attempt, verifier="gh"):
+        workflow_sha, workflow_run_id, workflow_run_attempt, verifier="gh",
+        attestation_runner_policy=ATTESTATION_RUNNER_POLICY_GITHUB_HOSTED):
     """Verify the Sigstore/GitHub attestation and its exact subject digest.
 
     ``gh attestation verify --bundle`` performs the cryptographic certificate,
@@ -317,6 +354,15 @@ def verify_github_artifact_attestation(
     workflow_sha = str(workflow_sha or "").strip()
     workflow_run_id = str(workflow_run_id or "").strip()
     workflow_run_attempt = str(workflow_run_attempt or "").strip()
+    attestation_runner_policy = str(attestation_runner_policy or "").strip()
+    if attestation_runner_policy not in (
+            ATTESTATION_RUNNER_POLICY_GITHUB_HOSTED,
+            ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER):
+        raise ValueError(
+            "unsupported GitHub artifact-attestation runner policy: {}".format(
+                attestation_runner_policy
+            )
+        )
     if not repository or not workflow or not workflow_run_id or \
             not workflow_run_attempt:
         raise ValueError(
@@ -343,8 +389,9 @@ def verify_github_artifact_attestation(
         "--signer-digest", workflow_sha,
         "--predicate-type", "https://slsa.dev/provenance/v1",
         "--format", "json",
-        "--deny-self-hosted-runners",
     ]
+    if attestation_runner_policy == ATTESTATION_RUNNER_POLICY_GITHUB_HOSTED:
+        command.append("--deny-self-hosted-runners")
     try:
         output = subprocess.check_output(
             command, stderr=subprocess.STDOUT,
@@ -404,4 +451,5 @@ def verify_github_artifact_attestation(
         "signer_workflow_sha": workflow_sha,
         "workflow_run_id": workflow_run_id,
         "workflow_run_attempt": workflow_run_attempt,
+        "attestation_runner_policy": attestation_runner_policy,
     }

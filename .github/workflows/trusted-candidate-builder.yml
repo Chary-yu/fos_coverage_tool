@@ -225,7 +225,10 @@ jobs:
           PYTHONPATH="$GITHUB_WORKSPACE/builder" python - <<'PY'
           import json
           from app.candidate_artifact import CandidateArtifactManifest
-          from app.candidate_build_receipt import verify_candidate_build_receipt
+          from app.candidate_build_receipt import (
+              ATTESTATION_RUNNER_POLICY_GITHUB_HOSTED,
+              verify_candidate_build_receipt,
+          )
 
           root = '.artifacts/candidate-build/candidate'
           with open('.artifacts/candidate-build/release_identity.json') as stream:
@@ -242,6 +245,7 @@ jobs:
                   'Chary-yu/fos_coverage_tool/'
                   '.github/workflows/trusted-candidate-builder.yml'
               ),
+              attestation_runner_policy=ATTESTATION_RUNNER_POLICY_GITHUB_HOSTED,
           )
           payload = result['payload']
           assert payload['build_workflow_run_id'] == manifest['build_workflow_run_id']

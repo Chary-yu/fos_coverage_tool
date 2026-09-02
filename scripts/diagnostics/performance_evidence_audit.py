@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import sys
 
 try:
@@ -23,6 +24,11 @@ def _sha256(path):
         for chunk in iter(lambda: stream.read(65536), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _valid_binding(value, pattern):
+    value = str(value or "")
+    return bool(re.fullmatch(pattern, value)) and not set(value.lower()) == {"0"}
 
 
 def audit(path, allow_partial=False, require_cross_layer=False,
@@ -74,6 +80,23 @@ def audit(path, allow_partial=False, require_cross_layer=False,
             if not evidence.get(field):
                 violations.append(
                     "release-eligible performance evidence is missing {}".format(field)
+                )
+        observed_publication = evidence.get("observed_publication") or {}
+        binding_sources = [evidence, observed_publication]
+        for field, pattern in (
+                ("previous_release_commit_sha", r"[0-9a-fA-F]{40}"),
+                ("served_root_tree_sha256", r"[0-9a-fA-F]{64}"),
+                ("served_root_identity_sha256", r"[0-9a-fA-F]{64}")):
+            value = next(
+                (source.get(field) for source in binding_sources
+                 if isinstance(source, dict) and source.get(field)),
+                "",
+            )
+            if not _valid_binding(value, pattern):
+                violations.append(
+                    "release-eligible performance evidence is missing or invalid {}".format(
+                        field
+                    )
                 )
 
     # A release A/B artifact has a stronger contract than the browser-only

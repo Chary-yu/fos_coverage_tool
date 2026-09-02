@@ -208,6 +208,9 @@ function publicationSnapshot(publication) {
     candidate_artifact_sha256: String(value.candidate_artifact_sha256 || ''),
     served_root_sha256: String(value.served_root_sha256 || ''),
     commit_sha: String(value.commit_sha || ''),
+    previous_release_commit_sha: String(value.previous_release_commit_sha || ''),
+    served_root_tree_sha256: String(value.served_root_tree_sha256 || ''),
+    served_root_identity_sha256: String(value.served_root_identity_sha256 || ''),
   };
 }
 
@@ -230,6 +233,15 @@ function publicationMismatch(expected, observed) {
   }
   if (observed.commit_sha && observed.commit_sha !== expected.commit_sha) {
     errors.push('publication commit SHA does not match expected revision');
+  }
+  if (!isSha(observed.previous_release_commit_sha)) {
+    errors.push('release endpoint publication previous release commit SHA is missing or invalid');
+  }
+  if (!isSha256(observed.served_root_tree_sha256)) {
+    errors.push('release endpoint publication Served Root tree SHA256 is missing or invalid');
+  }
+  if (!isSha256(observed.served_root_identity_sha256)) {
+    errors.push('release endpoint publication Served Root identity SHA256 is missing or invalid');
   }
   return errors;
 }
@@ -368,7 +380,9 @@ function buildEnvelope(report, reportPath, args) {
   const observed = report.observed_publication || {};
   const successfulObservation = report.status === 'PASSED' &&
     observed.release_validation_session_id &&
-    observed.candidate_artifact_sha256 && observed.served_root_sha256;
+    observed.candidate_artifact_sha256 && observed.served_root_sha256 &&
+    observed.previous_release_commit_sha &&
+    observed.served_root_tree_sha256 && observed.served_root_identity_sha256;
   const binding = successfulObservation ? observed : {
     release_validation_session_id: report.release_validation_session_id ||
       args.release_validation_session_id || '',
@@ -389,6 +403,9 @@ function buildEnvelope(report, reportPath, args) {
     release_validation_session_id: binding.release_validation_session_id,
     candidate_artifact_sha256: binding.candidate_artifact_sha256,
     served_root_sha256: binding.served_root_sha256,
+    previous_release_commit_sha: binding.previous_release_commit_sha,
+    served_root_tree_sha256: binding.served_root_tree_sha256,
+    served_root_identity_sha256: binding.served_root_identity_sha256,
     expected_release_validation_session_id: args.release_validation_session_id || '',
     expected_candidate_artifact_sha256: args.candidate_artifact_sha256 || '',
     expected_served_root_sha256: args.served_root_sha256 || '',

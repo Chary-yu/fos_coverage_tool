@@ -208,7 +208,8 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertNotIn("result['status']", production_workflow)
         self.assertIn("production-candidate-build:", caller)
         self.assertIn("production_candidate_build:", caller)
-        self.assertIn("production_served_root:", caller)
+        self.assertIn("production_publish_root:", caller)
+        self.assertNotIn("production_served_root:", caller)
         self.assertEqual(
             config["upgrade"]["production_candidate_builder_workflow_identity"],
             "github-actions/trusted-production-candidate-builder",

@@ -11,7 +11,10 @@ from app.candidate_artifact import (
     PRODUCTION_RELEASE_ARTIFACT_ROLE,
 )
 from app.release_identity import DEFAULT_RELEASE_ASSET_RELATIVE_PATHS
-from app.release_publication import build_release_manifest, validate_release_manifest
+from app.release_publication import (
+    build_release_manifest, current_served_root_binding,
+    validate_release_manifest,
+)
 from scripts.release.build_production_candidate_artifact import (
     build_production_candidate,
 )
@@ -85,7 +88,7 @@ class ProductionCandidateBuildTest(unittest.TestCase):
         release_manifest = build_release_manifest(
             release_root,
             {"commit_sha": previous_sha, "build_id": "baseline"},
-            "baseline-session",
+            "baseline",
             candidate_sha=previous_sha,
         )
         with open(os.path.join(release_root, "release_manifest.json"), "w",
@@ -100,6 +103,21 @@ class ProductionCandidateBuildTest(unittest.TestCase):
             "github-actions/trusted-production-builder", "123", "1", "f" * 40
         )
 
+    @staticmethod
+    def _expected_binding_kwargs(current):
+        binding = current_served_root_binding(os.path.dirname(current))
+        return {
+            "expected_previous_release_sha": binding[
+                "previous_release_commit_sha"
+            ],
+            "expected_served_root_tree_sha256": binding[
+                "served_root_tree_sha256"
+            ],
+            "expected_current_identity_sha256": binding[
+                "served_root_identity_sha256"
+            ],
+        }
+
     def test_builder_creates_a_separate_production_role_from_real_served_root(self):
         with tempfile.TemporaryDirectory(prefix="production-candidate-") as root:
             source = os.path.join(root, "source")
@@ -109,7 +127,8 @@ class ProductionCandidateBuildTest(unittest.TestCase):
             served, previous_sha = self._current_served_root(root)
             identity_output = os.path.join(root, "release_identity.json")
             result = build_production_candidate(
-                served, source, candidate, identity_output, *self._provenance_args()
+                served, source, candidate, identity_output, *self._provenance_args(),
+                **self._expected_binding_kwargs(served)
             )
             self.assertEqual(result["artifact_role"], PRODUCTION_RELEASE_ARTIFACT_ROLE)
             self.assertTrue(result["production_publishable"])
@@ -176,7 +195,8 @@ class ProductionCandidateBuildTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "production report project"):
                 build_production_candidate(
                     served, source, os.path.join(root, "candidate"),
-                    os.path.join(root, "identity.json"), *self._provenance_args()
+                    os.path.join(root, "identity.json"), *self._provenance_args(),
+                    **self._expected_binding_kwargs(served)
                 )
 
     def test_builder_rejects_a_manually_selected_served_directory(self):
@@ -207,8 +227,56 @@ class ProductionCandidateBuildTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "conflicting Served asset copies"):
                 build_production_candidate(
                     current, source, os.path.join(root, "candidate"),
+                    os.path.join(root, "identity.json"), *self._provenance_args(),
+                    **self._expected_binding_kwargs(current)
+                )
+
+    def test_builder_requires_complete_current_release_manifest(self):
+        with tempfile.TemporaryDirectory(prefix="production-candidate-manifest-") as root:
+            source = os.path.join(root, "source")
+            os.makedirs(source)
+            self._source_repo(source)
+            current, _ = self._current_served_root(root)
+            os.remove(os.path.join(os.path.realpath(current), "release_manifest.json"))
+            with self.assertRaisesRegex(ValueError, "release_manifest.json"):
+                build_production_candidate(
+                    current, source, os.path.join(root, "candidate"),
+                    os.path.join(root, "identity.json"), *self._provenance_args(),
+                    **self._expected_binding_kwargs(current)
+                )
+
+    def test_builder_requires_external_current_binding(self):
+        with tempfile.TemporaryDirectory(prefix="production-candidate-binding-") as root:
+            source = os.path.join(root, "source")
+            os.makedirs(source)
+            self._source_repo(source)
+            current, _ = self._current_served_root(root)
+            with self.assertRaisesRegex(ValueError, "expected Served Root binding"):
+                build_production_candidate(
+                    current, source, os.path.join(root, "candidate"),
                     os.path.join(root, "identity.json"), *self._provenance_args()
                 )
+
+    def test_builder_can_resolve_authoritative_publish_root_and_expected_binding(self):
+        with tempfile.TemporaryDirectory(prefix="production-candidate-publish-root-") as root:
+            source = os.path.join(root, "source")
+            os.makedirs(source)
+            self._source_repo(source)
+            current, _ = self._current_served_root(root)
+            publish_root = os.path.dirname(current)
+            binding = current_served_root_binding(publish_root)
+            result = build_production_candidate(
+                "", source, os.path.join(root, "candidate"),
+                os.path.join(root, "identity.json"), *self._provenance_args(),
+                expected_previous_release_sha=binding["previous_release_commit_sha"],
+                expected_served_root_tree_sha256=binding["served_root_tree_sha256"],
+                expected_current_identity_sha256=binding["served_root_identity_sha256"],
+                publish_root=publish_root,
+            )
+            self.assertEqual(
+                result["served_root_binding"]["realpath"],
+                binding["realpath"],
+            )
 
 
 if __name__ == "__main__":

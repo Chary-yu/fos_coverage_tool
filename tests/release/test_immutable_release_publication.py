@@ -15,6 +15,7 @@ from app.candidate_artifact import (
     identity_manifest_sha256,
 )
 from app.candidate_build_receipt import (
+    ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
     create_candidate_build_receipt, verify_github_artifact_attestation,
 )
 from app.release_publication import (
@@ -96,6 +97,9 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             "build_workflow_sha": "f" * 40,
             "source_manifest_sha256": "1" * 64,
             "build_input_manifest_sha256": "2" * 64,
+            "previous_release_commit_sha": "3" * 40,
+            "served_root_tree_sha256": "4" * 64,
+            "served_root_identity_sha256": "5" * 64,
         }
 
     @staticmethod
@@ -449,6 +453,11 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 build_workflow_run_attempt="1",
                 build_workflow_sha="f" * 40,
             )
+            provenance.update({
+                "previous_release_commit_sha": "3" * 40,
+                "served_root_tree_sha256": "4" * 64,
+                "served_root_identity_sha256": "5" * 64,
+            })
             self.assertEqual(provenance["provenance_class"], "trusted-ci-build")
             self.assertNotEqual(
                 provenance["source_manifest_sha256"],
@@ -542,6 +551,11 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 build_workflow_run_attempt="1",
                 build_workflow_sha="f" * 40,
             )
+            provenance.update({
+                "previous_release_commit_sha": "3" * 40,
+                "served_root_tree_sha256": "4" * 64,
+                "served_root_identity_sha256": "5" * 64,
+            })
             self._build_production_manifest(candidate, identity, provenance)
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
             with self.assertRaisesRegex(ValueError, "attestation_bundle"):
@@ -594,6 +608,21 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             self.assertIn("--signer-workflow", command)
             self.assertIn("--source-digest", command)
             self.assertIn("--signer-digest", command)
+            self.assertIn("--deny-self-hosted-runners", command)
+
+            with mock.patch.object(
+                    candidate_build_receipt.subprocess, "check_output",
+                    return_value=output) as production_check:
+                result = verify_github_artifact_attestation(
+                    subject, bundle, "Chary-yu/fos_coverage_tool",
+                    "Chary-yu/fos_coverage_tool/.github/workflows/trusted-production-candidate-builder.yml",
+                    "a" * 40, "b" * 40, "123", "1",
+                    attestation_runner_policy=ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
+                )
+            self.assertEqual(result["status"], "PASSED")
+            self.assertNotIn(
+                "--deny-self-hosted-runners", production_check.call_args[0][0]
+            )
 
             bad_output = json.dumps([{
                 "verificationResult": {
