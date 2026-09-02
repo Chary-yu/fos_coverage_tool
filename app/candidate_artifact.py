@@ -16,7 +16,7 @@ import os
 import re
 import subprocess
 
-from app.release_identity import is_valid_commit_sha
+from app.release_identity import build_asset_manifest, is_valid_commit_sha
 from app.time_utils import utc_iso
 
 
@@ -35,6 +35,7 @@ TRUSTED_PROVENANCE_CLASSES = (
 VALIDATION_FIXTURE_ARTIFACT_ROLE = "validation_fixture"
 PRODUCTION_RELEASE_ARTIFACT_ROLE = "production_release"
 PRODUCTION_PROJECT_NAME = "FOS_V6R2"
+VALIDATION_FIXTURE_PROJECT_NAME = "Coverage Candidate"
 ARTIFACT_ROLES = (
     VALIDATION_FIXTURE_ARTIFACT_ROLE, PRODUCTION_RELEASE_ARTIFACT_ROLE,
 )
@@ -137,7 +138,7 @@ def _identity_snapshot(identity):
     for key in (
             "version", "commit_sha", "build_id", "asset_hash",
             "schema_version", "asset_manifest_version", "asset_count",
-            "asset_manifest_hash"):
+            "asset_manifest_hash", "asset_manifest"):
         if identity.get(key) not in (None, ""):
             snapshot[key] = identity.get(key)
     snapshot["commit_sha"] = commit_sha
@@ -175,6 +176,45 @@ def _artifact_descriptor(artifact_role, production_publishable, project_name):
         "production_publishable": production_publishable,
         "project_name": project,
     }
+
+
+def _verify_release_assets(candidate_root, identity_snapshot):
+    """Verify the exact release assets claimed by a production identity.
+
+    ``CandidateArtifactManifest`` used to bind only the aggregate asset hash
+    from the release identity.  That made it possible for a production
+    candidate to carry a self-consistent artifact hash while one of the
+    individual compatibility/canonical files came from another release.  The
+    production candidate builder populates these exact paths; this second
+    check keeps the same contract in force when a Publisher copies the
+    candidate to a staging release.
+    """
+    declared = identity_snapshot.get("asset_manifest")
+    if declared in (None, ""):
+        # Older non-production fixtures intentionally carry only a minimal
+        # identity.  A current production release identity always contains a
+        # versioned asset manifest and is checked below when present.
+        return
+    if not isinstance(declared, list) or not declared:
+        raise ValueError("production candidate release asset_manifest is invalid")
+    paths = []
+    for item in declared:
+        if not isinstance(item, dict) or not item.get("path"):
+            raise ValueError("production candidate release asset_manifest is invalid")
+        paths.append(os.path.join(
+            candidate_root, *str(item["path"]).replace("\\", "/").split("/")
+        ))
+    try:
+        observed = build_asset_manifest(paths, candidate_root)
+    except (OSError, RuntimeError, ValueError, TypeError) as exc:
+        raise ValueError(
+            "production candidate release asset verification failed: {}".format(exc)
+        )
+    expected = sorted(declared, key=lambda item: item.get("path", ""))
+    if observed != expected:
+        raise ValueError(
+            "production candidate release asset manifest does not match candidate bytes"
+        )
 
 
 def identity_manifest_sha256(identity):
@@ -504,6 +544,9 @@ def _build_payload(candidate_root, identity, manifest_path, source_provenance,
     descriptor = _artifact_descriptor(
         artifact_role, production_publishable, project_name
     )
+    if descriptor["artifact_role"] == PRODUCTION_RELEASE_ARTIFACT_ROLE and \
+            provenance.get("provenance_class") != SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS:
+        _verify_release_assets(candidate_root, identity_snapshot)
     return {
         "artifact_manifest_version": CANDIDATE_ARTIFACT_MANIFEST_VERSION,
         "commit_sha": identity_snapshot["commit_sha"],
@@ -556,9 +599,9 @@ class CandidateArtifactManifest(object):
     @classmethod
     def build(cls, candidate_root, release_identity, output_path=None,
               source_provenance=None,
-              artifact_role=PRODUCTION_RELEASE_ARTIFACT_ROLE,
-              production_publishable=True,
-              project_name=PRODUCTION_PROJECT_NAME):
+              artifact_role=VALIDATION_FIXTURE_ARTIFACT_ROLE,
+              production_publishable=False,
+              project_name=VALIDATION_FIXTURE_PROJECT_NAME):
         candidate_root = _real(candidate_root)
         manifest_path = _real(output_path or os.path.join(
             candidate_root, CANDIDATE_ARTIFACT_MANIFEST_NAME

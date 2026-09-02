@@ -282,8 +282,10 @@ Candidate 必须先按用途分成两个互斥对象。受保护的
 
 正式发布使用独立的 `production_candidate_root`。它必须由真实的
 `FOS_V6R2` Served Root 构建，包含真实 `reports/`、`registry/`、Sidecar 和静态页面，
-再用目标 clean checkout 中的 741af8a（或实际目标 SHA）版本资产刷新
-`coverage_enhance.js/css`。构建、normalize 和 manifest 必须在发布前完成；Publisher
+再用目标 clean checkout 的 release identity `asset_manifest` 中声明的完整资产契约刷新
+所有静态资源（包括 root/web 兼容副本和目标版本新增的文件）。构建器只接受
+`publish_root/CURRENT` 这个不可变指针，并把 previous release SHA、CURRENT tree hash
+和 CURRENT identity 一起写入 provenance；构建、normalize 和 manifest 必须在发布前完成；Publisher
 只复制并验证最终字节，不再把验证夹具升级成生产页面：
 
 配置必须同时维护两套不可互换的 Builder policy：

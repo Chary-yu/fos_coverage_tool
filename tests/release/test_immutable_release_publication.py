@@ -10,6 +10,7 @@ import app.candidate_build_receipt as candidate_build_receipt
 
 from app.candidate_artifact import (
     CandidateArtifactManifest, build_git_source_provenance,
+    PRODUCTION_PROJECT_NAME, PRODUCTION_RELEASE_ARTIFACT_ROLE,
     VALIDATION_FIXTURE_ARTIFACT_ROLE,
     identity_manifest_sha256,
 )
@@ -66,11 +67,20 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
 
     def _prepare(self, publisher, source, identity, session_id, **kwargs):
         normalize_candidate_artifact(source)
-        CandidateArtifactManifest.build(
+        self._build_production_manifest(
             source, identity,
-            source_provenance=self._bootstrap_fixture_provenance(identity),
+            self._bootstrap_fixture_provenance(identity),
         )
         return publisher.prepare_bootstrap(source, identity, session_id, **kwargs)
+
+    @staticmethod
+    def _build_production_manifest(source, identity, provenance):
+        return CandidateArtifactManifest.build(
+            source, identity, source_provenance=provenance,
+            artifact_role=PRODUCTION_RELEASE_ARTIFACT_ROLE,
+            production_publishable=True,
+            project_name=PRODUCTION_PROJECT_NAME,
+        )
 
     @staticmethod
     def _trusted_fixture_provenance(identity):
@@ -221,9 +231,8 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             os.makedirs(source)
             self._source(source, mode="LEGACY_STATIC", include_mode=False)
             identity = {"commit_sha": "9" * 40, "build_id": "candidate-9"}
-            CandidateArtifactManifest.build(
-                source, identity,
-                source_provenance=self._bootstrap_fixture_provenance(identity),
+            self._build_production_manifest(
+                source, identity, self._bootstrap_fixture_provenance(identity)
             )
             source_html_path = os.path.join(source, "reports", "index.html")
             with open(source_html_path, "rb") as stream:
@@ -252,9 +261,8 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             source = os.path.join(root, "source")
             self._source(source)
             identity = {"commit_sha": "e" * 40, "build_id": "candidate-e"}
-            CandidateArtifactManifest.build(
-                source, identity,
-                source_provenance=self._bootstrap_fixture_provenance(identity),
+            self._build_production_manifest(
+                source, identity, self._bootstrap_fixture_provenance(identity)
             )
             nested = os.path.join(source, "assets", "nested-link")
             outside = os.path.join(root, "outside")
@@ -302,9 +310,8 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             source = os.path.join(root, "source")
             self._source(source)
             identity = {"commit_sha": "1" * 40, "build_id": "candidate-1"}
-            CandidateArtifactManifest.build(
-                source, identity,
-                source_provenance=self._bootstrap_fixture_provenance(identity),
+            self._build_production_manifest(
+                source, identity, self._bootstrap_fixture_provenance(identity)
             )
             with open(os.path.join(source, "assets", "coverage.js"), "a") as stream:
                 stream.write("\ntampered\n")
@@ -330,9 +337,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             identity = {"commit_sha": "3" * 40, "build_id": "candidate-3"}
             provenance = self._trusted_fixture_provenance(identity)
             provenance["provenance_class"] = "test-fixture"
-            CandidateArtifactManifest.build(
-                source, identity, source_provenance=provenance
-            )
+            self._build_production_manifest(source, identity, provenance)
             with self.assertRaisesRegex(ValueError, "trusted provenance class"):
                 ImmutableReleasePublisher(os.path.join(root, "publish")).prepare(
                     source, identity, "untrusted-session"
@@ -360,9 +365,8 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             source = os.path.join(root, "source")
             self._source(source)
             identity = {"commit_sha": "5" * 40, "build_id": "candidate-5"}
-            CandidateArtifactManifest.build(
-                source, identity,
-                source_provenance=self._trusted_fixture_provenance(identity),
+            self._build_production_manifest(
+                source, identity, self._trusted_fixture_provenance(identity)
             )
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
             with self.assertRaisesRegex(ValueError, "source_repo_root is required"):
@@ -373,9 +377,8 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             source = os.path.join(root, "source")
             self._source(source)
             identity = {"commit_sha": "6" * 40, "build_id": "candidate-6"}
-            CandidateArtifactManifest.build(
-                source, identity,
-                source_provenance=self._bootstrap_fixture_provenance(identity),
+            self._build_production_manifest(
+                source, identity, self._bootstrap_fixture_provenance(identity)
             )
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
             with self.assertRaisesRegex(ValueError, "trusted-ci-build"):
@@ -389,9 +392,8 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             source = os.path.join(root, "source")
             self._source(source)
             identity = {"commit_sha": "8" * 40, "build_id": "candidate-8"}
-            CandidateArtifactManifest.build(
-                source, identity,
-                source_provenance=self._bootstrap_fixture_provenance(identity),
+            self._build_production_manifest(
+                source, identity, self._bootstrap_fixture_provenance(identity)
             )
             identity_path = os.path.join(root, "identity.json")
             with open(identity_path, "w", encoding="utf-8") as stream:
@@ -453,8 +455,8 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 # This was the old, incorrect identity-only value.
                 identity_manifest_sha256(identity),
             )
-            manifest = CandidateArtifactManifest.build(
-                candidate, identity, source_provenance=provenance
+            manifest = self._build_production_manifest(
+                candidate, identity, provenance
             )
             self.assertEqual(manifest["build_workflow_run_id"], "123")
             self.assertEqual(manifest["build_workflow_run_attempt"], "1")
@@ -540,9 +542,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 build_workflow_run_attempt="1",
                 build_workflow_sha="f" * 40,
             )
-            CandidateArtifactManifest.build(
-                candidate, identity, source_provenance=provenance
-            )
+            self._build_production_manifest(candidate, identity, provenance)
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
             with self.assertRaisesRegex(ValueError, "attestation_bundle"):
                 publisher.prepare(
@@ -690,9 +690,8 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             source = os.path.join(root, "source")
             self._source(source)
             identity = {"commit_sha": "4" * 40, "build_id": "candidate-4"}
-            CandidateArtifactManifest.build(
-                source, identity,
-                source_provenance=self._bootstrap_fixture_provenance(identity),
+            self._build_production_manifest(
+                source, identity, self._bootstrap_fixture_provenance(identity)
             )
             attestation_path = os.path.join(source, "candidate_build_attestation.json")
             with open(attestation_path, "r", encoding="utf-8") as stream:

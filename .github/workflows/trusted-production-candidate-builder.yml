@@ -47,6 +47,15 @@ on:
       build_workflow_run_attempt:
         description: GitHub Actions workflow run attempt
         value: ${{ jobs.build.outputs.build_workflow_run_attempt }}
+      served_root_previous_release_sha:
+        description: Exact release SHA selected by CURRENT before the build
+        value: ${{ jobs.build.outputs.served_root_previous_release_sha }}
+      served_root_tree_sha256:
+        description: SHA256 inventory of the pre-build CURRENT Served Root
+        value: ${{ jobs.build.outputs.served_root_tree_sha256 }}
+      served_root_identity_sha256:
+        description: Canonical SHA256 of the pre-build CURRENT release identity
+        value: ${{ jobs.build.outputs.served_root_identity_sha256 }}
   workflow_dispatch:
     inputs:
       source_sha:
@@ -89,6 +98,9 @@ jobs:
       build_workflow_sha: ${{ steps.metadata.outputs.build_workflow_sha }}
       build_workflow_run_id: ${{ steps.metadata.outputs.build_workflow_run_id }}
       build_workflow_run_attempt: ${{ steps.metadata.outputs.build_workflow_run_attempt }}
+      served_root_previous_release_sha: ${{ steps.metadata.outputs.served_root_previous_release_sha }}
+      served_root_tree_sha256: ${{ steps.metadata.outputs.served_root_tree_sha256 }}
+      served_root_identity_sha256: ${{ steps.metadata.outputs.served_root_identity_sha256 }}
     env:
       BUILD_WORKFLOW_IDENTITY: github-actions/trusted-production-candidate-builder
       BUILD_WORKFLOW_RUN_ID: ${{ github.run_id }}
@@ -133,6 +145,8 @@ jobs:
           test -n "$BUILD_WORKFLOW_RUN_ID"
           test -n "$BUILD_WORKFLOW_RUN_ATTEMPT"
           test -n "$SERVED_ROOT"
+          test "$(basename "$SERVED_ROOT")" = "CURRENT"
+          test -L "$SERVED_ROOT"
           test -d "$SERVED_ROOT"
 
       - name: Build production Candidate from real Served Root
@@ -235,9 +249,9 @@ jobs:
                   + '/.github/workflows/trusted-production-candidate-builder.yml'
               ),
           )
-          assert result['status'] == 'PASSED'
-          assert result['workflow_run_id'] == manifest['build_workflow_run_id']
-          assert result['workflow_run_attempt'] == manifest['build_workflow_run_attempt']
+          payload = result['payload']
+          assert payload['build_workflow_run_id'] == manifest['build_workflow_run_id']
+          assert payload['build_workflow_run_attempt'] == manifest['build_workflow_run_attempt']
           PY
 
       - name: Expose exact production Candidate identity
@@ -257,6 +271,13 @@ jobs:
           print('build_workflow_run_id={}'.format(manifest['build_workflow_run_id']))
           print('build_workflow_run_attempt={}'.format(
               manifest['build_workflow_run_attempt']))
+          provenance = manifest.get('source_provenance') or {}
+          print('served_root_previous_release_sha={}'.format(
+              provenance['previous_release_commit_sha']))
+          print('served_root_tree_sha256={}'.format(
+              provenance['served_root_tree_sha256']))
+          print('served_root_identity_sha256={}'.format(
+              provenance['served_root_identity_sha256']))
           PY
 
       - name: Upload immutable production Candidate build evidence

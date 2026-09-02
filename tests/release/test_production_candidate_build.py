@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -69,6 +70,31 @@ class ProductionCandidateBuildTest(unittest.TestCase):
                 "project_name": project,
             }, stream)
 
+    def _current_served_root(self, root, project=PRODUCTION_PROJECT_NAME,
+                             extra_files=None):
+        publish_root = os.path.join(root, "publish")
+        release_root = os.path.join(publish_root, "releases", "baseline")
+        os.makedirs(release_root)
+        self._served_root(release_root, project)
+        for relative, contents in extra_files or ():
+            path = os.path.join(release_root, *relative.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write(contents)
+        previous_sha = "1" * 40
+        release_manifest = build_release_manifest(
+            release_root,
+            {"commit_sha": previous_sha, "build_id": "baseline"},
+            "baseline-session",
+            candidate_sha=previous_sha,
+        )
+        with open(os.path.join(release_root, "release_manifest.json"), "w",
+                  encoding="utf-8") as stream:
+            json.dump(release_manifest, stream, sort_keys=True)
+        current = os.path.join(publish_root, "CURRENT")
+        os.symlink(os.path.join("releases", "baseline"), current)
+        return current, previous_sha
+
     def _provenance_args(self):
         return (
             "github-actions/trusted-production-builder", "123", "1", "f" * 40
@@ -77,12 +103,10 @@ class ProductionCandidateBuildTest(unittest.TestCase):
     def test_builder_creates_a_separate_production_role_from_real_served_root(self):
         with tempfile.TemporaryDirectory(prefix="production-candidate-") as root:
             source = os.path.join(root, "source")
-            served = os.path.join(root, "served")
             candidate = os.path.join(root, "production-candidate")
             os.makedirs(source)
-            os.makedirs(served)
             self._source_repo(source)
-            self._served_root(served)
+            served, previous_sha = self._current_served_root(root)
             identity_output = os.path.join(root, "release_identity.json")
             result = build_production_candidate(
                 served, source, candidate, identity_output, *self._provenance_args()
@@ -107,6 +131,31 @@ class ProductionCandidateBuildTest(unittest.TestCase):
             with open(os.path.join(source, "web", "assets", "js", "coverage_enhance.js"), "rb") as stream:
                 source_js = stream.read()
             self.assertEqual(candidate_js, source_js)
+            with open(identity_output, encoding="utf-8") as stream:
+                identity = json.load(stream)
+            self.assertEqual(
+                result["served_root_binding"]["previous_release_sha"], previous_sha
+            )
+            provenance = manifest["source_provenance"]
+            self.assertEqual(
+                provenance["served_root_path"], os.path.abspath(served)
+            )
+            self.assertRegex(provenance["served_root_tree_sha256"], r"^[0-9a-f]{64}$")
+            self.assertRegex(provenance["served_root_identity_sha256"], r"^[0-9a-f]{64}$")
+            actual_assets = []
+            for item in identity["asset_manifest"]:
+                path = os.path.join(candidate, *item["path"].split("/"))
+                with open(path, "rb") as stream:
+                    actual_assets.append({
+                        "path": item["path"],
+                        "size": os.path.getsize(path),
+                        "sha256": hashlib.sha256(stream.read()).hexdigest(),
+                    })
+            self.assertEqual(actual_assets, identity["asset_manifest"])
+            for relative in DEFAULT_RELEASE_ASSET_RELATIVE_PATHS:
+                self.assertTrue(os.path.isfile(os.path.join(
+                    candidate, *relative.split("/")
+                )))
             release_manifest = build_release_manifest(
                 candidate, manifest, "production-candidate-test",
                 candidate_sha=manifest["commit_sha"],
@@ -121,14 +170,43 @@ class ProductionCandidateBuildTest(unittest.TestCase):
     def test_builder_rejects_non_production_project_and_validation_fixture_content(self):
         with tempfile.TemporaryDirectory(prefix="production-candidate-reject-") as root:
             source = os.path.join(root, "source")
-            served = os.path.join(root, "served")
             os.makedirs(source)
-            os.makedirs(served)
             self._source_repo(source)
-            self._served_root(served, project="Coverage Candidate")
+            served, _ = self._current_served_root(root, project="Coverage Candidate")
             with self.assertRaisesRegex(ValueError, "production report project"):
                 build_production_candidate(
                     served, source, os.path.join(root, "candidate"),
+                    os.path.join(root, "identity.json"), *self._provenance_args()
+                )
+
+    def test_builder_rejects_a_manually_selected_served_directory(self):
+        with tempfile.TemporaryDirectory(prefix="production-candidate-path-") as root:
+            source = os.path.join(root, "source")
+            os.makedirs(source)
+            self._source_repo(source)
+            current, _ = self._current_served_root(root)
+            with self.assertRaisesRegex(ValueError, "CURRENT"):
+                build_production_candidate(
+                    os.path.realpath(current), source,
+                    os.path.join(root, "candidate"),
+                    os.path.join(root, "identity.json"), *self._provenance_args()
+                )
+
+    def test_builder_rejects_conflicting_served_asset_copies(self):
+        with tempfile.TemporaryDirectory(prefix="production-candidate-conflict-") as root:
+            source = os.path.join(root, "source")
+            os.makedirs(source)
+            self._source_repo(source)
+            current, _ = self._current_served_root(
+                root,
+                extra_files=(
+                    ("assets/coverage_progress.js", "old-a"),
+                    ("reports/coverage_progress.js", "old-b"),
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "conflicting Served asset copies"):
+                build_production_candidate(
+                    current, source, os.path.join(root, "candidate"),
                     os.path.join(root, "identity.json"), *self._provenance_args()
                 )
 

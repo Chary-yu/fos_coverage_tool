@@ -13,6 +13,7 @@ if ROOT not in sys.path:
 
 from app.candidate_artifact import (
     CANDIDATE_ARTIFACT_MANIFEST_NAME, CandidateArtifactManifest,
+    VALIDATION_FIXTURE_ARTIFACT_ROLE, VALIDATION_FIXTURE_PROJECT_NAME,
     build_git_source_provenance,
 )
 from app.release_identity import verify_release_identity
@@ -79,6 +80,9 @@ def main(argv=None):
         manifest = CandidateArtifactManifest.build(
             candidate_root, identity, output,
             source_provenance=source_provenance,
+            artifact_role=VALIDATION_FIXTURE_ARTIFACT_ROLE,
+            production_publishable=False,
+            project_name=VALIDATION_FIXTURE_PROJECT_NAME,
         )
     except (OSError, RuntimeError, ValueError, TypeError) as exc:
         parser.error(str(exc))

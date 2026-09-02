@@ -59,12 +59,10 @@ class CandidateBuildTest(unittest.TestCase):
             manifest = CandidateArtifactManifest.build(
                 candidate, identity,
                 source_provenance=self._bootstrap_provenance(identity),
-                artifact_role=VALIDATION_FIXTURE_ARTIFACT_ROLE,
-                production_publishable=False,
-                project_name=CANDIDATE_PROJECT,
             )
-            self.assertEqual(manifest["artifact_role"], "validation_fixture")
+            self.assertEqual(manifest["artifact_role"], VALIDATION_FIXTURE_ARTIFACT_ROLE)
             self.assertFalse(manifest["production_publishable"])
+            self.assertEqual(manifest["project_name"], CANDIDATE_PROJECT)
             with self.assertRaisesRegex(ValueError, "validation_fixture"):
                 build_release_manifest(
                     candidate, identity, "candidate-build-test-session",

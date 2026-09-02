@@ -243,9 +243,9 @@ jobs:
                   '.github/workflows/trusted-candidate-builder.yml'
               ),
           )
-          assert result['status'] == 'PASSED'
-          assert result['workflow_run_id'] == manifest['build_workflow_run_id']
-          assert result['workflow_run_attempt'] == manifest['build_workflow_run_attempt']
+          payload = result['payload']
+          assert payload['build_workflow_run_id'] == manifest['build_workflow_run_id']
+          assert payload['build_workflow_run_attempt'] == manifest['build_workflow_run_attempt']
           PY
 
       - name: Expose exact Candidate build identity
