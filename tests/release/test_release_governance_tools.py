@@ -256,6 +256,8 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("_validate_stage_tree", bootstrap_previous_release)
         self.assertIn("_tree_inventory_sha256", bootstrap_previous_release)
         self.assertIn("Candidate copy does not match", bootstrap_previous_release)
+        self.assertIn("frozen_source_tree_sha", bootstrap_previous_release)
+        self.assertIn("frozen_input_manifest_sha", bootstrap_previous_release)
         self.assertIn("source root changed during Bootstrap validation", bootstrap_previous_release)
         with open(
                 os.path.join(os.getcwd(), "docs", "operations",

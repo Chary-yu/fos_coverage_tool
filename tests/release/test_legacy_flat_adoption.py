@@ -8,7 +8,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from app.candidate_artifact import PRODUCTION_PROJECT_NAME
+from app.candidate_artifact import (
+    PRODUCTION_PROJECT_NAME, build_directory_input_manifest_sha256,
+)
 from app.release_identity import (
     DEFAULT_RELEASE_ASSET_RELATIVE_PATHS, generate_release_identity,
     save_release_manifest,
@@ -655,6 +657,65 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
             self.assertFalse(os.path.lexists(
                 os.path.join(publish_root, "CURRENT")
             ))
+
+    def test_bootstrap_provenance_uses_frozen_copy_after_staging_changes(self):
+        with tempfile.TemporaryDirectory(
+                prefix="legacy-flat-bootstrap-provenance-") as root:
+            flat_root = os.path.join(root, "flat")
+            os.makedirs(flat_root)
+            self._flat_root(flat_root)
+            identity_path, _ = self._legacy_identity(root, flat_root)
+            adopted_root = os.path.join(root, "adopted")
+            prepare_legacy_flat_adoption(
+                flat_root, adopted_root, identity_path, LEGACY_COMMIT_SHA
+            )
+            expected_source_tree_sha = bootstrap_module._served_root_tree_sha(
+                adopted_root
+            )
+            expected_input_manifest_sha = build_directory_input_manifest_sha256(
+                adopted_root
+            )
+
+            real_copy = bootstrap_module._copy_source_without_following_links
+
+            def copy_then_change_source(source_root, target_root):
+                real_copy(source_root, target_root)
+                with open(os.path.join(
+                        source_root, "reports", "dhc", "source-file.html"),
+                        "ab") as stream:
+                    stream.write(b"CHANGED AFTER COPY")
+
+            publish_root = os.path.join(root, "publish")
+            with mock.patch.object(
+                    bootstrap_module,
+                    "_copy_source_without_following_links",
+                    side_effect=copy_then_change_source):
+                result = bootstrap(
+                    adopted_root, publish_root, identity_path,
+                    "previous-e9fcc837",
+                    served_identity_path=os.path.join(
+                        adopted_root, "release_identity.json"
+                    ),
+                    switch=True,
+                )
+
+            with open(os.path.join(
+                    result["release_root"], "candidate_artifact_manifest.json"),
+                    "r", encoding="utf-8") as stream:
+                provenance = json.load(stream)["source_provenance"]
+            self.assertEqual(
+                provenance["source_tree_sha"], expected_source_tree_sha
+            )
+            self.assertEqual(
+                provenance["source_manifest_sha256"], expected_input_manifest_sha
+            )
+            self.assertEqual(
+                provenance["build_input_manifest_sha256"], expected_input_manifest_sha
+            )
+            with open(os.path.join(
+                    result["release_root"], "reports", "dhc", "source-file.html"),
+                    "rb") as stream:
+                self.assertNotIn(b"CHANGED AFTER COPY", stream.read())
 
 
 if __name__ == "__main__":

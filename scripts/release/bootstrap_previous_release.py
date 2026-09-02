@@ -787,13 +787,20 @@ def bootstrap(served_root, publish_root, release_identity_path, session_id,
                     "bootstrap Candidate copy does not match the validated "
                     "legacy adoption staging"
                 )
+        # These provenance values describe the exact copy that will be
+        # normalized and hashed below.  Do not read the mutable Served Root
+        # again after the copy/equality boundary.
+        frozen_source_tree_sha = _served_root_tree_sha(build_root)
+        frozen_input_manifest_sha = build_directory_input_manifest_sha256(
+            build_root
+        )
         # Bootstrap creates the Candidate bytes that are about to be hashed;
         # the Publisher must not normalize a different copy later.
         normalize_candidate_artifact(build_root)
         source_provenance = {
             "provenance_class": "served-root-bootstrap",
             "source_commit_sha": expected.get("commit_sha"),
-            "source_tree_sha": _served_root_tree_sha(served_root),
+            "source_tree_sha": frozen_source_tree_sha,
             "worktree_clean": True,
             "build_workflow_identity": "bootstrap_previous_release",
             "build_workflow_run_id": str(session_id),
@@ -801,12 +808,8 @@ def bootstrap(served_root, publish_root, release_identity_path, session_id,
             # baseline identity, not a CI workflow.  Pin the attestation
             # to that identity while retaining the trusted schema.
             "build_workflow_sha": expected.get("commit_sha"),
-            "source_manifest_sha256": build_directory_input_manifest_sha256(
-                served_root
-            ),
-            "build_input_manifest_sha256": build_directory_input_manifest_sha256(
-                served_root
-            ),
+            "source_manifest_sha256": frozen_input_manifest_sha,
+            "build_input_manifest_sha256": frozen_input_manifest_sha,
         }
         source_provenance.update(legacy_adoption)
         artifact_manifest = CandidateArtifactManifest.build(
