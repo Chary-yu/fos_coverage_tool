@@ -254,6 +254,8 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
             bootstrap_previous_release = stream.read()
         self.assertIn("validate_legacy_adoption_staging", bootstrap_previous_release)
         self.assertIn("_validate_stage_tree", bootstrap_previous_release)
+        self.assertIn("_tree_inventory_sha256", bootstrap_previous_release)
+        self.assertIn("Candidate copy does not match", bootstrap_previous_release)
         self.assertIn("source root changed during Bootstrap validation", bootstrap_previous_release)
         with open(
                 os.path.join(os.getcwd(), "docs", "operations",

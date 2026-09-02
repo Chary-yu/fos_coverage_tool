@@ -17,6 +17,9 @@ from app.release_publication import (
     ImmutableReleasePublisher, current_served_root_binding,
     validate_production_candidate_content,
 )
+bootstrap_module = importlib.import_module(
+    "scripts.release.bootstrap_previous_release"
+)
 from scripts.release.bootstrap_previous_release import bootstrap
 from scripts.release.build_production_candidate_artifact import (
     build_production_candidate,
@@ -613,6 +616,45 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
                     self.assertFalse(os.path.lexists(
                         os.path.join(publish_root, "CURRENT")
                     ))
+
+    def test_bootstrap_rejects_copy_race_after_staging_validation(self):
+        with tempfile.TemporaryDirectory(
+                prefix="legacy-flat-bootstrap-copy-race-") as root:
+            flat_root = os.path.join(root, "flat")
+            os.makedirs(flat_root)
+            self._flat_root(flat_root)
+            identity_path, _ = self._legacy_identity(root, flat_root)
+            adopted_root = os.path.join(root, "adopted")
+            prepare_legacy_flat_adoption(
+                flat_root, adopted_root, identity_path, LEGACY_COMMIT_SHA
+            )
+
+            real_copy = bootstrap_module._copy_source_without_following_links
+
+            def copy_after_staging_tamper(source_root, target_root):
+                with open(os.path.join(
+                        source_root, "reports", "dhc", "source-file.html"),
+                        "ab") as stream:
+                    stream.write(b"TAMPERED BETWEEN VALIDATION AND COPY")
+                real_copy(source_root, target_root)
+
+            publish_root = os.path.join(root, "publish")
+            with mock.patch.object(
+                    bootstrap_module,
+                    "_copy_source_without_following_links",
+                    side_effect=copy_after_staging_tamper):
+                with self.assertRaisesRegex(ValueError, "copy does not match"):
+                    bootstrap(
+                        adopted_root, publish_root, identity_path,
+                        "previous-e9fcc837",
+                        served_identity_path=os.path.join(
+                            adopted_root, "release_identity.json"
+                        ),
+                        switch=True,
+                    )
+            self.assertFalse(os.path.lexists(
+                os.path.join(publish_root, "CURRENT")
+            ))
 
 
 if __name__ == "__main__":

@@ -117,6 +117,21 @@ def _json_bytes(value):
     ) + "\n").encode("utf-8")
 
 
+def _tree_inventory_sha256(files, directories):
+    entries = []
+    for relative in sorted(files):
+        entry = files[relative]
+        entries.append({
+            "path": relative,
+            "size": int(entry["size"]),
+            "sha256": str(entry["sha256"]).lower(),
+        })
+    return _canonical_hash({
+        "directories": sorted(directories),
+        "files": entries,
+    })
+
+
 def _stage_tree_inventory(root, description):
     """Hash a staging subtree while rejecting links and special files."""
     requested_root = os.path.abspath(str(root))
@@ -211,6 +226,7 @@ def _validate_stage_tree(root, expected_files, description):
                     description, relative
                 )
             )
+    return actual_files, actual_directories
 
 
 def _require_regular(path, description):
@@ -445,7 +461,8 @@ def validate_legacy_adoption_staging(staging_root, identity, identity_path):
         raise ValueError(
             "legacy adoption staging release identity does not match its binding"
         )
-    if _sha256(staged_identity_path).lower() != str(
+    staged_identity_sha256 = _sha256(staged_identity_path)
+    if staged_identity_sha256.lower() != str(
             manifest.get("release_identity_file_sha256") or "").lower():
         raise ValueError(
             "legacy adoption staging release identity bytes do not match manifest"
@@ -591,17 +608,29 @@ def validate_legacy_adoption_staging(staging_root, identity, identity_path):
             "legacy adoption source root changed during Bootstrap validation"
         )
 
-    _validate_stage_tree(
-        os.path.join(staging_root, "reports"), expected_reports,
-        "legacy adoption reports",
+    expected_staging_files = {
+        "release_identity.json": {
+            "size": os.path.getsize(staged_identity_path),
+            "sha256": staged_identity_sha256,
+        },
+        LEGACY_ADOPTION_MANIFEST_NAME: {
+            "size": os.path.getsize(os.path.join(
+                staging_root, LEGACY_ADOPTION_MANIFEST_NAME
+            )),
+            "sha256": binding["legacy_adoption_manifest_sha256"],
+        },
+    }
+    for relative, expected in expected_reports.items():
+        expected_staging_files["reports/" + relative] = expected
+    for relative, expected in expected_assets.items():
+        expected_staging_files["assets/" + relative] = expected
+    for relative, expected in expected_registry.items():
+        expected_staging_files["registry/" + relative] = expected
+    actual_staging_files, actual_staging_directories = _validate_stage_tree(
+        staging_root, expected_staging_files, "legacy adoption staging"
     )
-    _validate_stage_tree(
-        os.path.join(staging_root, "assets"), expected_assets,
-        "legacy adoption assets",
-    )
-    _validate_stage_tree(
-        os.path.join(staging_root, "registry"), expected_registry,
-        "legacy adoption registry",
+    staging_tree_sha256 = _tree_inventory_sha256(
+        actual_staging_files, actual_staging_directories
     )
     for relative in sorted(expected_html_metadata):
         path = os.path.join(staging_root, "reports", *relative.split("/"))
@@ -628,6 +657,7 @@ def validate_legacy_adoption_staging(staging_root, identity, identity_path):
         "staging_manifest_sha256": binding[
             "legacy_adoption_manifest_sha256"
         ],
+        "staging_tree_sha256": staging_tree_sha256,
         "source_tree_sha256": source_tree_sha256,
         "source_file_count": len(source_entries),
     }
@@ -710,11 +740,12 @@ def bootstrap(served_root, publish_root, release_identity_path, session_id,
     legacy_adoption = _legacy_adoption_binding(
         served_root, observed, identity_path
     )
+    legacy_adoption_validation = {}
     if legacy_adoption:
         # Adoption evidence describes a historical copy.  Rebind every byte
         # in that copy, and the original source root, before any fresh
         # Candidate manifest or immutable CURRENT can be created.
-        validate_legacy_adoption_staging(
+        legacy_adoption_validation = validate_legacy_adoption_staging(
             served_root, observed, identity_path
         )
     # If the current root already carries the immutable publication manifest,
@@ -742,6 +773,20 @@ def bootstrap(served_root, publish_root, release_identity_path, session_id,
 
     with tempfile.TemporaryDirectory(prefix="coverage-bootstrap-") as build_root:
         _copy_source_without_following_links(served_root, build_root)
+        if legacy_adoption_validation:
+            copied_files, copied_directories = _stage_tree_inventory(
+                build_root, "bootstrap Candidate copy"
+            )
+            copied_tree_sha256 = _tree_inventory_sha256(
+                copied_files, copied_directories
+            )
+            if copied_tree_sha256.lower() != str(
+                    legacy_adoption_validation["staging_tree_sha256"]
+            ).lower():
+                raise ValueError(
+                    "bootstrap Candidate copy does not match the validated "
+                    "legacy adoption staging"
+                )
         # Bootstrap creates the Candidate bytes that are about to be hashed;
         # the Publisher must not normalize a different copy later.
         normalize_candidate_artifact(build_root)
