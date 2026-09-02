@@ -293,6 +293,15 @@ Candidate 必须先按用途分成两个互斥对象。受保护的
 `production_candidate_builder_workflow_*` 只对应生产构建器，并且每个 SHA 必须固定到
 包含相应 workflow 的不可变 Git commit。生产升级只读取后者。
 
+受保护的 `trusted-production-candidate-build` Environment 必须配置一个固定的
+Environment Variable `PRODUCTION_PUBLISH_ROOT`，其值是
+`coverage-production-builder` runner 上唯一权威的 immutable publication root 绝对路径。
+`trusted-production-candidate-builder.yml` 只从 `${{ vars.PRODUCTION_PUBLISH_ROOT }}`
+读取该值；`workflow_dispatch` 和 reusable-workflow caller 都不再接受
+`publish_root`/`production_publish_root` 路径输入。变量缺失时构建器必须立即失败。
+本地 observation-only 的 `production_current_binding.py --publish-root` 仍可接受路径，
+但该 CLI 输入不属于受保护的正式生产构建路径。
+
 ```bash
 python3 scripts/release/build_production_candidate_artifact.py \
   --publish-root /srv/fos-coverage/publish-root \

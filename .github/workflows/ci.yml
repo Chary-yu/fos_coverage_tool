@@ -45,10 +45,6 @@ on:
         required: false
         type: boolean
         default: false
-      production_publish_root:
-        description: 'Absolute path to the authoritative immutable production publish root on the protected builder runner'
-        required: false
-        type: string
   pull_request:
     paths:
       - '**.py'
@@ -719,7 +715,6 @@ jobs:
     with:
       source_sha: ${{ github.sha }}
       builder_workflow_sha: ec96cadc23cd8c84d3207e00a7d7c0d10fcba58e
-      publish_root: ${{ inputs.production_publish_root }}
       attestation_repository: Chary-yu/fos_coverage_tool
     secrets: inherit
 

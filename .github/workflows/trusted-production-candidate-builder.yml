@@ -11,10 +11,6 @@ on:
         description: Immutable commit containing this production builder workflow
         required: true
         type: string
-      publish_root:
-        description: Absolute path to the authoritative immutable production publish root; CURRENT is resolved by the builder
-        required: true
-        type: string
       attestation_repository:
         description: Repository allowed to verify the production Candidate attestation
         required: true
@@ -66,10 +62,6 @@ on:
         description: Immutable commit containing this production builder workflow
         required: true
         type: string
-      publish_root:
-        description: Absolute path to the authoritative immutable production publish root; CURRENT is resolved by the builder
-        required: true
-        type: string
       attestation_repository:
         description: Repository allowed to verify the production Candidate attestation
         required: true
@@ -107,7 +99,10 @@ jobs:
       BUILD_WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
       BUILD_WORKFLOW_SHA: ${{ inputs.builder_workflow_sha }}
       SOURCE_SHA: ${{ inputs.source_sha }}
-      PRODUCTION_PUBLISH_ROOT: ${{ inputs.publish_root }}
+      # This is an environment-scoped protected variable.  The production
+      # lane never accepts a publish-root path from workflow_dispatch or from
+      # its reusable-workflow caller.
+      PRODUCTION_PUBLISH_ROOT: ${{ vars.PRODUCTION_PUBLISH_ROOT }}
       ATTESTATION_REPOSITORY: ${{ inputs.attestation_repository }}
       COVERAGE_BUILD_PROVENANCE_HMAC_KEY: ${{ secrets.COVERAGE_BUILD_PROVENANCE_HMAC_KEY }}
       GH_TOKEN: ${{ github.token }}

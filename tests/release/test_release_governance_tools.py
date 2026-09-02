@@ -201,6 +201,11 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("runs-on: [self-hosted, coverage-production-builder]", production_workflow)
         self.assertIn("trusted-production-candidate-builder", production_workflow)
         self.assertIn("workflow_call:", production_workflow)
+        self.assertIn(
+            "PRODUCTION_PUBLISH_ROOT: ${{ vars.PRODUCTION_PUBLISH_ROOT }}",
+            production_workflow,
+        )
+        self.assertNotIn("inputs.publish_root", production_workflow)
         self.assertIn("build_production_candidate_artifact.py", production_workflow)
         self.assertIn("PRODUCTION_PROJECT_NAME", production_workflow)
         self.assertIn("import os", production_workflow)
@@ -208,7 +213,7 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertNotIn("result['status']", production_workflow)
         self.assertIn("production-candidate-build:", caller)
         self.assertIn("production_candidate_build:", caller)
-        self.assertIn("production_publish_root:", caller)
+        self.assertNotIn("production_publish_root:", caller)
         self.assertNotIn("production_served_root:", caller)
         self.assertEqual(
             config["upgrade"]["production_candidate_builder_workflow_identity"],
