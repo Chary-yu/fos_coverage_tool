@@ -12,11 +12,11 @@ jobs:
   export:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout exact source
+      - name: Checkout repository history
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
-      - name: Build verified bundle
+      - name: Build and independently verify exact source bundle
         shell: bash
         run: |
           set -euo pipefail
@@ -26,8 +26,15 @@ jobs:
           test "$(git rev-parse ${TARGET}^{tree})" = "$TREE"
           mkdir -p out
           git branch -f exact-b160-source "$TARGET"
-          git bundle create out/fos_coverage_tool_b160c6a85.bundle exact-b160-source
-          git bundle verify out/fos_coverage_tool_b160c6a85.bundle
+          git bundle create out/fos_coverage_tool_b160c6a85.bundle refs/heads/exact-b160-source
+          rm -rf /tmp/fos-b160-verify
+          git clone out/fos_coverage_tool_b160c6a85.bundle /tmp/fos-b160-verify
+          cd /tmp/fos-b160-verify
+          git checkout --detach "$TARGET"
+          test "$(git rev-parse HEAD)" = "$TARGET"
+          test "$(git rev-parse HEAD^{tree})" = "$TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          cd "$GITHUB_WORKSPACE"
           BUNDLE_SHA="$(sha256sum out/fos_coverage_tool_b160c6a85.bundle | awk '{print $1}')"
           cat > out/source_manifest.txt <<EOF
           repository=Chary-yu/fos_coverage_tool
