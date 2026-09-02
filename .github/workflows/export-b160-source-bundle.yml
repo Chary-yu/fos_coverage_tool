@@ -1,0 +1,47 @@
+name: Export exact b160 source bundle
+
+on:
+  push:
+    branches:
+      - ops/export-b160-source-bundle-20260902
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - name: Build verified bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET='b160c6a85ca4f0190eb2827b281f08dff69412c3'
+          TREE='87ab5c4937a7fe8401dc3d15dbd543f563b90c60'
+          test "$(git rev-parse HEAD^)" = "$TARGET"
+          test "$(git rev-parse ${TARGET}^{tree})" = "$TREE"
+          mkdir -p out
+          git bundle create out/fos_coverage_tool_b160c6a85.bundle "${TARGET}^..${TARGET}"
+          git bundle verify out/fos_coverage_tool_b160c6a85.bundle
+          BUNDLE_SHA="$(sha256sum out/fos_coverage_tool_b160c6a85.bundle | awk '{print $1}')"
+          cat > out/source_manifest.txt <<EOF
+          repository=Chary-yu/fos_coverage_tool
+          commit_sha=$TARGET
+          tree_sha=$TREE
+          bundle_sha256=$BUNDLE_SHA
+          exporter_workflow=export-b160-source-bundle.yml
+          EOF
+          tar -C out -czf fos_source_bundle_b160c6a85.tar.gz fos_coverage_tool_b160c6a85.bundle source_manifest.txt
+          sha256sum fos_source_bundle_b160c6a85.tar.gz > fos_source_bundle_b160c6a85.tar.gz.sha256
+      - name: Upload exact source bundle
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: fos-source-bundle-b160c6a85
+          path: |
+            fos_source_bundle_b160c6a85.tar.gz
+            fos_source_bundle_b160c6a85.tar.gz.sha256
+          if-no-files-found: error
