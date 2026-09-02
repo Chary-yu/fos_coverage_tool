@@ -22,7 +22,8 @@ jobs:
           set -euo pipefail
           TARGET='b160c6a85ca4f0190eb2827b281f08dff69412c3'
           TREE='87ab5c4937a7fe8401dc3d15dbd543f563b90c60'
-          test "$(git rev-parse HEAD^)" = "$TARGET"
+          git cat-file -e "${TARGET}^{commit}"
+          git merge-base --is-ancestor "$TARGET" HEAD
           test "$(git rev-parse ${TARGET}^{tree})" = "$TREE"
           mkdir -p out
           git branch -f exact-b160-source "$TARGET"
