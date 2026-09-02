@@ -549,6 +549,71 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
                     )
             self.assertFalse(os.path.exists(changed_output))
 
+    def test_bootstrap_rebinds_adoption_staging_before_creating_current(self):
+        tamper_cases = (
+            "nested_html",
+            "missing_registry",
+            "extra_report",
+            "modified_asset",
+            "modified_source_root",
+        )
+        for case in tamper_cases:
+            with self.subTest(case=case):
+                with tempfile.TemporaryDirectory(
+                        prefix="legacy-flat-bootstrap-rebind-") as root:
+                    flat_root = os.path.join(root, "flat")
+                    os.makedirs(flat_root)
+                    self._flat_root(flat_root)
+                    identity_path, _ = self._legacy_identity(root, flat_root)
+                    adopted_root = os.path.join(root, "adopted")
+                    adoption = prepare_legacy_flat_adoption(
+                        flat_root, adopted_root, identity_path,
+                        LEGACY_COMMIT_SHA,
+                    )
+
+                    if case == "nested_html":
+                        with open(os.path.join(
+                                adopted_root, "reports", "dhc", "source-file.html"),
+                                "ab") as stream:
+                            stream.write(b"TAMPERED")
+                    elif case == "missing_registry":
+                        root_report = next(
+                            item for item in adoption["reports"]
+                            if item["report_scope"] == "root"
+                        )
+                        os.remove(os.path.join(
+                            adopted_root, "registry",
+                            root_report["report_id"] + ".json",
+                        ))
+                    elif case == "extra_report":
+                        self._write_bytes(
+                            os.path.join(adopted_root, "reports", "extra.html"),
+                            b"<html><head></head><body>extra</body></html>",
+                        )
+                    elif case == "modified_asset":
+                        with open(os.path.join(
+                                adopted_root, "assets", "dhc", "source.c"),
+                                "ab") as stream:
+                            stream.write(b"TAMPERED")
+                    elif case == "modified_source_root":
+                        with open(os.path.join(
+                                flat_root, "legacy-index.dat"), "ab") as stream:
+                            stream.write(b"TAMPERED")
+
+                    publish_root = os.path.join(root, "publish")
+                    with self.assertRaises(ValueError):
+                        bootstrap(
+                            adopted_root, publish_root, identity_path,
+                            "previous-e9fcc837",
+                            served_identity_path=os.path.join(
+                                adopted_root, "release_identity.json"
+                            ),
+                            switch=True,
+                        )
+                    self.assertFalse(os.path.lexists(
+                        os.path.join(publish_root, "CURRENT")
+                    ))
+
 
 if __name__ == "__main__":
     unittest.main()

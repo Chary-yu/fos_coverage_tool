@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import sys
 import tempfile
 
@@ -25,8 +26,18 @@ from app.candidate_artifact import (
     PRODUCTION_PROJECT_NAME, build_directory_input_manifest_sha256,
 )
 from app.release_publication import (
-    ImmutableReleasePublisher, normalize_candidate_artifact,
+    ImmutableReleasePublisher, _html_metadata, normalize_candidate_artifact,
     validate_release_manifest,
+)
+from app.reports.identity import LEGACY_STATIC
+from scripts.release.prepare_legacy_flat_adoption import (
+    ADOPTION_MANIFEST_NAME,
+    _add_legacy_identity_meta,
+    _bind_release_assets,
+    _legacy_report_id,
+    _scan_source_tree,
+    _source_manifest_entries,
+    _source_tree_sha256,
 )
 
 
@@ -35,7 +46,14 @@ IDENTITY_KEYS = (
     "asset_manifest_version", "asset_count", "asset_manifest_hash",
     "asset_manifest",
 )
-LEGACY_ADOPTION_MANIFEST_NAME = "legacy_adoption_manifest.json"
+LEGACY_ADOPTION_MANIFEST_NAME = ADOPTION_MANIFEST_NAME
+_LEGACY_ADOPTION_MANIFEST_KEYS = frozenset((
+    "schema_version", "source_kind", "source_root_realpath",
+    "source_tree_sha256", "source_file_count", "source_total_size",
+    "source_files", "source_scan", "release_identity_sha256",
+    "release_identity_file_sha256", "expected_commit_sha",
+    "release_asset_bindings", "source_to_reports", "modified_html",
+))
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
@@ -56,6 +74,10 @@ def _sha256(path):
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _real(path):
+    return os.path.realpath(os.path.abspath(str(path)))
 
 
 def _identity_from_payload(payload):
@@ -80,6 +102,169 @@ def _canonical_hash(value):
     return hashlib.sha256(json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")).hexdigest()
+
+
+def _fingerprint_bytes(value):
+    return {
+        "size": len(value),
+        "sha256": hashlib.sha256(value).hexdigest(),
+    }
+
+
+def _json_bytes(value):
+    return (json.dumps(
+        value, ensure_ascii=False, indent=2, sort_keys=True
+    ) + "\n").encode("utf-8")
+
+
+def _stage_tree_inventory(root, description):
+    """Hash a staging subtree while rejecting links and special files."""
+    requested_root = os.path.abspath(str(root))
+    if os.path.islink(requested_root) or not os.path.isdir(requested_root):
+        raise ValueError("{} must be a real directory".format(description))
+    root = os.path.realpath(requested_root)
+    files = {}
+    directories = set()
+
+    def visit(directory, relative_directory=""):
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError as exc:
+            raise ValueError(
+                "{} cannot be scanned: {}".format(description, exc)
+            )
+        for name in names:
+            path = os.path.join(directory, name)
+            relative = name if not relative_directory else \
+                relative_directory + "/" + name
+            if os.path.islink(path):
+                raise ValueError(
+                    "{} may not contain symlinks: {}".format(description, path)
+                )
+            try:
+                file_stat = os.stat(path, follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError(
+                    "{} entry cannot be inspected: {}: {}".format(
+                        description, path, exc
+                    )
+                )
+            if stat.S_ISDIR(file_stat.st_mode):
+                directories.add(relative)
+                visit(path, relative)
+            elif stat.S_ISREG(file_stat.st_mode):
+                files[relative] = {
+                    "path": relative,
+                    "size": int(file_stat.st_size),
+                    "sha256": _sha256(path),
+                }
+            else:
+                raise ValueError(
+                    "{} may contain only regular files or directories: {}".format(
+                        description, path
+                    )
+                )
+
+    visit(root)
+    return files, directories
+
+
+def _expected_parent_directories(relative_paths):
+    expected = set()
+    for relative in relative_paths:
+        parts = relative.split("/")
+        for index in range(1, len(parts)):
+            expected.add("/".join(parts[:index]))
+    return expected
+
+
+def _validate_stage_tree(root, expected_files, description):
+    actual_files, actual_directories = _stage_tree_inventory(root, description)
+    expected_paths = set(expected_files)
+    actual_paths = set(actual_files)
+    missing = sorted(expected_paths - actual_paths)
+    extra = sorted(actual_paths - expected_paths)
+    if missing or extra:
+        raise ValueError(
+            "{} file set does not match adoption manifest (missing={}, extra={})".format(
+                description, ",".join(missing), ",".join(extra)
+            )
+        )
+    expected_directories = _expected_parent_directories(expected_paths)
+    if actual_directories != expected_directories:
+        missing_directories = sorted(expected_directories - actual_directories)
+        extra_directories = sorted(actual_directories - expected_directories)
+        raise ValueError(
+            "{} directory set does not match adoption manifest (missing={}, extra={})".format(
+                description,
+                ",".join(missing_directories),
+                ",".join(extra_directories),
+            )
+        )
+    for relative in sorted(expected_paths):
+        expected = expected_files[relative]
+        actual = actual_files[relative]
+        if int(actual["size"]) != int(expected["size"]) or \
+                actual["sha256"].lower() != str(expected["sha256"]).lower():
+            raise ValueError(
+                "{} file fingerprint does not match adoption manifest: {}".format(
+                    description, relative
+                )
+            )
+
+
+def _require_regular(path, description):
+    if not os.path.lexists(path) or os.path.islink(path):
+        raise ValueError("{} is missing or linked: {}".format(description, path))
+    try:
+        file_stat = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError("{} cannot be inspected: {}".format(description, exc))
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ValueError("{} is not a regular file: {}".format(description, path))
+
+
+def _require_directory(path, description):
+    if not os.path.lexists(path) or os.path.islink(path):
+        raise ValueError("{} is missing or linked: {}".format(description, path))
+    try:
+        file_stat = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise ValueError("{} cannot be inspected: {}".format(description, exc))
+    if not stat.S_ISDIR(file_stat.st_mode):
+        raise ValueError("{} is not a directory: {}".format(description, path))
+
+
+def _validate_adoption_root_layout(staging_root):
+    expected_names = set((
+        "reports", "assets", "registry", "release_identity.json",
+        LEGACY_ADOPTION_MANIFEST_NAME,
+    ))
+    try:
+        actual_names = set(os.listdir(staging_root))
+    except OSError as exc:
+        raise ValueError("legacy adoption staging cannot be scanned: {}".format(exc))
+    if actual_names != expected_names:
+        raise ValueError(
+            "legacy adoption staging root does not match its declared payload "
+            "(missing={}, extra={})".format(
+                ",".join(sorted(expected_names - actual_names)),
+                ",".join(sorted(actual_names - expected_names)),
+            )
+        )
+    for name in ("reports", "assets", "registry"):
+        _require_directory(
+            os.path.join(staging_root, name),
+            "legacy adoption staging {} directory".format(name),
+        )
+    _require_regular(
+        os.path.join(staging_root, "release_identity.json"),
+        "legacy adoption staging release identity",
+    )
+    _require_regular(
+        os.path.join(staging_root, LEGACY_ADOPTION_MANIFEST_NAME),
+        "legacy adoption staging manifest",
+    )
 
 
 def _validate_legacy_asset_bindings(manifest, identity, source_files):
@@ -225,6 +410,229 @@ def _legacy_adoption_binding(served_root, identity, identity_path):
     }
 
 
+def validate_legacy_adoption_staging(staging_root, identity, identity_path):
+    """Rebind an Adoption manifest to the bytes Bootstrap is about to publish.
+
+    Adoption proves what was copied at one point in time.  Bootstrap must not
+    treat that proof as a substitute for checking the independent staging
+    directory again: a changed report, registry entry, asset or source root
+    would otherwise receive fresh Candidate hashes while retaining stale
+    legacy provenance.
+    """
+    requested_root = os.path.abspath(str(staging_root))
+    if os.path.islink(requested_root) or not os.path.isdir(requested_root):
+        raise ValueError("legacy adoption staging must be a real directory")
+    staging_root = _real(requested_root)
+    _validate_adoption_root_layout(staging_root)
+
+    binding = _legacy_adoption_binding(staging_root, identity, identity_path)
+    if not binding:
+        raise ValueError("legacy adoption staging manifest is required")
+    manifest = _load_json(
+        os.path.join(staging_root, LEGACY_ADOPTION_MANIFEST_NAME),
+        "legacy adoption manifest",
+    )
+    if set(manifest) != set(_LEGACY_ADOPTION_MANIFEST_KEYS):
+        raise ValueError(
+            "legacy adoption manifest fields do not match its schema"
+        )
+
+    staged_identity_path = os.path.join(staging_root, "release_identity.json")
+    staged_identity = _load_json(
+        staged_identity_path, "legacy adoption staging release identity"
+    )
+    if staged_identity != identity:
+        raise ValueError(
+            "legacy adoption staging release identity does not match its binding"
+        )
+    if _sha256(staged_identity_path).lower() != str(
+            manifest.get("release_identity_file_sha256") or "").lower():
+        raise ValueError(
+            "legacy adoption staging release identity bytes do not match manifest"
+        )
+
+    source_root = str(manifest.get("source_root_realpath") or "")
+    if not os.path.isabs(source_root) or _real(source_root) != source_root:
+        raise ValueError("legacy adoption manifest source root is not canonical")
+    source_entries = _scan_source_tree(source_root)
+    source_files = _source_manifest_entries(source_entries)
+    if manifest.get("source_files") != source_files:
+        raise ValueError(
+            "legacy adoption source root no longer matches adoption manifest"
+        )
+    source_tree_sha256 = _source_tree_sha256(source_entries)
+    if source_tree_sha256.lower() != str(
+            manifest.get("source_tree_sha256") or "").lower():
+        raise ValueError(
+            "legacy adoption source root tree hash no longer matches manifest"
+        )
+    source_file_count = int(manifest.get("source_file_count"))
+    source_total_size = int(manifest.get("source_total_size"))
+    if source_file_count != len(source_entries) or \
+            source_total_size != sum(int(entry["size"]) for entry in source_files):
+        raise ValueError(
+            "legacy adoption source root accounting no longer matches manifest"
+        )
+    expected_asset_bindings = _bind_release_assets(source_entries, identity)
+    if manifest.get("release_asset_bindings") != expected_asset_bindings:
+        raise ValueError(
+            "legacy adoption release asset bindings do not match source files"
+        )
+    expected_scan = {
+        "before": {
+            "tree_sha256": source_tree_sha256,
+            "file_count": len(source_entries),
+            "total_size": source_total_size,
+        },
+        "after": {
+            "tree_sha256": source_tree_sha256,
+            "file_count": len(source_entries),
+            "total_size": source_total_size,
+        },
+        "stable": True,
+    }
+    if manifest.get("source_scan") != expected_scan:
+        raise ValueError(
+            "legacy adoption source scan does not match source files"
+        )
+
+    source_to_reports = []
+    modified_html = []
+    expected_reports = {}
+    expected_assets = {}
+    expected_registry = {}
+    expected_registry_values = {}
+    expected_html_metadata = {}
+    for entry in source_entries:
+        relative = entry["path"]
+        source_path = entry["absolute_path"]
+        with open(source_path, "rb") as stream:
+            original = stream.read()
+        observed = _fingerprint_bytes(original)
+        if int(observed["size"]) != int(entry["size"]) or \
+                observed["sha256"].lower() != entry["sha256"].lower():
+            raise ValueError(
+                "legacy adoption source root changed while Bootstrap was validating: {}".format(
+                    relative
+                )
+            )
+
+        if relative.lower().endswith((".html", ".htm")):
+            is_root_report = "/" not in relative
+            report_id = _legacy_report_id(relative, entry["sha256"]) \
+                if is_root_report else ""
+            prepared = _add_legacy_identity_meta(
+                original, report_id=report_id, relative_path=relative
+            )
+            expected_reports[relative] = _fingerprint_bytes(prepared)
+            expected_metadata = {
+                "project_name": PRODUCTION_PROJECT_NAME,
+                "report_mode": LEGACY_STATIC,
+            }
+            if is_root_report:
+                expected_metadata["report_id"] = report_id
+            expected_html_metadata[relative] = expected_metadata
+            source_to_reports.append({
+                "source_path": relative,
+                "reports_path": "reports/" + relative,
+                "assets_path": "",
+                "report_scope": "root" if is_root_report else "nested",
+                "report_id": report_id,
+            })
+            modified_html.append({
+                "source_path": relative,
+                "reports_path": "reports/" + relative,
+                "report_id": report_id,
+                "before_size": int(entry["size"]),
+                "before_sha256": entry["sha256"],
+                "after_size": int(len(prepared)),
+                "after_sha256": hashlib.sha256(prepared).hexdigest(),
+            })
+            if is_root_report:
+                registry_value = {
+                    "project_name": PRODUCTION_PROJECT_NAME,
+                    "report_id": report_id,
+                    "report_mode": LEGACY_STATIC,
+                    "report_root": "reports",
+                    "legacy_source_path": relative,
+                    "legacy_source_sha256": entry["sha256"],
+                }
+                registry_relative = report_id + ".json"
+                registry_bytes = _json_bytes(registry_value)
+                expected_registry[registry_relative] = _fingerprint_bytes(
+                    registry_bytes
+                )
+                expected_registry_values[registry_relative] = registry_value
+        else:
+            expected_reports[relative] = dict(observed)
+            expected_assets[relative] = dict(observed)
+            source_to_reports.append({
+                "source_path": relative,
+                "reports_path": "reports/" + relative,
+                "assets_path": "assets/" + relative,
+                "report_scope": "static_asset",
+                "report_id": "",
+            })
+
+    if manifest.get("source_to_reports") != source_to_reports:
+        raise ValueError(
+            "legacy adoption source_to_reports does not match source files"
+        )
+    if manifest.get("modified_html") != modified_html:
+        raise ValueError(
+            "legacy adoption modified_html does not match deterministic HTML output"
+        )
+
+    # Re-scan after deriving the expected bytes so a source mutation during
+    # this validation cannot be hidden by the first scan.
+    source_after = _scan_source_tree(source_root)
+    if _source_manifest_entries(source_after) != source_files:
+        raise ValueError(
+            "legacy adoption source root changed during Bootstrap validation"
+        )
+
+    _validate_stage_tree(
+        os.path.join(staging_root, "reports"), expected_reports,
+        "legacy adoption reports",
+    )
+    _validate_stage_tree(
+        os.path.join(staging_root, "assets"), expected_assets,
+        "legacy adoption assets",
+    )
+    _validate_stage_tree(
+        os.path.join(staging_root, "registry"), expected_registry,
+        "legacy adoption registry",
+    )
+    for relative in sorted(expected_html_metadata):
+        path = os.path.join(staging_root, "reports", *relative.split("/"))
+        if _html_metadata(path) != expected_html_metadata[relative]:
+            raise ValueError(
+                "legacy adoption report identity does not match deterministic output: {}".format(
+                    relative
+                )
+            )
+    for relative, expected_value in sorted(expected_registry_values.items()):
+        actual_value = _load_json(
+            os.path.join(staging_root, "registry", relative),
+            "legacy adoption registry entry",
+        )
+        if actual_value != expected_value:
+            raise ValueError(
+                "legacy adoption registry entry does not match report: {}".format(
+                    relative
+                )
+            )
+    return {
+        "status": "PASSED",
+        "staging_root": staging_root,
+        "staging_manifest_sha256": binding[
+            "legacy_adoption_manifest_sha256"
+        ],
+        "source_tree_sha256": source_tree_sha256,
+        "source_file_count": len(source_entries),
+    }
+
+
 def _find_served_identity(served_root, explicit_path):
     candidates = []
     if explicit_path:
@@ -302,6 +710,13 @@ def bootstrap(served_root, publish_root, release_identity_path, session_id,
     legacy_adoption = _legacy_adoption_binding(
         served_root, observed, identity_path
     )
+    if legacy_adoption:
+        # Adoption evidence describes a historical copy.  Rebind every byte
+        # in that copy, and the original source root, before any fresh
+        # Candidate manifest or immutable CURRENT can be created.
+        validate_legacy_adoption_staging(
+            served_root, observed, identity_path
+        )
     # If the current root already carries the immutable publication manifest,
     # validate its physical Served Root before using it as the baseline.  A
     # legacy root may instead expose the identity in a standalone JSON file.

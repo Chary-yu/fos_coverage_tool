@@ -281,7 +281,11 @@ python3 scripts/release/bootstrap_previous_release.py \
 工具会读取并核对 Served Root、重新计算 reports/assets/registry 及完整文件清单，
 生成并验证 immutable previous release，然后原子创建 `CURRENT`。已有 `CURRENT`、
 identity 缺失/不匹配或 artifact hash 失败都会拒绝操作；bootstrap 不属于普通升级
-路径。Legacy adoption 后的 `validate_current()` 必须先通过；随后 Production Candidate
+路径。Bootstrap 在生成 Candidate manifest 之前会重新扫描 manifest 记录的原始
+`source_root_realpath`，并逐文件核对当前 staging 的 `reports/`、`assets/`、`registry/`、
+HTML after 指纹、根级 registry 和嵌套页面身份；缺失、额外、symlink、special file 或
+任一 byte/hash 不一致都会 fail-closed，且不会创建 `CURRENT`。Legacy adoption 后的
+`validate_current()` 必须先通过；随后 Production Candidate
 Builder 才能从这个 CURRENT 读取目标 binding。Builder 会刷新目标 release asset
 manifest 中声明的根级/模板资源，但不会把 `reports/**/*.html` 当成同名静态 asset alias
 覆盖，因此 Legacy HTML 的业务正文和身份字段保持不变。

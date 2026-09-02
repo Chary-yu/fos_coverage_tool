@@ -248,6 +248,14 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("source_scan", legacy_adoption)
         self.assertIn("legacy_adoption_manifest.json", legacy_adoption)
         with open(
+                os.path.join(os.getcwd(), "scripts", "release",
+                             "bootstrap_previous_release.py"),
+                encoding="utf-8") as stream:
+            bootstrap_previous_release = stream.read()
+        self.assertIn("validate_legacy_adoption_staging", bootstrap_previous_release)
+        self.assertIn("_validate_stage_tree", bootstrap_previous_release)
+        self.assertIn("source root changed during Bootstrap validation", bootstrap_previous_release)
+        with open(
                 os.path.join(os.getcwd(), "docs", "operations",
                              "gate-a-f-external-evidence-runbook.md"),
                 encoding="utf-8") as stream:
