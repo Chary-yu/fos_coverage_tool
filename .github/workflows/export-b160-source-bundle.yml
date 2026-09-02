@@ -25,7 +25,8 @@ jobs:
           test "$(git rev-parse HEAD^)" = "$TARGET"
           test "$(git rev-parse ${TARGET}^{tree})" = "$TREE"
           mkdir -p out
-          git bundle create out/fos_coverage_tool_b160c6a85.bundle "${TARGET}^..${TARGET}"
+          git branch -f exact-b160-source "$TARGET"
+          git bundle create out/fos_coverage_tool_b160c6a85.bundle exact-b160-source
           git bundle verify out/fos_coverage_tool_b160c6a85.bundle
           BUNDLE_SHA="$(sha256sum out/fos_coverage_tool_b160c6a85.bundle | awk '{print $1}')"
           cat > out/source_manifest.txt <<EOF
