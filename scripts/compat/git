@@ -1,0 +1,24 @@
+#!/bin/sh
+set -u
+
+REAL_GIT="${FOS_REAL_GIT:-/usr/bin/git}"
+
+if [ ! -x "$REAL_GIT" ]; then
+    echo "fos git compat: real Git is unavailable: $REAL_GIT" >&2
+    exit 127
+fi
+
+if [ "${1:-}" = "-C" ]; then
+    if [ "$#" -lt 3 ]; then
+        echo "fos git compat: git -C requires a repository and command" >&2
+        exit 129
+    fi
+    REPO="$2"
+    shift 2
+    cd "$REPO" 2>/dev/null || {
+        echo "fos git compat: repository is unavailable: $REPO" >&2
+        exit 128
+    }
+fi
+
+exec "$REAL_GIT" "$@"
