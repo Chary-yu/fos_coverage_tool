@@ -260,6 +260,17 @@ def _served_root_binding(served_root):
     }
 
 
+def _assert_served_root_binding_unchanged(binding):
+    """Reject a CURRENT pointer or payload that changed during the copy."""
+    if _real(binding["requested_path"]) != binding["realpath"]:
+        raise ValueError("CURRENT changed while building the production Candidate")
+    current_tree = _served_root_tree_sha256(binding["realpath"])
+    if current_tree != binding["served_root_tree_sha256"]:
+        raise ValueError(
+            "CURRENT Served Root changed while building the production Candidate"
+        )
+
+
 def _prepare_empty_root(root):
     root = os.path.abspath(root)
     if os.path.lexists(root):
@@ -446,9 +457,11 @@ def build_production_candidate(
     )
     asset_contract = _release_asset_contract(source_repo_root, identity)
     _copy_served_root(served_root, candidate_root)
+    _assert_served_root_binding_unchanged(served_root_binding)
     refreshed_assets = _refresh_release_assets(
         source_repo_root, candidate_root, asset_contract
     )
+    _assert_served_root_binding_unchanged(served_root_binding)
     validate_production_candidate_content(candidate_root, PRODUCTION_PROJECT_NAME)
     _reject_validation_fixture(candidate_root)
     provenance = build_git_source_provenance(
