@@ -236,20 +236,46 @@ served release identity、真实 HTTP、Chromium、artifact SHA、当前
 `run_upgrade.py` 不会在缺少 `CURRENT` 时偷偷创建基线。先从实际 Served Root
 取得完整 release identity JSON（不是仓库 checkout 的猜测值），再执行：
 
+如果实机是旧的 Flat Root（HTML、JS/CSS 直接位于同一个根目录，且没有
+`reports/`、`assets/`、`registry/` 和 `.source_cache/`），不能直接把它交给
+bootstrap。先用专用的 Legacy Flat Adoption 生成独立 staging；工具只复制原始文件，
+将非 HTML 文件同时保存到 `reports/` 和 `assets/`，并为每个 HTML 在 `<head>` 中添加
+`coverage-project=FOS_V6R2`、`coverage-report-mode=LEGACY_STATIC` 和基于“原始相对路径
++ 原始 HTML SHA256”的确定性 `coverage-report-id`。registry 只记录项目、Legacy
+模式、`reports` 根目录和原始文件指纹，不生成 scan、repository、file、Sidecar 或
+asset identity：
+
+```bash
+python3 scripts/release/prepare_legacy_flat_adoption.py \
+  --served-root /export0810/onesensor \
+  --output-root /secure/staging/legacy-flat-e9fcc837 \
+  --release-identity /secure/evidence/e9fcc837-release-identity.json \
+  --expected-commit-sha e9fcc837a1ac9847f3966fc8ddb2aed92ca473fc
+```
+
+该命令不会修改原始 Flat Root；后续 bootstrap 的 `--served-root` 和
+`--served-identity` 都必须指向它生成的 staging。只有已经具备完整
+`reports/`、`assets/`、`registry/` 的 immutable-shaped Served Root 才能跳过该阶段。
+下面的 bootstrap 命令以 Flat adoption staging 为例；已是 immutable-shaped 的环境应
+改用其实际 Served Root 和对应的已核验 identity evidence。
+
 ```bash
 python3 scripts/release/bootstrap_previous_release.py \
-  --served-root /srv/fos-coverage/current \
+  --served-root /secure/staging/legacy-flat-e9fcc837 \
   --publish-root /srv/fos-coverage/published \
-  --release-identity /secure/evidence/current-release-identity.json \
-  --served-identity /secure/evidence/current-release-identity.json \
-  --session-id previous-<exact-commit-sha> \
+  --release-identity /secure/evidence/e9fcc837-release-identity.json \
+  --served-identity /secure/staging/legacy-flat-e9fcc837/release_identity.json \
+  --session-id previous-e9fcc837 \
   --switch
 ```
 
 工具会读取并核对 Served Root、重新计算 reports/assets/registry 及完整文件清单，
 生成并验证 immutable previous release，然后原子创建 `CURRENT`。已有 `CURRENT`、
 identity 缺失/不匹配或 artifact hash 失败都会拒绝操作；bootstrap 不属于普通升级
-路径。
+路径。Legacy adoption 后的 `validate_current()` 必须先通过；随后 Production Candidate
+Builder 才能从这个 CURRENT 读取目标 binding。Builder 会刷新目标 release asset
+manifest 中声明的根级/模板资源，但不会把 `reports/**/*.html` 当成同名静态 asset alias
+覆盖，因此 Legacy HTML 的业务正文和身份字段保持不变。
 
 同一 Candidate 重试时不要复用旧的 validation session。`run_upgrade.py` 默认生成
 `candidate-<commit-sha>-<attempt-uuid>`，并将 validation session 与 teardown evidence

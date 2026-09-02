@@ -231,6 +231,23 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("production_candidate_root", production_builder)
         self.assertIn("PRODUCTION_RELEASE_ARTIFACT_ROLE", production_builder)
         self.assertIn("validate_production_candidate_content", production_builder)
+        self.assertIn("_is_report_html", production_builder)
+        with open(
+                os.path.join(os.getcwd(), "scripts", "release",
+                             "prepare_legacy_flat_adoption.py"),
+                encoding="utf-8") as stream:
+            legacy_adoption = stream.read()
+        self.assertIn("LEGACY_STATIC", legacy_adoption)
+        self.assertIn("legacy_source_sha256", legacy_adoption)
+        self.assertIn("coverage-project", legacy_adoption)
+        self.assertIn("coverage-report-id", legacy_adoption)
+        with open(
+                os.path.join(os.getcwd(), "docs", "operations",
+                             "gate-a-f-external-evidence-runbook.md"),
+                encoding="utf-8") as stream:
+            runbook = stream.read()
+        self.assertIn("prepare_legacy_flat_adoption.py", runbook)
+        self.assertIn("Legacy Flat Adoption", runbook)
 
     def test_cross_layer_performance_consumes_browser_artifact(self):
         with open(

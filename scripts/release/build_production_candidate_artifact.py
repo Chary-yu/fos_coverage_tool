@@ -279,6 +279,16 @@ def _copy_release_asset(source_path, target_path, candidate_root):
     return target_path
 
 
+def _is_report_html(candidate_root, path):
+    """Return whether a same-name file is a report, not an asset alias."""
+    relative = os.path.relpath(
+        os.path.abspath(path), os.path.abspath(candidate_root)
+    ).replace(os.sep, "/")
+    return relative.startswith("reports/") and relative.lower().endswith(
+        (".html", ".htm")
+    )
+
+
 def _verify_candidate_release_assets(candidate_root, contract):
     """Verify exact contract paths and every same-name Served alias."""
     _assert_no_symlinks(candidate_root)
@@ -293,6 +303,11 @@ def _verify_candidate_release_assets(candidate_root, contract):
             "production Candidate release asset path/size/sha256 contract failed"
         )
     for path in _walk_files(candidate_root):
+        if _is_report_html(candidate_root, path):
+            # A report named like a root/template release asset is still a
+            # report payload.  Refreshing it would erase its report identity
+            # metadata (especially during Legacy Flat Adoption).
+            continue
         basename = os.path.basename(path)
         item = contract["by_basename"].get(basename)
         if item is None:
@@ -321,6 +336,8 @@ def _refresh_release_assets(source_root, candidate_root, contract):
     refreshed = set()
     existing = {}
     for path in _walk_files(candidate_root):
+        if _is_report_html(candidate_root, path):
+            continue
         basename = os.path.basename(path)
         if basename not in contract["by_basename"]:
             continue

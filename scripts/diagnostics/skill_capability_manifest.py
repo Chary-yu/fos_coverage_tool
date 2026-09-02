@@ -83,6 +83,8 @@ SKILL_CAPABILITIES = {
             "app/release_publication.py",
             "scripts/release/build_candidate_artifact.py",
             "scripts/release/build_candidate_artifact_manifest.py",
+            "scripts/release/build_production_candidate_artifact.py",
+            "scripts/release/prepare_legacy_flat_adoption.py",
             "scripts/release/sign_candidate_build_receipt.py",
             "scripts/release/bootstrap_previous_release.py",
             "scripts/release/publish_release.py",
@@ -92,6 +94,7 @@ SKILL_CAPABILITIES = {
         "tests": [
             "tests/release/test_release_readiness.py",
             "tests/release/test_release_governance_tools.py",
+            "tests/release/test_legacy_flat_adoption.py",
             "tests/vnext/test_registry_and_api_contract.py",
         ],
         "audits": [

@@ -79,6 +79,8 @@ def audit_canonical_ownership(repo_root: str) -> Dict[str, Any]:
         "app/release_publication.py",
         "scripts/release/build_candidate_artifact.py",
         "scripts/release/build_candidate_artifact_manifest.py",
+        "scripts/release/build_production_candidate_artifact.py",
+        "scripts/release/prepare_legacy_flat_adoption.py",
         "scripts/release/sign_candidate_build_receipt.py",
         "scripts/release/bootstrap_previous_release.py",
         "scripts/upgrade/validation_session.py",
