@@ -1,0 +1,29 @@
+name: Ops build exact b160 production candidate
+
+on:
+  push:
+    branches:
+      - ops/export-b160-source-bundle-20260902
+    paths:
+      - '.github/workflows/ops-build-production-candidate-b160.yml'
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+jobs:
+  production-candidate:
+    name: Trusted Production Candidate b160
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    uses: Chary-yu/fos_coverage_tool/.github/workflows/trusted-production-candidate-builder.yml@d73753b4cf6d5d900e77035883adaf157b870903
+    with:
+      source_sha: b160c6a85ca4f0190eb2827b281f08dff69412c3
+      builder_workflow_sha: d73753b4cf6d5d900e77035883adaf157b870903
+      attestation_repository: Chary-yu/fos_coverage_tool
+    secrets: inherit
