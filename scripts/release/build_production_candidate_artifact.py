@@ -18,6 +18,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 
@@ -45,8 +46,9 @@ _CONTROL_FILES = frozenset((
     "CURRENT", "candidate_artifact_manifest.json",
     "candidate_build_attestation.json", "candidate_build_receipt.json",
     "release_identity.json", "release_manifest.json", "report_manifest.json",
-    "validated_publication_identity.json",
+    "validated_publication_identity.json", "legacy_adoption_manifest.json",
 ))
+_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def _real(path):
@@ -83,6 +85,61 @@ def _load_json(path, label):
     if not isinstance(value, dict):
         raise ValueError("{} must be a JSON object".format(label))
     return value
+
+
+def _legacy_adoption_provenance(served_root, served_root_binding):
+    """Bind a bootstrapped legacy source record into the next Candidate.
+
+    The adoption manifest is intentionally not copied into the production
+    Candidate payload.  Its digest and source snapshot are carried in the
+    signed Candidate provenance instead, so a later builder cannot silently
+    discard the evidence that established the historical baseline.
+    """
+    path = os.path.join(served_root, "legacy_adoption_manifest.json")
+    if not os.path.lexists(path):
+        return {}
+    if os.path.islink(path) or not os.path.isfile(path):
+        raise ValueError("legacy adoption manifest is missing or not a regular file")
+    manifest = _load_json(path, "legacy adoption manifest")
+    if int(manifest.get("schema_version") or 0) != 1 or \
+            manifest.get("source_kind") != "legacy_flat_root":
+        raise ValueError("legacy adoption manifest schema is invalid")
+    if str(manifest.get("expected_commit_sha") or "").lower() != \
+            str(served_root_binding.get("previous_release_sha") or "").lower():
+        raise ValueError("legacy adoption manifest previous release SHA does not match CURRENT")
+    if str(manifest.get("release_identity_sha256") or "").lower() != \
+            str(served_root_binding.get("current_identity_sha256") or "").lower():
+        raise ValueError("legacy adoption manifest identity does not match CURRENT")
+    source_tree_sha256 = str(manifest.get("source_tree_sha256") or "")
+    if not _SHA256_RE.fullmatch(source_tree_sha256):
+        raise ValueError("legacy adoption manifest source_tree_sha256 is invalid")
+    try:
+        source_file_count = int(manifest.get("source_file_count"))
+        source_total_size = int(manifest.get("source_total_size"))
+    except (TypeError, ValueError):
+        raise ValueError("legacy adoption manifest source size accounting is invalid")
+    source_root_realpath = str(manifest.get("source_root_realpath") or "")
+    if source_file_count < 1 or source_total_size < 0 or \
+            not os.path.isabs(source_root_realpath):
+        raise ValueError("legacy adoption manifest source accounting is invalid")
+    scan = manifest.get("source_scan") or {}
+    before = scan.get("before") or {}
+    after = scan.get("after") or {}
+    if scan.get("stable") is not True or before != after or \
+            before.get("tree_sha256") != source_tree_sha256 or \
+            int(before.get("file_count") or -1) != source_file_count or \
+            int(before.get("total_size") or -1) != source_total_size:
+        raise ValueError("legacy adoption manifest source scans are not stable")
+    return {
+        "legacy_adoption_manifest_sha256": _sha256(path),
+        "legacy_source_root_realpath": source_root_realpath,
+        "legacy_source_tree_sha256": source_tree_sha256,
+        "legacy_source_file_count": source_file_count,
+        "legacy_source_total_size": source_total_size,
+        "legacy_release_identity_sha256": str(
+            manifest["release_identity_sha256"]
+        ).lower(),
+    }
 
 
 def _safe_asset_path(root, relative):
@@ -463,6 +520,9 @@ def build_production_candidate(
         build_workflow_run_attempt=build_workflow_run_attempt,
         build_workflow_sha=build_workflow_sha,
     )
+    provenance.update(_legacy_adoption_provenance(
+        served_root, served_root_binding
+    ))
     provenance.update({
         "served_root_path": served_root_binding["requested_path"],
         "served_root_realpath": served_root_binding["realpath"],

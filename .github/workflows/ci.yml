@@ -617,6 +617,7 @@ jobs:
             tests.release.test_gate_matrix \
             tests.release.test_immutable_release_publication \
             tests.release.test_legacy_background_serialization \
+            tests.release.test_legacy_flat_adoption \
             tests.release.test_validation_session \
             tests.release.test_verified_backup_rehearsal -v
           python - <<'PY_EVIDENCE'
@@ -665,6 +666,7 @@ jobs:
             tests.release.test_gate_matrix \
             tests.release.test_immutable_release_publication \
             tests.release.test_legacy_background_serialization \
+            tests.release.test_legacy_flat_adoption \
             tests.release.test_validation_session \
             tests.release.test_verified_backup_rehearsal; do
             python -m unittest "$test_module" -v

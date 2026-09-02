@@ -1,10 +1,12 @@
 import hashlib
+import importlib
 import json
 import os
 import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from app.candidate_artifact import PRODUCTION_PROJECT_NAME
 from app.release_identity import (
@@ -24,6 +26,11 @@ from scripts.release.prepare_legacy_flat_adoption import (
 )
 
 
+adoption_module = importlib.import_module(
+    "scripts.release.prepare_legacy_flat_adoption"
+)
+
+
 LEGACY_COMMIT_SHA = "e9fcc837a1ac9847f3966fc8ddb2aed92ca473fc"
 LEGACY_ASSET_RELATIVE_PATHS = tuple(
     relative for relative in DEFAULT_RELEASE_ASSET_RELATIVE_PATHS
@@ -40,12 +47,21 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
         with open(path, "wb") as stream:
             stream.write(value)
 
-    def _legacy_identity(self, root):
+    def _legacy_identity(self, root, flat_root=None):
         identity_source = os.path.join(root, "identity-source")
         asset_files = []
         for relative in LEGACY_ASSET_RELATIVE_PATHS:
             path = os.path.join(identity_source, *relative.split("/"))
-            self._write_bytes(path, ("identity-asset:" + relative).encode("utf-8"))
+            if flat_root:
+                source = os.path.join(flat_root, os.path.basename(relative))
+                parent = os.path.dirname(path)
+                if parent and not os.path.isdir(parent):
+                    os.makedirs(parent)
+                shutil.copyfile(source, path)
+            else:
+                self._write_bytes(
+                    path, ("identity-asset:" + relative).encode("utf-8")
+                )
             asset_files.append(path)
         identity = generate_release_identity(
             identity_source,
@@ -58,10 +74,10 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
 
     def _flat_root(self, root):
         html_names = (
-            "coverage_progress.html", "coverage_summary.html",
-            "coverage_details.html", "coverage_branch.html",
-            "coverage_module.html", "coverage_history.html",
-            "coverage_index.html",
+            "coverage_progress.html", "index.html",
+            "incremental_coverage.html", "incremental_developer_tasks.html",
+            "coverage_summary.html", "coverage_details.html",
+            "coverage_history.html",
         )
         html_contents = {}
         for index, name in enumerate(html_names, 1):
@@ -75,6 +91,33 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
                 "<script src=\"coverage_progress.js\"></script>\r\n"
                 "</body></html>\r\n"
             ).format(name, index).encode("utf-8")
+        nested_html_contents = {
+            "dhc/index.html": (
+                "<!doctype html>\r\n<html><head>\r\n"
+                "<title>dhc index</title>\r\n</head><body>\r\n"
+                "<a href=\"source-file.html\">source</a>\r\n"
+                "<script src=\"../coverage_progress.js\"></script>\r\n"
+                "</body></html>\r\n"
+            ).encode("utf-8"),
+            "dhc/source-file.html": (
+                "<!doctype html>\r\n<html><head><title>dhc source</title>"
+                "</head><body><pre>legacy source</pre></body></html>\r\n"
+            ).encode("utf-8"),
+            "inc/index.html": (
+                "<!doctype html>\r\n<html><head><title>inc index</title>"
+                "</head><body><a href=\"../dhc/source-file.html\">dhc</a>"
+                "</body></html>\r\n"
+            ).encode("utf-8"),
+            "inc/xxx.html": (
+                "<!doctype html>\r\n<html><head><title>inc detail</title>"
+                "</head><body><code>legacy detail</code></body></html>\r\n"
+            ).encode("utf-8"),
+            "mpls/index.html": (
+                "<!doctype html>\r\n<html><head><title>mpls index</title>"
+                "</head><body><a href=\"../inc/xxx.html\">inc</a>"
+                "</body></html>\r\n"
+            ).encode("utf-8"),
+        }
         asset_contents = {
             name: ("legacy-asset:" + name).encode("utf-8")
             for name in (
@@ -83,10 +126,20 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
                 "incremental_developer_tasks.js",
             )
         }
+        asset_contents.update({
+            "incremental_coverage.xlsx": b"legacy-xlsx\x00\x01\x02",
+            "emerald.png": b"\x89PNG\r\nlegacy-image",
+            "legacy-index.dat": b"legacy-index-data",
+            "dhc/source.c": b"int dhc_source(void) { return 1; }\n",
+            "dhc/coverage-data.txt": b"dhc coverage data\n",
+            "inc/xxx.c": b"int inc_source(void) { return 2; }\n",
+            "mpls/routes.txt": b"mpls route data\n",
+        })
         all_contents = dict(html_contents)
+        all_contents.update(nested_html_contents)
         all_contents.update(asset_contents)
-        for name, contents in all_contents.items():
-            self._write_bytes(os.path.join(root, name), contents)
+        for relative, contents in all_contents.items():
+            self._write_bytes(os.path.join(root, *relative.split("/")), contents)
         return all_contents
 
     @staticmethod
@@ -151,7 +204,7 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
                             b"coverage-repository-name", b"coverage-file-path",
                             b"coverage-asset-identity", b"coverage-sidecar-schema"):
                         self.assertNotIn(identity_name, source_bytes)
-            identity_path, identity = self._legacy_identity(root)
+            identity_path, identity = self._legacy_identity(root, flat_root)
             adopted_root = os.path.join(root, "adopted")
 
             adoption = prepare_legacy_flat_adoption(
@@ -159,10 +212,18 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
             )
             self.assertEqual(adoption["status"], "PASSED")
             self.assertEqual(adoption["commit_sha"], LEGACY_COMMIT_SHA)
-            self.assertEqual(adoption["report_count"], 7)
-            self.assertEqual(adoption["asset_count"], 5)
+            self.assertEqual(
+                adoption["report_count"],
+                len([name for name in original if name.endswith((".html", ".htm"))]),
+            )
+            self.assertEqual(
+                adoption["asset_count"],
+                len([name for name in original if not name.endswith((".html", ".htm"))]),
+            )
+            self.assertEqual(adoption["registry_count"], 7)
             self.assertEqual(identity["asset_count"], 12)
             self.assertTrue(os.path.isfile(adoption["release_identity"]))
+            self.assertTrue(os.path.isfile(adoption["adoption_manifest"]))
             self.assertFalse(os.path.exists(os.path.join(
                 adopted_root, "pending_snapshot.js"
             )))
@@ -174,11 +235,54 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
                 adopted_root, "reports", ".source_cache"
             )))
 
+            with open(adoption["adoption_manifest"], "r", encoding="utf-8") as stream:
+                adoption_manifest = json.load(stream)
+            expected_source_files = [
+                {
+                    "path": name,
+                    "size": len(source_bytes),
+                    "sha256": hashlib.sha256(source_bytes).hexdigest(),
+                }
+                for name, source_bytes in sorted(original.items())
+            ]
+            self.assertEqual(adoption_manifest["source_files"], expected_source_files)
+            self.assertEqual(
+                adoption_manifest["source_file_count"], len(expected_source_files)
+            )
+            self.assertEqual(
+                adoption_manifest["source_total_size"],
+                sum(item["size"] for item in expected_source_files),
+            )
+            self.assertEqual(adoption_manifest["source_scan"]["stable"], True)
+            self.assertEqual(
+                adoption_manifest["source_scan"]["before"],
+                adoption_manifest["source_scan"]["after"],
+            )
+            self.assertEqual(
+                adoption_manifest["release_identity_sha256"],
+                hashlib.sha256(json.dumps(
+                    identity, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")).hexdigest(),
+            )
+            self.assertEqual(
+                len(adoption_manifest["release_asset_bindings"]),
+                identity["asset_count"],
+            )
+
             report_by_source = {
                 item["legacy_source_path"]: item
                 for item in adoption["reports"]
             }
+            source_to_report = {
+                item["source_path"]: item
+                for item in adoption_manifest["source_to_reports"]
+            }
+            self.assertEqual(set(source_to_report), set(original))
             for name, source_bytes in original.items():
+                self.assertEqual(
+                    source_to_report[name]["reports_path"], "reports/" + name
+                )
                 if name.endswith((".html", ".htm")):
                     entry = report_by_source[name]
                     source_sha256 = hashlib.sha256(source_bytes).hexdigest()
@@ -188,13 +292,26 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
                     )
                     with open(report_path, "rb") as stream:
                         adopted_html = stream.read()
-                    marker = (
-                        '\n<meta name="coverage-project" content="{}">\n'
-                        '<meta name="coverage-report-mode" content="{}">\n'
-                        '<meta name="coverage-report-id" content="{}">'
-                    ).format(
-                        PRODUCTION_PROJECT_NAME, LEGACY_STATIC, entry["report_id"]
-                    ).encode("ascii")
+                    if "/" in name:
+                        marker = (
+                            '\n<meta name="coverage-project" content="{}">\n'
+                            '<meta name="coverage-report-mode" content="{}">'
+                        ).format(PRODUCTION_PROJECT_NAME, LEGACY_STATIC).encode("ascii")
+                        self.assertEqual(entry["report_id"], "")
+                        self.assertEqual(entry["report_scope"], "nested")
+                        self.assertFalse(os.path.exists(os.path.join(
+                            adopted_root, "registry", "{}.json".format(entry["report_id"])
+                        )))
+                    else:
+                        marker = (
+                            '\n<meta name="coverage-project" content="{}">\n'
+                            '<meta name="coverage-report-mode" content="{}">\n'
+                            '<meta name="coverage-report-id" content="{}">'
+                        ).format(
+                            PRODUCTION_PROJECT_NAME, LEGACY_STATIC, entry["report_id"]
+                        ).encode("ascii")
+                        self.assertTrue(entry["report_id"])
+                        self.assertEqual(entry["report_scope"], "root")
                     head_start = source_bytes.index(b"<head>")
                     head_end = head_start + len(b"<head>")
                     self.assertEqual(
@@ -206,31 +323,47 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
                     self.assertNotIn(b"coverage-file-path", adopted_html)
                     self.assertNotIn(b"coverage-asset-identity", adopted_html)
                     self.assertNotIn(b"coverage-sidecar-schema", adopted_html)
-                    registry = self._registry_for(adopted_root, entry["report_id"])
+                    modified = {
+                        item["source_path"]: item
+                        for item in adoption_manifest["modified_html"]
+                    }[name]
+                    self.assertEqual(modified["before_sha256"], source_sha256)
                     self.assertEqual(
-                        set(registry), {
-                            "project_name", "report_id", "report_mode",
-                            "report_root", "legacy_source_path",
-                            "legacy_source_sha256",
-                        }
+                        modified["after_sha256"], hashlib.sha256(adopted_html).hexdigest()
                     )
-                    self.assertEqual(registry["project_name"], PRODUCTION_PROJECT_NAME)
-                    self.assertEqual(registry["report_mode"], LEGACY_STATIC)
-                    self.assertEqual(registry["report_root"], "reports")
-                    self.assertEqual(registry["legacy_source_path"], name)
-                    self.assertEqual(registry["legacy_source_sha256"], source_sha256)
+                    if "/" not in name:
+                        registry = self._registry_for(adopted_root, entry["report_id"])
+                        self.assertEqual(
+                            set(registry), {
+                                "project_name", "report_id", "report_mode",
+                                "report_root", "legacy_source_path",
+                                "legacy_source_sha256",
+                            }
+                        )
+                        self.assertEqual(registry["project_name"], PRODUCTION_PROJECT_NAME)
+                        self.assertEqual(registry["report_mode"], LEGACY_STATIC)
+                        self.assertEqual(registry["report_root"], "reports")
+                        self.assertEqual(registry["legacy_source_path"], name)
+                        self.assertEqual(registry["legacy_source_sha256"], source_sha256)
                 else:
                     for directory in ("reports", "assets"):
                         with open(
-                                os.path.join(adopted_root, directory, name),
+                                os.path.join(adopted_root, directory, *name.split("/")),
                                 "rb") as stream:
                             self.assertEqual(stream.read(), source_bytes)
+                    self.assertEqual(
+                        source_to_report[name]["assets_path"], "assets/" + name
+                    )
 
             second_adopted_root = os.path.join(root, "adopted-again")
             second_adoption = prepare_legacy_flat_adoption(
                 flat_root, second_adopted_root, identity_path, LEGACY_COMMIT_SHA
             )
             self.assertEqual(adoption["reports"], second_adoption["reports"])
+            with open(adoption["adoption_manifest"], "rb") as stream:
+                first_manifest_bytes = stream.read()
+            with open(second_adoption["adoption_manifest"], "rb") as stream:
+                self.assertEqual(stream.read(), first_manifest_bytes)
 
             publish_root = os.path.join(root, "publish")
             bootstrap(
@@ -250,9 +383,22 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
             for name, source_bytes in original.items():
                 if not name.endswith((".html", ".htm")):
                     with open(
-                            os.path.join(current_root, "reports", name),
+                            os.path.join(current_root, "reports", *name.split("/")),
                             "rb") as stream:
                         self.assertEqual(stream.read(), source_bytes)
+            with open(
+                    os.path.join(current_root, "candidate_artifact_manifest.json"),
+                    "r", encoding="utf-8") as stream:
+                bootstrap_manifest = json.load(stream)
+            bootstrap_provenance = bootstrap_manifest["source_provenance"]
+            self.assertEqual(
+                bootstrap_provenance["legacy_source_tree_sha256"],
+                adoption["source_tree_sha256"],
+            )
+            self.assertEqual(
+                bootstrap_provenance["legacy_source_file_count"],
+                adoption["source_file_count"],
+            )
 
             target_source = os.path.join(root, "target-source")
             os.makedirs(target_source)
@@ -286,35 +432,53 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
                             "rb") as stream:
                         self.assertEqual(candidate_html, stream.read())
                     entry = report_by_source[name]
-                    registry = self._registry_for(candidate_root, entry["report_id"])
-                    self.assertEqual(registry["project_name"], PRODUCTION_PROJECT_NAME)
-                    self.assertEqual(registry["report_mode"], LEGACY_STATIC)
-                    for forbidden in (
-                            "scan_id", "repository_name", "file_path",
-                            "sidecar_schema", "asset_identity"):
-                        self.assertNotIn(forbidden, registry)
+                    self.assertEqual(
+                        os.path.exists(os.path.join(
+                            candidate_root, "registry", "{}.json".format(entry["report_id"])
+                        )), "/" not in name
+                    )
+                    if "/" not in name:
+                        registry = self._registry_for(candidate_root, entry["report_id"])
+                        self.assertEqual(registry["project_name"], PRODUCTION_PROJECT_NAME)
+                        self.assertEqual(registry["report_mode"], LEGACY_STATIC)
+                        for forbidden in (
+                                "scan_id", "repository_name", "file_path",
+                                "sidecar_schema", "asset_identity"):
+                            self.assertNotIn(forbidden, registry)
+                    else:
+                        self.assertNotIn(b"coverage-report-id", candidate_html)
+            with open(
+                    os.path.join(candidate_root, "candidate_artifact_manifest.json"),
+                    "r", encoding="utf-8") as stream:
+                candidate_manifest = json.load(stream)
+            self.assertEqual(
+                candidate_manifest["source_provenance"]["legacy_source_tree_sha256"],
+                adoption["source_tree_sha256"],
+            )
             for relative in DEFAULT_RELEASE_ASSET_RELATIVE_PATHS:
                 self.assertTrue(os.path.isfile(os.path.join(
                     candidate_root, *relative.split("/")
                 )))
 
-    def test_flat_adoption_rejects_nested_or_preannotated_input(self):
+    def test_flat_adoption_allows_nested_reports_but_rejects_unsafe_input(self):
         with tempfile.TemporaryDirectory(prefix="legacy-flat-reject-") as root:
-            identity_path, _ = self._legacy_identity(root)
-            nested = os.path.join(root, "nested")
-            os.makedirs(nested)
-            self._flat_root(nested)
-            os.makedirs(os.path.join(nested, "unexpected"))
-            with self.assertRaisesRegex(ValueError, "only regular root-level files"):
-                prepare_legacy_flat_adoption(
-                    nested, os.path.join(root, "out"), identity_path,
-                    LEGACY_COMMIT_SHA,
-                )
+            flat_root = os.path.join(root, "flat")
+            os.makedirs(flat_root)
+            self._flat_root(flat_root)
+            identity_path, _ = self._legacy_identity(root, flat_root)
+            allowed = prepare_legacy_flat_adoption(
+                flat_root, os.path.join(root, "allowed"), identity_path,
+                LEGACY_COMMIT_SHA,
+            )
+            self.assertEqual(allowed["status"], "PASSED")
+            self.assertTrue(os.path.isfile(os.path.join(
+                allowed["output_root"], "reports", "dhc", "source-file.html"
+            )))
 
             annotated = os.path.join(root, "annotated")
             os.makedirs(annotated)
             self._flat_root(annotated)
-            with open(os.path.join(annotated, "coverage_index.html"), "ab") as stream:
+            with open(os.path.join(annotated, "dhc", "index.html"), "ab") as stream:
                 stream.write(
                     b'<meta name="coverage-project" content="FOS_V6R2">'
                 )
@@ -323,6 +487,67 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
                     annotated, os.path.join(root, "out-annotated"), identity_path,
                     LEGACY_COMMIT_SHA,
                 )
+
+            symlinked = os.path.join(root, "symlinked")
+            os.makedirs(symlinked)
+            self._flat_root(symlinked)
+            os.symlink(
+                os.path.join(symlinked, "coverage_progress.js"),
+                os.path.join(symlinked, "dhc", "linked.js"),
+            )
+            with self.assertRaisesRegex(ValueError, "symlinks"):
+                prepare_legacy_flat_adoption(
+                    symlinked, os.path.join(root, "out-symlink"), identity_path,
+                    LEGACY_COMMIT_SHA,
+                )
+
+            if hasattr(os, "mkfifo"):
+                special = os.path.join(root, "special")
+                os.makedirs(special)
+                self._flat_root(special)
+                fifo = os.path.join(special, "dhc", "special.pipe")
+                os.mkfifo(fifo)
+                with self.assertRaisesRegex(ValueError, "regular files or directories"):
+                    prepare_legacy_flat_adoption(
+                        special, os.path.join(root, "out-special"), identity_path,
+                        LEGACY_COMMIT_SHA,
+                    )
+
+            mismatched = os.path.join(root, "mismatched")
+            os.makedirs(mismatched)
+            self._flat_root(mismatched)
+            with open(os.path.join(mismatched, "coverage_progress.js"), "ab") as stream:
+                stream.write(b"changed")
+            with self.assertRaisesRegex(ValueError, "does not match identity"):
+                prepare_legacy_flat_adoption(
+                    mismatched, os.path.join(root, "out-mismatched"), identity_path,
+                    LEGACY_COMMIT_SHA,
+                )
+
+            changed = os.path.join(root, "changed")
+            os.makedirs(changed)
+            self._flat_root(changed)
+            calls = []
+            real_scan = adoption_module._scan_source_tree
+
+            def scan_with_change(path):
+                calls.append(path)
+                if len(calls) == 2:
+                    with open(os.path.join(path, "legacy-index.dat"), "ab") as stream:
+                        stream.write(b"changed during copy")
+                return real_scan(path)
+
+            changed_identity_path, _ = self._legacy_identity(root, changed)
+            changed_output = os.path.join(root, "out-changed")
+            with mock.patch.object(
+                    adoption_module, "_scan_source_tree",
+                    side_effect=scan_with_change):
+                with self.assertRaisesRegex(ValueError, "changed during adoption"):
+                    prepare_legacy_flat_adoption(
+                        changed, changed_output, changed_identity_path,
+                        LEGACY_COMMIT_SHA,
+                    )
+            self.assertFalse(os.path.exists(changed_output))
 
 
 if __name__ == "__main__":

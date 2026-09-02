@@ -94,6 +94,7 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
                 "tests.release.test_gate_matrix",
                 "tests.release.test_immutable_release_publication",
                 "tests.release.test_legacy_background_serialization",
+                "tests.release.test_legacy_flat_adoption",
                 "tests.release.test_validation_session",
                 "tests.release.test_verified_backup_rehearsal"):
             self.assertIn(test_module, workflow)
@@ -241,6 +242,11 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("legacy_source_sha256", legacy_adoption)
         self.assertIn("coverage-project", legacy_adoption)
         self.assertIn("coverage-report-id", legacy_adoption)
+        self.assertIn("_scan_source_tree", legacy_adoption)
+        self.assertIn("release_asset_bindings", legacy_adoption)
+        self.assertIn("source_to_reports", legacy_adoption)
+        self.assertIn("source_scan", legacy_adoption)
+        self.assertIn("legacy_adoption_manifest.json", legacy_adoption)
         with open(
                 os.path.join(os.getcwd(), "docs", "operations",
                              "gate-a-f-external-evidence-runbook.md"),

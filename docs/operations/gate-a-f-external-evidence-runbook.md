@@ -236,14 +236,16 @@ served release identity、真实 HTTP、Chromium、artifact SHA、当前
 `run_upgrade.py` 不会在缺少 `CURRENT` 时偷偷创建基线。先从实际 Served Root
 取得完整 release identity JSON（不是仓库 checkout 的猜测值），再执行：
 
-如果实机是旧的 Flat Root（HTML、JS/CSS 直接位于同一个根目录，且没有
-`reports/`、`assets/`、`registry/` 和 `.source_cache/`），不能直接把它交给
-bootstrap。先用专用的 Legacy Flat Adoption 生成独立 staging；工具只复制原始文件，
-将非 HTML 文件同时保存到 `reports/` 和 `assets/`，并为每个 HTML 在 `<head>` 中添加
-`coverage-project=FOS_V6R2`、`coverage-report-mode=LEGACY_STATIC` 和基于“原始相对路径
-+ 原始 HTML SHA256”的确定性 `coverage-report-id`。registry 只记录项目、Legacy
-模式、`reports` 根目录和原始文件指纹，不生成 scan、repository、file、Sidecar 或
-asset identity：
+如果实机是旧的 Flat Root（HTML、JS/CSS、LCOV/source-detail 子目录直接位于同一个根目录，
+且没有 `reports/`、`assets/`、`registry/` 和 `.source_cache/`），不能直接把它交给
+bootstrap。先用专用的 Legacy Flat Adoption 生成独立 staging。工具会递归扫描并保留
+每个文件的原始相对路径，将所有文件保存到 `reports/<relative-path>`，并将非 HTML 文件
+同时保存到 `assets/<relative-path>`。所有 HTML 只在 `<head>` 中添加
+`coverage-project=FOS_V6R2` 和 `coverage-report-mode=LEGACY_STATIC`；只有根级 Report
+Entry 另外添加基于“原始相对路径 + 原始 HTML SHA256”的确定性 `coverage-report-id`
+并建立 registry。嵌套 source/detail 页面不生成 report-id、scan、repository、file、
+Sidecar 或 asset identity。registry 只记录项目、Legacy 模式、`reports` 根目录和原始
+文件指纹：
 
 ```bash
 python3 scripts/release/prepare_legacy_flat_adoption.py \
@@ -252,6 +254,13 @@ python3 scripts/release/prepare_legacy_flat_adoption.py \
   --release-identity /secure/evidence/e9fcc837-release-identity.json \
   --expected-commit-sha e9fcc837a1ac9847f3966fc8ddb2aed92ca473fc
 ```
+
+Adoption 还会写入 `legacy_adoption_manifest.json`。其中包含源目录 realpath、完整源文件
+path/size/SHA256 清单、源树 SHA256、e9fcc837 release identity SHA256、逐个 release-owned
+asset alias 的 size/SHA256 对账，以及 HTML 的 before/after 指纹和 source-to-reports
+映射。复制完成后会再次扫描原始 Flat Root；前后清单不完全一致时不会创建 staging。
+因此 `--release-identity` 不是可以脱离实机目录单独成立的标签：缺失、错配、歧义或
+SHA/size 不一致的历史 asset 都会 fail-closed。
 
 该命令不会修改原始 Flat Root；后续 bootstrap 的 `--served-root` 和
 `--served-identity` 都必须指向它生成的 staging。只有已经具备完整
