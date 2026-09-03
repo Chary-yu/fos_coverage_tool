@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
@@ -156,6 +157,115 @@ class TestUpgradeManifest(unittest.TestCase):
         manifest = ProductionEvidenceManifest(root)
         manifest.data.update(data)
         return manifest
+
+    @staticmethod
+    def _inactive_lifecycle(**overrides):
+        values = {
+            "active": False,
+            "api_started": False,
+            "serving_api_started": False,
+            "current_api_stop_attempted": False,
+            "current_api_stopped": False,
+            "traffic_opened": False,
+        }
+        values.update(overrides)
+        return mock.Mock(**values)
+
+    def _orchestrator_with_created_target(self, root):
+        orchestrator = UpgradeOrchestrator(repo_root=root)
+        orchestrator.manifest = ProductionEvidenceManifest(root)
+        orchestrator._target_identity = {"commit_sha": "a" * 40}
+        orchestrator._target_preparation = {
+            "target_database": "coverage_vnext_candidate_test",
+            "target_database_created_by_this_run": True,
+        }
+        return orchestrator
+
+    def test_pre_cutover_failure_is_the_only_cleanup_eligible_boundary(self):
+        with tempfile.TemporaryDirectory(prefix="target-cleanup-pre-") as root:
+            orchestrator = self._orchestrator_with_created_target(root)
+            lifecycle = self._inactive_lifecycle()
+            cleanup = mock.Mock(return_value={"status": "PASSED"})
+            orchestrator._cleanup_target_database = cleanup
+
+            orchestrator._fail(lifecycle, "pre-cutover validation failed")
+
+            cleanup.assert_called_once_with()
+            self.assertEqual(
+                orchestrator.manifest.data["disposable_target_cleanup"]["status"],
+                "PASSED",
+            )
+
+    def test_current_rollback_failure_retains_candidate_database(self):
+        with tempfile.TemporaryDirectory(prefix="target-cleanup-current-") as root:
+            orchestrator = self._orchestrator_with_created_target(root)
+            orchestrator._phase_d_entered = True
+            orchestrator._current_switch_attempted = True
+            orchestrator._publication_switched = True
+            orchestrator.previous_published_session_id = "before-session"
+            orchestrator.publisher = mock.Mock()
+            orchestrator.publisher.rollback.side_effect = RuntimeError(
+                "CURRENT rollback failed"
+            )
+            cleanup = mock.Mock(return_value={"status": "PASSED"})
+            orchestrator._cleanup_target_database = cleanup
+
+            orchestrator._fail(
+                self._inactive_lifecycle(), "post-switch verification failed"
+            )
+
+            orchestrator.publisher.rollback.assert_called_once_with(
+                "before-session"
+            )
+            cleanup.assert_not_called()
+            evidence = orchestrator.manifest.data["disposable_target_cleanup"]
+            self.assertEqual(evidence["cleanup_status"], "RETAINED_FOR_RECOVERY")
+            self.assertTrue(evidence["data_safety_hold"])
+
+    def test_database_binding_rollback_failure_never_drops_candidate_database(self):
+        with tempfile.TemporaryDirectory(prefix="target-cleanup-db-binding-") as root:
+            orchestrator = self._orchestrator_with_created_target(root)
+            orchestrator._phase_d_entered = True
+            orchestrator._production_runtime_binding_attempted = True
+            orchestrator._production_runtime_bound = True
+            adapter = mock.Mock(runtime_bound=True)
+            adapter.restore_previous_database_binding.side_effect = RuntimeError(
+                "EnvironmentFile rollback failed"
+            )
+            orchestrator._production_lifecycle_adapter = adapter
+            cleanup = mock.Mock(return_value={"status": "PASSED"})
+            orchestrator._cleanup_target_database = cleanup
+
+            orchestrator._fail(
+                self._inactive_lifecycle(), "database binding verification failed"
+            )
+
+            adapter.restore_previous_database_binding.assert_called_once_with()
+            cleanup.assert_not_called()
+            self.assertEqual(
+                orchestrator.manifest.data["disposable_target_cleanup"][
+                    "cleanup_status"
+                ],
+                "RETAINED_FOR_RECOVERY",
+            )
+
+    def test_post_open_verification_failure_retains_candidate_database(self):
+        with tempfile.TemporaryDirectory(prefix="target-cleanup-open-") as root:
+            orchestrator = self._orchestrator_with_created_target(root)
+            orchestrator._phase_d_entered = True
+            orchestrator._traffic_open_attempted = True
+            cleanup = mock.Mock(return_value={"status": "PASSED"})
+            orchestrator._cleanup_target_database = cleanup
+
+            orchestrator._fail(
+                self._inactive_lifecycle(traffic_opened=True),
+                "post-open serving verification failed",
+            )
+
+            cleanup.assert_not_called()
+            evidence = orchestrator.manifest.data["disposable_target_cleanup"]
+            self.assertEqual(evidence["cleanup_status"], "RETAINED_FOR_RECOVERY")
+            self.assertIn("traffic_open_attempted", evidence["reasons"])
 
     def test_missing_rollback_artifact_blocks_phase_d_methods(self):
         with tempfile.TemporaryDirectory(prefix="pre-cutover-rollback-") as root:

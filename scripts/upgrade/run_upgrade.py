@@ -667,6 +667,10 @@ class UpgradeOrchestrator:
         self._validation_teardown_result = None
         self.logs: List[str] = []
         self._publication_switched = False
+        self._phase_d_entered = False
+        self._current_switch_attempted = False
+        self._production_runtime_binding_attempted = False
+        self._traffic_open_attempted = False
         self._previous_release_identity = {}
         self._release_trust_mode = RELEASE_TRUST_MODE_PROTECTED_BUILDER
         self._deployment_layout = ""
@@ -1371,6 +1375,61 @@ class UpgradeOrchestrator:
         self._target_cleanup_done = True
         return result
 
+    def _target_cleanup_safety(self, lifecycle=None):
+        """Return whether automatic target deletion is still data-safe.
+
+        A target is disposable only while it has remained entirely outside
+        Phase D. Once a cutover operation has been attempted, the controller
+        must retain the database even if rollback appears to have succeeded:
+        the target may contain writes, or the rollback may have left an
+        unknown binding behind. This is intentionally conservative.
+        """
+        reasons = []
+        if self._phase_d_entered:
+            reasons.append("phase_d_entered")
+        if self._current_switch_attempted or self._publication_switched:
+            reasons.append("current_switch_attempted")
+        if self._production_runtime_binding_attempted or \
+                self._production_runtime_bound:
+            reasons.append("production_runtime_binding_attempted")
+        if self._traffic_open_attempted:
+            reasons.append("traffic_open_attempted")
+        if lifecycle is not None:
+            if getattr(lifecycle, "traffic_opened", False):
+                reasons.append("traffic_opened")
+            if getattr(lifecycle, "serving_api_started", False):
+                reasons.append("candidate_serving_started")
+            if getattr(lifecycle, "api_started", False):
+                reasons.append("validation_api_started")
+            if getattr(lifecycle, "current_api_stop_attempted", False) or \
+                    getattr(lifecycle, "current_api_stopped", False):
+                reasons.append("production_api_stop_attempted")
+            if getattr(lifecycle, "active", False):
+                reasons.append("lifecycle_active")
+        adapter = self._production_lifecycle_adapter
+        if adapter is not None and getattr(adapter, "runtime_bound", False):
+            reasons.append("adapter_runtime_bound")
+        return not reasons, sorted(set(reasons))
+
+    def _record_retained_target(self, reasons):
+        """Record a post-cutover retention decision without deleting data."""
+        self.manifest.record("disposable_target_cleanup", {
+            "status": "BLOCKED",
+            "cleanup_status": "RETAINED_FOR_RECOVERY",
+            "data_safety_hold": True,
+            "revision": self._target_identity.get("commit_sha"),
+            "evidence_class": "blue_green_database",
+            "target_database": self._target_preparation.get("target_database", ""),
+            "reasons": list(reasons),
+            "command": "retain Candidate DB; automatic revoke/drop forbidden after Phase D",
+            "exit_code": 1,
+        })
+        self.log(
+            "⚠ Candidate database retained for recovery; automatic cleanup blocked: {}".format(
+                ", ".join(reasons)
+            )
+        )
+
     def _fail(self, lifecycle: Optional[UpgradeLifecycle], message: str) -> Tuple[bool, str]:
         self._mark_not_ready()
         # If a vfoswind serving process has already been started with the new
@@ -1394,7 +1453,7 @@ class UpgradeOrchestrator:
                         exc
                     )
                 )
-        if self._publication_switched:
+        if self._current_switch_attempted or self._publication_switched:
             try:
                 if self.publisher is None or not self.previous_published_session_id:
                     raise RuntimeError("immutable rollback identity is unavailable")
@@ -1469,22 +1528,29 @@ class UpgradeOrchestrator:
             except Exception as exc:
                 self.log("❌ DATA_SAFETY_HOLD: validation session teardown evidence failed: {}".format(exc))
         try:
-            target_cleanup = self._cleanup_target_database()
-            if target_cleanup.get("status") != "PASSED":
-                self.log(
-                    "❌ DATA_SAFETY_HOLD: disposable target cleanup failed: {}".format(
-                        target_cleanup
-                    )
-                )
+            cleanup_allowed, retention_reasons = self._target_cleanup_safety(
+                lifecycle
+            )
+            if not cleanup_allowed and self._target_preparation.get(
+                    "target_database_created_by_this_run"):
+                self._record_retained_target(retention_reasons)
             else:
-                self.manifest.record("disposable_target_cleanup", {
-                    "status": "PASSED",
-                    "revision": self._target_identity.get("commit_sha"),
-                    "evidence_class": "blue_green_database",
-                    "cleanup": target_cleanup,
-                    "command": "revoke Candidate DB grant + DROP disposable target",
-                    "exit_code": 0,
-                })
+                target_cleanup = self._cleanup_target_database()
+                if target_cleanup.get("status") != "PASSED":
+                    self.log(
+                        "❌ DATA_SAFETY_HOLD: disposable target cleanup failed: {}".format(
+                            target_cleanup
+                        )
+                    )
+                else:
+                    self.manifest.record("disposable_target_cleanup", {
+                        "status": "PASSED",
+                        "revision": self._target_identity.get("commit_sha"),
+                        "evidence_class": "blue_green_database",
+                        "cleanup": target_cleanup,
+                        "command": "revoke Candidate DB grant + DROP disposable target",
+                        "exit_code": 0,
+                    })
         except Exception as exc:
             self.log(
                 "❌ DATA_SAFETY_HOLD: disposable target cleanup failed: {}".format(
@@ -1591,6 +1657,11 @@ class UpgradeOrchestrator:
         self._production_lifecycle_adapter = None
         self._production_runtime_bound = False
         self._production_release_bindings_changed = False
+        self._publication_switched = False
+        self._phase_d_entered = False
+        self._current_switch_attempted = False
+        self._production_runtime_binding_attempted = False
+        self._traffic_open_attempted = False
         self._target_preparation = {}
         self._target_cleanup_done = False
         self._mark_not_ready()
@@ -2735,6 +2806,7 @@ class UpgradeOrchestrator:
         # performance, audits, and rollback rehearsal have all completed
         # while CURRENT and the active API were untouched.
         self.log("[Phase D] Candidate is PRE_CUTOVER_READY; entering short cutover window...")
+        self._phase_d_entered = True
         try:
             freeze_evidence = lifecycle.freeze(identity.get("commit_sha", ""))
             freeze_evidence["revision"] = identity.get("commit_sha")
@@ -2791,6 +2863,7 @@ class UpgradeOrchestrator:
             if adoption and self.previous_published_session_id:
                 lifecycle.previous_release["_published_session_id"] = \
                     self.previous_published_session_id
+            self._current_switch_attempted = True
             switched = self.publisher.switch_current(session_id)
             if switched.get("status") != "PASSED":
                 raise RuntimeError("immutable CURRENT switch did not pass")
@@ -2804,6 +2877,7 @@ class UpgradeOrchestrator:
                 self._production_release_bindings_changed = bool(
                     self._production_lifecycle_adapter.release_bindings_changed
                 )
+                self._production_runtime_binding_attempted = True
                 binding = self._production_lifecycle_adapter.bind_candidate_database(
                     self._target_db_config
                 )
@@ -2904,6 +2978,7 @@ class UpgradeOrchestrator:
             return self._fail(lifecycle, f"Final gate unmet: {unmet}")
 
         try:
+            self._traffic_open_attempted = True
             open_evidence = lifecycle.open_traffic()
             open_evidence.update({
                 "revision": identity.get("commit_sha"),

@@ -94,7 +94,7 @@
         "python": "/usr/bin/python3",
         "systemd_analyze": ["/usr/bin/systemd-analyze", "verify"],
         "nginx_test": ["/usr/sbin/nginx", "-t"],
-        "nginx_test_uses_staged_path": false
+        "nginx_probe_mode": "temporary_main_include"
       },
       "commands": {
         "daemon_reload": ["/bin/systemctl", "daemon-reload"],

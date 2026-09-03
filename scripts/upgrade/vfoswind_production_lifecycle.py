@@ -20,6 +20,7 @@ from __future__ import print_function
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -513,6 +514,97 @@ class VfoswindProductionLifecycle(object):
             )
         return evidence
 
+    @staticmethod
+    def _render_nginx_probe_main(managed_config_path, managed_config, stage):
+        """Render a disposable nginx.conf that includes the managed bytes.
+
+        The production file is normally a server or location snippet rather
+        than a complete nginx main configuration.  Testing that snippet with
+        ``nginx -t`` alone either tests the live configuration or produces a
+        misleading parse context.  This wrapper supplies the real nginx main
+        and http/server contexts while keeping every file under a disposable
+        staging directory.
+        """
+        def quote_path(value):
+            return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+        include_line = 'include "{}";'.format(quote_path(managed_config_path))
+        if re.search(r"(?m)^[ \t]*server[ \t]*\{", managed_config):
+            http_body = include_line
+        else:
+            http_body = (
+                "server {{\n"
+                "    listen 127.0.0.1:19528;\n"
+                "    {}\n"
+                "}}\n"
+            ).format(include_line)
+        return (
+            'pid "{}";\n'
+            'error_log "{}" crit;\n'
+            "events {{ worker_connections 16; }}\n"
+            "http {{\n"
+            "{}"
+            "}}\n"
+        ).format(
+            quote_path(os.path.join(stage, "nginx.pid")),
+            quote_path(os.path.join(stage, "nginx-error.log")),
+            http_body,
+        )
+
+    def _bootstrap_nginx_static_probe(self, managed_config, stage):
+        """Run nginx -t against the exact managed config being published.
+
+        ``nginx_test_uses_staged_path=false`` used to make this gate execute
+        against the live host configuration.  Bootstrap must never accept that
+        as evidence for a new binding, so the command is always pointed at a
+        temporary main config which includes the staged managed bytes.
+        """
+        bootstrap = self._bootstrap_config()
+        configured = bootstrap.get("nginx_test")
+        if not configured:
+            raise RuntimeError(
+                "production bootstrap command 'nginx_test' is required"
+            )
+        managed_path = os.path.join(stage, "managed.conf")
+        main_path = os.path.join(stage, "nginx.conf")
+        with open(managed_path, "w", encoding="utf-8", newline="") as stream:
+            stream.write(str(managed_config))
+        main_config = self._render_nginx_probe_main(
+            managed_path, str(managed_config), stage
+        )
+        with open(main_path, "w", encoding="utf-8", newline="") as stream:
+            stream.write(main_config)
+
+        argv = _argv(configured, "nginx_test")
+        if "{path}" in argv:
+            argv = [main_path if item == "{path}" else item for item in argv]
+        elif "-c" in argv:
+            config_index = argv.index("-c") + 1
+            if config_index >= len(argv):
+                raise ValueError("production bootstrap nginx_test -c has no path")
+            argv[config_index] = main_path
+        else:
+            argv.extend(["-c", main_path])
+        result = self.command_runner(argv)
+        evidence = {
+            "name": "nginx_test",
+            "command": argv,
+            "status": "PASSED" if result.returncode == 0 else "FAILED",
+            "exit_code": result.returncode,
+            "stdout": result.stdout.decode("utf-8", errors="replace")[-2000:],
+            "stderr": result.stderr.decode("utf-8", errors="replace")[-2000:],
+            "probe_mode": "temporary_main_include",
+            "staged_config_sha256": self._sha256_bytes(
+                str(managed_config).encode("utf-8")
+            ),
+            "staged_main_config_sha256": self._sha256_bytes(
+                main_config.encode("utf-8")
+            ),
+        }
+        if result.returncode != 0:
+            raise RuntimeError("production bootstrap nginx_test failed")
+        return evidence
+
     def _build_flat_bootstrap_plan(
             self, unit_text, nginx_text, legacy_application_root,
             legacy_served_root, runtime_mysql, candidate_application_root,
@@ -691,16 +783,13 @@ class VfoswindProductionLifecycle(object):
         )
         with tempfile.TemporaryDirectory(prefix="coverage-vfoswind-bootstrap-check-") as stage:
             unit_stage = os.path.join(stage, "managed.service")
-            nginx_stage = os.path.join(stage, "managed.conf")
             with open(unit_stage, "w", encoding="utf-8") as stream:
                 stream.write(plan["managed_systemd_unit"])
-            with open(nginx_stage, "w", encoding="utf-8") as stream:
-                stream.write(plan["managed_nginx"])
             systemd_check = self._bootstrap_static_probe(
                 "systemd_analyze", unit_stage
             )
-            nginx_check = self._bootstrap_static_probe(
-                "nginx_test", nginx_stage
+            nginx_check = self._bootstrap_nginx_static_probe(
+                plan["managed_nginx"], stage
             )
         plan["systemd_analyze"] = systemd_check
         plan["nginx_test"] = nginx_check

@@ -31,7 +31,10 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
             integration["bootstrap"]["legacy_nginx_config_path"],
             "/etc/nginx/conf.d/coverage.conf",
         )
-        self.assertFalse(integration["bootstrap"]["nginx_test_uses_staged_path"])
+        self.assertEqual(
+            integration["bootstrap"]["nginx_probe_mode"],
+            "temporary_main_include",
+        )
 
     def _fixture(self, flat=False):
         root = tempfile.TemporaryDirectory(prefix="vfoswind-lifecycle-")
@@ -165,7 +168,7 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
                 "legacy_nginx_config_path": nginx,
                 "systemd_analyze": ["systemd-analyze", "verify"],
                 "nginx_test": ["nginx", "-t"],
-                "nginx_test_uses_staged_path": False,
+                "nginx_probe_mode": "temporary_main_include",
             },
             "commands": commands,
         }
@@ -316,8 +319,19 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
         self.assertTrue(preflight["transition_required"])
         self.assertTrue(preflight["bootstrap_ready"])
         self.assertTrue(preflight["rollback_bytes_verified"])
+        self.assertEqual(
+            preflight["nginx_test"]["probe_mode"],
+            "temporary_main_include",
+        )
+        self.assertEqual(
+            preflight["nginx_test"]["staged_config_sha256"],
+            preflight["managed_nginx_sha256"],
+        )
         self.assertIn(["systemd-analyze", "verify"], [call[:2] for call in calls])
-        self.assertIn(["nginx", "-t"], calls)
+        self.assertTrue(any(
+            call[:2] == ["nginx", "-t"] and "-c" in call
+            for call in calls
+        ))
         with open(config["systemd_unit_file"], "rb") as stream:
             self.assertEqual(stream.read(), before_unit)
         with open(config["nginx_config_path"], "rb") as stream:
@@ -380,6 +394,48 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
         with open(config["nginx_config_path"], encoding="utf-8") as stream:
             self.assertIn(config["legacy_served_root"], stream.read())
         self.assertFalse(os.path.lexists(config["runtime_environment_file"]))
+
+    def test_flat_bootstrap_rejects_invalid_managed_nginx_before_phase_d(self):
+        _root, publish, config, _environment = self._fixture(flat=True)
+        calls = []
+
+        def runner(argv):
+            calls.append(list(argv))
+            if argv[:2] == ["nginx", "-t"]:
+                main_path = argv[argv.index("-c") + 1]
+                managed_path = os.path.join(
+                    os.path.dirname(main_path), "managed.conf"
+                )
+                with open(managed_path, "r", encoding="utf-8") as stream:
+                    managed = stream.read()
+                if "INVALID_NGINX_DIRECTIVE" in managed:
+                    return CompletedProcess(argv, 1, b"", b"syntax error")
+            return CompletedProcess(argv, 0, b"", b"")
+
+        adapter = VfoswindProductionLifecycle(
+            publish, config, command_runner=runner
+        )
+        original = adapter._build_flat_bootstrap_plan
+
+        def invalid_plan(*args, **kwargs):
+            plan = original(*args, **kwargs)
+            plan["managed_nginx"] = "INVALID_NGINX_DIRECTIVE;\n"
+            return plan
+
+        adapter._build_flat_bootstrap_plan = invalid_plan
+        with self.assertRaisesRegex(RuntimeError, "nginx_test failed"):
+            adapter.preflight(
+                expected_database="coverage_vnext_old",
+                runtime_mysql={
+                    "database": "coverage_vnext_old",
+                    "user": "coverage_user",
+                },
+                candidate_ports=[19528],
+            )
+        self.assertTrue(any(
+            call[:2] == ["nginx", "-t"] and "-c" in call
+            for call in calls
+        ))
 
 
 if __name__ == "__main__":

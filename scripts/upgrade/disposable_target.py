@@ -15,6 +15,7 @@ from __future__ import print_function
 
 import gzip
 import os
+import re
 import subprocess
 
 from scripts.maintenance.mysql_backup import (
@@ -160,6 +161,63 @@ def _principal_sql(user, host):
     return "{}@{}".format(_sql_string(user), _sql_string(host))
 
 
+def _parse_mysql_principal(value):
+    """Parse MySQL/MariaDB ``CURRENT_USER()`` into exact user and host parts."""
+    text = str(value or "").strip()
+    if text.startswith("'") and "'@'" in text:
+        user, host = text.split("'@'", 1)
+        user = user.lstrip("'")
+        host = host.rstrip("'")
+    elif "@" in text:
+        user, host = text.rsplit("@", 1)
+        user = user.strip("'`")
+        host = host.strip("'`")
+    else:
+        return None, None
+    user = user.strip()
+    host = host.strip()
+    if not user or not host:
+        return None, None
+    return user, host
+
+
+def _target_database_grants(snapshot, target_database):
+    """Return grants on this exact disposable database, if any already exist."""
+    normalized_database = str(target_database).strip().replace("`", "").upper()
+    grants = []
+    for grant in snapshot.get("grants") or []:
+        normalized = " ".join(
+            str(grant).replace("`", "").split()
+        ).upper()
+        if re.search(
+                r"\bON\s+{}\.\*\s".format(
+                    re.escape(normalized_database)
+                ),
+                normalized,
+        ):
+            grants.append(str(grant))
+    return sorted(set(grants))
+
+
+def _candidate_grant_preflight(
+        admin_client, admin_common, admin_env, target, target_database,
+        source=None):
+    """Validate the approved account and reject residual target grants."""
+    user, grant_host, privileges = _candidate_account(target, source=source)
+    pre_grant_snapshot = _principal_snapshot(
+        admin_client, admin_common, admin_env, user, grant_host
+    )
+    historical_grants = _target_database_grants(
+        pre_grant_snapshot, target_database
+    )
+    if historical_grants:
+        raise RuntimeError(
+            "approved application principal has a historical grant on the "
+            "disposable Candidate database; refusing to reuse it"
+        )
+    return user, grant_host, privileges, pre_grant_snapshot
+
+
 def _principal_snapshot(client, common, env, user, host):
     """Capture exact account existence and grants before a temporary GRANT."""
     principal = _principal_sql(user, host)
@@ -284,9 +342,10 @@ def probe_candidate_connection_access(connection, target_config):
                     observed_database or "<none>", target_database
                 )
             )
-        if user.lower() not in current_user.lower():
+        observed_user, observed_host = _parse_mysql_principal(current_user)
+        if observed_user != user or observed_host != grant_host:
             raise RuntimeError(
-                "Candidate connection current user does not match configured account"
+                "Candidate connection current user does not exactly match configured account"
             )
 
         cursor.execute("SHOW GRANTS")
@@ -375,9 +434,9 @@ def _grant_and_probe_candidate_access(
     probes run through the configured application account, so a successful
     admin connection can never masquerade as Candidate database access.
     """
-    user, grant_host, privileges = _candidate_account(target, source=source)
-    pre_grant_snapshot = _principal_snapshot(
-        admin_client, admin_common, admin_env, user, grant_host
+    user, grant_host, privileges, pre_grant_snapshot = _candidate_grant_preflight(
+        admin_client, admin_common, admin_env, target, target_database,
+        source=source,
     )
     grant_applied = False
     grant = (
@@ -625,6 +684,13 @@ def create_disposable_target_from_backup(
             raise RuntimeError(
                 "disposable target database already exists; refusing to reuse it"
             )
+        # Inspect the exact application principal before CREATE DATABASE.  A
+        # missing schema can still have a historical database-level grant; in
+        # that case this disposable name must be abandoned rather than
+        # mutating the account and attempting a best-effort privilege restore.
+        _candidate_grant_preflight(
+            client, common, env, target, target_database, source=source
+        )
 
         source_ok, source_identity, source_error = _runtime_identity(
             source_client, source_common, source_env, identity["source_database"]
@@ -753,6 +819,9 @@ def create_empty_disposable_target(source_config, target_config,
             raise RuntimeError(
                 "disposable target database already exists; refusing to reuse it"
             )
+        _candidate_grant_preflight(
+            client, common, env, target, target_database, source=source
+        )
         create = _run_client(
             client, common, env,
             "CREATE DATABASE `{}` CHARACTER SET utf8mb4 COLLATE {}".format(
