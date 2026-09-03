@@ -14,8 +14,10 @@ from scripts.upgrade.build_deployment_manifest import build
 from scripts.upgrade.cutover_controller import CutoverController
 from scripts.upgrade.run_upgrade import (
     _new_release_validation_session_id, _resolve_attempt_path,
+    _validate_candidate_authenticated_mutation_evidence,
     _validate_candidate_browser_evidence,
     _validate_ci_browser_fixture_evidence,
+    _validate_external_candidate_browser_url,
     UpgradeOrchestrator,
     validate_candidate_publication_preflight,
     verify_production_candidate_served_root_binding,
@@ -115,8 +117,56 @@ class TestUpgradeManifest(unittest.TestCase):
                 candidate_artifact_sha256=artifact,
                 served_root_sha256=served,
                 expected_commit_sha=revision,
+                candidate_url="https://candidate.example.invalid/coverage/report.html",
                 release_eligible=True, synthetic=False,
                 real_http=True, chromium=True,
+            ),
+            "candidate_gateway_preflight": dict(
+                passed,
+                read_only=True,
+                config_sha256="1" * 64,
+                browser_url="https://candidate.example.invalid/coverage/report.html",
+                auth_bridge={"status": "PASSED"},
+            ),
+            "candidate_authenticated_mutation": dict(
+                passed,
+                evidence_class="candidate_authenticated_mutation",
+                release_validation_session_id=session,
+                candidate_artifact_sha256=artifact,
+                served_root_sha256=served,
+                expected_commit_sha=revision,
+                candidate_url="https://candidate.example.invalid/coverage/report.html",
+                release_url="https://candidate.example.invalid/api/coverage/release",
+                mutation_url="https://candidate.example.invalid/api/coverage/projects",
+                auth_mode="reverse_proxy",
+                user_header="X-Remote-User",
+                identity_source="operator-supplied-authentication",
+                identity_propagated=True,
+                real_http=True,
+                synthetic=False,
+                release_eligible=True,
+                gateway_config_sha256="1" * 64,
+                mutation_probe={
+                    "status": "PASSED",
+                    "unauthenticated_status_code": 401,
+                    "authenticated_status_code": 200,
+                },
+            ),
+            "production_integration_preflight": dict(
+                passed, read_only=True,
+            ),
+            "production_bootstrap": dict(
+                passed, bootstrap_ready=True, read_only=True,
+            ),
+            "production_application_bundle": dict(passed),
+            "production_validation_runtime_binding": dict(
+                passed,
+                binding={"target_database": "coverage_vnext_candidate_test"},
+                candidate_gateway={
+                    "status": "PASSED",
+                    "release_validation_session_id": session,
+                    "validation_pointer_target": "/tmp/validation-release",
+                },
             ),
             "performance_benchmark": dict(
                 passed, evidence_class="release_performance_ab",
@@ -131,6 +181,7 @@ class TestUpgradeManifest(unittest.TestCase):
             "sidecar_audit": dict(passed, is_safe=True),
             "security_audit": dict(
                 passed, is_safe=True, critical_count=0, high_count=0,
+                auth_mode="reverse_proxy",
             ),
             "candidate_release_endpoint": dict(
                 passed, process_role="validation_candidate",
@@ -346,6 +397,91 @@ class TestUpgradeManifest(unittest.TestCase):
                 manifest.data["pre_cutover_ready"]["status"], "FAILED"
             )
 
+    def test_production_requires_real_authenticated_mutation_evidence(self):
+        revision = "a" * 40
+        identity = {
+            "version": "v-test", "commit_sha": revision,
+            "build_id": "build-test",
+        }
+        with tempfile.TemporaryDirectory(prefix="auth-probe-gate-") as root:
+            data = self._pre_cutover_data()
+            manifest = self._manifest_for_pre_cutover(root, data)
+            orchestrator = UpgradeOrchestrator(repo_root=root)
+            orchestrator.manifest = manifest
+            ready, unmet = orchestrator._validate_pre_cutover_ready(
+                identity, "production"
+            )
+            self.assertTrue(ready, unmet)
+
+            data["candidate_authenticated_mutation"].update({
+                "status": "FAILED",
+                "identity_propagated": False,
+                "mutation_probe": {
+                    "status": "FAILED",
+                    "unauthenticated_status_code": 200,
+                    "authenticated_status_code": 401,
+                },
+            })
+            manifest = self._manifest_for_pre_cutover(root, data)
+            orchestrator.manifest = manifest
+            ready, unmet = orchestrator._validate_pre_cutover_ready(
+                identity, "production"
+            )
+            self.assertFalse(ready)
+            self.assertTrue(any("authenticated Candidate mutation" in item for item in unmet), unmet)
+
+    def test_authenticated_mutation_evidence_rejects_loopback_and_missing_negative_control(self):
+        revision = "a" * 40
+        identity = {"commit_sha": revision}
+        payload = {
+            "status": "PASSED",
+            "evidence_class": "real_candidate_authenticated_mutation",
+            "release_eligible": True,
+            "synthetic": False,
+            "real_http": True,
+            "candidate_revision": revision,
+            "release_validation_session_id": "attempt-a",
+            "candidate_artifact_sha256": "b" * 64,
+            "served_root_sha256": "c" * 64,
+            "candidate_url": "http://127.0.0.1:19528/coverage/report.html",
+            "auth_mode": "reverse_proxy",
+            "user_header": "X-Remote-User",
+            "identity_source": "basic-auth",
+            "identity_propagated": True,
+            "gateway_config_sha256": "d" * 64,
+            "mutation_probe": {
+                "status": "PASSED",
+                "unauthenticated_status_code": 200,
+                "authenticated_status_code": 200,
+            },
+        }
+        errors, _normalized = _validate_candidate_authenticated_mutation_evidence(
+            "missing.json", payload, identity,
+            "https://candidate.example.invalid/coverage/report.html",
+            expected_session_id="attempt-a",
+            expected_candidate_artifact_sha256="b" * 64,
+            expected_served_root_sha256="c" * 64,
+            expected_auth_mode="reverse_proxy",
+            expected_user_header="X-Remote-User",
+            expected_gateway_config_sha256="d" * 64,
+        )
+        self.assertTrue(any("loopback" in item for item in errors), errors)
+        self.assertTrue(any("401/403" in item for item in errors), errors)
+
+    def test_production_browser_url_must_be_external_static_html(self):
+        self.assertTrue(_validate_external_candidate_browser_url(
+            "http://127.0.0.1:19528/"
+        ))
+        self.assertTrue(_validate_external_candidate_browser_url(
+            "https://candidate.example.invalid/api/coverage/release"
+        ))
+        self.assertEqual(
+            _validate_external_candidate_browser_url(
+                "https://candidate.example.invalid/coverage/report.html"
+            ),
+            [],
+        )
+
     def test_production_browser_fixture_consumes_ci_evidence_without_node_or_npm(self):
         revision = "a" * 40
         tree = "b" * 40
@@ -386,6 +522,80 @@ class TestUpgradeManifest(unittest.TestCase):
                 expected_source_tree_sha=tree,
             )
             self.assertTrue(any("revision" in item for item in errors), errors)
+
+    def test_ci_browser_fixture_provenance_is_exactly_bound_to_repository_workflow_and_artifact(self):
+        revision = "a" * 40
+        tree = "b" * 40
+        with tempfile.TemporaryDirectory(prefix="ci-browser-provenance-") as root:
+            evidence_path = os.path.join(root, "fixture.json")
+            with open(evidence_path, "w", encoding="utf-8") as stream:
+                json.dump(build_evidence(
+                    revision, tree, "wrong/repository", "123", "1",
+                    workflow_path="wrong.yml",
+                    workflow_identity="wrong-job",
+                    artifact_name="wrong-artifact",
+                ), stream)
+            with open(evidence_path, "r", encoding="utf-8") as stream:
+                payload = json.load(stream)
+            errors = _validate_ci_browser_fixture_evidence(
+                evidence_path, payload, {"commit_sha": revision},
+                expected_source_tree_sha=tree,
+                expected_repository="Chary-yu/fos_coverage_tool",
+                expected_workflow_path=".github/workflows/ci.yml",
+                expected_workflow_identity="browser-fixture-regression",
+                expected_artifact_name="browser-fixture-regression-{commit_sha}",
+            )
+            self.assertTrue(any("repository" in item for item in errors), errors)
+            self.assertTrue(any("workflow path" in item for item in errors), errors)
+            self.assertTrue(any("workflow identity" in item for item in errors), errors)
+            self.assertTrue(any("artifact identity" in item for item in errors), errors)
+
+    def test_ci_browser_fixture_default_policy_rejects_wrong_repository(self):
+        revision = "a" * 40
+        tree = "b" * 40
+        with tempfile.TemporaryDirectory(prefix="ci-browser-default-policy-") as root:
+            evidence_path = os.path.join(root, "fixture.json")
+            payload = build_evidence(
+                revision, tree, "unapproved/repository", "123", "1",
+            )
+            with open(evidence_path, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream)
+            errors = _validate_ci_browser_fixture_evidence(
+                evidence_path, payload, {"commit_sha": revision},
+                expected_source_tree_sha=tree,
+            )
+            self.assertTrue(any("repository identity" in item for item in errors), errors)
+
+    def test_ci_browser_fixture_detached_digest_is_verified(self):
+        revision = "a" * 40
+        tree = "b" * 40
+        with tempfile.TemporaryDirectory(prefix="ci-browser-digest-") as root:
+            evidence_path = os.path.join(root, "fixture.json")
+            digest_path = evidence_path + ".sha256"
+            with open(evidence_path, "w", encoding="utf-8") as stream:
+                json.dump(build_evidence(
+                    revision, tree, "Chary-yu/fos_coverage_tool", "123", "1",
+                ), stream)
+            with open(evidence_path, "rb") as stream:
+                digest = hashlib.sha256(stream.read()).hexdigest()
+            with open(digest_path, "w", encoding="utf-8") as stream:
+                stream.write(digest + "  fixture.json\n")
+            with open(evidence_path, "r", encoding="utf-8") as stream:
+                payload = json.load(stream)
+            errors = _validate_ci_browser_fixture_evidence(
+                evidence_path, payload, {"commit_sha": revision},
+                expected_source_tree_sha=tree,
+                expected_digest_path=digest_path,
+            )
+            self.assertEqual(errors, [])
+            with open(digest_path, "w", encoding="utf-8") as stream:
+                stream.write("0" * 64 + "  fixture.json\n")
+            errors = _validate_ci_browser_fixture_evidence(
+                evidence_path, payload, {"commit_sha": revision},
+                expected_source_tree_sha=tree,
+                expected_digest_path=digest_path,
+            )
+            self.assertTrue(any("detached digest" in item for item in errors), errors)
 
     def test_staging_missing_node_enters_failed_fixture_evidence(self):
         with tempfile.TemporaryDirectory(prefix="staging-browser-missing-node-") as root:

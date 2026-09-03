@@ -10,6 +10,7 @@ Candidate browser evidence.
 from __future__ import print_function
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -25,7 +26,10 @@ from app.time_utils import utc_iso
 
 
 def build_evidence(revision, source_tree_sha, repository, workflow_run_id,
-                   workflow_run_attempt, workflow_sha=None, command=None):
+                   workflow_run_attempt, workflow_sha=None, command=None,
+                   workflow_path=".github/workflows/ci.yml",
+                   workflow_identity="browser-fixture-regression",
+                   artifact_name=None):
     """Return a truthful, exact-revision CI fixture evidence envelope."""
     revision = str(revision or "").strip().lower()
     source_tree_sha = str(source_tree_sha or "").strip().lower()
@@ -33,6 +37,11 @@ def build_evidence(revision, source_tree_sha, repository, workflow_run_id,
     workflow_run_id = str(workflow_run_id or "").strip()
     workflow_run_attempt = str(workflow_run_attempt or "").strip()
     workflow_sha = str(workflow_sha or revision).strip().lower()
+    workflow_path = str(workflow_path or "").strip()
+    workflow_identity = str(workflow_identity or "").strip()
+    artifact_name = str(
+        artifact_name or "browser-fixture-regression-{}".format(revision)
+    ).strip()
     if not is_valid_commit_sha(revision):
         raise ValueError("revision must be an exact commit SHA")
     if not is_valid_commit_sha(source_tree_sha):
@@ -45,6 +54,12 @@ def build_evidence(revision, source_tree_sha, repository, workflow_run_id,
         raise ValueError("workflow_run_attempt must be a positive numeric ID")
     if workflow_sha != revision:
         raise ValueError("workflow_sha must match revision")
+    if not workflow_path:
+        raise ValueError("workflow_path is required")
+    if not workflow_identity:
+        raise ValueError("workflow_identity is required")
+    if not artifact_name:
+        raise ValueError("artifact_name is required")
     now = utc_iso()
     return {
         "status": "PASSED",
@@ -56,8 +71,11 @@ def build_evidence(revision, source_tree_sha, repository, workflow_run_id,
         "revision": revision,
         "candidate_revision": revision,
         "workflow_sha": workflow_sha,
+        "workflow_path": workflow_path,
+        "workflow_identity": workflow_identity,
         "source_tree_sha": source_tree_sha,
         "repository": repository,
+        "artifact_name": artifact_name,
         "workflow_run_id": workflow_run_id,
         "workflow_run_attempt": workflow_run_attempt,
         "suite": "node_and_playwright_fixture",
@@ -85,8 +103,19 @@ def main(argv=None):
     parser.add_argument("--workflow-run-id", required=True)
     parser.add_argument("--workflow-run-attempt", required=True)
     parser.add_argument("--workflow-sha", default="")
+    parser.add_argument(
+        "--workflow-path", default=".github/workflows/ci.yml"
+    )
+    parser.add_argument(
+        "--workflow-identity", default="browser-fixture-regression"
+    )
+    parser.add_argument("--artifact-name", default="")
     parser.add_argument("--command", default="")
     parser.add_argument("--output", required=True)
+    parser.add_argument(
+        "--digest-output", default="",
+        help="write a detached SHA256 digest for the evidence artifact",
+    )
     args = parser.parse_args(argv)
     evidence = build_evidence(
         args.revision,
@@ -96,6 +125,9 @@ def main(argv=None):
         args.workflow_run_attempt,
         workflow_sha=args.workflow_sha,
         command=args.command,
+        workflow_path=args.workflow_path,
+        workflow_identity=args.workflow_identity,
+        artifact_name=args.artifact_name or None,
     )
     output = os.path.abspath(args.output)
     parent = os.path.dirname(output)
@@ -104,11 +136,23 @@ def main(argv=None):
     with open(output, "w", encoding="utf-8") as stream:
         json.dump(evidence, stream, indent=2, sort_keys=True)
         stream.write("\n")
+    digest_output = os.path.abspath(args.digest_output) if args.digest_output else ""
+    if digest_output:
+        digest_parent = os.path.dirname(digest_output)
+        if digest_parent and not os.path.isdir(digest_parent):
+            os.makedirs(digest_parent)
+        digest = hashlib.sha256()
+        with open(output, "rb") as stream:
+            for chunk in iter(lambda: stream.read(65536), b""):
+                digest.update(chunk)
+        with open(digest_output, "w", encoding="utf-8") as stream:
+            stream.write("{}  {}\n".format(digest.hexdigest(), os.path.basename(output)))
     print(json.dumps({
         "status": evidence["status"],
         "revision": evidence["revision"],
         "source_tree_sha": evidence["source_tree_sha"],
         "output": output,
+        "digest_output": digest_output,
     }, sort_keys=True))
     return 0
 

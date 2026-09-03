@@ -838,13 +838,17 @@ jobs:
             --repository "$CI_REPOSITORY" \
             --workflow-run-id "$CI_WORKFLOW_RUN_ID" \
             --workflow-run-attempt "$CI_WORKFLOW_RUN_ATTEMPT" \
-            --output .artifacts/browser-fixture/browser-fixture-evidence.json
+            --workflow-path .github/workflows/ci.yml \
+            --workflow-identity browser-fixture-regression \
+            --artifact-name "browser-fixture-regression-${CANDIDATE_REVISION}" \
+            --output .artifacts/browser-fixture/browser-fixture-evidence.json \
+            --digest-output .artifacts/browser-fixture/browser-fixture-evidence.json.sha256
       - name: Upload exact-SHA CI fixture evidence
         if: ${{ always() }}
         uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
         with:
           name: browser-fixture-regression-${{ github.sha }}
-          path: .artifacts/browser-fixture/browser-fixture-evidence.json
+          path: .artifacts/browser-fixture/browser-fixture-evidence.json*
           if-no-files-found: error
 
   real-browser-e2e:
@@ -996,19 +1000,22 @@ jobs:
           REAL_BROWSER_RELEASE_VALIDATION_SESSION_ID: ${{ inputs.real_browser_release_validation_session_id }}
           REAL_BROWSER_CANDIDATE_ARTIFACT_SHA256: ${{ inputs.real_browser_candidate_artifact_sha256 }}
           REAL_BROWSER_SERVED_ROOT_SHA256: ${{ inputs.real_browser_served_root_sha256 }}
-          COVERAGE_BROWSER_USER: ${{ secrets.COVERAGE_BROWSER_USER }}
-          COVERAGE_BROWSER_ROLE: ${{ secrets.COVERAGE_BROWSER_ROLE }}
+          COVERAGE_BROWSER_AUTH_HEADER: ${{ secrets.COVERAGE_BROWSER_AUTH_HEADER }}
         run: |
           set -o pipefail
           mkdir -p .artifacts/real-browser-candidate
-          node scripts/diagnostics/real_browser_evidence.js \
+          browser_args=(
             --url "$REAL_BROWSER_URL" \
             --expected-revision "$REAL_BROWSER_EXPECTED_REVISION" \
             --release-validation-session-id "$REAL_BROWSER_RELEASE_VALIDATION_SESSION_ID" \
             --candidate-artifact-sha256 "$REAL_BROWSER_CANDIDATE_ARTIFACT_SHA256" \
-            --served-root-sha256 "$REAL_BROWSER_SERVED_ROOT_SHA256" \
-            --header "X-Remote-User=$COVERAGE_BROWSER_USER" \
-            --header "X-Remote-Role=${COVERAGE_BROWSER_ROLE:-reviewer}" \
+            --served-root-sha256 "$REAL_BROWSER_SERVED_ROOT_SHA256"
+          )
+          if [ -n "${COVERAGE_BROWSER_AUTH_HEADER:-}" ]; then
+            browser_args+=(--header "$COVERAGE_BROWSER_AUTH_HEADER")
+          fi
+          node scripts/diagnostics/real_browser_evidence.js \
+            "${browser_args[@]}" \
             --output .artifacts/real-browser-candidate/workload.json \
             --browser-evidence-output .artifacts/real-browser-candidate/browser-evidence.json \
             --evidence-output .artifacts/real-browser-candidate/performance-evidence.json

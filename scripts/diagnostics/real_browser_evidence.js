@@ -451,6 +451,18 @@ async function collect(args, startedAt) {
         + 'for synthetic local validation'
       );
     }
+    if (!localFixture) {
+      const targetPath = String(target.pathname || '');
+      if (targetPath === '/' || targetPath === '' ||
+          targetPath.toLowerCase().startsWith('/api/') ||
+          !targetPath.toLowerCase().endsWith('.html') &&
+          !targetPath.toLowerCase().endsWith('.htm')) {
+        throw new Error(
+          'production Candidate URL must identify an externally reachable static HTML report '
+          + 'served by the Candidate Gateway, not the API root'
+        );
+      }
+    }
     if (!localFixture && !hasPublicationBinding(args)) {
       throw new Error(
         'real Candidate evidence requires release-validation session, '

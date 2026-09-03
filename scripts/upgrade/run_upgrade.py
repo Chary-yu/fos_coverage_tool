@@ -25,7 +25,12 @@ import urllib.request
 import shutil
 import tempfile
 import uuid
+import ipaddress
 from typing import Dict, Any, List, Tuple, Optional
+try:
+    from urllib.parse import urlparse
+except ImportError:  # pragma: no cover - Python 2 compatibility for old tooling
+    from urlparse import urlparse
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if _REPO_ROOT not in sys.path:
@@ -538,6 +543,95 @@ def _normalize_evidence_url(value: Any) -> str:
     return str(value or "").strip().rstrip("/")
 
 
+_LOOPBACK_BROWSER_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+CI_BROWSER_FIXTURE_REPOSITORY = "Chary-yu/fos_coverage_tool"
+CI_BROWSER_FIXTURE_WORKFLOW_PATH = ".github/workflows/ci.yml"
+CI_BROWSER_FIXTURE_WORKFLOW_IDENTITY = "browser-fixture-regression"
+CI_BROWSER_FIXTURE_ARTIFACT_PREFIX = "browser-fixture-regression-"
+
+
+def _is_loopback_browser_host(hostname: str) -> bool:
+    hostname = str(hostname or "").strip().lower()
+    if hostname in _LOOPBACK_BROWSER_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(hostname.strip("[]")).is_loopback
+    except ValueError:
+        return False
+
+
+def _validate_external_candidate_browser_url(value: Any) -> List[str]:
+    """Validate the URL contract for a production Candidate browser.
+
+    The VNext API is intentionally loopback-bound on vfoswind.  A production
+    browser must therefore use the separately provisioned Candidate Gateway,
+    which serves an actual report HTML document and proxies the Candidate API.
+    This check is deliberately performed before backup or any cutover action.
+    """
+    errors = []
+    raw = str(value or "").strip()
+    if not raw:
+        return ["upgrade.candidate_browser_url is required"]
+    parsed = urlparse(raw)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        errors.append("production Candidate browser URL must be an absolute HTTP(S) URL")
+        return errors
+    hostname = str(parsed.hostname or "").strip().lower()
+    if _is_loopback_browser_host(hostname):
+        errors.append(
+            "production Candidate browser URL must not use loopback; "
+            "use an externally reachable Candidate Gateway"
+        )
+    path = str(parsed.path or "")
+    if path in ("", "/"):
+        errors.append(
+            "production Candidate browser URL must identify a static Candidate HTML document"
+        )
+    if path.lower().startswith("/api/"):
+        errors.append(
+            "production Candidate browser URL must not point at the Candidate API"
+        )
+    if not path.lower().endswith((".html", ".htm")):
+        errors.append(
+            "production Candidate browser URL must end in an HTML report path"
+        )
+    if parsed.username or parsed.password:
+        errors.append("production Candidate browser URL must not embed credentials")
+    return errors
+
+
+def _external_candidate_gateway_origin(value: Any):
+    parsed = urlparse(str(value or "").strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    hostname = str(parsed.hostname or "").strip().lower()
+    if _is_loopback_browser_host(hostname) or parsed.username or parsed.password:
+        return None
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None:
+        port = 443 if parsed.scheme.lower() == "https" else 80
+    return parsed.scheme.lower(), hostname, port
+
+
+def _validate_candidate_gateway_endpoint(
+        value: Any, candidate_url: Any, label: str) -> List[str]:
+    errors = []
+    observed = _external_candidate_gateway_origin(value)
+    expected = _external_candidate_gateway_origin(candidate_url)
+    if observed is None:
+        errors.append("{} must be an external HTTP(S) URL".format(label))
+        return errors
+    if expected is None or observed != expected:
+        errors.append("{} must use the Candidate Gateway origin".format(label))
+    parsed = urlparse(str(value or "").strip())
+    if not str(parsed.path or "").lower().startswith("/api/"):
+        errors.append("{} must point at a Candidate Gateway API path".format(label))
+    return errors
+
+
 def _validate_candidate_browser_evidence(path: str, payload: Dict[str, Any],
                                          identity: Dict[str, Any],
                                          expected_url: str,
@@ -633,9 +727,132 @@ def _validate_candidate_browser_evidence(path: str, payload: Dict[str, Any],
     return errors, normalized
 
 
+def _validate_candidate_authenticated_mutation_evidence(
+        path: str, payload: Dict[str, Any], identity: Dict[str, Any],
+        expected_url: str, expected_session_id: str = "",
+        expected_candidate_artifact_sha256: str = "",
+        expected_served_root_sha256: str = "", expected_auth_mode: str = "",
+        expected_user_header: str = "", expected_gateway_config_sha256: str = "") \
+        -> Tuple[List[str], Dict[str, Any]]:
+    """Validate real external Candidate auth-to-mutation evidence.
+
+    A reverse-proxy mode string is not proof that the production identity
+    chain works.  This envelope must come from an external HTTP client which
+    first proved that an unauthenticated mutation is rejected and then proved
+    that the same isolated Candidate mutation succeeds with the operator's
+    real credentials.  Credential/header values are intentionally not
+    accepted as evidence fields.
+    """
+    errors = []
+    if not isinstance(payload, dict):
+        return ["Candidate authenticated mutation evidence is not a JSON object"], {}
+    if payload.get("status") != "PASSED":
+        errors.append("Candidate authenticated mutation evidence status is not PASSED")
+    if payload.get("evidence_class") != "real_candidate_authenticated_mutation":
+        errors.append("Candidate authenticated mutation evidence class is invalid")
+    if payload.get("release_eligible") is not True:
+        errors.append("Candidate authenticated mutation evidence is not release eligible")
+    if payload.get("synthetic") is not False:
+        errors.append("synthetic Candidate authenticated mutation evidence is forbidden")
+    if payload.get("real_http") is not True:
+        errors.append("Candidate authenticated mutation evidence is not real HTTP")
+    revision = identity.get("commit_sha")
+    if payload.get("candidate_revision") != revision:
+        errors.append("Candidate authenticated mutation revision does not match target release")
+    if expected_session_id and payload.get("release_validation_session_id") != expected_session_id:
+        errors.append("Candidate authenticated mutation attempt identity does not match")
+    if expected_candidate_artifact_sha256 and payload.get(
+            "candidate_artifact_sha256") != expected_candidate_artifact_sha256:
+        errors.append("Candidate authenticated mutation artifact hash does not match publication")
+    if expected_served_root_sha256 and payload.get(
+            "served_root_sha256") != expected_served_root_sha256:
+        errors.append("Candidate authenticated mutation Served Root hash does not match publication")
+    candidate_url = payload.get("candidate_url") or payload.get("page_url")
+    if not candidate_url:
+        errors.append("Candidate authenticated mutation URL is missing")
+    elif _normalize_evidence_url(candidate_url) != _normalize_evidence_url(expected_url):
+        errors.append("Candidate authenticated mutation URL does not match Candidate Gateway")
+    url_errors = _validate_external_candidate_browser_url(candidate_url)
+    errors.extend(url_errors)
+
+    auth_mode = str(payload.get("auth_mode") or "").strip().lower()
+    if expected_auth_mode and auth_mode != str(expected_auth_mode).strip().lower():
+        errors.append("Candidate authenticated mutation auth mode does not match production")
+    if auth_mode == "disabled":
+        errors.append("disabled authentication cannot certify an authenticated mutation")
+    observed_header = str(payload.get("user_header") or "").strip()
+    if expected_user_header and observed_header != expected_user_header:
+        errors.append("Candidate authenticated mutation user header does not match production")
+    if not observed_header:
+        errors.append("Candidate authenticated mutation user header is missing")
+    if not str(payload.get("identity_source") or "").strip():
+        errors.append("Candidate authenticated mutation identity source is missing")
+    if payload.get("identity_propagated") is not True:
+        errors.append("Candidate authenticated mutation did not prove identity propagation")
+
+    mutation = payload.get("mutation_probe") or {}
+    if not isinstance(mutation, dict):
+        mutation = {}
+        errors.append("Candidate authenticated mutation probe is missing")
+    if mutation.get("status") != "PASSED":
+        errors.append("Candidate authenticated mutation probe is not PASSED")
+    status_code = mutation.get("authenticated_status_code")
+    if type(status_code) is not int or status_code < 200 or status_code >= 300:
+        errors.append("Candidate authenticated mutation did not return a successful HTTP status")
+    negative_status = mutation.get("unauthenticated_status_code")
+    if type(negative_status) is not int or negative_status not in (401, 403):
+        errors.append("Candidate unauthenticated mutation control did not return HTTP 401/403")
+    if mutation.get("credentials_recorded") is True:
+        errors.append("Candidate authenticated mutation evidence must not record credentials")
+
+    if expected_gateway_config_sha256 and payload.get(
+            "gateway_config_sha256") != expected_gateway_config_sha256:
+        errors.append("Candidate authenticated mutation Gateway config hash does not match preflight")
+    release_url = payload.get("release_url")
+    mutation_url = payload.get("mutation_url")
+    errors.extend(_validate_candidate_gateway_endpoint(
+        release_url, candidate_url, "Candidate authenticated mutation release_url"
+    ))
+    errors.extend(_validate_candidate_gateway_endpoint(
+        mutation_url, candidate_url, "Candidate authenticated mutation mutation_url"
+    ))
+
+    if not path or not os.path.isfile(path):
+        errors.append("Candidate authenticated mutation evidence artifact is missing")
+    normalized = {
+        "status": "PASSED" if not errors else "FAILED",
+        "evidence_class": "candidate_authenticated_mutation",
+        "source_evidence_class": payload.get("evidence_class", ""),
+        "release_validation_session_id": payload.get(
+            "release_validation_session_id", ""),
+        "candidate_artifact_sha256": payload.get(
+            "candidate_artifact_sha256", ""),
+        "served_root_sha256": payload.get("served_root_sha256", ""),
+        "expected_commit_sha": revision,
+        "candidate_url": candidate_url or "",
+        "release_url": release_url or "",
+        "mutation_url": mutation_url or "",
+        "auth_mode": auth_mode,
+        "user_header": observed_header,
+        "identity_source": payload.get("identity_source", ""),
+        "identity_propagated": payload.get("identity_propagated"),
+        "mutation_probe": mutation,
+        "gateway_config_sha256": payload.get("gateway_config_sha256", ""),
+        "real_http": payload.get("real_http") is True,
+        "synthetic": payload.get("synthetic"),
+        "release_eligible": payload.get("release_eligible"),
+        "violations": errors,
+    }
+    if path and os.path.isfile(path):
+        normalized["evidence_artifact_sha256"] = _sha256_file(path)
+    return errors, normalized
+
+
 def _validate_ci_browser_fixture_evidence(
         path: str, payload: Dict[str, Any], identity: Dict[str, Any],
-        expected_source_tree_sha: str = "") -> List[str]:
+        expected_source_tree_sha: str = "", expected_repository: str = "",
+        expected_workflow_path: str = "", expected_workflow_identity: str = "",
+        expected_artifact_name: str = "", expected_digest_path: str = "") -> List[str]:
     """Validate exact-SHA CI fixture evidence consumed by production.
 
     Production hosts intentionally do not need Node/npm.  The fixture lane is
@@ -644,6 +861,19 @@ def _validate_ci_browser_fixture_evidence(
     remains the production browser authority.
     """
     errors = []
+    expected_repository = str(
+        expected_repository or CI_BROWSER_FIXTURE_REPOSITORY
+    ).strip()
+    expected_workflow_path = str(
+        expected_workflow_path or CI_BROWSER_FIXTURE_WORKFLOW_PATH
+    ).strip()
+    expected_workflow_identity = str(
+        expected_workflow_identity or CI_BROWSER_FIXTURE_WORKFLOW_IDENTITY
+    ).strip()
+    expected_artifact_name = str(
+        expected_artifact_name or
+        CI_BROWSER_FIXTURE_ARTIFACT_PREFIX + "{commit_sha}"
+    ).strip()
     if not isinstance(payload, dict):
         return ["CI browser fixture evidence is not a JSON object"]
     revision = identity.get("commit_sha")
@@ -672,14 +902,48 @@ def _validate_ci_browser_fixture_evidence(
     if payload.get("evidence_origin") != "github_actions" or \
             payload.get("ci_provider") != "github_actions":
         errors.append("CI browser fixture evidence must identify GitHub Actions")
-    if not str(payload.get("repository") or "").strip():
+    repository = str(payload.get("repository") or "").strip()
+    if not repository:
         errors.append("CI browser fixture repository identity is missing")
+    if expected_repository and repository != str(expected_repository).strip():
+        errors.append("CI browser fixture repository identity does not match policy")
+    workflow_path = str(payload.get("workflow_path") or "").strip()
+    if not workflow_path:
+        errors.append("CI browser fixture workflow path is missing")
+    if expected_workflow_path and workflow_path != str(expected_workflow_path).strip():
+        errors.append("CI browser fixture workflow path does not match policy")
+    workflow_identity = str(payload.get("workflow_identity") or "").strip()
+    if not workflow_identity:
+        errors.append("CI browser fixture workflow identity is missing")
+    if expected_workflow_identity and workflow_identity != str(
+            expected_workflow_identity).strip():
+        errors.append("CI browser fixture workflow identity does not match policy")
+    artifact_name = str(payload.get("artifact_name") or "").strip()
+    if not artifact_name:
+        errors.append("CI browser fixture artifact identity is missing")
+    expected_name = str(expected_artifact_name or "").replace(
+        "{commit_sha}", str(revision or "")
+    ).strip()
+    if expected_name and artifact_name != expected_name:
+        errors.append("CI browser fixture artifact identity does not match policy")
     for field in ("workflow_run_id", "workflow_run_attempt"):
         value = str(payload.get(field) or "").strip()
         if not re.fullmatch(r"[1-9][0-9]*", value):
             errors.append("CI browser fixture {} is invalid".format(field))
     if not path or not os.path.isfile(path):
         errors.append("CI browser fixture evidence artifact is missing")
+    if expected_digest_path:
+        if not os.path.isfile(expected_digest_path):
+            errors.append("CI browser fixture detached digest artifact is missing")
+        elif path and os.path.isfile(path):
+            try:
+                with open(expected_digest_path, "r", encoding="utf-8") as stream:
+                    observed_digest = stream.read().strip().split()[0]
+            except (OSError, IndexError):
+                observed_digest = ""
+            actual_digest = _sha256_file(path)
+            if observed_digest != actual_digest:
+                errors.append("CI browser fixture detached digest does not match artifact")
     return errors
 
 
@@ -723,7 +987,9 @@ class UpgradeOrchestrator:
         self.release_validation_session_id = ""
         self.previous_published_session_id = ""
         self.ci_browser_fixture_evidence_path = ""
+        self.ci_browser_fixture_evidence_digest_path = ""
         self.candidate_browser_evidence_path = ""
+        self.candidate_auth_probe_evidence_path = ""
         self.rollback_evidence_path = ""
         self.performance_evidence_path = ""
         self.candidate_preflight = {}
@@ -942,15 +1208,75 @@ class UpgradeOrchestrator:
         self._previous_release_identity = dict(previous_release)
 
         if self._upgrade_mode == "production":
+            browser_url_errors = _validate_external_candidate_browser_url(
+                upgrade_config.get("candidate_browser_url")
+            )
+            if browser_url_errors:
+                raise RuntimeError("; ".join(browser_url_errors))
+            configured_fixture_path = str(
+                upgrade_config.get("ci_browser_fixture_evidence_path") or
+                os.environ.get("COVERAGE_CI_BROWSER_FIXTURE_EVIDENCE", "")
+            ).strip()
+            configured_fixture_digest = str(
+                upgrade_config.get("ci_browser_fixture_evidence_digest_path") or ""
+            ).strip()
+            if not configured_fixture_path:
+                raise RuntimeError(
+                    "production requires ci_browser_fixture_evidence_path"
+                )
+            if not configured_fixture_digest:
+                raise RuntimeError(
+                    "production requires ci_browser_fixture_evidence_digest_path"
+                )
+            configured_repository = str(
+                upgrade_config.get("ci_browser_fixture_repository") or
+                CI_BROWSER_FIXTURE_REPOSITORY
+            ).strip()
+            if configured_repository != CI_BROWSER_FIXTURE_REPOSITORY:
+                raise RuntimeError(
+                    "ci_browser_fixture_repository is not the approved repository"
+                )
+            configured_workflow_path = str(
+                upgrade_config.get("ci_browser_fixture_workflow_path") or
+                CI_BROWSER_FIXTURE_WORKFLOW_PATH
+            ).strip()
+            if configured_workflow_path != CI_BROWSER_FIXTURE_WORKFLOW_PATH:
+                raise RuntimeError(
+                    "ci_browser_fixture_workflow_path is not the approved workflow"
+                )
+            configured_workflow_identity = str(
+                upgrade_config.get("ci_browser_fixture_workflow_identity") or
+                CI_BROWSER_FIXTURE_WORKFLOW_IDENTITY
+            ).strip()
+            if configured_workflow_identity != CI_BROWSER_FIXTURE_WORKFLOW_IDENTITY:
+                raise RuntimeError(
+                    "ci_browser_fixture_workflow_identity is not the approved job"
+                )
+            configured_artifact_name = str(
+                upgrade_config.get("ci_browser_fixture_artifact_name") or
+                CI_BROWSER_FIXTURE_ARTIFACT_PREFIX + "{commit_sha}"
+            ).strip()
+            if configured_artifact_name != \
+                    CI_BROWSER_FIXTURE_ARTIFACT_PREFIX + "{commit_sha}":
+                raise RuntimeError(
+                    "ci_browser_fixture_artifact_name is not the approved artifact"
+                )
             self.ci_browser_fixture_evidence_path = _resolve_revision_path(
                 self.repo_root,
-                upgrade_config.get("ci_browser_fixture_evidence_path") or
-                os.environ.get("COVERAGE_CI_BROWSER_FIXTURE_EVIDENCE", ""),
+                configured_fixture_path,
                 "ci_browser_fixture_evidence_path",
                 identity.get("commit_sha", ""),
             )
+            self.ci_browser_fixture_evidence_digest_path = (
+                _resolve_revision_path(
+                    self.repo_root, configured_fixture_digest,
+                    "ci_browser_fixture_evidence_digest_path",
+                    identity.get("commit_sha", ""),
+                ) if configured_fixture_digest else ""
+            )
         else:
             self.ci_browser_fixture_evidence_path = ""
+            self.ci_browser_fixture_evidence_digest_path = ""
 
         self.validation_session_manifest_path = _resolve_attempt_path(
             self.repo_root,
@@ -981,6 +1307,23 @@ class UpgradeOrchestrator:
             "candidate_browser_evidence_path",
             session_id,
         )
+        if self._upgrade_mode == "production":
+            configured_auth_probe_path = str(
+                upgrade_config.get("candidate_auth_probe_evidence_path") or
+                os.environ.get("COVERAGE_CANDIDATE_AUTH_PROBE_EVIDENCE", "")
+            ).strip()
+            if not configured_auth_probe_path:
+                raise RuntimeError(
+                    "production requires candidate_auth_probe_evidence_path"
+                )
+            self.candidate_auth_probe_evidence_path = _resolve_attempt_path(
+                self.repo_root,
+                configured_auth_probe_path,
+                "candidate_auth_probe_evidence_path",
+                session_id,
+            )
+        else:
+            self.candidate_auth_probe_evidence_path = ""
         self.rollback_evidence_path = _resolve_attempt_path(
             self.repo_root,
             upgrade_config.get("rollback_evidence_path") or os.environ.get(
@@ -1341,6 +1684,30 @@ class UpgradeOrchestrator:
                     "❌ Validation systemd binding restore failed: {}".format(exc)
                 )
 
+        # The external Candidate Gateway is an isolated validation resource,
+        # not a serving pointer.  Remove its exact-session pointer even when
+        # validation teardown itself failed; if ownership cannot be proven,
+        # keep the target database on a safety hold rather than pretending the
+        # Candidate is no longer reachable.
+        if self._production_lifecycle_adapter is not None and \
+                self._production_lifecycle_adapter.validation_gateway_bound:
+            try:
+                restored_gateway = \
+                    self._production_lifecycle_adapter.restore_validation_gateway()
+                result["production_validation_gateway_restore"] = {
+                    "status": "PASSED",
+                    "binding": restored_gateway,
+                    "exit_code": 0,
+                }
+            except Exception as exc:
+                result["status"] = "FAILED"
+                result.setdefault("violations", []).append(
+                    "Candidate Gateway pointer restore failed: {}".format(exc)
+                )
+                self.log(
+                    "❌ Candidate Gateway pointer restore failed: {}".format(exc)
+                )
+
         verification = result.get("verification") or {}
         result["pids_closed"] = verification.get("pids_closed") is True
         result["ports_closed"] = verification.get("ports_closed") is True
@@ -1469,6 +1836,7 @@ class UpgradeOrchestrator:
                         "CI browser fixture evidence is unreadable: {}".format(exc)
                     )
             if not errors:
+                upgrade = dict(upgrade_config or {})
                 errors.extend(_validate_ci_browser_fixture_evidence(
                     path,
                     payload,
@@ -1476,6 +1844,19 @@ class UpgradeOrchestrator:
                     expected_source_tree_sha=str(
                         (self.candidate_preflight or {}).get("source_tree_sha") or ""
                     ),
+                    expected_repository=str(
+                        upgrade.get("ci_browser_fixture_repository") or ""
+                    ).strip(),
+                    expected_workflow_path=str(
+                        upgrade.get("ci_browser_fixture_workflow_path") or ""
+                    ).strip(),
+                    expected_workflow_identity=str(
+                        upgrade.get("ci_browser_fixture_workflow_identity") or ""
+                    ).strip(),
+                    expected_artifact_name=str(
+                        upgrade.get("ci_browser_fixture_artifact_name") or ""
+                    ).strip(),
+                    expected_digest_path=self.ci_browser_fixture_evidence_digest_path,
                 ))
             result = dict(payload) if isinstance(payload, dict) else {}
             result.update({
@@ -1488,6 +1869,7 @@ class UpgradeOrchestrator:
                 "consume exact-SHA GitHub Actions browser fixture evidence",
                 "exit_code": 0 if not errors else 1,
                 "artifact_path": path if path and os.path.isfile(path) else "",
+                "detached_digest_path": self.ci_browser_fixture_evidence_digest_path,
                 "violations": errors,
             })
             return result
@@ -1543,6 +1925,83 @@ class UpgradeOrchestrator:
             "exit_code": 0,
         }
 
+    def _candidate_authenticated_mutation_evidence(
+            self, upgrade_config: Dict[str, Any], runtime_config: Dict[str, Any],
+            identity: Dict[str, Any]) -> Dict[str, Any]:
+        """Consume the external authenticated Candidate mutation probe.
+
+        The production host does not invent credentials and does not call a
+        local fixture.  An operator-controlled external HTTP probe must have
+        exercised the Candidate Gateway and recorded the positive mutation
+        plus the unauthenticated 401/403 control.  Only the non-secret
+        evidence envelope is imported here.
+        """
+        path = self.candidate_auth_probe_evidence_path
+        payload = {}
+        errors = []
+        if not path or not os.path.isfile(path):
+            errors.append(
+                "upgrade.candidate_auth_probe_evidence_path must point to "
+                "real authenticated Candidate mutation evidence"
+            )
+        else:
+            try:
+                with open(path, "r", encoding="utf-8") as stream:
+                    payload = json.load(stream)
+            except (OSError, ValueError, TypeError) as exc:
+                errors.append(
+                    "Candidate authenticated mutation evidence is unreadable: {}".format(
+                        exc
+                    )
+                )
+        expected_auth = dict((runtime_config or {}).get("auth") or {})
+        expected_mode = str(expected_auth.get("mode") or "").strip().lower()
+        expected_header = str(
+            expected_auth.get("user_header") or "X-Remote-User"
+        ).strip()
+        gateway = self.manifest.data.get("candidate_gateway_preflight") or {}
+        if not errors:
+            errors, normalized = _validate_candidate_authenticated_mutation_evidence(
+                path, payload, identity,
+                str(upgrade_config.get("candidate_browser_url") or ""),
+                expected_session_id=self.release_validation_session_id,
+                expected_candidate_artifact_sha256=self._candidate_artifact_sha256,
+                expected_served_root_sha256=self._served_root_sha256,
+                expected_auth_mode=expected_mode,
+                expected_user_header=expected_header,
+                expected_gateway_config_sha256=str(
+                    gateway.get("config_sha256") or ""
+                ),
+            )
+        else:
+            normalized = {
+                "status": "FAILED",
+                "evidence_class": "candidate_authenticated_mutation",
+                "candidate_url": str(
+                    upgrade_config.get("candidate_browser_url") or ""
+                ),
+                "expected_commit_sha": identity.get("commit_sha"),
+                "release_validation_session_id": self.release_validation_session_id,
+                "candidate_artifact_sha256": self._candidate_artifact_sha256,
+                "served_root_sha256": self._served_root_sha256,
+                "auth_mode": expected_mode,
+                "user_header": expected_header,
+                "real_http": False,
+                "synthetic": False,
+                "release_eligible": False,
+                "identity_propagated": False,
+                "mutation_probe": {},
+                "gateway_config_sha256": gateway.get("config_sha256", ""),
+                "violations": errors,
+            }
+        normalized.update({
+            "revision": identity.get("commit_sha"),
+            "artifact_path": path if path and os.path.isfile(path) else "",
+            "command": "validate external Candidate authenticated mutation probe",
+            "exit_code": 0 if not errors else 1,
+        })
+        return normalized
+
     def _cleanup_target_database(self):
         """Remove only the disposable target after a failed attempt."""
         if self._target_cleanup_done or not self._target_preparation:
@@ -1590,6 +2049,11 @@ class UpgradeOrchestrator:
         adapter = self._production_lifecycle_adapter
         if adapter is not None and getattr(adapter, "runtime_bound", False):
             reasons.append("adapter_runtime_bound")
+        if adapter is not None and getattr(adapter, "validation_gateway_bound", False):
+            reasons.append("candidate_gateway_bound")
+        if self._validation_teardown_result is not None and \
+                self._validation_teardown_result.get("status") != "PASSED":
+            reasons.append("validation_teardown_failed")
         return not reasons, sorted(set(reasons))
 
     def _record_retained_target(self, reasons):
@@ -2057,6 +2521,11 @@ class UpgradeOrchestrator:
                     candidate_ports=upgrade_config.get("validation_ports") or [],
                     validation_commands=upgrade_config.get("commands") or {},
                     runtime_mysql=source_runtime_config,
+                    candidate_gateway_required=True,
+                    candidate_browser_url=str(
+                        upgrade_config.get("candidate_browser_url") or ""
+                    ),
+                    auth_config=(runtime_config or {}).get("auth") or {},
                 )
                 integration_evidence.update({
                     "revision": identity.get("commit_sha"),
@@ -2064,6 +2533,20 @@ class UpgradeOrchestrator:
                 })
                 self.manifest.record(
                     "production_integration_preflight", integration_evidence
+                )
+                candidate_gateway_evidence = dict(
+                    integration_evidence.get("candidate_gateway") or {}
+                )
+                if not candidate_gateway_evidence:
+                    raise RuntimeError(
+                        "production Candidate Gateway preflight evidence is missing"
+                    )
+                candidate_gateway_evidence.update({
+                    "revision": identity.get("commit_sha"),
+                    "evidence_class": "production_integration",
+                })
+                self.manifest.record(
+                    "candidate_gateway_preflight", candidate_gateway_evidence
                 )
                 bootstrap_evidence = dict(
                     integration_evidence.get("bootstrap") or {}
@@ -2546,6 +3029,14 @@ class UpgradeOrchestrator:
                 "exit_code": 0,
             })
             if self._production_lifecycle_adapter is not None:
+                gateway_binding = self._production_lifecycle_adapter.bind_validation_gateway(
+                    self.publisher.release_path(session_id),
+                    session_id,
+                    candidate_ports=self.validation_session.data.get("ports") or [],
+                    browser_url=str(
+                        upgrade_config.get("candidate_browser_url") or ""
+                    ),
+                )
                 validation_binding = \
                     self._production_lifecycle_adapter.bind_validation_candidate(
                         os.path.join(self.publisher.release_path(session_id), "app"),
@@ -2558,6 +3049,7 @@ class UpgradeOrchestrator:
                     "revision": identity.get("commit_sha"),
                     "evidence_class": "production_integration",
                     "binding": validation_binding,
+                    "candidate_gateway": gateway_binding,
                     "daemon_reload": validation_daemon_reload,
                     "credentials_written_to_evidence": False,
                     "exit_code": 0,
@@ -2749,6 +3241,27 @@ class UpgradeOrchestrator:
             ))
             return self._fail(lifecycle, "Real Candidate browser evidence rejected")
         self.log("✔ Real Candidate browser evidence passed.")
+
+        if mode == "production":
+            # A successful GET/browser workload does not prove that the
+            # reverse-proxy identity reaches MutationAuthorizer.  Require a
+            # separate external authenticated mutation probe while the
+            # Candidate is still isolated and before PRE_CUTOVER_READY.
+            self.log("[Step 6c/10] Validating external authenticated mutation evidence...")
+            auth_probe = self._candidate_authenticated_mutation_evidence(
+                upgrade_config, runtime_config, identity
+            )
+            self.manifest.record("candidate_authenticated_mutation", auth_probe)
+            if auth_probe.get("status") != "PASSED":
+                self.log(
+                    "❌ Candidate authenticated mutation evidence rejected: {}".format(
+                        "; ".join(auth_probe.get("violations") or [])
+                    )
+                )
+                return self._fail(
+                    lifecycle, "Candidate authenticated mutation evidence rejected"
+                )
+            self.log("✔ Candidate auth identity bridge and mutation probe passed.")
 
         # Step 7: Consume immutable release A/B evidence.  The synthetic DOM
         # benchmark remains a useful diagnostic, but it is not allowed to

@@ -35,6 +35,23 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
             integration["bootstrap"]["nginx_probe_mode"],
             "temporary_main_include",
         )
+        self.assertEqual(
+            integration["legacy_application_root"],
+            "/home/zcyu/coverage/onesensor_code-coverage_tool",
+        )
+        self.assertTrue(
+            config["upgrade"]["candidate_browser_url"].startswith("https://")
+        )
+        self.assertNotIn(
+            "127.0.0.1", config["upgrade"]["candidate_browser_url"]
+        )
+        self.assertIn(
+            "candidate_gateway", integration
+        )
+        self.assertEqual(
+            integration["candidate_gateway"]["reports_root"],
+            "/home/zcyu/coverage_published/VALIDATION_CURRENT/reports",
+        )
         self.assertIn(
             "{commit_sha}",
             config["upgrade"]["ci_browser_fixture_evidence_path"],
@@ -133,12 +150,22 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
                 )
             )
         with open(validation_config, "w", encoding="utf-8") as stream:
-            json.dump({"server": {"port": 19528}}, stream)
+            json.dump({
+                "server": {"port": 19528},
+                "auth": {
+                    "mode": "reverse_proxy",
+                    "user_header": "X-Remote-User",
+                    "trusted_proxy_addresses": ["127.0.0.1"],
+                },
+            }, stream)
         with open(nginx, "w", encoding="utf-8") as stream:
             stream.write(
                 "location /coverage/ {{\n"
                 "  alias {}/;\n"
                 "  proxy_pass http://127.0.0.1:9528;\n"
+                "  auth_basic Coverage;\n"
+                "  auth_basic_user_file /etc/nginx/.coverage_htpasswd;\n"
+                "  proxy_set_header X-Remote-User $remote_user;\n"
                 "}}\n".format(current_reports)
             )
         if flat:
@@ -162,8 +189,15 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
             "validation_runtime_environment_file": validation_environment,
             "validation_config_path": validation_config,
             "validation_application_root": validation_application,
-            "nginx_config_path": nginx,
-            "nginx_proxy_pass": "http://127.0.0.1:9528",
+           "nginx_config_path": nginx,
+           "nginx_proxy_pass": "http://127.0.0.1:9528",
+            "api_location": "/coverage/",
+            "auth_bridge": {
+                "mode": "basic_auth",
+                "user_header": "X-Remote-User",
+                "identity_expression": "$remote_user",
+                "auth_source": "/etc/nginx/.coverage_htpasswd",
+            },
             "legacy_application_root": current_app,
             "legacy_served_root": current_reports,
             "bootstrap": {
@@ -294,6 +328,112 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
             stream.write("location /coverage/ { alias /tmp/stale/reports/; }\n")
         with self.assertRaisesRegex(RuntimeError, "Nginx alias"):
             VfoswindProductionLifecycle(publish, config).preflight()
+
+    def test_missing_identity_bridge_fails_closed_before_flat_bootstrap(self):
+        _root, publish, config, _environment = self._fixture(flat=True)
+        with open(config["nginx_config_path"], "w", encoding="utf-8") as stream:
+            stream.write(
+                "location /coverage/ {{\n"
+                "  alias {}/;\n"
+                "  proxy_pass http://127.0.0.1:9528;\n"
+                "}}\n".format(config["legacy_served_root"])
+            )
+        with self.assertRaisesRegex(RuntimeError, "auth_(basic|request)"):
+            VfoswindProductionLifecycle(publish, config).preflight(
+                expected_database="coverage_vnext_old",
+                runtime_mysql={
+                    "database": "coverage_vnext_old",
+                    "user": "coverage_user",
+                },
+                candidate_ports=[19528],
+            )
+
+    def test_identity_bridge_in_static_location_does_not_protect_api_location(self):
+        _root, publish, config, _environment = self._fixture()
+        nginx = (
+            "location /coverage/ {{\n"
+            "  alias {}/;\n"
+            "  auth_basic Coverage;\n"
+            "  auth_basic_user_file /etc/nginx/.coverage_htpasswd;\n"
+            "  proxy_set_header X-Remote-User $remote_user;\n"
+            "}}\n"
+            "location /api/coverage {{\n"
+            "  proxy_pass http://127.0.0.1:9528;\n"
+            "}}\n"
+        ).format(config["legacy_served_root"])
+        with self.assertRaisesRegex(RuntimeError, "auth_basic"):
+            VfoswindProductionLifecycle(publish, config)._validate_auth_bridge(
+                nginx, "production", "/api/coverage"
+            )
+
+    def test_candidate_gateway_is_external_static_api_and_pointer_is_restorable(self):
+        root, publish, config, _environment = self._fixture()
+        gateway_path = os.path.join(root.name, "candidate-gateway.conf")
+        gateway_reports = os.path.join(publish, "VALIDATION_CURRENT", "reports")
+        browser_url = "https://candidate.example.invalid/coverage/report.html"
+        with open(gateway_path, "w", encoding="utf-8") as stream:
+            stream.write(
+                "server {{\n"
+                "  listen 127.0.0.1:19531;\n"
+                "  location /coverage/ {{\n"
+                "    alias {}/;\n"
+                "    try_files $uri $uri/ =404;\n"
+                "  }}\n"
+                "  location /api/coverage {{\n"
+                "    auth_basic Coverage;\n"
+                "    auth_basic_user_file /etc/nginx/.coverage_htpasswd;\n"
+                "    proxy_pass http://127.0.0.1:19528;\n"
+                "    proxy_set_header X-Remote-User $remote_user;\n"
+                "  }}\n"
+                "}}\n".format(gateway_reports)
+            )
+        config["candidate_gateway"] = {
+            "config_path": gateway_path,
+            "browser_url": browser_url,
+            "static_location": "/coverage/",
+            "api_location": "/api/coverage",
+            "reports_root": gateway_reports,
+            "proxy_pass": "http://127.0.0.1:19528",
+        }
+        calls = []
+
+        def runner(argv):
+            calls.append(list(argv))
+            return CompletedProcess(argv, 0, b"", b"")
+
+        adapter = VfoswindProductionLifecycle(
+            publish, config, command_runner=runner
+        )
+        preflight = adapter.preflight(
+            candidate_ports=[19528],
+            candidate_gateway_required=True,
+            candidate_browser_url=browser_url,
+            auth_config={
+                "mode": "reverse_proxy",
+                "user_header": "X-Remote-User",
+                "trusted_proxy_addresses": ["127.0.0.1"],
+            },
+        )
+        self.assertEqual(preflight["candidate_gateway"]["status"], "PASSED")
+        self.assertEqual(
+            preflight["candidate_gateway"]["auth_bridge"]["identity_expression"],
+            "$remote_user",
+        )
+        release = os.path.join(publish, "releases", "candidate-session")
+        os.makedirs(os.path.join(release, "reports"))
+        binding = adapter.bind_validation_gateway(
+            release, "candidate-session", candidate_ports=[19528],
+            browser_url=browser_url,
+        )
+        self.assertEqual(binding["status"], "PASSED")
+        self.assertTrue(os.path.islink(adapter.validation_current))
+        self.assertEqual(
+            os.path.realpath(adapter.validation_current),
+            os.path.realpath(release),
+        )
+        restored = adapter.restore_validation_gateway()
+        self.assertEqual(restored["status"], "PASSED")
+        self.assertFalse(os.path.lexists(adapter.validation_current))
 
     def test_flat_preflight_and_binding_transition_are_explicit_and_restorable(self):
         _root, publish, config, _environment = self._fixture(flat=True)

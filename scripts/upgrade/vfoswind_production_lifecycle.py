@@ -7,6 +7,10 @@ the immutable ``CURRENT`` switch:
 
 * systemd must execute ``publish_root/CURRENT/app``;
 * Nginx must serve ``publish_root/CURRENT/reports``;
+* the separately loaded Candidate Gateway must serve
+  ``publish_root/VALIDATION_CURRENT/reports`` and proxy the isolated API;
+* the production and Candidate Nginx configs must contain an explicit
+  authentication boundary and trusted ``X-Remote-User`` bridge;
 * the persistent EnvironmentFile must bind the serving process to the
   selected database;
 * daemon-reload, service restart, ``nginx -t``, and Nginx reload are explicit
@@ -19,6 +23,7 @@ cutover path after Candidate validation has reached PRE_CUTOVER_READY.
 from __future__ import print_function
 
 import json
+import ipaddress
 import os
 import re
 import shlex
@@ -32,6 +37,7 @@ from app.release_publication import (
 
 
 ADAPTER_NAME = "vfoswind"
+_AUTH_BRIDGE_MODES = ("basic_auth", "auth_request", "external_sso")
 _RUNTIME_KEYS = (
     "host", "port", "user", "password", "database", "charset",
     "connect_timeout",
@@ -118,6 +124,16 @@ class VfoswindProductionLifecycle(object):
         self.current_reports = _literal(os.path.join(
             self.publish_root, "CURRENT", "reports"
         ))
+        # Candidate browser traffic is isolated from the production CURRENT
+        # pointer.  The gateway is pre-provisioned, while this pointer is
+        # atomically rebound to the exact prepared release for one validation
+        # attempt and removed/restored during validation teardown.
+        self.validation_current = _literal(os.path.join(
+            self.publish_root, "VALIDATION_CURRENT"
+        ))
+        self.validation_current_reports = _literal(os.path.join(
+            self.validation_current, "reports"
+        ))
         self.environment_file = _literal(
             self.config.get("runtime_environment_file") or
             self.config.get("environment_file") or ""
@@ -162,6 +178,9 @@ class VfoswindProductionLifecycle(object):
         self._bootstrap_previous_environment = None
         self._bootstrap_previous_environment_mode = None
         self._bootstrap_runtime_environment_touched = False
+        self.validation_gateway_bound = False
+        self._validation_gateway_previous_link = None
+        self._validation_gateway_target = ""
 
     @staticmethod
     def _default_command_runner(argv):
@@ -302,6 +321,331 @@ class VfoswindProductionLifecycle(object):
     def _contains_alias(text, alias_root):
         alias = "alias {}/;".format(alias_root.rstrip(os.sep))
         return text.count(alias) == 1
+
+    @staticmethod
+    def _external_url_is_valid(value):
+        """Return whether a gateway URL is an external static HTTP(S) URL."""
+        try:
+            from urllib.parse import urlparse
+        except ImportError:  # pragma: no cover - Python 2 compatibility
+            from urlparse import urlparse
+        parsed = urlparse(str(value or "").strip())
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            return False
+        hostname = str(parsed.hostname or "").strip().lower()
+        if hostname in ("127.0.0.1", "localhost", "::1", "[::1]"):
+            return False
+        try:
+            if ipaddress.ip_address(hostname.strip("[]")).is_loopback:
+                return False
+        except ValueError:
+            pass
+        path = str(parsed.path or "")
+        return path not in ("", "/") and path.lower().endswith((".html", ".htm"))
+
+    def _auth_bridge_config(self):
+        gateway = self.config.get("candidate_gateway") or {}
+        configured = self.config.get("auth_bridge")
+        if configured is None and isinstance(gateway, dict):
+            configured = gateway.get("auth_bridge")
+        bridge = dict(configured or {})
+        mode = str(bridge.get("mode") or "").strip().lower()
+        if mode not in _AUTH_BRIDGE_MODES:
+            raise RuntimeError(
+                "production auth_bridge.mode must explicitly select basic_auth, "
+                "auth_request, or external_sso"
+            )
+        user_header = str(
+            bridge.get("user_header") or "X-Remote-User"
+        ).strip()
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", user_header):
+            raise RuntimeError("production auth_bridge.user_header is invalid")
+        expression = str(bridge.get("identity_expression") or "").strip()
+        if not expression or not expression.startswith("$"):
+            raise RuntimeError(
+                "production auth_bridge.identity_expression must be a trusted Nginx variable"
+            )
+        # A literal identity or the raw client X- header is not an identity
+        # bridge.  The authenticated Nginx boundary must derive the value.
+        client_expression = "$http_{}".format(
+            user_header.lower().replace("-", "_")
+        )
+        if "admin" in expression.lower() or expression.lower().startswith(
+                client_expression):
+            raise RuntimeError(
+                "production auth_bridge.identity_expression may not use a literal "
+                "or client-supplied X-Remote-User header"
+            )
+        if mode == "basic_auth" and expression != "$remote_user":
+            raise RuntimeError(
+                "basic_auth auth_bridge must forward Nginx $remote_user"
+            )
+        if mode in ("auth_request", "external_sso") and expression == \
+                "$remote_user":
+            raise RuntimeError(
+                "auth_request auth_bridge must forward the authenticated upstream identity"
+            )
+        directive = str(bridge.get("auth_directive") or "").strip().lower()
+        expected_directive = "auth_basic" if mode == "basic_auth" else "auth_request"
+        if directive and directive != expected_directive:
+            raise RuntimeError(
+                "production auth_bridge.auth_directive does not match mode"
+            )
+        source = str(bridge.get("auth_source") or "").strip()
+        if mode in ("auth_request", "external_sso") and not source:
+            raise RuntimeError(
+                "production auth_bridge.auth_source is required for auth_request/external_sso"
+            )
+        if mode == "basic_auth" and source and not source.startswith("/"):
+            raise RuntimeError(
+                "production basic_auth auth_source must be an absolute htpasswd path"
+            )
+        return {
+            "mode": mode,
+            "user_header": user_header,
+            "identity_expression": expression,
+            "auth_directive": expected_directive,
+            "auth_source": source,
+        }
+
+    @staticmethod
+    def _location_block(text, location):
+        """Return one exact Nginx location block, including nested braces."""
+        location = str(location or "").strip()
+        if not location:
+            return str(text or "")
+        content = str(text or "")
+        match = re.search(
+            r"(?m)^[ \t]*location[ \t]+(?:=[ \t]*)?{}[ \t]*\{{".format(
+                re.escape(location)
+            ),
+            content,
+        )
+        if not match:
+            raise RuntimeError(
+                "Nginx config lacks the configured API location {}".format(location)
+            )
+        opening = content.find("{", match.start(), match.end())
+        depth = 0
+        quoted = None
+        escaped = False
+        for index in range(opening, len(content)):
+            character = content[index]
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quoted:
+                    quoted = None
+                continue
+            if character in ("'", '"'):
+                quoted = character
+            elif character == "{":
+                depth += 1
+            elif character == "}":
+                depth -= 1
+                if depth == 0:
+                    return content[match.start():index + 1]
+        raise RuntimeError(
+            "Nginx API location {} has unbalanced braces".format(location)
+        )
+
+    def _api_location(self):
+        return str(self.config.get("api_location") or "/api/coverage").strip()
+
+    def _validate_auth_bridge(self, text, label, location=""):
+        """Validate the actual Nginx identity boundary, not config metadata."""
+        bridge = self._auth_bridge_config()
+        content = self._location_block(text, location)
+        directive = bridge["auth_directive"]
+        if directive == "auth_basic":
+            if not re.search(r"(?m)^[ \t]*auth_basic[ \t]+(?!off(?:[ \t;]|$))[^;]+;", content):
+                raise RuntimeError(
+                    "{} Nginx config lacks an active auth_basic boundary".format(label)
+                )
+            source = bridge.get("auth_source")
+            if source and not re.search(
+                    r"(?m)^[ \t]*auth_basic_user_file[ \t]+{}[ \t]*;".format(
+                        re.escape(source)
+                    ), content):
+                raise RuntimeError(
+                    "{} Nginx auth_basic_user_file does not match auth bridge".format(label)
+                )
+        else:
+            source = bridge.get("auth_source")
+            if not re.search(
+                    r"(?m)^[ \t]*auth_request[ \t]+{}[ \t]*;".format(
+                        re.escape(source)
+                    ), content):
+                raise RuntimeError(
+                    "{} Nginx config lacks the configured auth_request boundary".format(label)
+                )
+        header = re.escape(bridge["user_header"])
+        expression = re.escape(bridge["identity_expression"])
+        if not re.search(
+                r"(?m)^[ \t]*proxy_set_header[ \t]+{}[ \t]+{}[ \t]*;".format(
+                    header, expression
+                ), content):
+            raise RuntimeError(
+                "{} Nginx config does not forward the trusted authenticated identity".format(
+                    label
+                )
+            )
+        if re.search(
+                r"(?mi)^[ \t]*proxy_set_header[ \t]+{}[ \t]+\$http_".format(header),
+                content,
+        ):
+            raise RuntimeError(
+                "{} Nginx config forwards a client-supplied identity header".format(label)
+            )
+        return {
+            "status": "PASSED",
+            "mode": bridge["mode"],
+            "user_header": bridge["user_header"],
+            "identity_expression": bridge["identity_expression"],
+            "auth_directive": directive,
+            "auth_source": bridge.get("auth_source", ""),
+            "identity_bridge": "proxy_set_header {} {};".format(
+                bridge["user_header"], bridge["identity_expression"]
+            ),
+        }
+
+    def _validate_runtime_auth_config(self, auth_config):
+        """Join the backend auth settings to the Nginx bridge contract."""
+        if not auth_config:
+            return {}
+        auth = dict(auth_config or {})
+        mode = str(auth.get("mode") or "").strip().lower()
+        if mode != "reverse_proxy":
+            raise RuntimeError(
+                "production Candidate runtime auth.mode must be reverse_proxy"
+            )
+        bridge = self._auth_bridge_config()
+        user_header = str(
+            auth.get("user_header") or "X-Remote-User"
+        ).strip()
+        if user_header != bridge["user_header"]:
+            raise RuntimeError(
+                "Candidate runtime auth.user_header does not match Nginx auth bridge"
+            )
+        trusted = [str(item).strip() for item in
+                   (auth.get("trusted_proxy_addresses") or []) if str(item).strip()]
+        if not trusted:
+            raise RuntimeError(
+                "Candidate runtime auth.trusted_proxy_addresses is required"
+            )
+        return {
+            "status": "PASSED",
+            "mode": mode,
+            "user_header": user_header,
+            "trusted_proxy_addresses": trusted,
+        }
+
+    def _candidate_gateway_path(self):
+        gateway = self.config.get("candidate_gateway") or {}
+        configured = gateway.get("config_path") or gateway.get("nginx_config_path")
+        return _literal(configured) if configured else ""
+
+    def _candidate_gateway_preflight(
+            self, candidate_application_root="", candidate_ports=None,
+            expected_browser_url=""):
+        """Validate the isolated HTML/API gateway used by real Chromium.
+
+        The normal production Nginx file is not a Candidate HTML server.  A
+        separately loaded vhost must serve the immutable validation pointer
+        and proxy the validation API port.  This method is read-only and is
+        intentionally required by the production orchestrator before backup.
+        """
+        gateway = self.config.get("candidate_gateway") or {}
+        if not isinstance(gateway, dict) or not gateway:
+            raise RuntimeError(
+                "production Candidate Gateway configuration is required"
+            )
+        path = self._candidate_gateway_path()
+        if not path:
+            raise RuntimeError("candidate_gateway.config_path is required")
+        if path == self._nginx_file_path():
+            raise RuntimeError(
+                "Candidate Gateway must use a separate Nginx config from production"
+            )
+        text = self._read_file(path, "candidate_gateway_config")
+        browser_url = str(
+            gateway.get("browser_url") or gateway.get("url") or ""
+        ).strip()
+        if not self._external_url_is_valid(browser_url):
+            raise RuntimeError(
+                "candidate_gateway.browser_url must be an external static HTML URL"
+            )
+        if expected_browser_url and browser_url.rstrip("/") != str(
+                expected_browser_url).strip().rstrip("/"):
+            raise RuntimeError(
+                "candidate Gateway browser URL does not match upgrade.candidate_browser_url"
+            )
+        reports_root = _literal(
+            gateway.get("reports_root") or self.validation_current_reports
+        )
+        if reports_root != self.validation_current_reports:
+            raise RuntimeError(
+                "candidate Gateway reports_root must be publish_root/VALIDATION_CURRENT/reports"
+            )
+        if not self._contains_alias(text, reports_root):
+            raise RuntimeError(
+                "Candidate Gateway Nginx alias is not bound to VALIDATION_CURRENT/reports"
+            )
+        static_location = str(
+            gateway.get("static_location") or "/coverage/"
+        ).strip()
+        if not static_location.startswith("/") or not static_location.endswith("/"):
+            raise RuntimeError("candidate_gateway.static_location must be a slash-delimited path")
+        if not re.search(
+                r"(?m)^[ \t]*location[ \t]+(?:=\s*)?{}[ \t]*\{{".format(
+                    re.escape(static_location)
+                ), text):
+            raise RuntimeError(
+                "Candidate Gateway static location is not explicitly configured"
+            )
+        ports = [int(port) for port in (candidate_ports or [])]
+        if not ports:
+            raise RuntimeError("Candidate Gateway requires an owned validation port")
+        expected_proxy = str(gateway.get("proxy_pass") or "").strip()
+        if not expected_proxy:
+            expected_proxy = "http://127.0.0.1:{}".format(ports[0])
+        if expected_proxy not in text:
+            raise RuntimeError(
+                "Candidate Gateway proxy_pass does not match the validation API"
+            )
+        api_location = str(
+            gateway.get("api_location") or "/api/coverage"
+        ).strip()
+        if not re.search(
+                r"(?m)^[ \t]*location[ \t]+(?:=\s*)?{}(?:[/$ \t{{]|$)".format(
+                    re.escape(api_location)
+                ), text):
+            raise RuntimeError(
+                "Candidate Gateway API location is not explicitly configured"
+            )
+        auth_bridge = self._validate_auth_bridge(
+            text, "Candidate Gateway", api_location
+        )
+        with tempfile.TemporaryDirectory(prefix="coverage-candidate-gateway-check-") as stage:
+            nginx_check = self._bootstrap_nginx_static_probe(text, stage)
+        return {
+            "status": "PASSED",
+            "config_path": path,
+            "config_sha256": self._sha256_bytes(text.encode("utf-8")),
+            "browser_url": browser_url,
+            "static_location": static_location,
+            "api_location": api_location,
+            "reports_root": reports_root,
+            "proxy_pass": expected_proxy,
+            "validation_ports": ports,
+            "auth_bridge": auth_bridge,
+            "nginx_test": nginx_check,
+            "read_only": True,
+            "command": "read and syntax-check isolated Candidate Gateway Nginx config",
+            "exit_code": 0,
+        }
 
     @staticmethod
     def _replace_atomic(path, content, mode):
@@ -608,7 +952,7 @@ class VfoswindProductionLifecycle(object):
     def _build_flat_bootstrap_plan(
             self, unit_text, nginx_text, legacy_application_root,
             legacy_served_root, runtime_mysql, candidate_application_root,
-            candidate_ports):
+            candidate_ports, auth_config=None):
         unit_path = self._unit_file_path()
         nginx_path = self._nginx_file_path()
         legacy_unit_path = self._legacy_unit_path()
@@ -637,6 +981,11 @@ class VfoswindProductionLifecycle(object):
         if managed_nginx == nginx_text or not self._contains_alias(
                 managed_nginx, self.current_reports):
             raise RuntimeError("Flat bootstrap could not render the managed Nginx CURRENT alias")
+        managed_auth_bridge = None
+        if self.config.get("auth_bridge") or self.config.get("candidate_gateway"):
+            managed_auth_bridge = self._validate_auth_bridge(
+                managed_nginx, "managed production", self._api_location()
+            )
         # The bootstrap plan is a binding template, not a serving credential
         # handoff.  Keep source secrets out of temporary validation files and
         # let bind_candidate_database write the target credentials only after
@@ -651,6 +1000,8 @@ class VfoswindProductionLifecycle(object):
             "runtime_mode": "vnext",
             "environment": "candidate",
         }
+        if auth_config:
+            validation_config["auth"] = dict(auth_config)
         validation_config_text = json.dumps(
             validation_config, ensure_ascii=False, sort_keys=True, indent=2
         ) + "\n"
@@ -714,6 +1065,7 @@ class VfoswindProductionLifecycle(object):
             "legacy_systemd_unit_definition": unit_text,
             "managed_systemd_unit": managed_unit,
             "managed_nginx": managed_nginx,
+            "managed_auth_bridge": managed_auth_bridge or {},
             "runtime_environment": runtime_environment,
             "validation_unit": validation_unit,
             "validation_environment": validation_environment,
@@ -733,7 +1085,8 @@ class VfoswindProductionLifecycle(object):
 
     def _preflight_flat_bootstrap(
             self, expected_database, runtime_mysql, candidate_application_root,
-            candidate_ports):
+            candidate_ports, candidate_gateway_required=False,
+            candidate_browser_url="", auth_config=None):
         """Plan the one-time Flat-to-managed transition without writing host files."""
         legacy_application_root = str(
             self.config.get("legacy_application_root") or ""
@@ -757,6 +1110,15 @@ class VfoswindProductionLifecycle(object):
         nginx_text = self._read_file(nginx_path, "legacy_nginx_config")
         if not self._contains_alias(nginx_text, legacy_served_root):
             raise RuntimeError("legacy Nginx alias is not bound to the recorded Flat reports root")
+        legacy_auth_bridge = None
+        if candidate_gateway_required or self.config.get("auth_bridge"):
+            if candidate_gateway_required and not auth_config:
+                raise RuntimeError(
+                    "production Candidate runtime auth config is required"
+                )
+            legacy_auth_bridge = self._validate_auth_bridge(
+                nginx_text, "legacy production", self._api_location()
+            )
         expected_proxy = str(self.config.get("nginx_proxy_pass") or "").strip()
         if expected_proxy and expected_proxy not in nginx_text:
             raise RuntimeError("legacy Nginx proxy_pass does not match the production binding")
@@ -779,8 +1141,15 @@ class VfoswindProductionLifecycle(object):
         plan = self._build_flat_bootstrap_plan(
             unit_text, nginx_text, legacy_application_root,
             legacy_served_root, runtime, validation_application,
-            candidate_ports,
+            candidate_ports, auth_config=auth_config,
         )
+        candidate_gateway = None
+        if candidate_gateway_required or self.config.get("candidate_gateway"):
+            candidate_gateway = self._candidate_gateway_preflight(
+                candidate_application_root=validation_application,
+                candidate_ports=candidate_ports,
+                expected_browser_url=candidate_browser_url,
+            )
         with tempfile.TemporaryDirectory(prefix="coverage-vfoswind-bootstrap-check-") as stage:
             unit_stage = os.path.join(stage, "managed.service")
             with open(unit_stage, "w", encoding="utf-8") as stream:
@@ -796,6 +1165,9 @@ class VfoswindProductionLifecycle(object):
         plan["runtime_database"] = runtime.get("database", "")
         plan["runtime_application_user"] = runtime.get("user", "")
         plan["application"] = application_evidence
+        plan["runtime_auth"] = self._validate_runtime_auth_config(auth_config)
+        plan["legacy_auth_bridge"] = legacy_auth_bridge or {}
+        plan["candidate_gateway"] = candidate_gateway or {}
         plan["read_only"] = True
         plan["command"] = "read legacy vfoswind bindings + render managed bootstrap + static checks"
         plan["exit_code"] = 0
@@ -827,6 +1199,9 @@ class VfoswindProductionLifecycle(object):
             "rollback_bytes_verified": plan["rollback_bytes_verified"],
             "systemd_analyze": systemd_check,
             "nginx_test": nginx_check,
+            "auth_bridge": legacy_auth_bridge or {},
+            "runtime_auth": plan["runtime_auth"],
+            "candidate_gateway": candidate_gateway or {},
             "read_only": True,
             "command": plan["command"],
             "exit_code": 0,
@@ -864,7 +1239,8 @@ class VfoswindProductionLifecycle(object):
 
     def preflight(self, expected_database="", candidate_application_root="",
                   candidate_ports=None, validation_commands=None,
-                  runtime_mysql=None):
+                  runtime_mysql=None, candidate_gateway_required=False,
+                  candidate_browser_url="", auth_config=None):
         """Read and validate systemd, Nginx, and persistent DB bindings."""
         if str(self.config.get("adapter") or ADAPTER_NAME).strip() != ADAPTER_NAME:
             raise RuntimeError("unsupported production lifecycle adapter")
@@ -879,6 +1255,9 @@ class VfoswindProductionLifecycle(object):
                 runtime_mysql=runtime_mysql,
                 candidate_application_root=candidate_application_root,
                 candidate_ports=candidate_ports,
+                candidate_gateway_required=candidate_gateway_required,
+                candidate_browser_url=candidate_browser_url,
+                auth_config=auth_config,
             )
         unit_text = self._unit_definition()
         expected_environment = "EnvironmentFile={}".format(self.environment_file)
@@ -936,6 +1315,17 @@ class VfoswindProductionLifecycle(object):
         expected_proxy = str(self.config.get("nginx_proxy_pass") or "").strip()
         if expected_proxy and expected_proxy not in nginx_text:
             raise RuntimeError("Nginx proxy_pass does not match the production binding")
+        auth_bridge = None
+        runtime_auth = None
+        if candidate_gateway_required or self.config.get("auth_bridge"):
+            if candidate_gateway_required and not auth_config:
+                raise RuntimeError(
+                    "production Candidate runtime auth config is required"
+                )
+            auth_bridge = self._validate_auth_bridge(
+                nginx_text, "production", self._api_location()
+            )
+            runtime_auth = self._validate_runtime_auth_config(auth_config)
 
         environment_text, runtime_config = self._read_runtime_mysql_binding(
             self.environment_file, "runtime_environment_file"
@@ -1010,6 +1400,22 @@ class VfoswindProductionLifecycle(object):
             )
         if not isinstance(validation_config, dict):
             raise RuntimeError("validation runtime config must be an object")
+        if auth_config:
+            expected_auth = self._validate_runtime_auth_config(auth_config)
+            observed_auth = dict(validation_config.get("auth") or {})
+            observed_mode = str(observed_auth.get("mode") or "").strip().lower()
+            observed_header = str(
+                observed_auth.get("user_header") or ""
+            ).strip()
+            observed_trusted = [str(item).strip() for item in
+                                (observed_auth.get("trusted_proxy_addresses") or [])
+                                if str(item).strip()]
+            if observed_mode != expected_auth.get("mode") or \
+                    observed_header != expected_auth.get("user_header") or \
+                    observed_trusted != expected_auth.get("trusted_proxy_addresses"):
+                raise RuntimeError(
+                    "validation runtime auth config does not match production auth contract"
+                )
         if candidate_ports:
             configured_port = int(
                 (validation_config.get("server") or {}).get("port") or 0
@@ -1023,6 +1429,13 @@ class VfoswindProductionLifecycle(object):
         if not validation_user or validation_user.lower() == "root":
             raise RuntimeError(
                 "validation database binding must use a non-root application user"
+            )
+        candidate_gateway = None
+        if candidate_gateway_required or self.config.get("candidate_gateway"):
+            candidate_gateway = self._candidate_gateway_preflight(
+                candidate_application_root=validation_application,
+                candidate_ports=candidate_ports,
+                expected_browser_url=candidate_browser_url,
             )
         return {
             "status": "PASSED",
@@ -1043,6 +1456,9 @@ class VfoswindProductionLifecycle(object):
             "validation_runtime_database": validation_runtime.get("database", ""),
             "validation_runtime_application_user": validation_user,
             "validation_config_path": self.validation_config_path,
+            "auth_bridge": auth_bridge or {},
+            "runtime_auth": runtime_auth or {},
+            "candidate_gateway": candidate_gateway or {},
             "application_source": application_source,
             "application": application_evidence,
             "deployment_layout": deployment_layout,
@@ -1262,6 +1678,132 @@ class VfoswindProductionLifecycle(object):
             "status": "PASSED",
             "restored": True,
             "command": "restore exact pre-bootstrap serving EnvironmentFile",
+            "exit_code": 0,
+        }
+
+    def bind_validation_gateway(self, release_root, session_id,
+                                candidate_ports=None, browser_url=""):
+        """Point the isolated Candidate Gateway at one prepared release.
+
+        ``CURRENT`` is never touched here.  The gateway serves
+        ``publish_root/VALIDATION_CURRENT/reports`` and proxies the isolated
+        validation API.  Only that disposable validation pointer is changed,
+        so browser evidence can be collected before Phase D.
+        """
+        if not self.config.get("candidate_gateway"):
+            return {
+                "status": "PASSED",
+                "skipped": True,
+                "reason": "candidate_gateway_not_configured",
+                "command": "no Candidate Gateway binding",
+                "exit_code": 0,
+            }
+        release_root = _literal(release_root)
+        session_id = str(session_id or "").strip()
+        expected_release = _literal(os.path.join(
+            self.publish_root, "releases", session_id
+        ))
+        if release_root != expected_release:
+            raise RuntimeError(
+                "Candidate Gateway release root is not the exact validation release"
+            )
+        if not os.path.isdir(os.path.join(release_root, "reports")):
+            raise RuntimeError("Candidate Gateway release is missing reports/")
+        gateway = self._candidate_gateway_preflight(
+            candidate_application_root=os.path.join(release_root, "app"),
+            candidate_ports=candidate_ports,
+            expected_browser_url=browser_url,
+        )
+        pointer = self.validation_current
+        if os.path.lexists(pointer):
+            if not os.path.islink(pointer):
+                raise RuntimeError(
+                    "Candidate Gateway VALIDATION_CURRENT exists but is not a symlink"
+                )
+            previous_link = os.readlink(pointer)
+            previous_target = _literal(os.path.join(
+                os.path.dirname(pointer), previous_link
+            ))
+            if previous_target != release_root:
+                raise RuntimeError(
+                    "Candidate Gateway VALIDATION_CURRENT is owned by another session"
+                )
+        else:
+            previous_link = None
+        relative_target = os.path.relpath(release_root, os.path.dirname(pointer))
+        temporary = "{}.tmp-{}".format(pointer, os.getpid())
+        try:
+            if os.path.lexists(temporary):
+                raise RuntimeError(
+                    "Candidate Gateway temporary validation pointer already exists"
+                )
+            os.symlink(relative_target, temporary)
+            os.replace(temporary, pointer)
+        finally:
+            try:
+                if os.path.lexists(temporary):
+                    os.remove(temporary)
+            except OSError:
+                pass
+        self.validation_gateway_bound = True
+        self._validation_gateway_previous_link = previous_link
+        self._validation_gateway_target = release_root
+        return {
+            "status": "PASSED",
+            "gateway": gateway,
+            "validation_pointer": pointer,
+            "validation_pointer_target": release_root,
+            "release_validation_session_id": session_id,
+            "browser_url": gateway.get("browser_url", ""),
+            "config_sha256": gateway.get("config_sha256", ""),
+            "command": "atomic Candidate Gateway VALIDATION_CURRENT pointer bind",
+            "exit_code": 0,
+        }
+
+    def restore_validation_gateway(self):
+        """Restore/remove only the validation pointer created by this attempt."""
+        if not self.validation_gateway_bound:
+            return {
+                "status": "PASSED",
+                "skipped": True,
+                "reason": "no_validation_gateway_binding",
+                "command": "no Candidate Gateway pointer to restore",
+                "exit_code": 0,
+            }
+        pointer = self.validation_current
+        if not os.path.islink(pointer):
+            raise RuntimeError(
+                "Candidate Gateway VALIDATION_CURRENT changed unexpectedly before restore"
+            )
+        observed_target = _literal(os.path.join(
+            os.path.dirname(pointer), os.readlink(pointer)
+        ))
+        if observed_target != self._validation_gateway_target:
+            raise RuntimeError(
+                "Candidate Gateway VALIDATION_CURRENT no longer points at this attempt"
+            )
+        previous_link = self._validation_gateway_previous_link
+        if previous_link is None:
+            os.remove(pointer)
+        else:
+            temporary = "{}.restore-{}".format(pointer, os.getpid())
+            try:
+                os.symlink(previous_link, temporary)
+                os.replace(temporary, pointer)
+            finally:
+                try:
+                    if os.path.lexists(temporary):
+                        os.remove(temporary)
+                except OSError:
+                    pass
+        self.validation_gateway_bound = False
+        self._validation_gateway_previous_link = None
+        self._validation_gateway_target = ""
+        return {
+            "status": "PASSED",
+            "validation_pointer": pointer,
+            "restored_previous_pointer": previous_link is not None,
+            "command": "restore Candidate Gateway VALIDATION_CURRENT pointer",
             "exit_code": 0,
         }
 
@@ -1500,6 +2042,10 @@ class VfoswindProductionLifecycle(object):
 
         if self._contains_alias(nginx_text, self.current_reports) and \
                 "WorkingDirectory={}".format(self.current_app) in unit_text:
+            if self.config.get("auth_bridge") or self.config.get("candidate_gateway"):
+                self._validate_auth_bridge(
+                    nginx_text, "production", self._api_location()
+                )
             self.release_bindings_changed = False
             return {
                 "status": "PASSED",
@@ -1554,6 +2100,11 @@ class VfoswindProductionLifecycle(object):
             self._replace_atomic(nginx_path, updated_nginx, nginx_mode)
             rebound_unit = self._read_file(unit_path, "systemd_unit_file")
             rebound_nginx = self._read_file(nginx_path, "nginx_config")
+            rebound_auth = None
+            if self.config.get("auth_bridge") or self.config.get("candidate_gateway"):
+                rebound_auth = self._validate_auth_bridge(
+                    rebound_nginx, "production", self._api_location()
+                )
             if "WorkingDirectory={}".format(self.current_app) not in rebound_unit or \
                     not any(
                         self.current_app in line and "enhance_coverage.py" in line
@@ -1574,6 +2125,7 @@ class VfoswindProductionLifecycle(object):
             "systemd_working_directory": self.current_app,
             "nginx_config_path": nginx_path,
             "nginx_alias": self.current_reports,
+            "auth_bridge": rebound_auth or {},
             "bootstrap_runtime": bootstrap_runtime,
             "command": "atomic systemd/Nginx CURRENT binding transition",
             "exit_code": 0,

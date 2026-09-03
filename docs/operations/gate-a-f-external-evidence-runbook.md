@@ -177,12 +177,51 @@ node scripts/diagnostics/real_browser_evidence.js \
   --release-validation-session-id "$RELEASE_VALIDATION_SESSION_ID" \
   --candidate-artifact-sha256 "$CANDIDATE_ARTIFACT_SHA256" \
   --served-root-sha256 "$SERVED_ROOT_SHA256" \
-  --header "X-Remote-User=$COVERAGE_BROWSER_USER" \
-  --header "X-Remote-Role=reviewer" \
+  --header "Authorization=$COVERAGE_AUTHORIZATION_HEADER" \
   --output /secure/evidence/gate-e/real-browser-workload.json \
   --browser-evidence-output /secure/evidence/gate-e/browser-evidence.json \
   --evidence-output /secure/evidence/gate-e/performance-evidence.json
 ```
+
+在 vfoswind 上，`--url` 必须是独立 Candidate Gateway 提供的真实 HTML
+文档，例如 `/coverage/coverage_candidate.gcov.html`，不能使用
+`127.0.0.1:19528/` 或 `/api/coverage/release`。Gateway 的静态 alias 指向
+`publish_root/VALIDATION_CURRENT/reports`，API location 只代理隔离的
+Candidate validation port；`VALIDATION_CURRENT` 由升级器在 Phase B 原子指向
+本次 immutable release，并在 validation teardown 时恢复。生产 `CURRENT` 不在
+这一步改变。
+
+Candidate Gateway 和正式 production Nginx 都必须配置真实的认证边界
+（`auth_request` 或明确选择的 `auth_basic`），再通过可信 Nginx 变量转发
+`X-Remote-User`。禁止写死用户，也禁止把客户端提交的同名 header 原样转发。
+在 PRE_CUTOVER_READY 前另行执行：
+
+```bash
+python scripts/diagnostics/candidate_authenticated_mutation_probe.py \
+  --candidate-url 'https://<candidate-host>/coverage/coverage_candidate.gcov.html' \
+  --release-url 'https://<candidate-host>/api/coverage/release' \
+  --mutation-url 'https://<candidate-host>/api/coverage/projects' \
+  --mutation-body-file /secure/evidence/gate-e/mutation-body.json \
+  --expected-revision "$CANDIDATE_COMMIT_SHA" \
+  --release-validation-session-id "$RELEASE_VALIDATION_SESSION_ID" \
+  --candidate-artifact-sha256 "$CANDIDATE_ARTIFACT_SHA256" \
+  --served-root-sha256 "$SERVED_ROOT_SHA256" \
+  --identity-source 'operator-selected SSO or Basic Auth' \
+  --gateway-config-sha256 "$CANDIDATE_GATEWAY_CONFIG_SHA256" \
+  --header "Authorization=$COVERAGE_AUTHORIZATION_HEADER" \
+  --output /secure/evidence/gate-e/auth-mutation.json
+```
+
+该探针必须同时得到未认证 mutation 的 401/403 和认证 mutation 的 2xx；证据
+只保存 header 名，不保存凭据。升级器会 exact 校验 revision、attempt、发布
+hash、Gateway 配置 hash 和 `reverse_proxy` 身份桥，缺失即不进入 Phase D。
+
+生产配置中的 `auth_bridge` 只是契约，不会替操作员选择认证产品，也不会把
+`X-Remote-User` 写死为某个用户。必须明确选择 `basic_auth`、`auth_request` 或
+`external_sso`，并在 production API location 和 Candidate Gateway API location
+中都配置真实认证边界及可信 Nginx 身份变量；示例中的 `REPLACE_WITH_*` 会被
+preflight 拒绝。当前生产没有身份桥时，升级器会在 backup 前失败，不会修改
+数据库、CURRENT、systemd 或 Nginx。
 
 将 `COVERAGE_GATE_E_BROWSER_EVIDENCE` 指向 `browser-evidence.json`，将
 `COVERAGE_GATE_E_PERF_EVIDENCE` 指向 `performance-evidence.json`。采集器不会把
@@ -209,7 +248,9 @@ node scripts/diagnostics/release_performance_ab.js \
 同一采集器也接入 `.github/workflows/ci.yml` 的手动
 `real-browser-candidate` lane。触发 `workflow_dispatch` 时提供
 `real_browser_url`（可选提供 `real_browser_expected_revision`），并在仓库/环境
-Secret 中配置 `COVERAGE_BROWSER_USER`；job 会上传三个 exact-SHA JSON artifact。
+Secret 中配置 `COVERAGE_BROWSER_AUTH_HEADER`（例如完整的
+`Authorization=Basic ...`，不要把 `X-Remote-User` 当作凭据）；job 会上传三个
+exact-SHA JSON artifact。
 未提供 Candidate URL 时该 lane 不运行，普通 CI 仍只保留明确标记为 synthetic 的
 fixture/browser evidence。
 

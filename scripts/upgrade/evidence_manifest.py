@@ -342,6 +342,8 @@ class ProductionEvidenceManifest:
             "targeted_tests": {},
             "browser_fixture_regression": {},
             "candidate_browser_evidence": {},
+            "candidate_authenticated_mutation": {},
+            "candidate_gateway_preflight": {},
             "path_mapping_audit": {},
             "sidecar_audit": {},
             "security_audit": {},
@@ -631,6 +633,55 @@ class ProductionEvidenceManifest:
                 browser.get("chromium") is not True:
             unmet.append("real Candidate browser evidence is not release eligible")
 
+        if require_production_integration:
+            gateway = record("candidate_gateway_preflight")
+            if gateway.get("read_only") is not True or \
+                    not gateway.get("config_sha256") or \
+                    not isinstance(gateway.get("auth_bridge"), dict) or \
+                    gateway.get("auth_bridge", {}).get("status") != "PASSED":
+                unmet.append("Candidate Gateway/auth bridge preflight is not closed")
+            if gateway.get("browser_url") != browser.get("candidate_url"):
+                unmet.append("Candidate Gateway URL is not exact to browser evidence")
+            auth_probe = record("candidate_authenticated_mutation")
+            mutation = auth_probe.get("mutation_probe") or {}
+            if auth_probe.get("evidence_class") != \
+                    "candidate_authenticated_mutation" or \
+                    auth_probe.get("release_eligible") is not True or \
+                    auth_probe.get("synthetic") is not False or \
+                    auth_probe.get("real_http") is not True or \
+                    auth_probe.get("identity_propagated") is not True or \
+                    mutation.get("status") != "PASSED" or \
+                    type(mutation.get("authenticated_status_code")) is not int or \
+                    not 200 <= mutation.get("authenticated_status_code") < 300 or \
+                    mutation.get("unauthenticated_status_code") not in (401, 403):
+                unmet.append(
+                    "real authenticated Candidate mutation evidence is not PASSED"
+                )
+            for field, expected in (
+                    ("release_validation_session_id", expected_session),
+                    ("candidate_artifact_sha256", expected_artifact),
+                    ("served_root_sha256", expected_served_root),
+                    ("expected_commit_sha", revision),
+                    ("gateway_config_sha256", gateway.get("config_sha256"))):
+                if auth_probe.get(field) != expected:
+                    unmet.append(
+                        "Candidate authenticated mutation {} is not exact".format(
+                            field
+                        )
+                    )
+            if auth_probe.get("candidate_url") != browser.get(
+                    "candidate_url"):
+                unmet.append(
+                    "Candidate authenticated mutation URL is not exact to browser evidence"
+                )
+            if (
+                    str(auth_probe.get("auth_mode") or "").strip().lower() !=
+                    "reverse_proxy" or
+                    not str(auth_probe.get("user_header") or "").strip()):
+                unmet.append(
+                    "Candidate authenticated mutation auth identity contract is incomplete"
+                )
+
         performance = record("performance_benchmark")
         if performance.get("evidence_class") != "release_performance_ab" or \
                 performance.get("candidate_commit") != revision or \
@@ -660,6 +711,12 @@ class ProductionEvidenceManifest:
             # failure cannot occur after service/CURRENT mutation.
             unmet.append(
                 "production authentication policy rejects auth_mode=disabled"
+            )
+        if require_production_integration and str(
+                security.get("auth_mode") or ""
+        ).strip().lower() != "reverse_proxy":
+            unmet.append(
+                "production authentication policy requires auth_mode=reverse_proxy"
             )
 
         endpoint = record("candidate_release_endpoint")
@@ -704,6 +761,13 @@ class ProductionEvidenceManifest:
             if production_binding.get("binding", {}).get("target_database") != (
                     (self.data.get("disposable_target") or {}).get("target_database")):
                 unmet.append("validation runtime binding database is not the disposable target")
+            gateway_binding = production_binding.get("candidate_gateway") or {}
+            if gateway_binding.get("status") != "PASSED" or \
+                    not gateway_binding.get("validation_pointer_target") or \
+                    gateway_binding.get("release_validation_session_id") != expected_session:
+                unmet.append(
+                    "validation Candidate Gateway is not bound to this exact release"
+                )
             bootstrap = self.data.get("production_bootstrap") or {}
             if bootstrap.get("status") != "PASSED" or bootstrap.get("bootstrap_ready") is not True:
                 unmet.append("production bootstrap gate is not READY")
@@ -875,6 +939,13 @@ class ProductionEvidenceManifest:
             if (self.data.get(section) or {}).get("status") != "PASSED":
                 unmet.append("{} lifecycle evidence is not PASSED".format(section))
         if self.data.get("upgrade_mode") == "production":
+            security_mode = str(
+                (self.data.get("security_audit") or {}).get("auth_mode") or ""
+            ).strip().lower()
+            if security_mode != "reverse_proxy":
+                unmet.append(
+                    "production authentication policy requires auth_mode=reverse_proxy"
+                )
             for section in (
                     "production_integration_preflight",
                     "production_application_bundle",
@@ -887,6 +958,57 @@ class ProductionEvidenceManifest:
                             section
                         )
                     )
+            gateway = self.data.get("candidate_gateway_preflight") or {}
+            if gateway.get("status") != "PASSED" or \
+                    gateway.get("read_only") is not True or \
+                    not gateway.get("config_sha256"):
+                unmet.append("candidate Gateway preflight is not PASSED")
+            if gateway.get("browser_url") != (
+                    self.data.get("candidate_browser_evidence") or {}
+            ).get("candidate_url"):
+                unmet.append("candidate Gateway URL is not exact to browser evidence")
+            auth_probe = self.data.get("candidate_authenticated_mutation") or {}
+            mutation = auth_probe.get("mutation_probe") or {}
+            if auth_probe.get("status") != "PASSED" or \
+                    auth_probe.get("synthetic") is not False or \
+                    auth_probe.get("real_http") is not True or \
+                    auth_probe.get("identity_propagated") is not True or \
+                    mutation.get("status") != "PASSED":
+                unmet.append(
+                    "candidate authenticated mutation evidence is not PASSED"
+                )
+            for field, expected in (
+                    ("release_validation_session_id", attempt_id),
+                    ("candidate_artifact_sha256", expected_candidate_artifact),
+                    ("served_root_sha256", expected_served_root),
+                    ("expected_commit_sha", revision)):
+                if auth_probe.get(field) != expected:
+                    unmet.append(
+                        "candidate authenticated mutation {} is not exact".format(
+                            field
+                        )
+                    )
+            if str(auth_probe.get("auth_mode") or "").strip().lower() != \
+                    "reverse_proxy":
+                unmet.append(
+                    "candidate authenticated mutation auth mode is not reverse_proxy"
+                )
+            if not auth_probe.get("user_header"):
+                unmet.append(
+                    "candidate authenticated mutation user header is missing"
+                )
+            if auth_probe.get("gateway_config_sha256") != gateway.get(
+                    "config_sha256"
+            ):
+                unmet.append(
+                    "candidate authenticated mutation Gateway config hash is not exact"
+                )
+            if type(mutation.get("authenticated_status_code")) is not int or \
+                    not 200 <= mutation.get("authenticated_status_code") < 300 or \
+                    mutation.get("unauthenticated_status_code") not in (401, 403):
+                unmet.append(
+                    "candidate authenticated mutation HTTP controls are not exact"
+                )
         if require_traffic_open and (self.data.get("traffic_open") or {}).get("status") != "PASSED":
             unmet.append("traffic_open lifecycle evidence is not PASSED")
 
