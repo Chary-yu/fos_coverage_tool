@@ -11,6 +11,28 @@ from scripts.upgrade.vfoswind_production_lifecycle import (
 
 
 class VfoswindProductionLifecycleTest(unittest.TestCase):
+    def test_production_example_binds_observed_vfoswind_baseline(self):
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "config", "coverage_config.production.vfoswind.example.json",
+        )
+        with open(path, "r", encoding="utf-8") as stream:
+            config = json.load(stream)
+        integration = config["upgrade"]["production_integration"]
+        self.assertEqual(integration["systemd_unit"], "onesensor-api.service")
+        self.assertEqual(
+            integration["nginx_config_path"], "/etc/nginx/conf.d/coverage.conf"
+        )
+        self.assertEqual(
+            integration["bootstrap"]["legacy_systemd_unit"],
+            "onesensor-api.service",
+        )
+        self.assertEqual(
+            integration["bootstrap"]["legacy_nginx_config_path"],
+            "/etc/nginx/conf.d/coverage.conf",
+        )
+        self.assertFalse(integration["bootstrap"]["nginx_test_uses_staged_path"])
+
     def _fixture(self, flat=False):
         root = tempfile.TemporaryDirectory(prefix="vfoswind-lifecycle-")
         self.addCleanup(root.cleanup)
@@ -76,7 +98,10 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
                 "[Service]\n"
                 "WorkingDirectory={}\n"
                 "ExecStart=/usr/bin/python3 {}/enhance_coverage.py server\n"
-                "EnvironmentFile={}\n".format(current_app, current_app, environment)
+                "{}".format(
+                    current_app, current_app,
+                    "EnvironmentFile={}\n".format(environment) if not flat else "",
+                )
             )
         with open(environment, "w", encoding="utf-8") as stream:
             stream.write(
@@ -109,16 +134,20 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
                 "  proxy_pass http://127.0.0.1:9528;\n"
                 "}}\n".format(current_reports)
             )
+        if flat:
+            os.remove(environment)
+            for path in (validation_unit, validation_environment, validation_config):
+                os.remove(path)
         commands = {
             "daemon_reload": ["systemctl", "daemon-reload"],
-            "service_stop": ["systemctl", "stop", "onesensor-coverage.service"],
-            "service_restart": ["systemctl", "restart", "onesensor-coverage.service"],
+            "service_stop": ["systemctl", "stop", "onesensor-api.service"],
+            "service_restart": ["systemctl", "restart", "onesensor-api.service"],
             "nginx_test": ["nginx", "-t", "-c", nginx],
             "nginx_reload": ["systemctl", "reload", "nginx"],
         }
         config = {
             "adapter": "vfoswind",
-            "systemd_unit": "onesensor-coverage.service",
+            "systemd_unit": "onesensor-api.service",
             "systemd_unit_file": unit,
             "runtime_environment_file": environment,
             "validation_systemd_unit": "onesensor-coverage-validation.service",
@@ -130,6 +159,14 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
             "nginx_proxy_pass": "http://127.0.0.1:9528",
             "legacy_application_root": current_app,
             "legacy_served_root": current_reports,
+            "bootstrap": {
+                "legacy_systemd_unit": "onesensor-api.service",
+                "legacy_systemd_unit_file": unit,
+                "legacy_nginx_config_path": nginx,
+                "systemd_analyze": ["systemd-analyze", "verify"],
+                "nginx_test": ["nginx", "-t"],
+                "nginx_test_uses_staged_path": False,
+            },
             "commands": commands,
         }
         return root, publish, config, environment
@@ -180,7 +217,7 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
             calls,
             [
                 ["systemctl", "daemon-reload"],
-                ["systemctl", "restart", "onesensor-coverage.service"],
+                ["systemctl", "restart", "onesensor-api.service"],
                 ["nginx", "-t", "-c", config["nginx_config_path"]],
                 ["systemctl", "reload", "nginx"],
             ],
@@ -253,10 +290,54 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
 
     def test_flat_preflight_and_binding_transition_are_explicit_and_restorable(self):
         _root, publish, config, _environment = self._fixture(flat=True)
-        adapter = VfoswindProductionLifecycle(publish, config)
-        preflight = adapter.preflight(expected_database="coverage_vnext_old")
+        with open(config["systemd_unit_file"], "rb") as stream:
+            before_unit = stream.read()
+        with open(config["nginx_config_path"], "rb") as stream:
+            before_nginx = stream.read()
+
+        calls = []
+
+        def runner(argv):
+            calls.append(list(argv))
+            return CompletedProcess(argv, 0, b"", b"")
+
+        adapter = VfoswindProductionLifecycle(
+            publish, config, command_runner=runner
+        )
+        preflight = adapter.preflight(
+            expected_database="coverage_vnext_old",
+            runtime_mysql={
+                "database": "coverage_vnext_old",
+                "user": "coverage_user",
+            },
+            candidate_ports=[19528],
+        )
         self.assertEqual(preflight["deployment_layout"], "FLAT")
         self.assertTrue(preflight["transition_required"])
+        self.assertTrue(preflight["bootstrap_ready"])
+        self.assertTrue(preflight["rollback_bytes_verified"])
+        self.assertIn(["systemd-analyze", "verify"], [call[:2] for call in calls])
+        self.assertIn(["nginx", "-t"], calls)
+        with open(config["systemd_unit_file"], "rb") as stream:
+            self.assertEqual(stream.read(), before_unit)
+        with open(config["nginx_config_path"], "rb") as stream:
+            self.assertEqual(stream.read(), before_nginx)
+        validation_candidate = os.path.join(_root.name, "validation-candidate")
+        shutil.copytree(config["validation_application_root"], validation_candidate)
+        validation_binding = adapter.bind_validation_candidate(
+            validation_candidate,
+            {
+                "database": "coverage_vnext_candidate",
+                "user": "coverage_user",
+            },
+        )
+        self.assertTrue(validation_binding["bootstrap_validation"]["installed"])
+        self.assertTrue(os.path.isfile(config["validation_systemd_unit_file"]))
+        validation_restore = adapter.restore_validation_candidate_binding()
+        self.assertEqual(validation_restore["status"], "PASSED")
+        self.assertFalse(os.path.lexists(config["validation_systemd_unit_file"]))
+        self.assertFalse(os.path.lexists(config["validation_runtime_environment_file"]))
+        self.assertFalse(os.path.lexists(config["validation_config_path"]))
         release = os.path.join(publish, "releases", "candidate")
         os.makedirs(os.path.join(release, "app", "app"))
         os.makedirs(os.path.join(release, "app", "web"))
@@ -274,6 +355,12 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
                    os.path.join(publish, "CURRENT"))
         transitioned = adapter.bind_current_release()
         self.assertEqual(transitioned["status"], "PASSED")
+        candidate_binding = adapter.bind_candidate_database({
+            "database": "coverage_vnext_candidate",
+            "user": "coverage_user",
+            "password": "candidate-secret",
+        })
+        self.assertEqual(candidate_binding["status"], "PASSED")
         with open(config["systemd_unit_file"], encoding="utf-8") as stream:
             unit = stream.read()
         with open(config["nginx_config_path"], encoding="utf-8") as stream:
@@ -282,10 +369,17 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
         self.assertIn("alias {}/CURRENT/reports/;".format(publish), nginx)
         restored = adapter.restore_previous_release_bindings()
         self.assertEqual(restored["status"], "PASSED")
+        self.assertEqual(
+            restored["runtime_environment_restore"]["reason"],
+            "deferred_to_database_binding_rollback",
+        )
+        database_restored = adapter.restore_previous_database_binding()
+        self.assertEqual(database_restored["status"], "PASSED")
         with open(config["systemd_unit_file"], encoding="utf-8") as stream:
             self.assertIn(config["legacy_application_root"], stream.read())
         with open(config["nginx_config_path"], encoding="utf-8") as stream:
             self.assertIn(config["legacy_served_root"], stream.read())
+        self.assertFalse(os.path.lexists(config["runtime_environment_file"]))
 
 
 if __name__ == "__main__":

@@ -674,6 +674,8 @@ class UpgradeOrchestrator:
         self._database_generation = {}
         self._target_database_generation = {}
         self._target_db_config = {}
+        self._target_preparation = {}
+        self._target_cleanup_done = False
         self._production_lifecycle_adapter = None
         self._production_runtime_bound = False
         self._production_release_bindings_changed = False
@@ -1324,6 +1326,51 @@ class UpgradeOrchestrator:
             self.manifest.data["status"] = "UNMET_GATES"
         self.manifest.save()
 
+    def _validate_pre_cutover_ready(self, identity, mode):
+        """Record a hard PRE_CUTOVER_READY decision before Phase D.
+
+        This method intentionally has no lifecycle, publication, database,
+        systemd, Nginx, or traffic side effects.  A failed result is recorded
+        as ``PRE_CUTOVER_READY=FAILED`` and the caller must return through
+        ``_fail`` without entering the cutover block.
+        """
+        try:
+            passed, unmet = self.manifest.validate_pre_cutover_gate(
+                require_production_integration=mode == "production"
+            )
+        except Exception as exc:
+            passed = False
+            unmet = ["pre-cutover gate evaluation failed: {}".format(exc)]
+        payload = {
+            "status": "PASSED" if passed else "FAILED",
+            "phase": "PRE_CUTOVER_READY",
+            "revision": identity.get("commit_sha"),
+            "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
+            "current_unchanged_until_phase_d": True,
+            "phase_d_entered": False,
+            "freeze_called": False,
+            "stop_production_called": False,
+            "current_switch_called": False,
+            "unmet": list(unmet),
+            "command": "ProductionEvidenceManifest.validate_pre_cutover_gate",
+            "exit_code": 0 if passed else 1,
+        }
+        self.manifest.record("pre_cutover_ready", payload)
+        return passed, unmet
+
+    def _cleanup_target_database(self):
+        """Remove only the disposable target after a failed attempt."""
+        if self._target_cleanup_done or not self._target_preparation:
+            return {"status": "PASSED", "skipped": True, "reason": "no_disposable_target"}
+        if not self._target_preparation.get("target_database_created_by_this_run"):
+            return {"status": "PASSED", "skipped": True, "reason": "target_not_created_by_run"}
+        from scripts.upgrade.disposable_target import cleanup_disposable_target
+        result = cleanup_disposable_target(
+            self._target_db_config, self._target_preparation
+        )
+        self._target_cleanup_done = True
+        return result
+
     def _fail(self, lifecycle: Optional[UpgradeLifecycle], message: str) -> Tuple[bool, str]:
         self._mark_not_ready()
         # If a vfoswind serving process has already been started with the new
@@ -1421,6 +1468,29 @@ class UpgradeOrchestrator:
                     self.log("❌ Release NOT_READY: validation session teardown did not pass.")
             except Exception as exc:
                 self.log("❌ DATA_SAFETY_HOLD: validation session teardown evidence failed: {}".format(exc))
+        try:
+            target_cleanup = self._cleanup_target_database()
+            if target_cleanup.get("status") != "PASSED":
+                self.log(
+                    "❌ DATA_SAFETY_HOLD: disposable target cleanup failed: {}".format(
+                        target_cleanup
+                    )
+                )
+            else:
+                self.manifest.record("disposable_target_cleanup", {
+                    "status": "PASSED",
+                    "revision": self._target_identity.get("commit_sha"),
+                    "evidence_class": "blue_green_database",
+                    "cleanup": target_cleanup,
+                    "command": "revoke Candidate DB grant + DROP disposable target",
+                    "exit_code": 0,
+                })
+        except Exception as exc:
+            self.log(
+                "❌ DATA_SAFETY_HOLD: disposable target cleanup failed: {}".format(
+                    exc
+                )
+            )
         return False, message
 
     def _verify_release_endpoint(self, endpoint: str, identity: Dict[str, Any]) -> Dict[str, Any]:
@@ -1521,6 +1591,8 @@ class UpgradeOrchestrator:
         self._production_lifecycle_adapter = None
         self._production_runtime_bound = False
         self._production_release_bindings_changed = False
+        self._target_preparation = {}
+        self._target_cleanup_done = False
         self._mark_not_ready()
         self.manifest.data["upgrade_mode"] = mode
         self.manifest.save()
@@ -1732,6 +1804,7 @@ class UpgradeOrchestrator:
                     ),
                     candidate_ports=upgrade_config.get("validation_ports") or [],
                     validation_commands=upgrade_config.get("commands") or {},
+                    runtime_mysql=source_runtime_config,
                 )
                 integration_evidence.update({
                     "revision": identity.get("commit_sha"),
@@ -1740,6 +1813,49 @@ class UpgradeOrchestrator:
                 self.manifest.record(
                     "production_integration_preflight", integration_evidence
                 )
+                bootstrap_evidence = dict(
+                    integration_evidence.get("bootstrap") or {}
+                )
+                if not bootstrap_evidence and \
+                        integration_evidence.get("bootstrap_ready") is not None:
+                    # The vfoswind adapter returns the Flat transition plan as
+                    # its top-level preflight result.  Preserve that evidence
+                    # in the dedicated bootstrap record instead of silently
+                    # downgrading a required bootstrap to "already present".
+                    bootstrap_evidence = {
+                        key: integration_evidence[key]
+                        for key in (
+                            "status", "bootstrap_ready", "bootstrap_required",
+                            "deployment_layout", "transition_required",
+                            "legacy_systemd_unit", "legacy_systemd_unit_file",
+                            "legacy_nginx_config_path", "legacy_application_root",
+                            "legacy_served_root", "managed_systemd_unit_file",
+                            "managed_nginx_config_path", "runtime_database",
+                            "runtime_application_user", "candidate_application_root",
+                            "candidate_artifact_sha256", "validation_ports",
+                            "old_unit_sha256", "old_nginx_sha256",
+                            "managed_unit_sha256", "managed_nginx_sha256",
+                            "rollback_bytes_verified", "systemd_analyze", "nginx_test",
+                            "read_only", "command", "exit_code",
+                        ) if key in integration_evidence
+                    }
+                if not bootstrap_evidence:
+                    bootstrap_evidence = {
+                        "status": "PASSED",
+                        "bootstrap_ready": True,
+                        "bootstrap_required": False,
+                        "deployment_layout": integration_evidence.get(
+                            "deployment_layout", ""
+                        ),
+                        "read_only": True,
+                        "command": "managed vfoswind layout already present",
+                        "exit_code": 0,
+                    }
+                bootstrap_evidence.update({
+                    "revision": identity.get("commit_sha"),
+                    "evidence_class": "production_integration",
+                })
+                self.manifest.record("production_bootstrap", bootstrap_evidence)
             except (OSError, RuntimeError, ValueError, TypeError) as exc:
                 self.log(
                     "❌ vfoswind systemd/Nginx integration preflight failed: {}".format(
@@ -1935,6 +2051,7 @@ class UpgradeOrchestrator:
                     "command": "create disposable target + restore/empty-target probe",
                     "exit_code": 0,
                 })
+                self._target_preparation = dict(target_preparation)
                 self.manifest.record("disposable_target", target_preparation)
                 self.manifest.record("database_separation", {
                     "status": "PASSED", "revision": identity.get("commit_sha"),
@@ -2002,6 +2119,40 @@ class UpgradeOrchestrator:
                 raise RuntimeError(
                     "migration returned non-PASSED status: {}".format(
                         migration_report
+                    )
+                )
+            file_state_gates = migration_report.get("file_state_ready_gate")
+            if not isinstance(file_state_gates, list):
+                raise RuntimeError(
+                    "migration did not return an explicit FileState Ready Gate"
+                )
+            file_state_failed = []
+            for index, gate in enumerate(file_state_gates):
+                if not isinstance(gate, dict) or gate.get("status") != "PASSED":
+                    file_state_failed.append("project {} status is not PASSED".format(index))
+                    continue
+                conditions = gate.get("explicit_conditions") or {}
+                if conditions and not all(value is True for value in conditions.values()):
+                    file_state_failed.append(
+                        "project {} explicit FileState condition failed".format(index)
+                    )
+            file_state_status = "PASSED" if not file_state_failed else "FAILED"
+            self.manifest.record("file_state_gate", {
+                "status": file_state_status,
+                "revision": identity.get("commit_sha"),
+                "evidence_class": "blue_green_database",
+                "database_generation": source_generation,
+                "project_gates": file_state_gates,
+                "project_count": len(file_state_gates),
+                "conditions_passed": not file_state_failed,
+                "violations": file_state_failed,
+                "command": "FileStateService rebuild_validate_and_mark_ready",
+                "exit_code": 0 if not file_state_failed else 1,
+            })
+            if file_state_failed:
+                raise RuntimeError(
+                    "FileState Ready Gate failed: {}".format(
+                        "; ".join(file_state_failed)
                     )
                 )
         except Exception as exc:
@@ -2497,6 +2648,7 @@ class UpgradeOrchestrator:
         self.log(f"  ✔ Security Scan passed: Critical={sec_res['critical_count']}, High={sec_res['high_count']}")
 
         rollback_path = self.rollback_evidence_path
+        rollback_evidence = {}
         if rollback_path:
             try:
                 with open(rollback_path, "r", encoding="utf-8") as stream:
@@ -2527,7 +2679,37 @@ class UpgradeOrchestrator:
                 rollback_evidence.setdefault("artifact_path", os.path.abspath(rollback_path))
                 self.manifest.record("rollback_evidence", rollback_evidence)
             except Exception as exc:
+                invalid_rollback = dict(rollback_evidence) if isinstance(
+                    rollback_evidence, dict
+                ) else {}
+                invalid_rollback.update({
+                    "status": "FAILED",
+                    "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
+                    "revision": identity.get("commit_sha"),
+                    "release_validation_session_id": self.release_validation_session_id,
+                    "candidate_artifact_sha256": self._candidate_artifact_sha256,
+                    "served_root_sha256": self._served_root_sha256,
+                    "violations": [str(exc)],
+                    "command": "validate rollback rehearsal evidence",
+                    "exit_code": 1,
+                    "artifact_path": os.path.abspath(rollback_path),
+                })
+                self.manifest.record("rollback_evidence", invalid_rollback)
                 self.log("❌ Rollback rehearsal evidence unavailable: {}".format(exc))
+        else:
+            self.manifest.record("rollback_evidence", {
+                "status": "FAILED",
+                "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
+                "revision": identity.get("commit_sha"),
+                "release_validation_session_id": self.release_validation_session_id,
+                "candidate_artifact_sha256": self._candidate_artifact_sha256,
+                "served_root_sha256": self._served_root_sha256,
+                "violations": ["rollback evidence artifact path is missing"],
+                "command": "validate rollback rehearsal evidence",
+                "exit_code": 1,
+                "artifact_path": "",
+            })
+            self.log("❌ Rollback rehearsal evidence unavailable: artifact path is missing")
 
         # Teardown is a hard release prerequisite.  This runs before the
         # final evidence read and records both the session manifest and the
@@ -2539,17 +2721,14 @@ class UpgradeOrchestrator:
             self.log("❌ Release NOT_READY: validation session teardown is incomplete.")
             return self._fail(lifecycle, "Validation session teardown failed")
 
-        self.manifest.record("pre_cutover_ready", {
-            "status": "PASSED",
-            "phase": "PRE_CUTOVER_READY",
-            "revision": identity.get("commit_sha"),
-            "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
-            "current_unchanged_until_phase_d": True,
-            "database_target": (self._target_db_config or {}).get("database", ""),
-            "candidate_release_root": self.publisher.release_path(session_id),
-            "command": "candidate gates + validation teardown",
-            "exit_code": 0,
-        })
+        ready, unmet = self._validate_pre_cutover_ready(identity, mode)
+        if not ready:
+            self.log(
+                "❌ Release NOT_READY: PRE_CUTOVER_READY hard gate failed: {}".format(
+                    "; ".join(unmet)
+                )
+            )
+            return self._fail(lifecycle, "PRE_CUTOVER_READY hard gate failed")
         lifecycle.api_started = False
 
         # Phase D is the only cutover window.  Candidate validation, browser,

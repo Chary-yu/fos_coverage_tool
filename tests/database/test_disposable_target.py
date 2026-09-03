@@ -6,6 +6,7 @@ from subprocess import CompletedProcess
 from unittest import mock
 
 from scripts.upgrade.disposable_target import (
+    _grant_and_probe_candidate_access, cleanup_disposable_target,
     create_disposable_target_from_backup, probe_candidate_connection_access,
     validate_disposable_target_config,
 )
@@ -50,6 +51,8 @@ class DisposableTargetTest(unittest.TestCase):
             "database": "coverage_vnext_candidate_801",
             "user": "coverage",
             "candidate_grant_host": "db",
+            "approved_application_user": "coverage",
+            "approved_application_host": "db",
         })
         self.assertEqual(result["status"], "PASSED")
         self.assertIn("SHOW GRANTS", connection.cursor_instance.sql)
@@ -92,10 +95,14 @@ class DisposableTargetTest(unittest.TestCase):
             source = {
                 "host": "db", "port": 3306, "user": "coverage",
                 "database": "coverage_vnext_e9fcc837",
+                "application_grant_host": "db",
             }
             target = {
                 "host": "db", "port": 3306, "user": "coverage",
                 "database": "coverage_vnext_candidate_801",
+                "candidate_grant_host": "db",
+                "approved_application_user": "coverage",
+                "approved_application_host": "db",
             }
             calls = []
 
@@ -103,6 +110,14 @@ class DisposableTargetTest(unittest.TestCase):
                 calls.append((sql, database))
                 if sql.startswith("SHOW TABLES"):
                     return CompletedProcess([], 0, b"coverage_projects\n", b"")
+                if sql.startswith("SELECT User, Host FROM mysql.user"):
+                    return CompletedProcess([], 0, b"coverage\tdb\n", b"")
+                if sql.startswith("SHOW GRANTS FOR"):
+                    return CompletedProcess(
+                        [], 0,
+                        b"GRANT USAGE ON *.* TO 'coverage'@'db'\n",
+                        b"",
+                    )
                 if sql.startswith("SHOW GRANTS"):
                     return CompletedProcess(
                         [], 0,
@@ -147,7 +162,11 @@ class DisposableTargetTest(unittest.TestCase):
             target = {
                 "database": "coverage_vnext_candidate_801",
                 "user": "coverage",
+                "candidate_grant_host": "db",
+                "approved_application_user": "coverage",
+                "approved_application_host": "db",
             }
+            source["application_grant_host"] = "db"
             calls = []
 
             def run_client(_client, _common, _env, sql, database=None):
@@ -164,6 +183,119 @@ class DisposableTargetTest(unittest.TestCase):
                     create_disposable_target_from_backup(backup, source, target)
             self.assertEqual(len(calls), 1)
             self.assertFalse(any(sql.startswith("DROP DATABASE") for sql in calls))
+
+    def _approved_target(self):
+        return {
+            "database": "coverage_vnext_candidate_801",
+            "user": "coverage",
+            "candidate_grant_host": "db",
+            "approved_application_user": "coverage",
+            "approved_application_host": "db",
+        }
+
+    def test_nonexistent_candidate_account_fails_before_grant(self):
+        calls = []
+
+        def run_client(_client, _common, _env, sql, database=None):
+            calls.append(sql)
+            if sql.startswith("SELECT User, Host FROM mysql.user"):
+                return CompletedProcess([], 0, b"", b"")
+            return CompletedProcess([], 0, b"", b"")
+
+        with mock.patch(
+                "scripts.upgrade.disposable_target._run_client",
+                side_effect=run_client):
+            with self.assertRaisesRegex(RuntimeError, "does not exist"):
+                _grant_and_probe_candidate_access(
+                    "mysql", [], {}, self._approved_target(),
+                    "coverage_vnext_candidate_801",
+                    source={"user": "coverage", "application_grant_host": "db"},
+                )
+        self.assertFalse(any(sql.startswith("GRANT ") for sql in calls))
+
+    def test_failed_after_grant_restores_grant_state(self):
+        calls = []
+        pre_grant = b"GRANT USAGE ON *.* TO 'coverage'@'db'\n"
+        target_grant = (
+            b"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, "
+            b"CREATE TEMPORARY TABLES ON `coverage_vnext_candidate_801`.* "
+            b"TO 'coverage'@'db'\n"
+        )
+
+        def run_client(_client, _common, _env, sql, database=None):
+            calls.append(sql)
+            if sql.startswith("SELECT User, Host FROM mysql.user"):
+                return CompletedProcess([], 0, b"coverage\tdb\n", b"")
+            if sql.startswith("SHOW GRANTS FOR"):
+                return CompletedProcess([], 0, pre_grant, b"")
+            if sql.startswith("SHOW GRANTS"):
+                return CompletedProcess([], 0, target_grant, b"")
+            if sql.startswith("CREATE TEMPORARY TABLE"):
+                return CompletedProcess([], 1, b"", b"probe denied")
+            return CompletedProcess([], 0, b"", b"")
+
+        with mock.patch(
+                "scripts.upgrade.disposable_target._client_settings",
+                return_value=("mysql", [], {})), \
+                mock.patch(
+                    "scripts.upgrade.disposable_target._run_client",
+                    side_effect=run_client):
+            with self.assertRaisesRegex(RuntimeError, "capability probe failed"):
+                _grant_and_probe_candidate_access(
+                    "mysql", [], {}, self._approved_target(),
+                    "coverage_vnext_candidate_801",
+                    source={"user": "coverage", "application_grant_host": "db"},
+                )
+        self.assertTrue(any(sql.startswith("REVOKE ALL PRIVILEGES") for sql in calls))
+        self.assertGreaterEqual(
+            sum(sql.startswith("SHOW GRANTS FOR") for sql in calls), 2
+        )
+
+    def test_wrong_candidate_grant_host_is_rejected(self):
+        source = {
+            "database": "coverage_vnext_e9fcc837",
+            "user": "coverage",
+            "application_grant_host": "127.0.0.1",
+        }
+        target = self._approved_target()
+        target["candidate_grant_host"] = "localhost"
+        with self.assertRaisesRegex(ValueError, "principal does not match"):
+            validate_disposable_target_config(source, target)
+
+    def test_cleanup_restores_account_then_drops_only_new_target(self):
+        calls = []
+        pre_grant = b"GRANT USAGE ON *.* TO 'coverage'@'db'\n"
+
+        def run_client(_client, _common, _env, sql, database=None):
+            calls.append(sql)
+            if sql.startswith("SELECT User, Host FROM mysql.user"):
+                return CompletedProcess([], 0, b"coverage\tdb\n", b"")
+            if sql.startswith("SHOW GRANTS FOR"):
+                return CompletedProcess([], 0, pre_grant, b"")
+            if sql.startswith("SELECT SCHEMA_NAME"):
+                return CompletedProcess([], 0, b"", b"")
+            return CompletedProcess([], 0, b"", b"")
+
+        evidence = {
+            "target_database_created_by_this_run": True,
+            "target_database": "coverage_vnext_candidate_801",
+            "candidate_access": {
+                "grant_applied_by_run": True,
+                "pre_grant_privilege_snapshot": {
+                    "grants": ["GRANT USAGE ON *.* TO 'coverage'@'db'"]
+                },
+            },
+        }
+        with mock.patch(
+                "scripts.upgrade.disposable_target._client_settings",
+                return_value=("mysql", [], {})), \
+                mock.patch(
+                    "scripts.upgrade.disposable_target._run_client",
+                    side_effect=run_client):
+            result = cleanup_disposable_target(self._approved_target(), evidence)
+        self.assertEqual(result["status"], "PASSED")
+        self.assertTrue(any(sql.startswith("REVOKE ALL PRIVILEGES") for sql in calls))
+        self.assertTrue(any(sql.startswith("DROP DATABASE") for sql in calls))
 
 
 if __name__ == "__main__":

@@ -14,12 +14,206 @@ from scripts.upgrade.cutover_controller import CutoverController
 from scripts.upgrade.run_upgrade import (
     _new_release_validation_session_id, _resolve_attempt_path,
     _validate_candidate_browser_evidence,
+    UpgradeOrchestrator,
     validate_candidate_publication_preflight,
     verify_production_candidate_served_root_binding,
 )
+from scripts.upgrade.evidence_manifest import ProductionEvidenceManifest
 
 
 class TestUpgradeManifest(unittest.TestCase):
+    @staticmethod
+    def _pre_cutover_data():
+        revision = "a" * 40
+        session = "candidate-attempt-1"
+        artifact = "b" * 64
+        served = "c" * 64
+        passed = {"status": "PASSED", "revision": revision, "exit_code": 0}
+        return {
+            "release_identity": {
+                "version": "v-test", "commit_sha": revision,
+                "build_id": "build-test",
+            },
+            "backup_evidence": dict(
+                passed, evidence_class="blue_green_database",
+                full_sql_gz_sha256="d" * 64,
+            ),
+            "database_generation": dict(
+                passed, generation="VNEXT",
+            ),
+            "disposable_target": dict(
+                passed,
+                target_database="coverage_vnext_candidate_test",
+                target_database_created_by_this_run=True,
+                candidate_access={
+                    "status": "PASSED",
+                    "grant_applied_by_run": True,
+                    "pre_grant_privilege_snapshot": {
+                        "account": "coverage_user@127.0.0.1",
+                        "grants": ["GRANT USAGE ON *.*"],
+                    },
+                },
+            ),
+            "database_separation": dict(passed),
+            "schema_migration": dict(passed, preflight_safe=True),
+            "candidate_release_prepared": dict(
+                passed, current_unchanged=True,
+                release_validation_session_id=session,
+                candidate_artifact_sha256=artifact,
+                served_root_sha256=served,
+            ),
+            "data_hash_verification": dict(
+                passed, verified=True,
+                source_semantic_hash="e" * 64,
+                target_semantic_hash="e" * 64,
+            ),
+            "file_state_gate": dict(
+                passed, conditions_passed=True, project_count=1,
+                project_gates=[{
+                    "status": "PASSED",
+                    "explicit_conditions": {
+                        "expected_file_count_equals_file_state_count": True,
+                        "missing_file_count_zero": True,
+                        "orphan_file_state_count_zero": True,
+                        "stale_file_count_zero": True,
+                        "pending_conservation": True,
+                        "authoritative_reconciliation": True,
+                        "file_state_version_equals_data_version": True,
+                    },
+                    "data_version": 7,
+                    "file_state_version": 7,
+                    "completeness": {
+                        "status": "PASSED",
+                        "expected_file_count": 1,
+                        "state_file_count": 1,
+                        "missing_file_count": 0,
+                        "orphan_file_state_count": 0,
+                        "stale_file_count": 0,
+                    },
+                    "pending_conservation": {
+                        "status": "PASSED",
+                        "pending_total": 1,
+                        "ordinary_pending_total": 1,
+                        "inherited_pending_total": 0,
+                        "manual_draft_pending_total": 0,
+                    },
+                    "reconciliation": {"status": "PASSED"},
+                }],
+            ),
+            "targeted_tests": {
+                "tests.release.test_upgrade_manifest": dict(passed),
+            },
+            "browser_fixture_regression": dict(
+                passed, evidence_class="browser_fixture_regression",
+            ),
+            "candidate_browser_evidence": dict(
+                passed, evidence_class="real_candidate_browser",
+                release_validation_session_id=session,
+                candidate_artifact_sha256=artifact,
+                served_root_sha256=served,
+                expected_commit_sha=revision,
+                release_eligible=True, synthetic=False,
+                real_http=True, chromium=True,
+            ),
+            "performance_benchmark": dict(
+                passed, evidence_class="release_performance_ab",
+                candidate_commit=revision,
+                release_validation_session_id=session,
+                candidate_artifact_sha256=artifact,
+                served_root_sha256=served,
+            ),
+            "path_mapping_audit": dict(
+                passed, is_valid=True, input_kind="repository_lcov",
+            ),
+            "sidecar_audit": dict(passed, is_safe=True),
+            "security_audit": dict(
+                passed, is_safe=True, critical_count=0, high_count=0,
+            ),
+            "candidate_release_endpoint": dict(
+                passed, process_role="validation_candidate",
+            ),
+            "api_start": dict(passed, process_role="validation_candidate"),
+            "validation_session_manifest": dict(
+                passed, session_id=session, candidate_sha=revision,
+                artifact_sha256="f" * 64,
+            ),
+            "validation_teardown": dict(
+                passed, session_id=session, pids_closed=True,
+                ports_closed=True, ports_probe_ok=True,
+            ),
+            "rollback_evidence": dict(
+                passed, rehearsal_verified=True,
+                before_release_id="before-session",
+                target_release_id=session,
+                rollback_release_id="before-session",
+                release_validation_session_id=session,
+                candidate_artifact_sha256=artifact,
+                served_root_sha256=served,
+            ),
+        }
+
+    def _manifest_for_pre_cutover(self, root, data):
+        manifest = ProductionEvidenceManifest(root)
+        manifest.data.update(data)
+        return manifest
+
+    def test_missing_rollback_artifact_blocks_phase_d_methods(self):
+        with tempfile.TemporaryDirectory(prefix="pre-cutover-rollback-") as root:
+            manifest = self._manifest_for_pre_cutover(root, self._pre_cutover_data())
+            manifest.data.pop("rollback_evidence")
+            orchestrator = UpgradeOrchestrator(repo_root=root)
+            orchestrator.manifest = manifest
+            phase_d_methods = []
+            ready, _unmet = orchestrator._validate_pre_cutover_ready(
+                manifest.data["release_identity"], "staging"
+            )
+            if ready:
+                phase_d_methods.extend(("freeze", "stop_current", "switch_current"))
+            self.assertFalse(ready)
+            self.assertEqual(phase_d_methods, [])
+            self.assertEqual(
+                manifest.data["pre_cutover_ready"]["status"], "FAILED"
+            )
+
+    def test_complete_pre_cutover_evidence_can_pass_without_phase_d_methods(self):
+        with tempfile.TemporaryDirectory(prefix="pre-cutover-pass-") as root:
+            manifest = self._manifest_for_pre_cutover(
+                root, self._pre_cutover_data()
+            )
+            orchestrator = UpgradeOrchestrator(repo_root=root)
+            orchestrator.manifest = manifest
+            ready, unmet = orchestrator._validate_pre_cutover_ready(
+                manifest.data["release_identity"], "staging"
+            )
+            self.assertTrue(ready, unmet)
+            self.assertEqual(
+                manifest.data["pre_cutover_ready"]["status"], "PASSED"
+            )
+            self.assertFalse(
+                manifest.data["pre_cutover_ready"]["phase_d_entered"]
+            )
+
+    def test_failed_path_mapping_blocks_phase_d_methods(self):
+        with tempfile.TemporaryDirectory(prefix="pre-cutover-path-") as root:
+            data = self._pre_cutover_data()
+            data["path_mapping_audit"].update({
+                "status": "FAILED", "is_valid": False, "exit_code": 1,
+            })
+            manifest = self._manifest_for_pre_cutover(root, data)
+            orchestrator = UpgradeOrchestrator(repo_root=root)
+            orchestrator.manifest = manifest
+            phase_d_methods = []
+            ready, _unmet = orchestrator._validate_pre_cutover_ready(
+                manifest.data["release_identity"], "staging"
+            )
+            if ready:
+                phase_d_methods.extend(("freeze", "stop_current", "switch_current"))
+            self.assertFalse(ready)
+            self.assertEqual(phase_d_methods, [])
+            self.assertEqual(
+                manifest.data["pre_cutover_ready"]["status"], "FAILED"
+            )
+
     def test_candidate_preflight_rejects_workflow_sha_placeholder_before_maintenance(self):
         with self.assertRaisesRegex(RuntimeError, "still a placeholder"):
             validate_candidate_publication_preflight(
@@ -88,6 +282,7 @@ class TestUpgradeManifest(unittest.TestCase):
         candidate_endpoint = source.index('"candidate_release_endpoint"')
         targeted = source.index("# Step 5: Run Targeted Unit Test Suites")
         browser = source.index("# Step 6: Run Node DOM & Event-loop Smoke Suite")
+        pre_cutover_gate = source.index("self._validate_pre_cutover_ready(identity, mode)")
         freeze = source.index("lifecycle.freeze(identity.get(\"commit_sha\", \"\"))")
         stop = source.index("lifecycle.stop_current_api()")
         switched = source.index("self.publisher.switch_current(session_id)")
@@ -96,6 +291,7 @@ class TestUpgradeManifest(unittest.TestCase):
         self.assertLess(validation, targeted)
         self.assertLess(targeted, browser)
         self.assertLess(browser, freeze)
+        self.assertLess(pre_cutover_gate, freeze)
         self.assertLess(freeze, stop)
         self.assertLess(stop, switched)
         self.assertIn("current_unchanged_until_phase_d", source)

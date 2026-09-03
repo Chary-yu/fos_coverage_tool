@@ -147,11 +147,20 @@ class VfoswindProductionLifecycle(object):
         self._previous_validation_unit_mode = None
         self._previous_unit = None
         self._previous_unit_mode = None
+        self._previous_unit_was_absent = False
         self._previous_nginx = None
         self._previous_nginx_mode = None
         self.release_bindings_changed = False
         self.validation_binding_changed = False
         self.runtime_bound = False
+        self.bootstrap_required = False
+        self.bootstrap_plan = {}
+        self._bootstrap_validation_installed = False
+        self._bootstrap_validation_previous = {}
+        self._bootstrap_runtime_environment_created = False
+        self._bootstrap_previous_environment = None
+        self._bootstrap_previous_environment_mode = None
+        self._bootstrap_runtime_environment_touched = False
 
     @staticmethod
     def _default_command_runner(argv):
@@ -167,7 +176,7 @@ class VfoswindProductionLifecycle(object):
                 )
             )
         try:
-            with open(path, "r", encoding="utf-8") as stream:
+            with open(path, "r", encoding="utf-8", newline="") as stream:
                 return stream.read()
         except (OSError, UnicodeError) as exc:
             raise RuntimeError(
@@ -239,6 +248,50 @@ class VfoswindProductionLifecycle(object):
     def _validation_unit_file_path(self):
         return self.validation_unit_file
 
+    def _bootstrap_config(self):
+        value = self.config.get("bootstrap") or {}
+        if not isinstance(value, dict):
+            raise RuntimeError("production integration bootstrap must be an object")
+        return value
+
+    def _legacy_unit_path(self):
+        bootstrap = self._bootstrap_config()
+        configured = bootstrap.get("legacy_systemd_unit_file") or \
+            self.config.get("legacy_systemd_unit_file") or \
+            self._unit_file_path()
+        return _literal(configured) if configured else ""
+
+    def _legacy_nginx_path(self):
+        bootstrap = self._bootstrap_config()
+        configured = bootstrap.get("legacy_nginx_config_path") or \
+            self.config.get("legacy_nginx_config_path") or \
+            self._nginx_file_path()
+        return _literal(configured) if configured else ""
+
+    def _legacy_unit_name(self):
+        bootstrap = self._bootstrap_config()
+        return str(
+            bootstrap.get("legacy_systemd_unit") or
+            self.config.get("legacy_systemd_unit") or
+            self.config.get("systemd_unit") or ""
+        ).strip()
+
+    def _legacy_unit_definition(self):
+        path = self._legacy_unit_path()
+        if path and os.path.isfile(path) and not os.path.islink(path):
+            return self._read_file(path, "legacy_systemd_unit_file")
+        unit = self._legacy_unit_name()
+        if not unit:
+            raise RuntimeError("legacy systemd unit identity is required")
+        result = self.command_runner(["systemctl", "cat", unit])
+        if result.returncode != 0:
+            raise RuntimeError(
+                "legacy systemd unit definition probe failed: {}".format(
+                    result.stderr.decode("utf-8", errors="replace")
+                )
+            )
+        return result.stdout.decode("utf-8", errors="replace")
+
     def _nginx_file_path(self):
         configured = self.config.get("nginx_config_path") or \
             self.config.get("nginx_config")
@@ -256,7 +309,11 @@ class VfoswindProductionLifecycle(object):
             prefix=".coverage-production-binding-", dir=directory
         )
         try:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            if isinstance(content, bytes):
+                stream = os.fdopen(descriptor, "wb")
+            else:
+                stream = os.fdopen(descriptor, "w", encoding="utf-8")
+            with stream:
                 stream.write(content)
                 stream.flush()
                 try:
@@ -375,6 +432,317 @@ class VfoswindProductionLifecycle(object):
                 "{} systemd ExecStart is not bound to the expected application root".format(label)
             )
 
+    @staticmethod
+    def _validate_legacy_runtime_unit(text, application_root):
+        """Validate the observed Flat service without requiring new env files."""
+        application_root = _literal(application_root)
+        if "WorkingDirectory={}".format(application_root) not in text:
+            raise RuntimeError(
+                "legacy systemd WorkingDirectory is not bound to the recorded Flat application root"
+            )
+        exec_lines = [
+            line.strip() for line in text.splitlines()
+            if line.strip().startswith("ExecStart=")
+        ]
+        if not any(
+                application_root in line and "enhance_coverage.py" in line
+                for line in exec_lines
+        ):
+            raise RuntimeError(
+                "legacy systemd ExecStart is not bound to the recorded Flat application root"
+            )
+
+    @staticmethod
+    def _sha256_bytes(value):
+        import hashlib
+        return hashlib.sha256(value).hexdigest()
+
+    @staticmethod
+    def _replace_unit_application_and_environment(
+            text, old_application_root, new_application_root, environment_file):
+        old_application_root = _literal(old_application_root)
+        new_application_root = _literal(new_application_root)
+        lines = []
+        environment_replaced = False
+        service_section_seen = False
+        for line in str(text).splitlines(True):
+            stripped = line.strip()
+            if stripped == "[Service]":
+                service_section_seen = True
+            if stripped.startswith("WorkingDirectory="):
+                line = "WorkingDirectory={}\n".format(new_application_root)
+            elif stripped.startswith("ExecStart="):
+                line = line.replace(old_application_root, new_application_root)
+            elif stripped.startswith("EnvironmentFile="):
+                line = "EnvironmentFile={}\n".format(environment_file)
+                environment_replaced = True
+            lines.append(line)
+            if service_section_seen and not environment_replaced and stripped == "[Service]":
+                lines.append("EnvironmentFile={}\n".format(environment_file))
+                environment_replaced = True
+        if not service_section_seen:
+            raise RuntimeError("legacy systemd unit has no [Service] section")
+        if not environment_replaced:
+            lines.append("EnvironmentFile={}\n".format(environment_file))
+        return "".join(lines)
+
+    def _bootstrap_static_probe(self, field, staged_path):
+        bootstrap = self._bootstrap_config()
+        configured = bootstrap.get(field)
+        if not configured:
+            raise RuntimeError(
+                "production bootstrap command '{}' is required".format(field)
+            )
+        argv = _argv(configured, field)
+        if "{path}" in argv:
+            argv = [staged_path if item == "{path}" else item for item in argv]
+        elif bootstrap.get("{}_uses_staged_path".format(field), True):
+            argv.append(staged_path)
+        result = self.command_runner(argv)
+        evidence = {
+            "name": field,
+            "command": argv,
+            "status": "PASSED" if result.returncode == 0 else "FAILED",
+            "exit_code": result.returncode,
+            "stdout": result.stdout.decode("utf-8", errors="replace")[-2000:],
+            "stderr": result.stderr.decode("utf-8", errors="replace")[-2000:],
+        }
+        if result.returncode != 0:
+            raise RuntimeError(
+                "production bootstrap {} failed".format(field)
+            )
+        return evidence
+
+    def _build_flat_bootstrap_plan(
+            self, unit_text, nginx_text, legacy_application_root,
+            legacy_served_root, runtime_mysql, candidate_application_root,
+            candidate_ports):
+        unit_path = self._unit_file_path()
+        nginx_path = self._nginx_file_path()
+        legacy_unit_path = self._legacy_unit_path()
+        legacy_nginx_path = self._legacy_nginx_path()
+        if not unit_path or not nginx_path or not legacy_unit_path or not legacy_nginx_path:
+            raise RuntimeError("Flat bootstrap requires explicit systemd/Nginx file paths")
+        if unit_path != legacy_unit_path or nginx_path != legacy_nginx_path:
+            raise RuntimeError(
+                "Flat bootstrap requires stable systemd and Nginx binding paths"
+            )
+        if not candidate_application_root:
+            raise RuntimeError("Flat bootstrap requires the immutable Candidate application root")
+        ports = [int(port) for port in (candidate_ports or [])]
+        if not ports:
+            raise RuntimeError("Flat bootstrap requires an isolated Candidate port")
+        runtime_mysql = _runtime_mysql_config(runtime_mysql)
+        managed_unit = self._replace_unit_application_and_environment(
+            unit_text, legacy_application_root, self.current_app,
+            self.environment_file,
+        )
+        managed_nginx = nginx_text.replace(
+            "alias {}/;".format(legacy_served_root.rstrip(os.sep)),
+            "alias {}/;".format(self.current_reports.rstrip(os.sep)),
+            1,
+        )
+        if managed_nginx == nginx_text or not self._contains_alias(
+                managed_nginx, self.current_reports):
+            raise RuntimeError("Flat bootstrap could not render the managed Nginx CURRENT alias")
+        # The bootstrap plan is a binding template, not a serving credential
+        # handoff.  Keep source secrets out of temporary validation files and
+        # let bind_candidate_database write the target credentials only after
+        # CURRENT has been switched.
+        bootstrap_runtime_mysql = dict(runtime_mysql)
+        bootstrap_runtime_mysql.pop("password", None)
+        runtime_environment = self._render_mysql_environment(
+            "", bootstrap_runtime_mysql
+        )
+        validation_config = {
+            "server": {"host": "127.0.0.1", "port": ports[0]},
+            "runtime_mode": "vnext",
+            "environment": "candidate",
+        }
+        validation_config_text = json.dumps(
+            validation_config, ensure_ascii=False, sort_keys=True, indent=2
+        ) + "\n"
+        validation_unit = (
+            "[Unit]\n"
+            "Description=onesensor coverage isolated Candidate validation\n"
+            "[Service]\n"
+            "Type=simple\n"
+            "WorkingDirectory={application}\n"
+            "ExecStart={python} {application}/enhance_coverage.py server\n"
+            "EnvironmentFile={environment}\n"
+        ).format(
+            application=_literal(self.config.get("validation_application_root") or
+                                 candidate_application_root),
+            python=str(self._bootstrap_config().get(
+                "python", "/usr/bin/python3"
+            )),
+            environment=self.validation_environment_file,
+        )
+        validation_environment = (
+            "COVERAGE_CONFIG_PATH={}\n".format(self.validation_config_path) +
+            "COVERAGE_MYSQL_JSON={}\n".format(
+                _quote_environment_value(json.dumps(
+                    bootstrap_runtime_mysql, ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"),
+                ))
+            )
+        )
+        with tempfile.TemporaryDirectory(prefix="coverage-vfoswind-bootstrap-") as stage:
+            unit_stage = os.path.join(stage, "managed.service")
+            nginx_stage = os.path.join(stage, "managed.conf")
+            # Round-trip the exact legacy bytes through disposable files.  The
+            # managed rendering is checked separately by the read-only static
+            # probes in _preflight_flat_bootstrap; keeping these stages
+            # separate prevents a test fixture from accidentally verifying the
+            # original bytes after overwriting the managed rendering.
+            with open(unit_stage, "w", encoding="utf-8", newline="") as stream:
+                stream.write(unit_text)
+            with open(nginx_stage, "w", encoding="utf-8", newline="") as stream:
+                stream.write(nginx_text)
+            with open(unit_stage, "r", encoding="utf-8", newline="") as stream:
+                restored_unit = stream.read()
+            with open(nginx_stage, "r", encoding="utf-8", newline="") as stream:
+                restored_nginx = stream.read()
+            rollback_bytes_verified = (
+                restored_unit == unit_text and restored_nginx == nginx_text
+            )
+        if not rollback_bytes_verified:
+            raise RuntimeError("Flat bootstrap rollback byte verification failed")
+        plan = {
+            "status": "PASSED",
+            "bootstrap_ready": True,
+            "bootstrap_required": True,
+            "legacy_systemd_unit": self._legacy_unit_name(),
+            "legacy_systemd_unit_file": legacy_unit_path,
+            "legacy_nginx_config_path": legacy_nginx_path,
+            "legacy_application_root": _literal(legacy_application_root),
+            "legacy_served_root": _literal(legacy_served_root),
+            "managed_systemd_unit_file": unit_path,
+            "managed_nginx_config_path": nginx_path,
+            "legacy_systemd_unit_definition": unit_text,
+            "managed_systemd_unit": managed_unit,
+            "managed_nginx": managed_nginx,
+            "runtime_environment": runtime_environment,
+            "validation_unit": validation_unit,
+            "validation_environment": validation_environment,
+            "validation_config": validation_config_text,
+            "validation_application_root": _literal(
+                self.config.get("validation_application_root") or
+                candidate_application_root
+            ),
+            "validation_ports": ports,
+            "old_unit_sha256": self._sha256_bytes(unit_text.encode("utf-8")),
+            "old_nginx_sha256": self._sha256_bytes(nginx_text.encode("utf-8")),
+            "managed_unit_sha256": self._sha256_bytes(managed_unit.encode("utf-8")),
+            "managed_nginx_sha256": self._sha256_bytes(managed_nginx.encode("utf-8")),
+            "rollback_bytes_verified": rollback_bytes_verified,
+        }
+        return plan
+
+    def _preflight_flat_bootstrap(
+            self, expected_database, runtime_mysql, candidate_application_root,
+            candidate_ports):
+        """Plan the one-time Flat-to-managed transition without writing host files."""
+        legacy_application_root = str(
+            self.config.get("legacy_application_root") or ""
+        ).strip()
+        legacy_served_root = str(
+            self.config.get("legacy_served_root") or
+            self.config.get("legacy_reports_root") or ""
+        ).strip()
+        if not legacy_application_root or not legacy_served_root:
+            raise RuntimeError(
+                "Flat vfoswind bootstrap requires legacy application and reports roots"
+            )
+        legacy_application_root = _literal(legacy_application_root)
+        legacy_served_root = _literal(legacy_served_root)
+        if not os.path.isdir(legacy_served_root) or os.path.islink(legacy_served_root):
+            raise RuntimeError("legacy vfoswind reports root is not a real directory")
+
+        unit_text = self._legacy_unit_definition()
+        self._validate_legacy_runtime_unit(unit_text, legacy_application_root)
+        nginx_path = self._legacy_nginx_path()
+        nginx_text = self._read_file(nginx_path, "legacy_nginx_config")
+        if not self._contains_alias(nginx_text, legacy_served_root):
+            raise RuntimeError("legacy Nginx alias is not bound to the recorded Flat reports root")
+        expected_proxy = str(self.config.get("nginx_proxy_pass") or "").strip()
+        if expected_proxy and expected_proxy not in nginx_text:
+            raise RuntimeError("legacy Nginx proxy_pass does not match the production binding")
+
+        runtime = _runtime_mysql_config(runtime_mysql)
+        if expected_database and runtime.get("database", "").lower() != str(
+                expected_database
+        ).lower():
+            raise RuntimeError("Flat bootstrap runtime database does not match source identity")
+        validation_application = str(
+            candidate_application_root or
+            self.config.get("validation_application_root") or ""
+        ).strip()
+        if not validation_application:
+            raise RuntimeError("Flat bootstrap Candidate application root is required")
+        validation_application = _literal(validation_application)
+        application_evidence = validate_production_application_root(
+            validation_application
+        )
+        plan = self._build_flat_bootstrap_plan(
+            unit_text, nginx_text, legacy_application_root,
+            legacy_served_root, runtime, validation_application,
+            candidate_ports,
+        )
+        with tempfile.TemporaryDirectory(prefix="coverage-vfoswind-bootstrap-check-") as stage:
+            unit_stage = os.path.join(stage, "managed.service")
+            nginx_stage = os.path.join(stage, "managed.conf")
+            with open(unit_stage, "w", encoding="utf-8") as stream:
+                stream.write(plan["managed_systemd_unit"])
+            with open(nginx_stage, "w", encoding="utf-8") as stream:
+                stream.write(plan["managed_nginx"])
+            systemd_check = self._bootstrap_static_probe(
+                "systemd_analyze", unit_stage
+            )
+            nginx_check = self._bootstrap_static_probe(
+                "nginx_test", nginx_stage
+            )
+        plan["systemd_analyze"] = systemd_check
+        plan["nginx_test"] = nginx_check
+        plan["runtime_database"] = runtime.get("database", "")
+        plan["runtime_application_user"] = runtime.get("user", "")
+        plan["application"] = application_evidence
+        plan["read_only"] = True
+        plan["command"] = "read legacy vfoswind bindings + render managed bootstrap + static checks"
+        plan["exit_code"] = 0
+        self.bootstrap_required = True
+        self.bootstrap_plan = plan
+        return {
+            "status": "PASSED",
+            "adapter": ADAPTER_NAME,
+            "bootstrap_ready": True,
+            "bootstrap_required": True,
+            "deployment_layout": "FLAT",
+            "transition_required": True,
+            "legacy_systemd_unit": plan["legacy_systemd_unit"],
+            "legacy_systemd_unit_file": plan["legacy_systemd_unit_file"],
+            "legacy_nginx_config_path": plan["legacy_nginx_config_path"],
+            "legacy_application_root": plan["legacy_application_root"],
+            "legacy_served_root": plan["legacy_served_root"],
+            "managed_systemd_unit_file": plan["managed_systemd_unit_file"],
+            "managed_nginx_config_path": plan["managed_nginx_config_path"],
+            "runtime_database": plan["runtime_database"],
+            "runtime_application_user": plan["runtime_application_user"],
+            "candidate_application_root": validation_application,
+            "candidate_artifact_sha256": application_evidence.get("application_sha256", ""),
+            "validation_ports": plan["validation_ports"],
+            "old_unit_sha256": plan["old_unit_sha256"],
+            "old_nginx_sha256": plan["old_nginx_sha256"],
+            "managed_unit_sha256": plan["managed_unit_sha256"],
+            "managed_nginx_sha256": plan["managed_nginx_sha256"],
+            "rollback_bytes_verified": plan["rollback_bytes_verified"],
+            "systemd_analyze": systemd_check,
+            "nginx_test": nginx_check,
+            "read_only": True,
+            "command": plan["command"],
+            "exit_code": 0,
+        }
+
     def _read_runtime_mysql_binding(self, path, field):
         text = self._read_file(path, field)
         values = parse_environment_file(text)
@@ -406,11 +774,23 @@ class VfoswindProductionLifecycle(object):
         return text, runtime
 
     def preflight(self, expected_database="", candidate_application_root="",
-                  candidate_ports=None, validation_commands=None):
+                  candidate_ports=None, validation_commands=None,
+                  runtime_mysql=None):
         """Read and validate systemd, Nginx, and persistent DB bindings."""
         if str(self.config.get("adapter") or ADAPTER_NAME).strip() != ADAPTER_NAME:
             raise RuntimeError("unsupported production lifecycle adapter")
         self._validate_commands(validation_commands=validation_commands)
+        current_path = os.path.join(self.publish_root, "CURRENT")
+        if os.path.lexists(current_path) and not os.path.islink(current_path):
+            raise RuntimeError("vfoswind CURRENT exists but is not an immutable symlink")
+        current_exists = os.path.islink(current_path)
+        if not current_exists:
+            return self._preflight_flat_bootstrap(
+                expected_database=expected_database,
+                runtime_mysql=runtime_mysql,
+                candidate_application_root=candidate_application_root,
+                candidate_ports=candidate_ports,
+            )
         unit_text = self._unit_definition()
         expected_environment = "EnvironmentFile={}".format(self.environment_file)
         if expected_environment not in unit_text and \
@@ -418,8 +798,6 @@ class VfoswindProductionLifecycle(object):
             raise RuntimeError(
                 "systemd unit does not persist the configured EnvironmentFile"
             )
-        current_path = os.path.join(self.publish_root, "CURRENT")
-        current_exists = os.path.islink(current_path)
         expected_application_root = self.current_app
         application_source = "immutable_current"
         deployment_layout = "IMMUTABLE_CURRENT"
@@ -618,6 +996,186 @@ class VfoswindProductionLifecycle(object):
             updated.append(rendered + "\n")
         return "".join(updated)
 
+    @staticmethod
+    def _optional_file_state(path, field):
+        if not os.path.lexists(path):
+            return None, None
+        if os.path.islink(path) or not os.path.isfile(path):
+            raise RuntimeError(
+                "production integration {} must be a regular file when present: {}".format(
+                    field, path
+                )
+            )
+        with open(path, "rb") as stream:
+            content = stream.read()
+        return content, os.stat(path).st_mode & 0o777
+
+    def _install_bootstrap_validation_bindings(self):
+        """Install only the isolated validation files from a preflight plan."""
+        if not self.bootstrap_required:
+            return {"status": "PASSED", "skipped": True, "reason": "managed_layout"}
+        plan = dict(self.bootstrap_plan or {})
+        paths = {
+            "unit": self._validation_unit_file_path(),
+            "environment": self.validation_environment_file,
+            "config": self.validation_config_path,
+        }
+        states = {}
+        present = []
+        for key, path in paths.items():
+            content, mode = self._optional_file_state(path, "validation_{}".format(key))
+            states[key] = (content, mode)
+            present.append(content is not None)
+        if any(present):
+            if not all(present):
+                raise RuntimeError(
+                    "Flat bootstrap validation files are partially provisioned"
+                )
+            self._bootstrap_validation_previous = {}
+            return {
+                "status": "PASSED",
+                "skipped": True,
+                "reason": "validation_bootstrap_already_provisioned",
+            }
+        plan_keys = {
+            "unit": "validation_unit",
+            "environment": "validation_environment",
+            "config": "validation_config",
+        }
+        for key, plan_key in plan_keys.items():
+            if plan_key not in plan:
+                raise RuntimeError(
+                    "Flat bootstrap validation plan is incomplete: {}".format(
+                        plan_key
+                    )
+                )
+        self._bootstrap_validation_previous = states
+        try:
+            self._replace_atomic(paths["unit"], plan[plan_keys["unit"]], 0o644)
+            self._replace_atomic(
+                paths["environment"], plan[plan_keys["environment"]], 0o600
+            )
+            self._replace_atomic(
+                paths["config"], plan[plan_keys["config"]], 0o644
+            )
+        except Exception:
+            self._restore_bootstrap_validation_bindings()
+            raise
+        self._bootstrap_validation_installed = True
+        return {
+            "status": "PASSED",
+            "installed": True,
+            "validation_systemd_unit_file": paths["unit"],
+            "validation_runtime_environment_file": paths["environment"],
+            "validation_config_path": paths["config"],
+            "command": "atomic Flat bootstrap validation unit/EnvironmentFile/config provision",
+            "exit_code": 0,
+        }
+
+    def _restore_bootstrap_validation_bindings(self):
+        if not self._bootstrap_validation_previous:
+            return {"status": "PASSED", "skipped": True,
+                    "reason": "no_bootstrap_validation_files"}
+        paths = {
+            "unit": self._validation_unit_file_path(),
+            "environment": self.validation_environment_file,
+            "config": self.validation_config_path,
+        }
+        for key, path in paths.items():
+            previous, mode = self._bootstrap_validation_previous.get(
+                key, (None, None)
+            )
+            if previous is None:
+                if os.path.lexists(path):
+                    if os.path.islink(path) or not os.path.isfile(path):
+                        raise RuntimeError(
+                            "cannot remove unexpected bootstrap validation file: {}".format(
+                                path
+                            )
+                        )
+                    os.remove(path)
+            else:
+                self._replace_atomic(path, previous, mode)
+        self._bootstrap_validation_previous = {}
+        self._bootstrap_validation_installed = False
+        return {
+            "status": "PASSED",
+            "restored": True,
+            "command": "restore exact pre-bootstrap validation files",
+            "exit_code": 0,
+        }
+
+    def _install_bootstrap_runtime_environment(self):
+        """Create the managed serving EnvironmentFile only at cutover."""
+        if not self.bootstrap_required:
+            return {"status": "PASSED", "skipped": True, "reason": "managed_layout"}
+        plan = dict(self.bootstrap_plan or {})
+        content, mode = self._optional_file_state(
+            self.environment_file, "runtime_environment_file"
+        )
+        self._bootstrap_previous_environment = content
+        self._bootstrap_previous_environment_mode = mode
+        self._bootstrap_runtime_environment_touched = True
+        if content is not None:
+            _observed_text, observed_runtime = self._read_runtime_mysql_binding(
+                self.environment_file, "runtime_environment_file"
+            )
+            if observed_runtime.get("database") != plan.get("runtime_database"):
+                raise RuntimeError(
+                    "existing serving EnvironmentFile database does not match Flat source identity"
+                )
+            return {
+                "status": "PASSED",
+                "created": False,
+                "runtime_database": observed_runtime.get("database"),
+                "command": "validate existing serving EnvironmentFile during bootstrap",
+                "exit_code": 0,
+            }
+        if not plan.get("runtime_environment"):
+            raise RuntimeError("Flat bootstrap runtime EnvironmentFile plan is missing")
+        self._replace_atomic(
+            self.environment_file, plan["runtime_environment"], 0o600
+        )
+        self._bootstrap_runtime_environment_created = True
+        return {
+            "status": "PASSED",
+            "created": True,
+            "runtime_environment_file": self.environment_file,
+            "runtime_database": plan.get("runtime_database"),
+            "command": "atomic serving EnvironmentFile bootstrap provision",
+            "exit_code": 0,
+        }
+
+    def _restore_bootstrap_runtime_environment(self):
+        if not self._bootstrap_runtime_environment_touched:
+            return {"status": "PASSED", "skipped": True,
+                    "reason": "no_bootstrap_runtime_environment"}
+        if self._bootstrap_previous_environment is None:
+            if os.path.lexists(self.environment_file):
+                if os.path.islink(self.environment_file) or not os.path.isfile(
+                        self.environment_file
+                ):
+                    raise RuntimeError(
+                        "cannot remove unexpected bootstrap EnvironmentFile"
+                    )
+                os.remove(self.environment_file)
+        else:
+            self._replace_atomic(
+                self.environment_file,
+                self._bootstrap_previous_environment,
+                self._bootstrap_previous_environment_mode,
+            )
+        self._bootstrap_runtime_environment_created = False
+        self._bootstrap_previous_environment = None
+        self._bootstrap_previous_environment_mode = None
+        self._bootstrap_runtime_environment_touched = False
+        return {
+            "status": "PASSED",
+            "restored": True,
+            "command": "restore exact pre-bootstrap serving EnvironmentFile",
+            "exit_code": 0,
+        }
+
     def bind_validation_candidate(self, application_root, target):
         """Bind the isolated validation unit to the immutable Candidate.
 
@@ -639,28 +1197,33 @@ class VfoswindProductionLifecycle(object):
             )
         unit_path = self._validation_unit_file_path()
         environment_path = self.validation_environment_file
-        unit_text, unit_mode = self._read_binding_file(
-            unit_path, "validation_systemd_unit_file"
-        )
-        environment_text, environment_mode = self._read_binding_file(
-            environment_path, "validation_runtime_environment_file"
-        )
-        self._validate_runtime_unit(
-            unit_text, source_application, environment_path, "validation"
-        )
-        self._previous_validation_unit = unit_text.encode("utf-8")
-        self._previous_validation_unit_mode = unit_mode
-        self._previous_validation_environment = environment_text.encode("utf-8")
-        self._previous_validation_environment_mode = environment_mode
-        updated_unit = unit_text.replace(source_application, application_root)
-        if updated_unit == unit_text:
-            raise RuntimeError(
-                "validation systemd unit did not contain the configured Candidate root"
-            )
-        updated_environment = self._render_mysql_environment(
-            environment_text, target_mysql
-        )
+        bootstrap_validation = None
         try:
+            # The bootstrap installer may create the isolated validation files.
+            # Keep every subsequent read/validation in this try block so a
+            # malformed generated binding cannot leak those files.
+            bootstrap_validation = self._install_bootstrap_validation_bindings()
+            unit_text, unit_mode = self._read_binding_file(
+                unit_path, "validation_systemd_unit_file"
+            )
+            environment_text, environment_mode = self._read_binding_file(
+                environment_path, "validation_runtime_environment_file"
+            )
+            self._validate_runtime_unit(
+                unit_text, source_application, environment_path, "validation"
+            )
+            self._previous_validation_unit = unit_text.encode("utf-8")
+            self._previous_validation_unit_mode = unit_mode
+            self._previous_validation_environment = environment_text.encode("utf-8")
+            self._previous_validation_environment_mode = environment_mode
+            updated_unit = unit_text.replace(source_application, application_root)
+            if updated_unit == unit_text:
+                raise RuntimeError(
+                    "validation systemd unit did not contain the configured Candidate root"
+                )
+            updated_environment = self._render_mysql_environment(
+                environment_text, target_mysql
+            )
             self._replace_atomic(unit_path, updated_unit, unit_mode)
             self._replace_atomic(
                 environment_path, updated_environment, environment_mode
@@ -692,6 +1255,7 @@ class VfoswindProductionLifecycle(object):
             "validation_application_root": application_root,
             "target_database": target_mysql.get("database"),
             "runtime_application_user": target_mysql.get("user"),
+            "bootstrap_validation": bootstrap_validation,
             "command": "atomic validation systemd/Candidate EnvironmentFile binding",
             "credentials_written_to_evidence": False,
             "exit_code": 0,
@@ -701,27 +1265,31 @@ class VfoswindProductionLifecycle(object):
         """Restore the exact pre-validation unit and database binding."""
         if self._previous_validation_unit is None and \
                 self._previous_validation_environment is None:
+            bootstrap_restore = self._restore_bootstrap_validation_bindings()
             return {
                 "status": "PASSED", "skipped": True,
                 "reason": "no_validation_candidate_binding",
+                "bootstrap_validation_restore": bootstrap_restore,
             }
         if self._previous_validation_unit is not None:
             self._replace_atomic(
                 self._validation_unit_file_path(),
-                self._previous_validation_unit.decode("utf-8"),
+                self._previous_validation_unit,
                 self._previous_validation_unit_mode,
             )
         if self._previous_validation_environment is not None:
             self._replace_atomic(
                 self.validation_environment_file,
-                self._previous_validation_environment.decode("utf-8"),
+                self._previous_validation_environment,
                 self._previous_validation_environment_mode,
             )
+        bootstrap_restore = self._restore_bootstrap_validation_bindings()
         self.validation_binding_changed = False
         return {
             "status": "PASSED",
             "adapter": ADAPTER_NAME,
             "restored_previous_validation_binding": True,
+            "bootstrap_validation_restore": bootstrap_restore,
             "credentials_written_to_evidence": False,
             "command": "atomic validation systemd/EnvironmentFile rollback",
             "exit_code": 0,
@@ -778,7 +1346,24 @@ class VfoswindProductionLifecycle(object):
             raise RuntimeError(
                 "vfoswind binding transition requires systemd_unit_file and nginx_config_path"
             )
-        unit_text, unit_mode = self._read_binding_file(unit_path, "systemd_unit_file")
+        unit_was_absent = False
+        if self.bootstrap_required and not os.path.lexists(unit_path):
+            legacy_definition = (self.bootstrap_plan or {}).get(
+                "legacy_systemd_unit_definition"
+            )
+            if not legacy_definition:
+                raise RuntimeError(
+                    "Flat bootstrap plan lacks the legacy systemd unit definition"
+                )
+            # systemctl cat may have resolved a vendor unit outside the
+            # configured persistent override path.  Treat the path as a new
+            # managed override and remember that rollback must remove it.
+            unit_text, unit_mode = legacy_definition, 0o644
+            unit_was_absent = True
+        else:
+            unit_text, unit_mode = self._read_binding_file(
+                unit_path, "systemd_unit_file"
+            )
         nginx_text, nginx_mode = self._read_binding_file(nginx_path, "nginx_config")
         old_application_root = str(self.config.get("legacy_application_root") or "").strip()
         old_served_root = str(
@@ -789,6 +1374,40 @@ class VfoswindProductionLifecycle(object):
             old_application_root = _literal(old_application_root)
         if old_served_root:
             old_served_root = _literal(old_served_root)
+
+        bootstrap_runtime = None
+        if self.bootstrap_required:
+            plan = dict(self.bootstrap_plan or {})
+            if plan.get("managed_systemd_unit_file") != unit_path or \
+                    plan.get("managed_nginx_config_path") != nginx_path:
+                raise RuntimeError("Flat bootstrap plan binding paths changed before cutover")
+            if self._sha256_bytes(unit_text.encode("utf-8")) != plan.get(
+                    "old_unit_sha256"
+            ) or self._sha256_bytes(nginx_text.encode("utf-8")) != plan.get(
+                    "old_nginx_sha256"
+            ):
+                raise RuntimeError(
+                    "Flat vfoswind binding changed after bootstrap preflight"
+                )
+            if plan.get("rollback_bytes_verified") is not True:
+                raise RuntimeError("Flat bootstrap rollback byte gate is not PASSED")
+            self._previous_unit = unit_text.encode("utf-8")
+            self._previous_unit_mode = unit_mode
+            self._previous_unit_was_absent = unit_was_absent
+            self._previous_nginx = nginx_text.encode("utf-8")
+            self._previous_nginx_mode = nginx_mode
+            try:
+                bootstrap_runtime = self._install_bootstrap_runtime_environment()
+                updated_unit = plan.get("managed_systemd_unit")
+                updated_nginx = plan.get("managed_nginx")
+                if not updated_unit or not updated_nginx:
+                    raise RuntimeError("Flat bootstrap managed binding plan is incomplete")
+            except Exception:
+                self._restore_bootstrap_runtime_environment()
+                raise
+        else:
+            updated_unit = None
+            updated_nginx = None
 
         if self._contains_alias(nginx_text, self.current_reports) and \
                 "WorkingDirectory={}".format(self.current_app) in unit_text:
@@ -824,22 +1443,25 @@ class VfoswindProductionLifecycle(object):
                 "Nginx alias no longer matches the recorded Flat reports root"
             )
 
-        self._previous_unit = unit_text.encode("utf-8")
-        self._previous_unit_mode = unit_mode
-        self._previous_nginx = nginx_text.encode("utf-8")
-        self._previous_nginx_mode = nginx_mode
-        updated_unit = []
-        for line in unit_text.splitlines(True):
-            if line.strip().startswith("WorkingDirectory="):
-                line = line.replace(old_application_root, self.current_app, 1)
-            elif line.strip().startswith("ExecStart="):
-                line = line.replace(old_application_root, self.current_app)
-            updated_unit.append(line)
-        updated_nginx = nginx_text.replace(
-            old_alias, "alias {}/;".format(self.current_reports.rstrip(os.sep)), 1
-        )
+        if not self.bootstrap_required:
+            self._previous_unit = unit_text.encode("utf-8")
+            self._previous_unit_mode = unit_mode
+            self._previous_unit_was_absent = False
+            self._previous_nginx = nginx_text.encode("utf-8")
+            self._previous_nginx_mode = nginx_mode
+            updated_unit_lines = []
+            for line in unit_text.splitlines(True):
+                if line.strip().startswith("WorkingDirectory="):
+                    line = line.replace(old_application_root, self.current_app, 1)
+                elif line.strip().startswith("ExecStart="):
+                    line = line.replace(old_application_root, self.current_app)
+                updated_unit_lines.append(line)
+            updated_unit = "".join(updated_unit_lines)
+            updated_nginx = nginx_text.replace(
+                old_alias, "alias {}/;".format(self.current_reports.rstrip(os.sep)), 1
+            )
         try:
-            self._replace_atomic(unit_path, "".join(updated_unit), unit_mode)
+            self._replace_atomic(unit_path, updated_unit, unit_mode)
             self._replace_atomic(nginx_path, updated_nginx, nginx_mode)
             rebound_unit = self._read_file(unit_path, "systemd_unit_file")
             rebound_nginx = self._read_file(nginx_path, "nginx_config")
@@ -863,6 +1485,7 @@ class VfoswindProductionLifecycle(object):
             "systemd_working_directory": self.current_app,
             "nginx_config_path": nginx_path,
             "nginx_alias": self.current_reports,
+            "bootstrap_runtime": bootstrap_runtime,
             "command": "atomic systemd/Nginx CURRENT binding transition",
             "exit_code": 0,
         }
@@ -870,23 +1493,42 @@ class VfoswindProductionLifecycle(object):
     def restore_previous_release_bindings(self):
         """Restore the exact systemd/Nginx bytes captured before adoption."""
         if self._previous_unit is None and self._previous_nginx is None:
+            runtime_restore = {
+                "status": "PASSED", "skipped": True,
+                "reason": "deferred_to_database_binding_rollback",
+            } if self.runtime_bound else self._restore_bootstrap_runtime_environment()
             return {"status": "PASSED", "skipped": True,
-                    "reason": "no_release_binding_transition"}
+                    "reason": "no_release_binding_transition",
+                    "runtime_environment_restore": runtime_restore}
         if self._previous_unit is not None:
-            self._replace_atomic(
-                self._unit_file_path(), self._previous_unit.decode("utf-8"),
-                self._previous_unit_mode,
-            )
+            unit_path = self._unit_file_path()
+            if self._previous_unit_was_absent:
+                if os.path.lexists(unit_path):
+                    if os.path.islink(unit_path) or not os.path.isfile(unit_path):
+                        raise RuntimeError(
+                            "cannot remove unexpected bootstrapped systemd unit file"
+                        )
+                    os.remove(unit_path)
+            else:
+                self._replace_atomic(
+                    unit_path, self._previous_unit, self._previous_unit_mode,
+                )
         if self._previous_nginx is not None:
             self._replace_atomic(
-                self._nginx_file_path(), self._previous_nginx.decode("utf-8"),
+                self._nginx_file_path(), self._previous_nginx,
                 self._previous_nginx_mode,
             )
+        runtime_restore = {
+            "status": "PASSED", "skipped": True,
+            "reason": "deferred_to_database_binding_rollback",
+        } if self.runtime_bound else self._restore_bootstrap_runtime_environment()
         self.release_bindings_changed = False
+        self._previous_unit_was_absent = False
         return {
             "status": "PASSED",
             "adapter": ADAPTER_NAME,
             "restored_previous_release_bindings": True,
+            "runtime_environment_restore": runtime_restore,
             "command": "atomic systemd/Nginx binding rollback",
             "exit_code": 0,
         }
@@ -993,12 +1635,14 @@ class VfoswindProductionLifecycle(object):
         self._write_environment(
             self._previous_environment, self._previous_environment_mode
         )
+        bootstrap_restore = self._restore_bootstrap_runtime_environment()
         self.runtime_bound = False
         return {
             "status": "PASSED",
             "adapter": ADAPTER_NAME,
             "runtime_environment_file": self.environment_file,
             "restored_previous_binding": True,
+            "bootstrap_runtime_environment_restore": bootstrap_restore,
             "credentials_written_to_evidence": False,
             "command": "atomic EnvironmentFile rollback",
             "exit_code": 0,

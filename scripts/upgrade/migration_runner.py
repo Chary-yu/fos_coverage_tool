@@ -3820,6 +3820,7 @@ def _migrate_legacy_with_source_spool(source_connection, target_connection,
     job_repo = JobRepository()
     scan_ids = {}
     project_ids = {}
+    file_state_ready_gates = []
 
     def setup_project(project_name):
         project_fragment = source_descriptor["project_fragments"].get(project_name, "")
@@ -4004,6 +4005,7 @@ def _migrate_legacy_with_source_spool(source_connection, target_connection,
         "authoritative_semantic_match": source_hash == target_hash,
         "release_sha": release_sha or "", "migration_id": migration_id,
         "captured_at": utc_iso(), "checkpointed": True,
+        "file_state_ready_gate": file_state_ready_gates,
     }
     if source_hash != target_hash:
         result["error_class"] = "semantic_zero_loss_gate_failed"
@@ -4020,10 +4022,57 @@ def _migrate_legacy_with_source_spool(source_connection, target_connection,
     # semantic failure, not converted into a partially-ready migration error.
     for project_name in project_names:
         with transaction(target_connection) as conn:
-            file_state_service.rebuild_validate_and_mark_ready_in_transaction(
+            ready = file_state_service.rebuild_validate_and_mark_ready_in_transaction(
                 conn, project_ids[project_name], scan_ids[project_name],
                 int(data_versions.get(project_name, 0)),
             )
+            gate = file_state_service.validate_rebuilt(
+                conn, project_ids[project_name], scan_ids[project_name],
+                int(data_versions.get(project_name, 0)),
+            )
+            completeness = gate.get("completeness") or {}
+            conservation = gate.get("pending_conservation") or {}
+            explicit_conditions = {
+                "expected_file_count_equals_file_state_count": int(
+                    completeness.get("expected_file_count") or 0
+                ) == int(completeness.get("state_file_count") or 0),
+                "missing_file_count_zero": int(
+                    completeness.get("missing_file_count") or 0
+                ) == 0,
+                "orphan_file_state_count_zero": int(
+                    completeness.get("orphan_state_count") or
+                    completeness.get("orphan_file_state_count") or 0
+                ) == 0,
+                "stale_file_count_zero": int(
+                    completeness.get("stale_file_count") or 0
+                ) == 0,
+                "pending_conservation": int(
+                    conservation.get("pending_total") or 0
+                ) == (
+                    int(conservation.get("ordinary_pending_total") or 0) +
+                    int(conservation.get("inherited_pending_total") or 0) +
+                    int(conservation.get("manual_draft_pending_total") or 0)
+                ),
+                "authoritative_reconciliation": gate.get(
+                    "reconciliation", {}
+                ).get("status") == "PASSED",
+                "file_state_version_equals_data_version": int(
+                    ready.get("file_state_version") or 0
+                ) == int(data_versions.get(project_name, 0)),
+            }
+            gate["explicit_conditions"] = explicit_conditions
+            gate["file_state_version"] = int(
+                ready.get("file_state_version") or 0
+            )
+            if gate.get("status") != "PASSED" or not all(
+                    explicit_conditions.values()
+            ):
+                raise ValueError(
+                    "MIGRATION FAILED: FileState Ready Gate did not satisfy all conditions: {}".format(
+                        gate
+                    )
+                )
+            file_state_ready_gates.append(gate)
             _upsert_migration_checkpoint(
                 conn, migration_id, "project:" + project_name, "PROJECT",
                 project_name,

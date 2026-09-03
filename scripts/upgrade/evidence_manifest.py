@@ -381,6 +381,329 @@ class ProductionEvidenceManifest:
         self.data.setdefault("logs", []).append(f"[{get_utc_iso()}] {message}")
         self.save()
 
+    def validate_pre_cutover_gate(self, require_production_integration=False):
+        """Validate every evidence item before any Phase-D mutation.
+
+        ``validate_final_gate`` deliberately includes traffic freeze, service
+        restart, CURRENT, and post-open evidence.  It is therefore too late
+        to be the first guard before cutover.  This smaller gate consumes only
+        Phase-A/B/C evidence and is the sole authority allowed to certify
+        ``PRE_CUTOVER_READY``.
+        """
+        unmet = []
+
+        release = self.data.get("release_identity") or {}
+        revision = release.get("commit_sha")
+        if not release.get("version") or not revision or not release.get("build_id"):
+            unmet.append("release_identity is incomplete")
+
+        def record(section, required=True):
+            payload = self.data.get(section) or {}
+            if required and (not isinstance(payload, dict) or
+                             payload.get("status") != "PASSED"):
+                unmet.append("{} evidence is not PASSED".format(section))
+            if required and isinstance(payload, dict):
+                if payload.get("revision") != revision:
+                    unmet.append("{} evidence revision is missing or mismatched".format(section))
+                if payload.get("exit_code") != 0:
+                    unmet.append("{} evidence exit_code is not 0".format(section))
+            return payload
+
+        # Every source/target and runtime preparation result must be present
+        # before the controller is allowed to enter the short cutover window.
+        backup = record("backup_evidence")
+        if backup.get("evidence_class") == "mock":
+            unmet.append("mock backup evidence cannot certify PRE_CUTOVER_READY")
+        if not backup.get("full_sql_gz_sha256"):
+            unmet.append("backup artifact SHA256 is missing")
+
+        generation = record("database_generation")
+        if generation.get("generation") not in ("LEGACY", "VNEXT"):
+            unmet.append("database generation is not classified as LEGACY or VNEXT")
+        target = record("disposable_target")
+        if not target.get("target_database"):
+            unmet.append("disposable target database identity is missing")
+        candidate_access = target.get("candidate_access")
+        if not isinstance(candidate_access, dict) or \
+                candidate_access.get("status") != "PASSED":
+            unmet.append("Candidate database application access was not verified")
+        elif target.get("target_database_created_by_this_run") is True:
+            if candidate_access.get("grant_applied_by_run") is not True or \
+                    not isinstance(
+                        candidate_access.get("pre_grant_privilege_snapshot"), dict
+                    ):
+                unmet.append(
+                    "Candidate database grant lacks exact pre-grant account evidence"
+                )
+        record("database_separation")
+
+        schema = record("schema_migration")
+        if schema.get("preflight_safe") is not True:
+            unmet.append("schema migration preflight is not safe")
+        record("candidate_release_prepared")
+        prepared = self.data.get("candidate_release_prepared") or {}
+        if prepared.get("current_unchanged") is not True:
+            unmet.append("Candidate publication did not prove CURRENT unchanged")
+        expected_session = prepared.get("release_validation_session_id")
+        expected_artifact = prepared.get("candidate_artifact_sha256")
+        expected_served_root = prepared.get("served_root_sha256")
+        if not expected_session or not expected_artifact or not expected_served_root:
+            unmet.append("Candidate publication session or immutable hashes are incomplete")
+
+        data_hash = record("data_hash_verification")
+        if data_hash.get("verified") is not True:
+            unmet.append("authoritative data hash gate is not verified")
+        if not data_hash.get("source_semantic_hash") or not data_hash.get("target_semantic_hash"):
+            unmet.append("authoritative source/target semantic hashes are missing")
+        elif data_hash.get("source_semantic_hash") != data_hash.get("target_semantic_hash"):
+            unmet.append("authoritative source/target semantic hashes differ")
+
+        file_state = record("file_state_gate")
+        if file_state.get("conditions_passed") is not True:
+            unmet.append("FileState Ready Gate did not certify all conditions")
+        project_gates = file_state.get("project_gates") or []
+        if not isinstance(project_gates, list):
+            unmet.append("file_state_gate project_gates is not a list")
+            project_gates = []
+        if isinstance(file_state.get("project_count"), int) and \
+                file_state.get("project_count") != len(project_gates):
+            unmet.append("file_state_gate project count does not match evidence")
+        for index, gate in enumerate(project_gates):
+            if not isinstance(gate, dict) or gate.get("status") != "PASSED":
+                unmet.append("file_state_gate project {} is not PASSED".format(index))
+                continue
+            required_conditions = (
+                "expected_file_count_equals_file_state_count",
+                "missing_file_count_zero",
+                "orphan_file_state_count_zero",
+                "stale_file_count_zero",
+                "pending_conservation",
+                "authoritative_reconciliation",
+                "file_state_version_equals_data_version",
+            )
+            conditions = gate.get("explicit_conditions")
+            if not isinstance(conditions, dict):
+                unmet.append(
+                    "file_state_gate project {} explicit conditions are missing".format(
+                        index
+                    )
+                )
+            else:
+                missing_conditions = [
+                    name for name in required_conditions if name not in conditions
+                ]
+                if missing_conditions:
+                    unmet.append(
+                        "file_state_gate project {} conditions are incomplete: {}".format(
+                            index, ", ".join(missing_conditions)
+                        )
+                    )
+                if any(conditions.get(name) is not True for name in required_conditions):
+                    unmet.append(
+                        "file_state_gate project {} has failed explicit conditions".format(
+                            index
+                        )
+                    )
+            completeness = gate.get("completeness")
+            if not isinstance(completeness, dict):
+                unmet.append(
+                    "file_state_gate project {} completeness evidence is missing".format(
+                        index
+                    )
+                )
+                completeness = {}
+            if completeness.get("status") != "PASSED":
+                unmet.append(
+                    "file_state_gate project {} completeness is not PASSED".format(
+                        index
+                    )
+                )
+            completeness_fields = (
+                "expected_file_count", "state_file_count", "missing_file_count",
+                "stale_file_count",
+            )
+            for field in completeness_fields:
+                if field not in completeness:
+                    unmet.append(
+                        "file_state_gate project {} completeness {} is missing".format(
+                            index, field
+                        )
+                    )
+            orphan_field = "orphan_file_state_count"
+            if orphan_field not in completeness and "orphan_state_count" not in completeness:
+                unmet.append(
+                    "file_state_gate project {} completeness orphan count is missing".format(
+                        index
+                    )
+                )
+            try:
+                if int(completeness.get("expected_file_count")) != int(
+                        completeness.get("state_file_count")):
+                    unmet.append("file_state_gate project {} file counts differ".format(index))
+                orphan_count = completeness.get(orphan_field)
+                if orphan_count is None:
+                    orphan_count = completeness.get("orphan_state_count")
+                for field, value in (
+                        ("missing_file_count", completeness.get("missing_file_count")),
+                        ("orphan_file_state_count", orphan_count),
+                        ("stale_file_count", completeness.get("stale_file_count"))):
+                    if int(value) != 0:
+                        unmet.append(
+                            "file_state_gate project {} {} is non-zero".format(
+                                index, field
+                            )
+                        )
+            except (TypeError, ValueError):
+                unmet.append(
+                    "file_state_gate project {} completeness counts are invalid".format(
+                        index
+                    )
+                )
+            conservation = gate.get("pending_conservation")
+            if not isinstance(conservation, dict):
+                unmet.append(
+                    "file_state_gate project {} pending conservation evidence is missing".format(
+                        index
+                    )
+                )
+                conservation = {}
+            if conservation.get("status") != "PASSED":
+                unmet.append(
+                    "file_state_gate project {} pending conservation is not PASSED".format(
+                        index
+                    )
+                )
+            pending_fields = (
+                "pending_total", "ordinary_pending_total",
+                "inherited_pending_total", "manual_draft_pending_total",
+            )
+            if any(field not in conservation for field in pending_fields):
+                unmet.append(
+                    "file_state_gate project {} pending conservation counts are incomplete".format(
+                        index
+                    )
+                )
+            try:
+                if int(conservation.get("pending_total")) != (
+                        int(conservation.get("ordinary_pending_total")) +
+                        int(conservation.get("inherited_pending_total")) +
+                        int(conservation.get("manual_draft_pending_total"))):
+                    unmet.append(
+                        "file_state_gate project {} pending conservation failed".format(
+                            index
+                        )
+                    )
+            except (TypeError, ValueError):
+                unmet.append(
+                    "file_state_gate project {} pending conservation counts are invalid".format(
+                        index
+                    )
+                )
+            reconciliation = gate.get("reconciliation")
+            if not isinstance(reconciliation, dict) or \
+                    reconciliation.get("status") != "PASSED":
+                unmet.append("file_state_gate project {} reconciliation failed".format(index))
+
+        targeted = self.data.get("targeted_tests") or {}
+        test_records = [value for name, value in targeted.items()
+                        if name != "_record_meta"] if isinstance(targeted, dict) else []
+        if not test_records or any(
+                not isinstance(value, dict) or value.get("status") != "PASSED"
+                or value.get("revision") != revision or value.get("exit_code") != 0
+                for value in test_records):
+            unmet.append("targeted test matrix is incomplete or contains failures")
+
+        fixture = record("browser_fixture_regression")
+        if fixture.get("evidence_class") != "browser_fixture_regression":
+            unmet.append("browser fixture evidence class is invalid")
+        browser = record("candidate_browser_evidence")
+        for field, expected in (
+                ("release_validation_session_id", expected_session),
+                ("candidate_artifact_sha256", expected_artifact),
+                ("served_root_sha256", expected_served_root),
+                ("expected_commit_sha", revision)):
+            if browser.get(field) != expected:
+                unmet.append("Candidate browser {} is not exact".format(field))
+        if browser.get("evidence_class") != "real_candidate_browser" or \
+                browser.get("release_eligible") is not True or \
+                browser.get("synthetic") is not False or \
+                browser.get("real_http") is not True or \
+                browser.get("chromium") is not True:
+            unmet.append("real Candidate browser evidence is not release eligible")
+
+        performance = record("performance_benchmark")
+        if performance.get("evidence_class") != "release_performance_ab" or \
+                performance.get("candidate_commit") != revision or \
+                performance.get("release_validation_session_id") != expected_session or \
+                performance.get("candidate_artifact_sha256") != expected_artifact or \
+                performance.get("served_root_sha256") != expected_served_root:
+            unmet.append("Performance A/B evidence is not exact to this Candidate")
+
+        path_mapping = record("path_mapping_audit")
+        if path_mapping.get("is_valid") is not True or \
+                path_mapping.get("input_kind") != "repository_lcov":
+            unmet.append("path mapping audit is not a valid repository+LCOV PASS")
+        sidecar = record("sidecar_audit")
+        if sidecar.get("is_safe") is not True:
+            unmet.append("sidecar audit is not safe")
+        security = record("security_audit")
+        if security.get("is_safe") is not True or \
+                int(security.get("critical_count") or 0) != 0 or \
+                int(security.get("high_count") or 0) != 0:
+            unmet.append("security audit has unresolved findings")
+
+        endpoint = record("candidate_release_endpoint")
+        if endpoint.get("process_role") != "validation_candidate":
+            unmet.append("Candidate release endpoint is not bound to validation runtime")
+        api_start = record("api_start")
+        if api_start.get("process_role") != "validation_candidate":
+            unmet.append("api_start is not bound to validation Candidate")
+
+        session = record("validation_session_manifest")
+        if session.get("session_id") != expected_session or \
+                session.get("candidate_sha") != revision or \
+                not session.get("artifact_sha256"):
+            unmet.append("validation session identity/hash is not exact")
+        teardown = record("validation_teardown")
+        if teardown.get("session_id") != expected_session or \
+                teardown.get("pids_closed") is not True or \
+                teardown.get("ports_closed") is not True or \
+                teardown.get("ports_probe_ok") is not True:
+            unmet.append("validation teardown did not close the exact session")
+
+        rollback = record("rollback_evidence")
+        if rollback.get("rehearsal_verified") is not True or \
+                rollback.get("release_validation_session_id") != expected_session or \
+                rollback.get("target_release_id") != expected_session or \
+                rollback.get("rollback_release_id") != rollback.get("before_release_id") or \
+                rollback.get("candidate_artifact_sha256") != expected_artifact or \
+                rollback.get("served_root_sha256") != expected_served_root:
+            unmet.append("rollback rehearsal evidence is missing or not exact")
+
+        if require_production_integration:
+            for section in (
+                    "production_integration_preflight",
+                    "production_bootstrap",
+                    "production_application_bundle",
+                    "production_validation_runtime_binding"):
+                record(section)
+            if (self.data.get("production_integration_preflight") or {}).get(
+                    "read_only") is not True:
+                unmet.append("production integration preflight is not read-only")
+            production_binding = self.data.get("production_validation_runtime_binding") or {}
+            if production_binding.get("binding", {}).get("target_database") != (
+                    (self.data.get("disposable_target") or {}).get("target_database")):
+                unmet.append("validation runtime binding database is not the disposable target")
+            bootstrap = self.data.get("production_bootstrap") or {}
+            if bootstrap.get("status") != "PASSED" or bootstrap.get("bootstrap_ready") is not True:
+                unmet.append("production bootstrap gate is not READY")
+            if bootstrap.get("read_only") is not True:
+                unmet.append("production bootstrap gate is not read-only")
+
+        # Return deterministic diagnostics so a failed gate is auditable and
+        # cannot be accidentally hidden by repeated identical entries.
+        return not unmet, sorted(set(unmet))
+
     def save(self):
         temp_path = self.manifest_path + ".tmp"
         with open(temp_path, "w", encoding="utf-8") as f:

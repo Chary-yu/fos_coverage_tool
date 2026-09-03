@@ -63,7 +63,7 @@ def _sql_string(value):
     )
 
 
-def _candidate_account(target):
+def _candidate_account(target, source=None):
     user = str(target.get("user") or "").strip()
     if not user:
         raise ValueError("disposable target application user is required")
@@ -75,6 +75,40 @@ def _candidate_account(target):
     ).strip()
     if not grant_host:
         raise ValueError("disposable target application grant host is required")
+    source = dict(source or {})
+    approved_user = str(
+        target.get("approved_application_user") or
+        target.get("approved_user") or
+        source.get("application_user") or source.get("user") or ""
+    ).strip()
+    approved_host = str(
+        target.get("approved_application_host") or
+        target.get("approved_grant_host") or
+        source.get("application_grant_host") or
+        source.get("application_host") or ""
+    ).strip()
+    if not approved_user or not approved_host:
+        raise ValueError(
+            "approved existing application principal user@host is required"
+        )
+    if user != approved_user or grant_host != approved_host:
+        raise ValueError(
+            "Candidate application principal does not match the approved production account"
+        )
+    source_user = str(
+        source.get("application_user") or source.get("user") or ""
+    ).strip()
+    if source_user and user != source_user:
+        raise ValueError(
+            "Candidate application user does not match the current production application user"
+        )
+    source_host = str(
+        source.get("application_grant_host") or source.get("application_host") or ""
+    ).strip()
+    if source_host and grant_host != source_host:
+        raise ValueError(
+            "Candidate application host does not match the current production application host"
+        )
     configured = target.get("candidate_privileges") or \
         target.get("required_privileges") or _CANDIDATE_PRIVILEGES
     if isinstance(configured, str):
@@ -120,6 +154,102 @@ def _row_value(row, key=None, index=0):
     if isinstance(row, (list, tuple)):
         return row[index] if len(row) > index else None
     return row
+
+
+def _principal_sql(user, host):
+    return "{}@{}".format(_sql_string(user), _sql_string(host))
+
+
+def _principal_snapshot(client, common, env, user, host):
+    """Capture exact account existence and grants before a temporary GRANT."""
+    principal = _principal_sql(user, host)
+    exists = _run_client(
+        client, common, env,
+        "SELECT User, Host FROM mysql.user WHERE User = {} AND Host = {}".format(
+            _sql_string(user), _sql_string(host)
+        ),
+    )
+    if exists.returncode != 0:
+        raise RuntimeError(
+            "approved application principal lookup failed: {}".format(
+                exists.stderr.decode("utf-8", errors="replace")
+            )
+        )
+    rows = []
+    for line in exists.stdout.decode("utf-8", errors="replace").splitlines():
+        fields = line.rstrip("\r").split("\t")
+        if len(fields) >= 2 and fields[0] == user and fields[1] == host:
+            rows.append({"user": fields[0], "host": fields[1]})
+    if len(rows) != 1:
+        raise RuntimeError(
+            "approved application principal {} does not exist exactly once".format(
+                "{}@{}".format(user, host)
+            )
+        )
+    grants = _run_client(
+        client, common, env, "SHOW GRANTS FOR {}".format(principal)
+    )
+    if grants.returncode != 0:
+        raise RuntimeError(
+            "approved application principal grant snapshot failed: {}".format(
+                grants.stderr.decode("utf-8", errors="replace")
+            )
+        )
+    grant_lines = sorted(set(
+        line.strip() for line in grants.stdout.decode(
+            "utf-8", errors="replace"
+        ).splitlines() if line.strip()
+    ))
+    if not grant_lines:
+        raise RuntimeError(
+            "approved application principal {} has no observable grants".format(
+                "{}@{}".format(user, host)
+            )
+        )
+    return {
+        "status": "PASSED",
+        "user": user,
+        "host": host,
+        "account": "{}@{}".format(user, host),
+        "exists_exactly_once": True,
+        "rows": rows,
+        "grants": grant_lines,
+    }
+
+
+def _revoke_candidate_database_grant(
+        admin_client, admin_common, admin_env, target_database,
+        user, grant_host, pre_grant_snapshot):
+    """Remove only this run's database grant and prove account restoration."""
+    principal = _principal_sql(user, grant_host)
+    revoke = _run_client(
+        admin_client, admin_common, admin_env,
+        "REVOKE ALL PRIVILEGES, GRANT OPTION ON `{}`.* FROM {}".format(
+            target_database, principal
+        ),
+    )
+    if revoke.returncode != 0:
+        raise RuntimeError(
+            "Candidate database grant revoke failed: {}".format(
+                revoke.stderr.decode("utf-8", errors="replace")
+            )
+        )
+    restored = _principal_snapshot(
+        admin_client, admin_common, admin_env, user, grant_host
+    )
+    expected = sorted(set(pre_grant_snapshot.get("grants") or []))
+    if restored.get("grants") != expected:
+        raise RuntimeError(
+            "application principal grant state did not restore after Candidate revoke"
+        )
+    return {
+        "status": "PASSED",
+        "account": "{}@{}".format(user, grant_host),
+        "database": target_database,
+        "restored_pre_grant_snapshot": True,
+        "command": "REVOKE ALL PRIVILEGES, GRANT OPTION ON `<candidate_db>`.* FROM <approved_account>",
+        "exit_code": 0,
+    }
 
 
 def probe_candidate_connection_access(connection, target_config):
@@ -237,14 +367,19 @@ def probe_candidate_connection_access(connection, target_config):
 
 
 def _grant_and_probe_candidate_access(
-        admin_client, admin_common, admin_env, target, target_database):
+        admin_client, admin_common, admin_env, target, target_database,
+        source=None):
     """Grant and verify the exact account used by the Candidate runtime.
 
     The database administrator is used only for the grant.  All subsequent
     probes run through the configured application account, so a successful
     admin connection can never masquerade as Candidate database access.
     """
-    user, grant_host, privileges = _candidate_account(target)
+    user, grant_host, privileges = _candidate_account(target, source=source)
+    pre_grant_snapshot = _principal_snapshot(
+        admin_client, admin_common, admin_env, user, grant_host
+    )
+    grant_applied = False
     grant = (
         "GRANT {} ON `{}`.* TO {}@{}"
     ).format(
@@ -258,90 +393,111 @@ def _grant_and_probe_candidate_access(
                 grant_result.stderr.decode("utf-8", errors="replace")
             )
         )
+    grant_applied = True
 
-    application = _application_settings(target)
-    app_client, app_common, app_env = _client_settings(application)
-    if not app_client:
-        raise RuntimeError(
-            "mariadb/mysql client is unavailable for Candidate access probe"
-        )
-    grants = _run_client(
-        app_client, app_common, app_env, "SHOW GRANTS", database=target_database
-    )
-    grants_text = grants.stdout.decode("utf-8", errors="replace").strip()
-    if grants.returncode != 0 or not grants_text:
-        raise RuntimeError(
-            "Candidate application SHOW GRANTS probe failed: {}".format(
-                grants.stderr.decode("utf-8", errors="replace")
+    try:
+        application = _application_settings(target)
+        app_client, app_common, app_env = _client_settings(application)
+        if not app_client:
+            raise RuntimeError(
+                "mariadb/mysql client is unavailable for Candidate access probe"
             )
+        grants = _run_client(
+            app_client, app_common, app_env, "SHOW GRANTS", database=target_database
         )
-    normalized_grants = grants_text.upper()
-    if target_database.upper() not in normalized_grants or \
-            user.upper() not in normalized_grants:
-        raise RuntimeError(
-            "Candidate application SHOW GRANTS does not identify the target account/database"
-        )
-    missing_grants = [
-        privilege for privilege in privileges
-        if privilege.upper() not in normalized_grants
-    ]
-    if missing_grants:
-        raise RuntimeError(
-            "Candidate application grants are incomplete: {}".format(
-                ", ".join(missing_grants)
+        grants_text = grants.stdout.decode("utf-8", errors="replace").strip()
+        if grants.returncode != 0 or not grants_text:
+            raise RuntimeError(
+                "Candidate application SHOW GRANTS probe failed: {}".format(
+                    grants.stderr.decode("utf-8", errors="replace")
+                )
             )
-        )
+        normalized_grants = grants_text.upper()
+        if target_database.upper() not in normalized_grants or \
+                user.upper() not in normalized_grants:
+            raise RuntimeError(
+                "Candidate application SHOW GRANTS does not identify the target account/database"
+            )
+        missing_grants = [
+            privilege for privilege in privileges
+            if privilege.upper() not in normalized_grants
+        ]
+        if missing_grants:
+            raise RuntimeError(
+                "Candidate application grants are incomplete: {}".format(
+                    ", ".join(missing_grants)
+                )
+            )
 
-    probe_table = "__coverage_upgrade_privilege_probe"
-    probe_sql = (
-        "CREATE TEMPORARY TABLE `{}` (probe_id INT); "
-        "INSERT INTO `{}` (probe_id) VALUES (1); "
-        "UPDATE `{}` SET probe_id = 2 WHERE probe_id = 1; "
-        "SELECT COUNT(*) FROM `{}`; "
-        "DELETE FROM `{}` WHERE probe_id = 2; "
-        "ALTER TABLE `{}` ADD COLUMN probe_marker VARCHAR(1); "
-        "DROP TEMPORARY TABLE `{}`"
-    ).format(*([probe_table] * 7))
-    probe = _run_client(
-        app_client, app_common, app_env, probe_sql, database=target_database
-    )
-    if probe.returncode != 0:
-        raise RuntimeError(
-            "Candidate application capability probe failed: {}".format(
-                probe.stderr.decode("utf-8", errors="replace")
-            )
+        probe_table = "__coverage_upgrade_privilege_probe"
+        probe_sql = (
+            "CREATE TEMPORARY TABLE `{}` (probe_id INT); "
+            "INSERT INTO `{}` (probe_id) VALUES (1); "
+            "UPDATE `{}` SET probe_id = 2 WHERE probe_id = 1; "
+            "SELECT COUNT(*) FROM `{}`; "
+            "DELETE FROM `{}` WHERE probe_id = 2; "
+            "ALTER TABLE `{}` ADD COLUMN probe_marker VARCHAR(1); "
+            "DROP TEMPORARY TABLE `{}`"
+        ).format(*([probe_table] * 7))
+        probe = _run_client(
+            app_client, app_common, app_env, probe_sql, database=target_database
         )
-    return {
-        "status": "PASSED",
-        "application_user": user,
-        "application_grant_host": grant_host,
-        "granted_privileges": list(privileges),
-        "grant": {
+        if probe.returncode != 0:
+            raise RuntimeError(
+                "Candidate application capability probe failed: {}".format(
+                    probe.stderr.decode("utf-8", errors="replace")
+                )
+            )
+        return {
             "status": "PASSED",
-            "database": target_database,
-            "privileges": list(privileges),
-            "account": "{}@{}".format(user, grant_host),
-            "command": "GRANT <candidate_privileges> ON `{}`.* TO <candidate_account>".format(
-                target_database
-            ),
-            "exit_code": grant_result.returncode,
-        },
-        "show_grants": {
-            "status": "PASSED",
-            "database": target_database,
-            "account": "{}@{}".format(user, grant_host),
-            "output": grants_text[-4000:],
-            "exit_code": grants.returncode,
-        },
-        "capability_probe": {
-            "status": "PASSED",
-            "operations": [
-                "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE TEMPORARY TABLES",
-                "ALTER TEMPORARY TABLE",
-            ],
-            "exit_code": probe.returncode,
-        },
-    }
+            "application_user": user,
+            "application_grant_host": grant_host,
+            "approved_application_user": user,
+            "approved_application_host": grant_host,
+            "granted_privileges": list(privileges),
+            "grant_applied_by_run": True,
+            "pre_grant_privilege_snapshot": pre_grant_snapshot,
+            "grant": {
+                "status": "PASSED",
+                "database": target_database,
+                "privileges": list(privileges),
+                "account": "{}@{}".format(user, grant_host),
+                "applied_by_run": True,
+                "command": "GRANT <candidate_privileges> ON `{}`.* TO <candidate_account>".format(
+                    target_database
+                ),
+                "exit_code": grant_result.returncode,
+            },
+            "show_grants": {
+                "status": "PASSED",
+                "database": target_database,
+                "account": "{}@{}".format(user, grant_host),
+                "output": grants_text[-4000:],
+                "exit_code": grants.returncode,
+            },
+            "capability_probe": {
+                "status": "PASSED",
+                "operations": [
+                    "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE TEMPORARY TABLES",
+                    "ALTER TEMPORARY TABLE",
+                ],
+                "exit_code": probe.returncode,
+            },
+        }
+    except Exception as exc:
+        if grant_applied:
+            try:
+                _revoke_candidate_database_grant(
+                    admin_client, admin_common, admin_env, target_database,
+                    user, grant_host, pre_grant_snapshot,
+                )
+            except Exception as restore_exc:
+                raise RuntimeError(
+                    "{}; application principal grant rollback failed: {}".format(
+                        exc, restore_exc
+                    )
+                )
+        raise
 
 
 def validate_disposable_target_config(source_config, target_config):
@@ -354,7 +510,9 @@ def validate_disposable_target_config(source_config, target_config):
         raise ValueError("source database name is missing or unsafe")
     if source_database.lower() == target_database.lower():
         raise ValueError("disposable target database must differ from source database")
-    application_user, grant_host, privileges = _candidate_account(target)
+    application_user, grant_host, privileges = _candidate_account(
+        target, source=source
+    )
     return {
         "source_database": source_database,
         "target_database": target_database,
@@ -520,7 +678,7 @@ def create_disposable_target_from_backup(
                 "disposable target identity query failed: {}".format(target_error)
             )
         candidate_access = _grant_and_probe_candidate_access(
-            client, common, env, target, target_database
+            client, common, env, target, target_database, source=source
         )
         return {
             "status": "PASSED",
@@ -618,7 +776,7 @@ def create_empty_disposable_target(source_config, target_config,
                 )
             )
         candidate_access = _grant_and_probe_candidate_access(
-            client, common, env, target, target_database
+            client, common, env, target, target_database, source=source
         )
         return {
             "status": "PASSED",
@@ -646,3 +804,62 @@ def create_empty_disposable_target(source_config, target_config,
                     )
                 )
         raise
+
+
+def cleanup_disposable_target(target_config, preparation_evidence):
+    """Revoke this run's grant and drop only its newly-created target.
+
+    Cleanup is intentionally separate from creation because the Candidate
+    may fail after the target has been returned to the orchestrator.  The
+    account must have an exact pre-grant snapshot; without that evidence the
+    function refuses to drop anything and leaves a data-safety hold.
+    """
+    preparation = dict(preparation_evidence or {})
+    if not preparation.get("target_database_created_by_this_run"):
+        return {"status": "PASSED", "skipped": True, "reason": "target_not_created_by_run"}
+    target = _mysql_section(target_config)
+    target_database = _target_name(
+        preparation.get("target_database") or target.get("database")
+    )
+    candidate_access = dict(preparation.get("candidate_access") or {})
+    if candidate_access.get("grant_applied_by_run") is not True or \
+            not isinstance(candidate_access.get("pre_grant_privilege_snapshot"), dict):
+        raise RuntimeError(
+            "disposable target cleanup lacks exact pre-grant account snapshot"
+        )
+    user, grant_host, _privileges = _candidate_account(target)
+    admin = dict(target)
+    client, common, env = _client_settings(admin)
+    if not client:
+        raise RuntimeError("mariadb/mysql client is unavailable for disposable target cleanup")
+    revoke = _revoke_candidate_database_grant(
+        client, common, env, target_database, user, grant_host,
+        candidate_access["pre_grant_privilege_snapshot"],
+    )
+    drop = _run_client(
+        client, common, env, "DROP DATABASE `{}`".format(target_database)
+    )
+    if drop.returncode != 0:
+        raise RuntimeError(
+            "disposable target drop failed after grant restoration: {}".format(
+                drop.stderr.decode("utf-8", errors="replace")
+            )
+        )
+    exists = _run_client(
+        client, common, env,
+        "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA "
+        "WHERE SCHEMA_NAME = '{}'".format(target_database),
+    )
+    if exists.returncode != 0 or exists.stdout.decode("utf-8", errors="replace").strip():
+        raise RuntimeError("disposable target still exists after cleanup")
+    return {
+        "status": "PASSED",
+        "target_database": target_database,
+        "account": "{}@{}".format(user, grant_host),
+        "grant_rollback": revoke,
+        "database_dropped": True,
+        "database_verified_absent": True,
+        "command": "revoke Candidate DB grant + DROP disposable target + verify absence",
+        "credentials_written_to_evidence": False,
+        "exit_code": 0,
+    }

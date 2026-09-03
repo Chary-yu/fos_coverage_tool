@@ -3,6 +3,7 @@
     "host": "127.0.0.1",
     "port": 13306,
     "user": "coverage_user",
+    "application_grant_host": "127.0.0.1",
     "password": "CHANGE_ME",
     "database": "coverage_candidate",
     "connect_timeout": 5,
@@ -41,6 +42,8 @@
       "database": "coverage_candidate_target",
       "connect_timeout": 5,
       "candidate_grant_host": "127.0.0.1",
+      "approved_application_user": "coverage_user",
+      "approved_application_host": "127.0.0.1",
       "backup_restore_user": "root",
       "backup_restore_password": ""
     },

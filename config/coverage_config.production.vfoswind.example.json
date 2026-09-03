@@ -7,6 +7,7 @@
     "host": "127.0.0.1",
     "port": 3306,
     "user": "coverage_user",
+    "application_grant_host": "127.0.0.1",
     "password": "SET_ONLY_IN_COVERAGE_MYSQL_JSON",
     "database": "coverage_vnext_e9fcc837",
     "charset": "utf8mb4"
@@ -34,6 +35,8 @@
       "database": "coverage_vnext_candidate_RELEASE",
       "charset": "utf8mb4",
       "candidate_grant_host": "127.0.0.1",
+      "approved_application_user": "coverage_user",
+      "approved_application_host": "127.0.0.1",
       "backup_restore_user": "root",
       "backup_restore_password": "SET_ONLY_IN_OPERATOR_SECRET"
     },
@@ -72,8 +75,8 @@
     "flat_baseline_session_id": "previous-flat-baseline",
     "production_integration": {
       "adapter": "vfoswind",
-      "systemd_unit": "onesensor-coverage.service",
-      "systemd_unit_file": "/etc/systemd/system/onesensor-coverage.service",
+      "systemd_unit": "onesensor-api.service",
+      "systemd_unit_file": "/etc/systemd/system/onesensor-api.service",
       "runtime_environment_file": "/etc/onesensor/coverage-runtime.env",
       "validation_systemd_unit": "onesensor-coverage-validation.service",
       "validation_systemd_unit_file": "/etc/systemd/system/onesensor-coverage-validation.service",
@@ -82,12 +85,21 @@
       "validation_application_root": "/home/zcyu/coverage_candidate/production/app",
       "legacy_application_root": "/home/zcyu/coverage/onesensor_code-coverage-tool",
       "legacy_served_root": "/home/zcyu/coverage/export0810/onesensor",
-      "nginx_config_path": "/etc/nginx/conf.d/onesensor-coverage.conf",
+      "nginx_config_path": "/etc/nginx/conf.d/coverage.conf",
       "nginx_proxy_pass": "http://127.0.0.1:9528",
+      "bootstrap": {
+        "legacy_systemd_unit": "onesensor-api.service",
+        "legacy_systemd_unit_file": "/etc/systemd/system/onesensor-api.service",
+        "legacy_nginx_config_path": "/etc/nginx/conf.d/coverage.conf",
+        "python": "/usr/bin/python3",
+        "systemd_analyze": ["/usr/bin/systemd-analyze", "verify"],
+        "nginx_test": ["/usr/sbin/nginx", "-t"],
+        "nginx_test_uses_staged_path": false
+      },
       "commands": {
         "daemon_reload": ["/bin/systemctl", "daemon-reload"],
-        "service_stop": ["/bin/systemctl", "stop", "onesensor-coverage.service"],
-        "service_restart": ["/bin/systemctl", "restart", "onesensor-coverage.service"],
+        "service_stop": ["/bin/systemctl", "stop", "onesensor-api.service"],
+        "service_restart": ["/bin/systemctl", "restart", "onesensor-api.service"],
         "nginx_test": ["/usr/sbin/nginx", "-t"],
         "nginx_reload": ["/bin/systemctl", "reload", "nginx"]
       }
@@ -100,12 +112,12 @@
     "commands": {
       "freeze_traffic": ["/usr/local/sbin/onesensor-coverage-freeze"],
       "drain_jobs": ["/usr/local/sbin/onesensor-coverage-drain"],
-      "stop_current_api": ["/bin/systemctl", "stop", "onesensor-coverage.service"],
+      "stop_current_api": ["/bin/systemctl", "stop", "onesensor-api.service"],
       "stop_validation_api": ["/bin/systemctl", "stop", "onesensor-coverage-validation.service"],
       "start_validation_api": ["/bin/systemctl", "start", "onesensor-coverage-validation.service"],
-      "start_serving_api": ["/bin/systemctl", "restart", "onesensor-coverage.service"],
-      "stop_serving_api": ["/bin/systemctl", "stop", "onesensor-coverage.service"],
-      "start_previous_api": ["/bin/systemctl", "restart", "onesensor-coverage.service"],
+      "start_serving_api": ["/bin/systemctl", "restart", "onesensor-api.service"],
+      "stop_serving_api": ["/bin/systemctl", "stop", "onesensor-api.service"],
+      "start_previous_api": ["/bin/systemctl", "restart", "onesensor-api.service"],
       "open_traffic": ["/usr/local/sbin/onesensor-coverage-open"]
     }
   }
