@@ -90,6 +90,17 @@ def load_application_config(path: Optional[str] = None, base_dir: Optional[str] 
             raise ValueError("runtime config root must be an object")
     result = _merge(defaults, raw_loaded) if configured_path else defaults
     result = _apply_compatibility_aliases(result)
+    runtime_mysql_json = os.environ.get("COVERAGE_MYSQL_JSON", "").strip()
+    if runtime_mysql_json:
+        try:
+            runtime_mysql = json.loads(runtime_mysql_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("COVERAGE_MYSQL_JSON is invalid: {}".format(exc))
+        if not isinstance(runtime_mysql, dict) or not runtime_mysql.get("database"):
+            raise ValueError(
+                "COVERAGE_MYSQL_JSON must contain a database object"
+            )
+        result["mysql"] = _merge(result.get("mysql") or {}, runtime_mysql)
     candidate_mysql_json = os.environ.get("COVERAGE_CANDIDATE_MYSQL_JSON", "").strip()
     if candidate_mysql_json:
         try:
@@ -237,5 +248,65 @@ def validate_production_config(config: Dict[str, Any],
                 raise RuntimeError("production upgrade lifecycle command '{}' is required".format(command_name))
         if not lifecycle.get("release_endpoint") or not lifecycle.get("previous_release_endpoint"):
             raise RuntimeError("production release and previous-release endpoints are required")
+        if not lifecycle.get("candidate_release_endpoint"):
+            raise RuntimeError(
+                "production candidate_release_endpoint is required for isolated validation"
+            )
+        if str(lifecycle.get("candidate_release_endpoint")).strip() == \
+                str(lifecycle.get("release_endpoint")).strip():
+            raise RuntimeError(
+                "production Candidate and serving release endpoints must be distinct"
+            )
+        for field in ("candidate_browser_url", "health_endpoint",
+                      "served_root_probe_url"):
+            if not lifecycle.get(field):
+                raise RuntimeError(
+                    "production upgrade.{} is required".format(field)
+                )
+        validation_ports = lifecycle.get("validation_ports") or []
+        if isinstance(validation_ports, (str, int)):
+            validation_ports = [validation_ports]
+        try:
+            validation_ports = set(int(port) for port in validation_ports)
+        except (TypeError, ValueError):
+            raise RuntimeError("production validation_ports must contain integers")
+        serving_port = int((config.get("server") or {}).get("port") or 0)
+        if not validation_ports or serving_port in validation_ports:
+            raise RuntimeError(
+                "production validation_ports must identify a separate Candidate listener"
+            )
         if not lifecycle.get("previous_release"):
             raise RuntimeError("production previous release identity is required")
+        integration = lifecycle.get("production_integration") or {}
+        if str(lifecycle.get("lifecycle_adapter") or "").strip() != "vfoswind":
+            raise RuntimeError(
+                "production.lifecycle_adapter must be explicitly 'vfoswind'"
+            )
+        if str(integration.get("adapter") or "").strip() != "vfoswind":
+            raise RuntimeError(
+                "production.lifecycle.production_integration.adapter must be 'vfoswind'"
+            )
+        for field in (
+                "systemd_unit", "runtime_environment_file", "nginx_config_path",
+                "validation_systemd_unit", "validation_systemd_unit_file",
+                "validation_runtime_environment_file", "validation_application_root",
+                "validation_config_path"):
+            if not integration.get(field):
+                raise RuntimeError(
+                    "production vfoswind integration field '{}' is required".format(field)
+                )
+        integration_commands = integration.get("commands") or {}
+        for field in (
+                "daemon_reload", "service_stop", "service_restart",
+                "nginx_test", "nginx_reload"):
+            if not integration_commands.get(field):
+                raise RuntimeError(
+                    "production vfoswind integration command '{}' is required".format(field)
+                )
+        if any(
+                "local_staging_control.py" in str(command)
+                for command in commands.values()
+        ):
+            raise RuntimeError(
+                "production lifecycle cannot use local_staging_control.py"
+            )

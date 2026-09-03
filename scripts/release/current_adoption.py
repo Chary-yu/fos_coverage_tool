@@ -122,7 +122,8 @@ def plan_flat_current_adoption(publish_root, flat_served_root,
 
 def bootstrap_flat_current(publish_root, flat_served_root,
                            release_identity_path, expected_commit_sha,
-                           session_id, switch=False, api_contract_version=""):
+                           session_id, switch=False, api_contract_version="",
+                           application_root=""):
     """Adopt a Flat root only when the caller explicitly authorizes switching."""
     plan = plan_flat_current_adoption(
         publish_root, flat_served_root, release_identity_path, expected_commit_sha
@@ -147,6 +148,7 @@ def bootstrap_flat_current(publish_root, flat_served_root,
             staging_root, publish_root,
             os.path.join(staging_root, "release_identity.json"),
             session_id, switch=True, api_contract_version=api_contract_version,
+            application_root=application_root,
         )
         result["adoption_plan"] = plan
         result["deployment_layout"] = FLAT

@@ -6,11 +6,58 @@ from subprocess import CompletedProcess
 from unittest import mock
 
 from scripts.upgrade.disposable_target import (
-    create_disposable_target_from_backup, validate_disposable_target_config,
+    create_disposable_target_from_backup, probe_candidate_connection_access,
+    validate_disposable_target_config,
 )
 
 
 class DisposableTargetTest(unittest.TestCase):
+    class _ProbeCursor(object):
+        def __init__(self):
+            self.sql = []
+
+        def execute(self, sql):
+            self.sql.append(sql)
+
+        def fetchone(self):
+            if self.sql[-1].startswith("SELECT DATABASE"):
+                return {
+                    "database_name": "coverage_vnext_candidate_801",
+                    "current_user": "coverage@db",
+                }
+            return (1,)
+
+        def fetchall(self):
+            return [
+                ("GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, "
+                 "CREATE TEMPORARY TABLES ON `coverage_vnext_candidate_801`.* "
+                 "TO 'coverage'@'db'",)
+            ]
+
+        def close(self):
+            return None
+
+    class _ProbeConnection(object):
+        def __init__(self):
+            self.cursor_instance = DisposableTargetTest._ProbeCursor()
+
+        def cursor(self):
+            return self.cursor_instance
+
+    def test_supplied_target_connection_is_checked_as_candidate_account(self):
+        connection = self._ProbeConnection()
+        result = probe_candidate_connection_access(connection, {
+            "database": "coverage_vnext_candidate_801",
+            "user": "coverage",
+            "candidate_grant_host": "db",
+        })
+        self.assertEqual(result["status"], "PASSED")
+        self.assertIn("SHOW GRANTS", connection.cursor_instance.sql)
+        self.assertTrue(any(
+            sql.startswith("CREATE TEMPORARY TABLE")
+            for sql in connection.cursor_instance.sql
+        ))
+
     def _backup(self, root):
         dump = os.path.join(root, "full.sql.gz")
         with gzip.open(dump, "wb") as stream:
@@ -33,6 +80,11 @@ class DisposableTargetTest(unittest.TestCase):
             validate_disposable_target_config(
                 source, {"database": "coverage_vnext_e9fcc837"}
             )
+        with self.assertRaisesRegex(ValueError, "may not be root"):
+            validate_disposable_target_config(
+                source,
+                {"database": "coverage_vnext_candidate_801", "user": "root"},
+            )
 
     def test_restore_creates_only_the_new_target_and_retains_it(self):
         with tempfile.TemporaryDirectory(prefix="disposable-target-") as root:
@@ -51,11 +103,18 @@ class DisposableTargetTest(unittest.TestCase):
                 calls.append((sql, database))
                 if sql.startswith("SHOW TABLES"):
                     return CompletedProcess([], 0, b"coverage_projects\n", b"")
+                if sql.startswith("SHOW GRANTS"):
+                    return CompletedProcess(
+                        [], 0,
+                        b"GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, CREATE TEMPORARY TABLES ON `coverage_vnext_candidate_801`.* TO 'coverage'@'db'\n",
+                        b"",
+                    )
                 return CompletedProcess([], 0, b"", b"")
 
             with mock.patch(
                     "scripts.upgrade.disposable_target._client_settings",
-                    side_effect=[("mysql", [], {}), ("mysql", [], {})]), \
+                    side_effect=[("mysql", [], {}), ("mysql", [], {}),
+                                 ("mysql", [], {})]), \
                     mock.patch(
                         "scripts.upgrade.disposable_target._run_client",
                         side_effect=run_client), \
@@ -85,7 +144,10 @@ class DisposableTargetTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="disposable-target-existing-") as root:
             dump, backup = self._backup(root)
             source = {"database": "coverage_vnext_e9fcc837"}
-            target = {"database": "coverage_vnext_candidate_801"}
+            target = {
+                "database": "coverage_vnext_candidate_801",
+                "user": "coverage",
+            }
             calls = []
 
             def run_client(_client, _common, _env, sql, database=None):

@@ -73,9 +73,32 @@ class TestUpgradeManifest(unittest.TestCase):
             source = stream.read()
         self.assertIn("ImmutableReleasePublisher", source)
         self.assertIn("self.publisher.prepare", source)
+        self.assertIn("self.publisher.validate_current(persist=False)", source)
         self.assertIn("self.publisher.switch_current", source)
         self.assertNotIn("from scripts.upgrade.cutover_controller import", source)
         self.assertNotIn("self.cutover.apply", source)
+
+    def test_candidate_gates_run_before_phase_d_cutover_mutations(self):
+        with open(
+                os.path.join(ROOT, "scripts", "upgrade", "run_upgrade.py"),
+                encoding="utf-8") as stream:
+            source = stream.read()
+        prepared = source.index("prepared = self.publisher.prepare")
+        validation = source.index("lifecycle.start_validation_api()")
+        candidate_endpoint = source.index('"candidate_release_endpoint"')
+        targeted = source.index("# Step 5: Run Targeted Unit Test Suites")
+        browser = source.index("# Step 6: Run Node DOM & Event-loop Smoke Suite")
+        freeze = source.index("lifecycle.freeze(identity.get(\"commit_sha\", \"\"))")
+        stop = source.index("lifecycle.stop_current_api()")
+        switched = source.index("self.publisher.switch_current(session_id)")
+        self.assertLess(prepared, validation)
+        self.assertLess(validation, candidate_endpoint)
+        self.assertLess(validation, targeted)
+        self.assertLess(targeted, browser)
+        self.assertLess(browser, freeze)
+        self.assertLess(freeze, stop)
+        self.assertLess(stop, switched)
+        self.assertIn("current_unchanged_until_phase_d", source)
 
     def test_explicit_manifest_hash_and_rollback(self):
         with tempfile.TemporaryDirectory() as root:

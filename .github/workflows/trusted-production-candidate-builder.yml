@@ -201,7 +201,10 @@ jobs:
               CandidateArtifactManifest, PRODUCTION_PROJECT_NAME,
               PRODUCTION_RELEASE_ARTIFACT_ROLE,
           )
-          from app.release_publication import validate_production_candidate_content
+          from app.release_publication import (
+              validate_production_application_bundle,
+              validate_production_candidate_content,
+          )
 
           root = '.artifacts/production-candidate/candidate'
           with open('.artifacts/production-candidate/release_identity.json') as stream:
@@ -214,6 +217,8 @@ jobs:
               require_production_publishable=True,
           )
           validate_production_candidate_content(root, PRODUCTION_PROJECT_NAME)
+          application = validate_production_application_bundle(root)
+          assert application['status'] == 'PASSED'
           assert manifest['artifact_role'] == 'production_release'
           assert manifest['production_publishable'] is True
           assert manifest['project_name'] == 'FOS_V6R2'

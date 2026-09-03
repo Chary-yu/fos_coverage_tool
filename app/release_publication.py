@@ -51,6 +51,18 @@ RELEASE_MANIFEST_SCHEMA_VERSION = 1
 REPORT_MANIFEST_SCHEMA_VERSION = 1
 VALIDATED_PUBLICATION_IDENTITY_SCHEMA_VERSION = 1
 VALIDATED_PUBLICATION_IDENTITY_NAME = "validated_publication_identity.json"
+PRODUCTION_APPLICATION_BUNDLE_DIRECTORY = "app"
+PRODUCTION_APPLICATION_ENTRYPOINT = "app/enhance_coverage.py"
+_PRODUCTION_APPLICATION_REQUIRED_FILES = (
+    "enhance_coverage.py",
+    "app/__init__.py",
+    "app/bootstrap.py",
+)
+_PRODUCTION_APPLICATION_REQUIRED_DIRECTORIES = (
+    "app", "web", "contracts",
+)
+_PRODUCTION_APPLICATION_COMPAT_DIRECTORY = "scripts/compat"
+_PRODUCTION_APPLICATION_COMPAT_SHIM = "scripts/compat/git"
 _SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 _META_RE = re.compile(r"<meta\b([^>]*)>", re.IGNORECASE)
 _ATTR_RE = re.compile(
@@ -174,6 +186,133 @@ def _copy_tree_contents(source_root, target_root):
             shutil.copy2(source, target)
         else:
             raise ValueError("unsupported release source entry: {}".format(source))
+
+
+def _application_inventory(application_root):
+    """Return the complete byte inventory for one production app bundle."""
+    application_root = _real(application_root)
+    entries = []
+    for path in _walk_regular_files(application_root):
+        entries.append({
+            "path": _safe_relative(application_root, path),
+            "size": int(os.path.getsize(path)),
+            "sha256": _sha256(path),
+        })
+    return sorted(entries, key=lambda item: item["path"])
+
+
+def validate_production_application_root(application_root,
+                                         require_git_compat_shim=True):
+    """Validate the runtime tree used by the vfoswind systemd service.
+
+    The service is intentionally started from ``CURRENT/app``.  This helper
+    is also used for the pre-adoption Flat application directory, where the
+    supplied root is the historical checkout itself.  Keeping the required
+    files here makes both paths use one runtime contract.
+    """
+    requested = os.path.abspath(str(application_root or ""))
+    if os.path.islink(requested) or not os.path.isdir(requested):
+        raise ValueError(
+            "production application root must be a real directory: {}".format(
+                requested
+            )
+        )
+    root = _real(requested)
+    _assert_no_symlinks(root, "production application may not contain symlinks")
+    required_directories = list(_PRODUCTION_APPLICATION_REQUIRED_DIRECTORIES)
+    if require_git_compat_shim:
+        required_directories.append(_PRODUCTION_APPLICATION_COMPAT_DIRECTORY)
+    for relative in required_directories:
+        path = os.path.join(root, *relative.split("/"))
+        if not os.path.isdir(path) or os.path.islink(path):
+            raise ValueError(
+                "production application directory is missing: {}".format(path)
+            )
+    required_files = list(_PRODUCTION_APPLICATION_REQUIRED_FILES)
+    if require_git_compat_shim:
+        required_files.append(_PRODUCTION_APPLICATION_COMPAT_SHIM)
+    for relative in required_files:
+        path = os.path.join(root, *relative.split("/"))
+        if not os.path.isfile(path) or os.path.islink(path):
+            raise ValueError(
+                "production application file is missing: {}".format(path)
+            )
+    shim = os.path.join(root, _PRODUCTION_APPLICATION_COMPAT_SHIM)
+    if require_git_compat_shim and not (
+            os.stat(shim).st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)):
+        raise ValueError("production Git compatibility shim is not executable")
+    entries = _application_inventory(root)
+    return {
+        "status": "PASSED",
+        "application_root": root,
+        "entrypoint": os.path.join(root, "enhance_coverage.py"),
+        "file_count": len(entries),
+        "application_sha256": _inventory_hash(entries),
+        "command": "validate production application bundle",
+        "exit_code": 0,
+    }
+
+
+def validate_production_application_bundle(release_root,
+                                           require_git_compat_shim=True):
+    """Validate ``release_root/app`` before a production release can start."""
+    release_root = _real(release_root)
+    result = validate_production_application_root(
+        os.path.join(release_root, PRODUCTION_APPLICATION_BUNDLE_DIRECTORY),
+        require_git_compat_shim=require_git_compat_shim,
+    )
+    result["release_root"] = release_root
+    result["entrypoint"] = os.path.join(
+        release_root, PRODUCTION_APPLICATION_ENTRYPOINT.replace("/", os.sep)
+    )
+    return result
+
+
+def copy_production_application_bundle(source_root, release_root,
+                                       require_git_compat_shim=True):
+    """Copy the exact runtime bundle into ``release_root/app``.
+
+    Only runtime-owned source paths are copied.  The source checkout's Git
+    metadata, tests, local state, and credentials are never copied into a
+    release.  The resulting bundle is validated before the caller hashes or
+    publishes it.
+    """
+    source_root = _real(source_root)
+    release_root = _real(release_root)
+    validate_production_application_root(
+        source_root, require_git_compat_shim=require_git_compat_shim
+    )
+    target_root = os.path.join(release_root, PRODUCTION_APPLICATION_BUNDLE_DIRECTORY)
+    if os.path.lexists(target_root):
+        raise ValueError(
+            "production release already contains an application bundle: {}".format(
+                target_root
+            )
+        )
+    os.makedirs(target_root)
+    root_files = ("enhance_coverage.py",)
+    directories = ("app", "web", "contracts")
+    for relative in root_files:
+        shutil.copy2(
+            os.path.join(source_root, relative),
+            os.path.join(target_root, relative),
+        )
+    for relative in directories:
+        shutil.copytree(
+            os.path.join(source_root, relative),
+            os.path.join(target_root, relative),
+            symlinks=False,
+        )
+    source_compat = os.path.join(source_root, _PRODUCTION_APPLICATION_COMPAT_DIRECTORY)
+    if os.path.isdir(source_compat):
+        shutil.copytree(
+            source_compat,
+            os.path.join(target_root, _PRODUCTION_APPLICATION_COMPAT_DIRECTORY),
+            symlinks=False,
+        )
+    return validate_production_application_bundle(
+        release_root, require_git_compat_shim=require_git_compat_shim
+    )
 
 
 def _html_metadata(path):
@@ -752,6 +891,7 @@ def validate_release_manifest(release_root, manifest=None, expected_session_id="
     if declared_served_hash != observed_served_hash:
         violations.append("actual Served Root hash changed")
     candidate_artifact = manifest.get("candidate_artifact_manifest") or {}
+    candidate_provenance = candidate_artifact.get("source_provenance") or {}
     if candidate_artifact:
         if candidate_artifact.get("artifact_role") != \
                 PRODUCTION_RELEASE_ARTIFACT_ROLE:
@@ -783,9 +923,46 @@ def validate_release_manifest(release_root, manifest=None, expected_session_id="
                 if persisted_candidate.get("artifact_sha256") != \
                         candidate_artifact.get("artifact_sha256"):
                     violations.append("candidate artifact hash does not match release manifest")
+                # The release manifest historically covered only the
+                # browser-served directories.  Re-run the Candidate artifact
+                # verifier here as well so an app bundle used by systemd
+                # cannot be changed without invalidating CURRENT.
+                verified_candidate = CandidateArtifactManifest.verify(
+                    release_root,
+                    manifest.get("release_identity") or {},
+                    candidate_sha=actual_commit,
+                    manifest_path=candidate_path,
+                    require_trusted_provenance=True,
+                    expected_artifact_role=PRODUCTION_RELEASE_ARTIFACT_ROLE,
+                    expected_project_name=PRODUCTION_PROJECT_NAME,
+                    require_production_publishable=True,
+                    excluded_paths=(
+                        os.path.join(release_root, "release_manifest.json"),
+                        os.path.join(release_root, "report_manifest.json"),
+                        os.path.join(
+                            release_root, VALIDATED_PUBLICATION_IDENTITY_NAME
+                        ),
+                    ),
+                )
+                if verified_candidate.get("artifact_sha256") != \
+                        candidate_artifact.get("artifact_sha256"):
+                    violations.append("candidate artifact bytes do not match release manifest")
+                application_root = os.path.join(release_root, "app")
+                if os.path.isdir(application_root):
+                    validate_production_application_bundle(
+                        release_root,
+                        require_git_compat_shim=(
+                            candidate_provenance.get("provenance_class") !=
+                            SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS
+                        ),
+                    )
+                elif candidate_provenance.get("provenance_class") != \
+                        SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS:
+                    raise ValueError(
+                        "normal production Candidate is missing app/ bundle"
+                    )
             except (OSError, ValueError, TypeError):
-                violations.append("candidate artifact manifest is unreadable")
-        candidate_provenance = candidate_artifact.get("source_provenance") or {}
+                violations.append("candidate artifact or application bundle is invalid")
         if candidate_provenance.get("provenance_class") == TRUSTED_CI_PROVENANCE_CLASS:
             receipt_relative = str(candidate_artifact.get("receipt_path") or "")
             receipt_path = _real(os.path.join(release_root, receipt_relative))
@@ -937,7 +1114,13 @@ def _runtime_inventory_stat_fingerprint(release_root):
     """
     release_root = _real(release_root)
     entries = []
-    for directory in ("reports", "assets", "registry"):
+    directories = ["reports", "assets", "registry"]
+    # A production release also carries the systemd runtime under CURRENT/app.
+    # Include it in the stat boundary so a changed executable cannot reuse a
+    # previously validated publication identity sidecar/cache.
+    if os.path.isdir(os.path.join(release_root, "app")):
+        directories.append("app")
+    for directory in directories:
         directory_root = os.path.join(release_root, directory)
         if os.path.islink(directory_root) or not os.path.isdir(directory_root):
             raise ValueError("runtime release directory is missing or linked: {}".format(
@@ -1260,6 +1443,7 @@ class ImmutableReleasePublisher(object):
         )
         if not allow_bootstrap:
             validate_production_candidate_content(source_root)
+            validate_production_application_bundle(source_root)
         provenance = verified_candidate_manifest.get("source_provenance") or {}
         provenance_class = str(provenance.get("provenance_class") or "")
         trust_evidence = {}
@@ -1359,6 +1543,7 @@ class ImmutableReleasePublisher(object):
             )
             if not allow_bootstrap:
                 validate_production_candidate_content(staging)
+                validate_production_application_bundle(staging)
             copied_provenance = copied_candidate_manifest.get("source_provenance") or {}
             if allow_bootstrap:
                 if str(copied_provenance.get("provenance_class") or "") != \
@@ -1478,7 +1663,14 @@ class ImmutableReleasePublisher(object):
             "served_root": checked["served_root"],
         }
 
-    def validate_current(self):
+    def validate_current(self, persist=True):
+        """Validate CURRENT, optionally without writing a validation sidecar.
+
+        Pre-cutover validation is part of the read-only preflight phase.  The
+        default keeps the historical cache/sidecar behavior for publication,
+        post-switch, and API callers; callers that are only proving the
+        existing binding can set ``persist=False``.
+        """
         session_id = self.current_session_id()
         if not session_id:
             return {"status": "FAILED", "violations": ["CURRENT is not a valid release pointer"]}
@@ -1486,7 +1678,7 @@ class ImmutableReleasePublisher(object):
         result = validate_release_manifest(
             release_root, expected_session_id=session_id
         )
-        if result.get("status") == "PASSED":
+        if result.get("status") == "PASSED" and persist:
             _write_validated_publication_identity(
                 self.publish_root, release_root,
             )

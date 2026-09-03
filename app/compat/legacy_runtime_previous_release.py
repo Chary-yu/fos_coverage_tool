@@ -41,7 +41,10 @@ from app.config.runtime_config import (
     normalize_candidate_paths,
     validate_production_config,
 )
-from app.release_identity import generate_release_identity, verify_release_identity
+from app.release_identity import (
+    generate_release_identity, resolve_runtime_release_root,
+    verify_release_identity,
+)
 from app.reports.identity import (
     LEGACY_STATIC, VNEXT_ARTIFACT_READY, validate_report_mode,
 )
@@ -99,7 +102,9 @@ for module_name in ['pymysql', 'mysql.connector']:
 # This module is retained only for the legacy CLI compatibility surface.  Its
 # resources still belong to the repository root after the implementation moved
 # out of ``enhance_coverage.py``.
-SCRIPT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+SCRIPT_DIR = resolve_runtime_release_root(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+)
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "coverage_config.json")
 WEB_ASSET_ROOT = os.path.join(SCRIPT_DIR, "web", "assets")
 JS_SOURCE_PATH = os.path.join(WEB_ASSET_ROOT, "js", "coverage_enhance.js")

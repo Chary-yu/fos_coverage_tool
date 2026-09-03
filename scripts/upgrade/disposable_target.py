@@ -32,6 +32,11 @@ DISPOSABLE_TARGET_MODES = (
     EMPTY_NEW_TARGET,
 )
 _DISPOSABLE_PREFIXES = ("coverage_vnext_", "coverage_candidate_", "coverage_gate_")
+_CANDIDATE_PRIVILEGES = (
+    "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "INDEX",
+    "CREATE TEMPORARY TABLES",
+)
+_PRIVILEGE_TOKENS = frozenset(_CANDIDATE_PRIVILEGES)
 
 
 def _mysql_section(config):
@@ -51,6 +56,294 @@ def _target_name(value):
     return name
 
 
+def _sql_string(value):
+    """Quote a non-secret MySQL string literal without accepting SQL syntax."""
+    return "'{}'".format(
+        str(value).replace("\\", "\\\\").replace("'", "''")
+    )
+
+
+def _candidate_account(target):
+    user = str(target.get("user") or "").strip()
+    if not user:
+        raise ValueError("disposable target application user is required")
+    if user.lower() == "root":
+        raise ValueError("disposable target application user may not be root")
+    grant_host = str(
+        target.get("candidate_grant_host") or target.get("grant_host") or
+        target.get("host") or "127.0.0.1"
+    ).strip()
+    if not grant_host:
+        raise ValueError("disposable target application grant host is required")
+    configured = target.get("candidate_privileges") or \
+        target.get("required_privileges") or _CANDIDATE_PRIVILEGES
+    if isinstance(configured, str):
+        configured = [item.strip() for item in configured.split(",") if item.strip()]
+    privileges = []
+    for value in configured:
+        privilege = str(value).strip().upper()
+        if privilege not in _PRIVILEGE_TOKENS:
+            raise ValueError(
+                "unsupported disposable target application privilege: {}".format(
+                    privilege
+                )
+            )
+        if privilege not in privileges:
+            privileges.append(privilege)
+    missing = [item for item in _CANDIDATE_PRIVILEGES if item not in privileges]
+    if missing:
+        raise ValueError(
+            "disposable target application privileges are incomplete: {}".format(
+                ", ".join(missing)
+            )
+        )
+    return user, grant_host, privileges
+
+
+def _application_settings(target):
+    """Return target connection settings without restore-admin overrides."""
+    result = dict(target or {})
+    for key in (
+            "backup_restore_host", "backup_restore_port",
+            "backup_restore_user", "backup_restore_password"):
+        result.pop(key, None)
+    return result
+
+
+def _row_value(row, key=None, index=0):
+    """Read a DB-API row from either DictCursor or tuple-style cursors."""
+    if isinstance(row, dict):
+        if key and key in row:
+            return row.get(key)
+        values = list(row.values())
+        return values[index] if len(values) > index else None
+    if isinstance(row, (list, tuple)):
+        return row[index] if len(row) > index else None
+    return row
+
+
+def probe_candidate_connection_access(connection, target_config):
+    """Verify the already-open Candidate connection owns the target database.
+
+    The disposable-target CLI path grants and probes the application account
+    before returning a connection.  A caller may also supply a pre-restored
+    target connection, so that path must receive the same fail-closed check;
+    merely being able to connect as an administrator is not Candidate access.
+    """
+    target = _mysql_section(target_config)
+    target_database = _target_name(target.get("database"))
+    user, grant_host, privileges = _candidate_account(target)
+    cursor = None
+    probe_table = "__coverage_upgrade_privilege_probe_{}".format(os.getpid())
+    created = False
+    try:
+        cursor = connection.cursor()
+        cursor.execute(
+            "SELECT DATABASE() AS database_name, CURRENT_USER() AS current_user"
+        )
+        identity_row = cursor.fetchone()
+        observed_database = str(
+            _row_value(identity_row, "database_name", 0) or ""
+        ).strip()
+        current_user = str(
+            _row_value(identity_row, "current_user", 1) or ""
+        ).strip()
+        if observed_database.lower() != target_database.lower():
+            raise RuntimeError(
+                "Candidate connection selected database {} instead of {}".format(
+                    observed_database or "<none>", target_database
+                )
+            )
+        if user.lower() not in current_user.lower():
+            raise RuntimeError(
+                "Candidate connection current user does not match configured account"
+            )
+
+        cursor.execute("SHOW GRANTS")
+        grants = cursor.fetchall() or []
+        grants_text = "\n".join(str(_row_value(row)) for row in grants).upper()
+        if target_database.upper() not in grants_text or user.upper() not in grants_text:
+            raise RuntimeError(
+                "Candidate connection SHOW GRANTS does not identify the target account/database"
+            )
+        missing = [
+            privilege for privilege in privileges
+            if privilege.upper() not in grants_text
+        ]
+        if missing:
+            raise RuntimeError(
+                "Candidate connection grants are incomplete: {}".format(
+                    ", ".join(missing)
+                )
+            )
+
+        cursor.execute(
+            "CREATE TEMPORARY TABLE `{}` (probe_id INT)".format(probe_table)
+        )
+        created = True
+        cursor.execute(
+            "INSERT INTO `{}` (probe_id) VALUES (1)".format(probe_table)
+        )
+        cursor.execute(
+            "UPDATE `{}` SET probe_id = 2 WHERE probe_id = 1".format(probe_table)
+        )
+        cursor.execute("SELECT COUNT(*) FROM `{}`".format(probe_table))
+        cursor.fetchone()
+        cursor.execute(
+            "DELETE FROM `{}` WHERE probe_id = 2".format(probe_table)
+        )
+        cursor.execute(
+            "ALTER TABLE `{}` ADD COLUMN probe_marker VARCHAR(1)".format(
+                probe_table
+            )
+        )
+        cursor.execute("DROP TEMPORARY TABLE `{}`".format(probe_table))
+        created = False
+        return {
+            "status": "PASSED",
+            "application_user": user,
+            "application_grant_host": grant_host,
+            "configured_privileges": list(privileges),
+            "database": target_database,
+            "current_user": current_user,
+            "show_grants": {
+                "status": "PASSED",
+                "database": target_database,
+                "account": "{}@{}".format(user, grant_host),
+                "grant_count": len(grants),
+            },
+            "capability_probe": {
+                "status": "PASSED",
+                "operations": [
+                    "SELECT", "INSERT", "UPDATE", "DELETE",
+                    "CREATE TEMPORARY TABLES", "ALTER TEMPORARY TABLE",
+                ],
+                "table": probe_table,
+            },
+        }
+    except Exception as exc:
+        raise RuntimeError("Candidate application access probe failed: {}".format(exc))
+    finally:
+        if created and cursor is not None:
+            try:
+                cursor.execute("DROP TEMPORARY TABLE `{}`".format(probe_table))
+            except Exception:
+                pass
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+
+
+def _grant_and_probe_candidate_access(
+        admin_client, admin_common, admin_env, target, target_database):
+    """Grant and verify the exact account used by the Candidate runtime.
+
+    The database administrator is used only for the grant.  All subsequent
+    probes run through the configured application account, so a successful
+    admin connection can never masquerade as Candidate database access.
+    """
+    user, grant_host, privileges = _candidate_account(target)
+    grant = (
+        "GRANT {} ON `{}`.* TO {}@{}"
+    ).format(
+        ", ".join(privileges), target_database,
+        _sql_string(user), _sql_string(grant_host),
+    )
+    grant_result = _run_client(admin_client, admin_common, admin_env, grant)
+    if grant_result.returncode != 0:
+        raise RuntimeError(
+            "disposable target application grant failed: {}".format(
+                grant_result.stderr.decode("utf-8", errors="replace")
+            )
+        )
+
+    application = _application_settings(target)
+    app_client, app_common, app_env = _client_settings(application)
+    if not app_client:
+        raise RuntimeError(
+            "mariadb/mysql client is unavailable for Candidate access probe"
+        )
+    grants = _run_client(
+        app_client, app_common, app_env, "SHOW GRANTS", database=target_database
+    )
+    grants_text = grants.stdout.decode("utf-8", errors="replace").strip()
+    if grants.returncode != 0 or not grants_text:
+        raise RuntimeError(
+            "Candidate application SHOW GRANTS probe failed: {}".format(
+                grants.stderr.decode("utf-8", errors="replace")
+            )
+        )
+    normalized_grants = grants_text.upper()
+    if target_database.upper() not in normalized_grants or \
+            user.upper() not in normalized_grants:
+        raise RuntimeError(
+            "Candidate application SHOW GRANTS does not identify the target account/database"
+        )
+    missing_grants = [
+        privilege for privilege in privileges
+        if privilege.upper() not in normalized_grants
+    ]
+    if missing_grants:
+        raise RuntimeError(
+            "Candidate application grants are incomplete: {}".format(
+                ", ".join(missing_grants)
+            )
+        )
+
+    probe_table = "__coverage_upgrade_privilege_probe"
+    probe_sql = (
+        "CREATE TEMPORARY TABLE `{}` (probe_id INT); "
+        "INSERT INTO `{}` (probe_id) VALUES (1); "
+        "UPDATE `{}` SET probe_id = 2 WHERE probe_id = 1; "
+        "SELECT COUNT(*) FROM `{}`; "
+        "DELETE FROM `{}` WHERE probe_id = 2; "
+        "ALTER TABLE `{}` ADD COLUMN probe_marker VARCHAR(1); "
+        "DROP TEMPORARY TABLE `{}`"
+    ).format(*([probe_table] * 7))
+    probe = _run_client(
+        app_client, app_common, app_env, probe_sql, database=target_database
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(
+            "Candidate application capability probe failed: {}".format(
+                probe.stderr.decode("utf-8", errors="replace")
+            )
+        )
+    return {
+        "status": "PASSED",
+        "application_user": user,
+        "application_grant_host": grant_host,
+        "granted_privileges": list(privileges),
+        "grant": {
+            "status": "PASSED",
+            "database": target_database,
+            "privileges": list(privileges),
+            "account": "{}@{}".format(user, grant_host),
+            "command": "GRANT <candidate_privileges> ON `{}`.* TO <candidate_account>".format(
+                target_database
+            ),
+            "exit_code": grant_result.returncode,
+        },
+        "show_grants": {
+            "status": "PASSED",
+            "database": target_database,
+            "account": "{}@{}".format(user, grant_host),
+            "output": grants_text[-4000:],
+            "exit_code": grants.returncode,
+        },
+        "capability_probe": {
+            "status": "PASSED",
+            "operations": [
+                "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE TEMPORARY TABLES",
+                "ALTER TEMPORARY TABLE",
+            ],
+            "exit_code": probe.returncode,
+        },
+    }
+
+
 def validate_disposable_target_config(source_config, target_config):
     """Validate names and server settings before any CREATE DATABASE call."""
     source = _mysql_section(source_config)
@@ -61,6 +354,7 @@ def validate_disposable_target_config(source_config, target_config):
         raise ValueError("source database name is missing or unsafe")
     if source_database.lower() == target_database.lower():
         raise ValueError("disposable target database must differ from source database")
+    application_user, grant_host, privileges = _candidate_account(target)
     return {
         "source_database": source_database,
         "target_database": target_database,
@@ -68,6 +362,9 @@ def validate_disposable_target_config(source_config, target_config):
         "source_port": int(source.get("port", 3306) or 3306),
         "target_host": str(target.get("host", "127.0.0.1")),
         "target_port": int(target.get("port", 3306) or 3306),
+        "application_user": application_user,
+        "application_grant_host": grant_host,
+        "candidate_privileges": privileges,
     }
 
 
@@ -222,6 +519,9 @@ def create_disposable_target_from_backup(
             raise RuntimeError(
                 "disposable target identity query failed: {}".format(target_error)
             )
+        candidate_access = _grant_and_probe_candidate_access(
+            client, common, env, target, target_database
+        )
         return {
             "status": "PASSED",
             "preparation_mode": RESTORE_FROM_VERIFIED_BACKUP,
@@ -237,6 +537,7 @@ def create_disposable_target_from_backup(
             "restored_table_inventory": observed_tables,
             "source_database_runtime_identity": source_identity,
             "target_database_runtime_identity": target_identity,
+            "candidate_access": candidate_access,
             "target_retained_for_candidate": True,
         }
     except Exception as exc:
@@ -316,6 +617,9 @@ def create_empty_disposable_target(source_config, target_config,
                     target_error
                 )
             )
+        candidate_access = _grant_and_probe_candidate_access(
+            client, common, env, target, target_database
+        )
         return {
             "status": "PASSED",
             "preparation_mode": EMPTY_NEW_TARGET,
@@ -326,6 +630,7 @@ def create_empty_disposable_target(source_config, target_config,
             "restore_completed": False,
             "source_database_untouched": True,
             "target_database_runtime_identity": target_identity,
+            "candidate_access": candidate_access,
             "target_retained_for_candidate": True,
         }
     except Exception as exc:

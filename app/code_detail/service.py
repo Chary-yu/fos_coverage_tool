@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .code_region import CodeRegion, FunctionRange, build_code_regions
 from app.code_detail.overlay_cache import AnalysisOverlay, AnalysisOverlayCache
+from app.release_identity import resolve_runtime_release_root
 from app.reports.registry import ReportRegistry
 from .source_reader import (
     SourceContext,
@@ -37,7 +38,9 @@ compute_file_path_hash = compute_db_file_path_hash
 
 logger = logging.getLogger(__name__)
 
-SCRIPT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+SCRIPT_DIR = resolve_runtime_release_root(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+)
 
 
 def get_configured_registry_dir() -> str:

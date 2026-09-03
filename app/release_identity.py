@@ -322,6 +322,26 @@ def get_current_release_identity(repo_root: Optional[str] = None) -> Dict[str, A
         raise RuntimeError("release identity drift: " + ", ".join(mismatches))
     return manifest
 
+
+def resolve_runtime_release_root(repo_root: Optional[str] = None) -> str:
+    """Resolve the immutable release root from an application bundle path.
+
+    vfoswind starts ``CURRENT/app/enhance_coverage.py`` with
+    ``WorkingDirectory=CURRENT/app``.  Release identity and publication
+    manifests live one directory above that bundle, so runtime code must not
+    mistake the application subdirectory for the release root.
+    """
+    requested = os.path.realpath(os.path.abspath(
+        repo_root or os.getcwd()
+    ))
+    if os.path.isfile(os.path.join(requested, RELEASE_MANIFEST_NAME)):
+        return requested
+    if os.path.basename(requested) == "app":
+        parent = os.path.dirname(requested)
+        if os.path.isfile(os.path.join(parent, RELEASE_MANIFEST_NAME)):
+            return parent
+    return requested
+
 def verify_release_identity(repo_root: Optional[str] = None, target: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Verify runtime identity, optionally against an exact release target."""
     actual = get_current_release_identity(repo_root)

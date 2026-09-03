@@ -26,7 +26,8 @@ from app.candidate_artifact import (
     PRODUCTION_PROJECT_NAME, build_directory_input_manifest_sha256,
 )
 from app.release_publication import (
-    ImmutableReleasePublisher, _html_metadata, normalize_candidate_artifact,
+    ImmutableReleasePublisher, _html_metadata, copy_production_application_bundle,
+    normalize_candidate_artifact, validate_production_application_bundle,
     validate_release_manifest,
 )
 from app.reports.identity import LEGACY_STATIC
@@ -725,7 +726,8 @@ def _served_root_tree_sha(root):
 
 
 def bootstrap(served_root, publish_root, release_identity_path, session_id,
-              served_identity_path="", switch=False, api_contract_version=""):
+              served_identity_path="", switch=False, api_contract_version="",
+              application_root=""):
     served_root = os.path.realpath(os.path.abspath(served_root))
     publish_root = os.path.realpath(os.path.abspath(publish_root))
     if not os.path.isdir(served_root):
@@ -773,6 +775,7 @@ def bootstrap(served_root, publish_root, release_identity_path, session_id,
 
     with tempfile.TemporaryDirectory(prefix="coverage-bootstrap-") as build_root:
         _copy_source_without_following_links(served_root, build_root)
+        application_evidence = {}
         if legacy_adoption_validation:
             copied_files, copied_directories = _stage_tree_inventory(
                 build_root, "bootstrap Candidate copy"
@@ -787,6 +790,10 @@ def bootstrap(served_root, publish_root, release_identity_path, session_id,
                     "bootstrap Candidate copy does not match the validated "
                     "legacy adoption staging"
                 )
+        if application_root:
+            application_evidence = copy_production_application_bundle(
+                application_root, build_root, require_git_compat_shim=False
+            )
         # These provenance values describe the exact copy that will be
         # normalized and hashed below.  Do not read the mutable Served Root
         # again after the copy/equality boundary.
@@ -823,6 +830,10 @@ def bootstrap(served_root, publish_root, release_identity_path, session_id,
             build_root, expected, session_id,
             api_contract_version=api_contract_version,
         )
+    if application_root:
+        application_evidence = validate_production_application_bundle(
+            publisher.release_path(session_id), require_git_compat_shim=False
+        )
     switched = publisher.switch_current(session_id)
     checked = publisher.validate_current()
     if checked.get("status") != "PASSED":
@@ -849,6 +860,7 @@ def bootstrap(served_root, publish_root, release_identity_path, session_id,
             "registry_sha256": artifact_manifest.get("registry_sha256"),
             "file_count": len(artifact_manifest.get("files") or []),
         },
+        "application": application_evidence,
         "release_manifest": prepared,
         "legacy_adoption": legacy_adoption,
         "switch": switched,
@@ -867,6 +879,10 @@ def main(argv=None):
     )
     parser.add_argument("--session-id", required=True)
     parser.add_argument("--api-contract-version", default="")
+    parser.add_argument(
+        "--application-root", default="",
+        help="historical application checkout to bundle under CURRENT/app",
+    )
     parser.add_argument("--switch", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -874,6 +890,7 @@ def main(argv=None):
             args.served_root, args.publish_root, args.release_identity,
             args.session_id, served_identity_path=args.served_identity,
             switch=args.switch, api_contract_version=args.api_contract_version,
+            application_root=args.application_root,
         )
     except (OSError, RuntimeError, ValueError, TypeError) as exc:
         parser.error(str(exc))

@@ -35,6 +35,7 @@ from app.release_identity import is_valid_commit_sha, verify_release_identity
 from app.release_publication import (
     ImmutableReleasePublisher, PRODUCTION_PROJECT_NAME,
     PRODUCTION_RELEASE_ARTIFACT_ROLE, current_served_root_binding,
+    validate_production_application_bundle,
     validate_production_candidate_content,
 )
 from app.candidate_artifact import (
@@ -63,7 +64,9 @@ from scripts.upgrade.existing_vnext_upgrade import upgrade_existing_vnext
 from scripts.upgrade.disposable_target import (
     DISPOSABLE_TARGET_MODES, EMPTY_NEW_TARGET, PRE_RESTORED_CONSISTENT_BACKUP,
     RESTORE_FROM_VERIFIED_BACKUP,
-    create_disposable_target_from_backup, create_empty_disposable_target,
+    _application_settings, create_disposable_target_from_backup,
+    create_empty_disposable_target,
+    probe_candidate_connection_access, validate_disposable_target_config,
 )
 from scripts.upgrade.migration_runner import (
     apply_schema, migrate_legacy, validate_migration_database_separation,
@@ -71,6 +74,10 @@ from scripts.upgrade.migration_runner import (
 from scripts.upgrade.validation_residue import (
     BLOCKED as RESIDUE_BLOCKED, SAFE_TO_TEARDOWN,
     scan_validation_residue, teardown_validation_residue,
+)
+from scripts.upgrade.vfoswind_production_lifecycle import (
+    ADAPTER_NAME as VFOSWIND_ADAPTER,
+    VfoswindProductionLifecycle,
 )
 from scripts.release.current_adoption import (
     FLAT, IMMUTABLE_CURRENT, validate_current_or_plan_flat,
@@ -667,6 +674,9 @@ class UpgradeOrchestrator:
         self._database_generation = {}
         self._target_database_generation = {}
         self._target_db_config = {}
+        self._production_lifecycle_adapter = None
+        self._production_runtime_bound = False
+        self._production_release_bindings_changed = False
 
     def _configure_backup_root(self, configured_root: Optional[str]):
         resolved = resolve_backup_root(self.repo_root, configured_root)
@@ -797,6 +807,14 @@ class UpgradeOrchestrator:
             publish_root, create_root=self._deployment_layout != FLAT
         )
         if self._deployment_layout == IMMUTABLE_CURRENT:
+            current_validation = self.publisher.validate_current(persist=False)
+            if current_validation.get("status") != "PASSED":
+                raise RuntimeError(
+                    "CURRENT release failed validation: {}".format(
+                        "; ".join(current_validation.get("violations") or [])
+                    )
+                )
+            self.candidate_preflight["current_validation"] = current_validation
             current = deployment.get("current") or {}
             current_binding = deployment.get("current_binding") or {}
             candidate_binding = verify_production_candidate_served_root_binding(
@@ -978,11 +996,23 @@ class UpgradeOrchestrator:
             raise RuntimeError(
                 "flat_baseline_session_id is required for explicit adoption"
             )
+        application_root = ""
+        if self._production_lifecycle_adapter is not None:
+            application_root = str(
+                self._production_lifecycle_adapter.config.get(
+                    "legacy_application_root"
+                ) or ""
+            ).strip()
+            if not application_root:
+                raise RuntimeError(
+                    "vfoswind Flat adoption requires legacy_application_root"
+                )
         result = bootstrap_flat_current(
             self.publish_root, flat_root, identity_path,
             previous_release.get("commit_sha", ""), baseline_session,
             switch=True,
             api_contract_version=upgrade_config.get("api_contract_version", ""),
+            application_root=application_root,
         )
         if result.get("status") != "PASSED":
             raise RuntimeError("Flat baseline adoption did not pass")
@@ -1004,6 +1034,88 @@ class UpgradeOrchestrator:
         result["deployment_layout_after_adoption"] = IMMUTABLE_CURRENT
         self.manifest.record("flat_current_adoption", result)
         return result
+
+    @staticmethod
+    def _selected_database_identity(connection):
+        """Read the selected database without mutating either connection."""
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT DATABASE() AS database_name")
+            row = cursor.fetchone() or {}
+        if isinstance(row, dict):
+            return str(row.get("database_name") or row.get("DATABASE()") or "")
+        return str(row[0] if row else "")
+
+    def _reconfirm_cutover_identity(self, connection, target_connection,
+                                    db_config, target_db_config,
+                                    previous_release):
+        """Recheck all mutable identities immediately before stopping CURRENT."""
+        if connection is None or target_connection is None:
+            raise RuntimeError("source and target connections are required for cutover identity")
+        source_generation = inspect_database_generation(connection)
+        if source_generation.get("generation") != \
+                self._database_generation.get("generation"):
+            raise RuntimeError("source database generation changed before cutover")
+        target_generation = inspect_database_generation(target_connection)
+        if target_generation.get("generation") != \
+                self._target_database_generation.get("generation"):
+            raise RuntimeError("target database generation changed before cutover")
+
+        source_cfg = dict(db_config or {})
+        if isinstance(source_cfg.get("mysql"), dict):
+            source_cfg = dict(source_cfg["mysql"])
+        target_cfg = dict(target_db_config or {})
+        if isinstance(target_cfg.get("mysql"), dict):
+            target_cfg = dict(target_cfg["mysql"])
+        selected_source = self._selected_database_identity(connection)
+        selected_target = self._selected_database_identity(target_connection)
+        expected_source = str(source_cfg.get("database") or "")
+        expected_target = str(target_cfg.get("database") or "")
+        if expected_source and selected_source.lower() != expected_source.lower():
+            raise RuntimeError(
+                "source database identity changed before cutover: {}".format(
+                    selected_source
+                )
+            )
+        if expected_target and selected_target.lower() != expected_target.lower():
+            raise RuntimeError(
+                "target database identity changed before cutover: {}".format(
+                    selected_target
+                )
+            )
+        if selected_source and selected_target and \
+                selected_source.lower() == selected_target.lower():
+            raise RuntimeError("source and target selected database identities are equal")
+
+        current_path = os.path.join(self.publish_root, "CURRENT")
+        current = {}
+        if self._deployment_layout == IMMUTABLE_CURRENT:
+            current = current_served_root_binding(self.publish_root)
+            if str(current.get("previous_release_commit_sha") or "").lower() != \
+                    str(previous_release.get("commit_sha") or "").lower():
+                raise RuntimeError("CURRENT baseline identity changed before cutover")
+            if self.previous_published_session_id and \
+                    current.get("release_validation_session_id") != \
+                    self.previous_published_session_id:
+                raise RuntimeError("CURRENT validation session changed before cutover")
+        elif self._deployment_layout == FLAT:
+            if os.path.lexists(current_path):
+                raise RuntimeError(
+                    "Flat deployment changed to CURRENT before the cutover boundary"
+                )
+        else:
+            raise RuntimeError("deployment layout changed before cutover")
+        return {
+            "status": "PASSED",
+            "source_generation": source_generation,
+            "target_generation": target_generation,
+            "source_database": selected_source,
+            "target_database": selected_target,
+            "deployment_layout": self._deployment_layout,
+            "current": current,
+            "current_path": current_path,
+            "command": "inspect_database_generation + SELECT DATABASE() + CURRENT binding",
+            "exit_code": 0,
+        }
 
     def _configure_serving_session(self, upgrade_config: Dict[str, Any],
                                    previous_release: Dict[str, Any]):
@@ -1066,11 +1178,27 @@ class UpgradeOrchestrator:
             self.previous_published_session_id or ""
         )
 
-    def _teardown_validation_session(self, identity: Dict[str, Any], mode: str):
+    def _teardown_validation_session(self, identity: Dict[str, Any], mode: str,
+                                      lifecycle=None):
         if self.validation_session is None:
             return None
         if self._validation_teardown_result is not None:
             return self._validation_teardown_result
+
+        service_stop = {}
+        service_stop_error = ""
+        # A systemd-managed validation service is not a child of the
+        # controller and therefore is not stopped by ValidationSession's PID
+        # signals alone. Stop the explicit validation owner first, then use
+        # the session manifest/port probe as the independent closure check.
+        if lifecycle is not None and lifecycle.api_started:
+            try:
+                service_stop = lifecycle.stop_validation_api()
+            except Exception as exc:
+                service_stop_error = str(exc)
+                self.log(
+                    "❌ Validation API stop failed: {}".format(service_stop_error)
+                )
 
         try:
             result = self.validation_session.teardown(
@@ -1096,10 +1224,46 @@ class UpgradeOrchestrator:
             }
             self.log("❌ Validation session teardown failed: {}".format(exc))
 
+        if service_stop_error:
+            result["status"] = "FAILED"
+            result.setdefault("violations", []).append(
+                "validation API stop failed: {}".format(service_stop_error)
+            )
+            result["pids_closed"] = False
+            result["ports_closed"] = False
+            result["ports_probe_ok"] = False
+        result["validation_api_stop"] = service_stop
+        if result.get("status") == "PASSED" and \
+                self._production_lifecycle_adapter is not None and \
+                self._production_lifecycle_adapter.validation_binding_changed:
+            try:
+                restored_validation = \
+                    self._production_lifecycle_adapter.restore_validation_candidate_binding()
+                daemon_reload = self._production_lifecycle_adapter.daemon_reload()
+                result["production_validation_binding_restore"] = {
+                    "status": "PASSED",
+                    "binding": restored_validation,
+                    "daemon_reload": daemon_reload,
+                    "credentials_written_to_evidence": False,
+                    "exit_code": 0,
+                }
+            except Exception as exc:
+                result["status"] = "FAILED"
+                result.setdefault("violations", []).append(
+                    "validation systemd binding restore failed: {}".format(exc)
+                )
+                self.log(
+                    "❌ Validation systemd binding restore failed: {}".format(exc)
+                )
+
         verification = result.get("verification") or {}
         result["pids_closed"] = verification.get("pids_closed") is True
         result["ports_closed"] = verification.get("ports_closed") is True
         result["ports_probe_ok"] = verification.get("ports_probe_ok") is True
+        if service_stop_error:
+            result["pids_closed"] = False
+            result["ports_closed"] = False
+            result["ports_probe_ok"] = False
         result.update({
             "revision": identity.get("commit_sha"),
             "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
@@ -1162,6 +1326,27 @@ class UpgradeOrchestrator:
 
     def _fail(self, lifecycle: Optional[UpgradeLifecycle], message: str) -> Tuple[bool, str]:
         self._mark_not_ready()
+        # If a vfoswind serving process has already been started with the new
+        # persistent DB binding, stop it before restoring CURRENT and the old
+        # EnvironmentFile.  This keeps rollback from restarting a process with
+        # a mixed release/database identity.
+        if self._production_runtime_bound and lifecycle is not None and \
+                lifecycle.serving_api_started:
+            try:
+                stop_serving = lifecycle.stop_serving_api()
+                self.manifest.record("production_integration_rollback", {
+                    "status": "PASSED",
+                    "phase": "stop_candidate_serving",
+                    "command": stop_serving,
+                    "credentials_written_to_evidence": False,
+                    "exit_code": 0,
+                })
+            except Exception as exc:
+                self.log(
+                    "❌ DATA_SAFETY_HOLD: candidate serving stop failed: {}".format(
+                        exc
+                    )
+                )
         if self._publication_switched:
             try:
                 if self.publisher is None or not self.previous_published_session_id:
@@ -1173,17 +1358,64 @@ class UpgradeOrchestrator:
                 self.log("✔ Immutable CURRENT pointer rolled back before traffic was opened.")
             except Exception as exc:
                 self.log("❌ DATA_SAFETY_HOLD: immutable publication rollback failed: {}".format(exc))
+        if self._production_release_bindings_changed and \
+                self._production_lifecycle_adapter is not None:
+            try:
+                restored_bindings = self._production_lifecycle_adapter.restore_previous_release_bindings()
+                daemon_reload = self._production_lifecycle_adapter.daemon_reload()
+                self.manifest.record("production_integration_rollback", {
+                    "status": "PASSED",
+                    "phase": "restore_previous_release_bindings",
+                    "release_bindings": restored_bindings,
+                    "daemon_reload": daemon_reload,
+                    "exit_code": 0,
+                })
+                self._production_release_bindings_changed = False
+            except Exception as exc:
+                self.log(
+                    "❌ DATA_SAFETY_HOLD: production release binding rollback failed: {}".format(
+                        exc
+                    )
+                )
+        if self._production_runtime_bound and self._production_lifecycle_adapter is not None:
+            try:
+                restored = self._production_lifecycle_adapter.restore_previous_database_binding()
+                reload_evidence = self._production_lifecycle_adapter.daemon_reload()
+                self.manifest.record("production_integration_rollback", {
+                    "status": "PASSED",
+                    "phase": "restore_previous_database_binding",
+                    "runtime_binding": restored,
+                    "daemon_reload": reload_evidence,
+                    "credentials_written_to_evidence": False,
+                    "exit_code": 0,
+                })
+                self._production_runtime_bound = False
+            except Exception as exc:
+                self.log(
+                    "❌ DATA_SAFETY_HOLD: production runtime binding rollback failed: {}".format(
+                        exc
+                    )
+                )
         if lifecycle is not None and lifecycle.active:
             try:
                 rollback_result = lifecycle.abort()
                 self.log("✔ Upgrade lifecycle aborted and previous API restored: {}".format(
                     rollback_result.get("previous_release_verified", False)))
+                if self._production_lifecycle_adapter is not None:
+                    nginx_rollback = self._production_lifecycle_adapter.reload_nginx()
+                    self.manifest.record("production_integration_rollback", {
+                        "status": "PASSED",
+                        "phase": "nginx_reload_previous_current",
+                        "nginx": nginx_rollback,
+                        "credentials_written_to_evidence": False,
+                        "exit_code": 0,
+                    })
             except Exception as exc:
                 self.log("❌ DATA_SAFETY_HOLD: lifecycle abort failed: {}".format(exc))
         if self.validation_session is not None:
             try:
                 teardown = self._teardown_validation_session(
-                    self._target_identity, self._upgrade_mode
+                    self._target_identity, self._upgrade_mode, lifecycle=lifecycle
                 )
                 if teardown and teardown.get("status") != "PASSED":
                     self.log("❌ Release NOT_READY: validation session teardown did not pass.")
@@ -1286,7 +1518,12 @@ class UpgradeOrchestrator:
         """Run complete upgrade procedure."""
         self._runtime_config = dict(runtime_config or {})
         self._upgrade_mode = mode
+        self._production_lifecycle_adapter = None
+        self._production_runtime_bound = False
+        self._production_release_bindings_changed = False
         self._mark_not_ready()
+        self.manifest.data["upgrade_mode"] = mode
+        self.manifest.save()
         self.log("=== Starting Manifest-Driven Upgrade Procedure ===")
         if mode not in ("staging", "production"):
             return False, "Invalid upgrade mode"
@@ -1357,6 +1594,12 @@ class UpgradeOrchestrator:
         if not dry_run and target_connection is None and \
                 not target_connection_deferred:
             return False, "Disposable target factory or pre-restored target is required"
+        if not dry_run:
+            try:
+                validate_disposable_target_config(db_config or {}, self._target_db_config)
+            except (RuntimeError, ValueError, TypeError) as exc:
+                self.log("❌ Disposable target application access preflight failed: {}".format(exc))
+                return False, "Disposable target application access preflight failed"
         if connection is not None:
             self._database_generation = inspect_database_generation(connection)
             if self._database_generation.get("generation") == UNKNOWN:
@@ -1387,6 +1630,9 @@ class UpgradeOrchestrator:
                 return False, "Disposable target database configuration is required"
             if target_connection is not None:
                 try:
+                    candidate_access = probe_candidate_connection_access(
+                        target_connection, self._target_db_config
+                    )
                     separation = validate_migration_database_separation(
                         db_config or {}, self._target_db_config,
                         source_connection=connection,
@@ -1413,6 +1659,7 @@ class UpgradeOrchestrator:
                     "evidence_class": "production_database",
                     "separation": separation,
                     "target_generation": target_generation,
+                    "candidate_access": candidate_access,
                     "command": "validate_migration_database_separation + inspect_database_generation(target)",
                     "exit_code": 0,
                 })
@@ -1457,6 +1704,49 @@ class UpgradeOrchestrator:
         except (OSError, RuntimeError, ValueError, TypeError) as exc:
             self.log("❌ Immutable publication/session preflight failed: {}".format(exc))
             return False, "Immutable publication/session preflight failed"
+        if mode == "production":
+            production_integration = upgrade_config.get(
+                "production_integration"
+            ) or {}
+            if str(upgrade_config.get("lifecycle_adapter") or "").strip() != \
+                    VFOSWIND_ADAPTER or \
+                    str(production_integration.get("adapter") or "").strip() != \
+                    VFOSWIND_ADAPTER:
+                self.log(
+                    "❌ Production lifecycle adapter must explicitly be {}".format(
+                        VFOSWIND_ADAPTER
+                    )
+                )
+                return False, "Production integration adapter is not configured"
+            try:
+                self._production_lifecycle_adapter = VfoswindProductionLifecycle(
+                    self.publish_root, production_integration
+                )
+                source_runtime_config = dict(db_config or {})
+                if isinstance(source_runtime_config.get("mysql"), dict):
+                    source_runtime_config = dict(source_runtime_config["mysql"])
+                integration_evidence = self._production_lifecycle_adapter.preflight(
+                    expected_database=source_runtime_config.get("database", ""),
+                    candidate_application_root=os.path.join(
+                        self.production_candidate_root, "app"
+                    ),
+                    candidate_ports=upgrade_config.get("validation_ports") or [],
+                    validation_commands=upgrade_config.get("commands") or {},
+                )
+                integration_evidence.update({
+                    "revision": identity.get("commit_sha"),
+                    "evidence_class": "production_integration",
+                })
+                self.manifest.record(
+                    "production_integration_preflight", integration_evidence
+                )
+            except (OSError, RuntimeError, ValueError, TypeError) as exc:
+                self.log(
+                    "❌ vfoswind systemd/Nginx integration preflight failed: {}".format(
+                        exc
+                    )
+                )
+                return False, "Production systemd/Nginx integration is not closed"
         self.manifest.record("deployment_layout", {
             "status": "PASSED",
             "deployment_layout": self._deployment_layout,
@@ -1475,6 +1765,17 @@ class UpgradeOrchestrator:
         residue_ports = upgrade_config.get("validation_residue_ports")
         if residue_ports is None:
             residue_ports = upgrade_config.get("validation_ports") or []
+        configured_residue_manifests = upgrade_config.get(
+            "validation_residue_session_manifests"
+        ) or []
+        if isinstance(configured_residue_manifests, str):
+            configured_residue_manifests = [configured_residue_manifests]
+        residue_manifests = []
+        for manifest_path in configured_residue_manifests:
+            manifest_path = str(manifest_path)
+            if not os.path.isabs(manifest_path):
+                manifest_path = os.path.join(self.repo_root, manifest_path)
+            residue_manifests.append(manifest_path)
         residue_session = str(
             upgrade_config.get("validation_residue_session_id") or
             self.release_validation_session_id
@@ -1482,6 +1783,7 @@ class UpgradeOrchestrator:
         residue = scan_validation_residue(
             candidate_roots=residue_roots, ports=residue_ports,
             session_identity=residue_session,
+            session_manifests=residue_manifests,
         )
         residue.update({
             "revision": identity.get("commit_sha"),
@@ -1498,6 +1800,7 @@ class UpgradeOrchestrator:
             teardown_residue = teardown_validation_residue(
                 candidate_roots=residue_roots, ports=residue_ports,
                 session_identity=residue_session,
+                session_manifests=residue_manifests,
             )
             teardown_residue.update({
                 "revision": identity.get("commit_sha"),
@@ -1513,31 +1816,23 @@ class UpgradeOrchestrator:
         source_runtime_mysql = dict(db_config or {})
         if isinstance(source_runtime_mysql.get("mysql"), dict):
             source_runtime_mysql = dict(source_runtime_mysql["mysql"])
-        lifecycle_previous["_previous_runtime_mysql"] = source_runtime_mysql
+        lifecycle_previous["_previous_runtime_mysql"] = _application_settings(
+            source_runtime_mysql
+        )
         lifecycle_config = dict(self._runtime_config)
         lifecycle_upgrade = dict((self._runtime_config.get("upgrade") or {}))
         if self._target_db_config:
-            lifecycle_upgrade["candidate_runtime_mysql"] = dict(self._target_db_config)
+            lifecycle_upgrade["candidate_runtime_mysql"] = _application_settings(
+                self._target_db_config
+            )
         lifecycle_config["upgrade"] = lifecycle_upgrade
         lifecycle = UpgradeLifecycle(
             self.repo_root, lifecycle_config, mode, lifecycle_previous
         )
-        try:
-            freeze_evidence = lifecycle.freeze(identity.get("commit_sha", ""))
-            freeze_evidence["revision"] = identity.get("commit_sha")
-            self.manifest.record("traffic_freeze", freeze_evidence)
-            if connection is None:
-                return self._fail(lifecycle, "Live database connection required before drain")
-            drain_timeout = float(((runtime_config or {}).get("upgrade") or {}).get("drain_timeout_sec", 30))
-            drain_evidence = lifecycle.drain(connection, timeout_sec=drain_timeout)
-            drain_evidence["revision"] = identity.get("commit_sha")
-            self.manifest.record("job_drain", drain_evidence)
-        except Exception as exc:
-            self.log("❌ Freeze/drain failed: {}".format(exc))
-            return self._fail(lifecycle, "Freeze/drain failed")
-
-        # Step 3: MySQL Backup (fails closed if mysqldump missing unless test mock)
-        self.log("[Step 3/10] Creating Pre-upgrade Full MySQL Backup & Checksum...")
+        # Phase B starts with source backup and disposable-target preparation.
+        # Freeze/drain is intentionally deferred until every Candidate gate has
+        # passed; a failed backup or migration must not touch the active API.
+        self.log("[Phase B / Step 3] Creating Pre-upgrade Full MySQL Backup & Checksum...")
         backup_db_config = dict(db_config or {"database": "coverage_tool"})
         configured_deploy_roots = list(
             backup_db_config.get("deployment_roots") or []
@@ -1610,6 +1905,12 @@ class UpgradeOrchestrator:
                     )
                 if not isinstance(target_preparation, dict):
                     target_preparation = {}
+                if (target_preparation.get("candidate_access") or {}).get(
+                        "status") != "PASSED":
+                    target_preparation["candidate_access"] = \
+                        probe_candidate_connection_access(
+                            target_connection, self._target_db_config
+                        )
                 target_generation = inspect_database_generation(target_connection)
                 self._target_database_generation = target_generation
                 separation = validate_migration_database_separation(
@@ -1660,6 +1961,9 @@ class UpgradeOrchestrator:
                 "target_connection_supplied": True,
                 "target_retained_for_candidate": True,
             }
+            target_preparation["candidate_access"] = probe_candidate_connection_access(
+                target_connection, self._target_db_config
+            )
             self.manifest.record("disposable_target", target_preparation)
 
         # Step 4: Blue/green database migration and authoritative fact gate.
@@ -1743,44 +2047,19 @@ class UpgradeOrchestrator:
             return self._fail(lifecycle, "Authoritative data integrity verification failed")
         self.log("✔ Disposable target migration and authoritative data gate passed.")
 
-        # Only after the disposable target is proven do we touch the lifecycle
-        # boundary for an eventual cutover.  A failed migration never stops
-        # the current serving PID.
+        # Phase B publication is preparation only.  It creates an immutable
+        # release directory but must not alter CURRENT or the active service.
+        # The switch is performed in the short Phase D cutover window below,
+        # after the isolated Candidate has passed all validation gates.
+        self.log("[Phase B] Preparing immutable Candidate release (CURRENT unchanged)...")
+        session_id = self.validation_session.data.get("session_id")
+        offline_evidence = upgrade_config.get("offline_operator_evidence", "")
+        offline_bundle = upgrade_config.get("offline_operator_source_bundle", "")
+        if offline_evidence and not os.path.isabs(str(offline_evidence)):
+            offline_evidence = os.path.join(self.repo_root, str(offline_evidence))
+        if offline_bundle and not os.path.isabs(str(offline_bundle)):
+            offline_bundle = os.path.join(self.repo_root, str(offline_bundle))
         try:
-            stop_evidence = lifecycle.stop_current_api()
-            stop_evidence.update({
-                "revision": identity.get("commit_sha"),
-                "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
-                "process_role": "pre_upgrade_baseline",
-            })
-            self.manifest.record("api_stop", stop_evidence)
-        except Exception as exc:
-            self.log("❌ API stop failed: {}".format(exc))
-            return self._fail(lifecycle, "API stop failed")
-
-        # The deployment manifest remains a review record, while publication
-        # itself is exclusively an immutable artifact preparation followed by
-        # one atomic CURRENT pointer switch.  The active checkout is never
-        # rewritten by the production upgrade path.
-        self.log("[Cutover] Preparing immutable release and switching CURRENT atomically...")
-        try:
-            adoption = self._ensure_flat_current_baseline(
-                upgrade_config, previous_release
-            )
-            # UpgradeLifecycle snapshots the rollback identity at construction
-            # time.  Flat adoption creates the immutable baseline session only
-            # at this boundary, so publish that generated session into the
-            # lifecycle before any later gate can invoke abort().
-            if adoption and self.previous_published_session_id:
-                lifecycle.previous_release["_published_session_id"] = \
-                    self.previous_published_session_id
-            session_id = self.validation_session.data.get("session_id")
-            offline_evidence = upgrade_config.get("offline_operator_evidence", "")
-            offline_bundle = upgrade_config.get("offline_operator_source_bundle", "")
-            if offline_evidence and not os.path.isabs(str(offline_evidence)):
-                offline_evidence = os.path.join(self.repo_root, str(offline_evidence))
-            if offline_bundle and not os.path.isabs(str(offline_bundle)):
-                offline_bundle = os.path.join(self.repo_root, str(offline_bundle))
             prepared = self.publisher.prepare(
                 self.production_candidate_root,
                 identity,
@@ -1820,10 +2099,6 @@ class UpgradeOrchestrator:
                 previous_release.get("commit_sha", ""),
                 validation_session_id=session_id,
             )
-            switched = self.publisher.switch_current(session_id)
-            if switched.get("status") != "PASSED":
-                raise RuntimeError("immutable CURRENT switch did not pass")
-            self._publication_switched = True
             candidate_manifest_summary = prepared.get("candidate_artifact_manifest") or {}
             self._candidate_artifact_sha256 = str(
                 candidate_manifest_summary.get("artifact_sha256") or ""
@@ -1833,7 +2108,21 @@ class UpgradeOrchestrator:
             )
             if not self._candidate_artifact_sha256 or not self._served_root_sha256:
                 raise RuntimeError("immutable publication hashes are incomplete")
-            self.manifest.record("file_cutover", {
+            self.validation_session.data["candidate_root"] = \
+                self.publisher.release_path(session_id)
+            self.validation_session.save()
+            application_evidence = validate_production_application_bundle(
+                self.publisher.release_path(session_id)
+            )
+            application_evidence.update({
+                "revision": identity.get("commit_sha"),
+                "evidence_class": "staging_cutover" if mode == "staging" else
+                "production_integration",
+            })
+            self.manifest.record(
+                "production_application_bundle", application_evidence
+            )
+            self.manifest.record("candidate_release_prepared", {
                 "status": "PASSED",
                 "revision": identity.get("commit_sha"),
                 "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
@@ -1849,10 +2138,27 @@ class UpgradeOrchestrator:
                 "candidate_artifact_sha256": self._candidate_artifact_sha256,
                 "served_root_sha256": self._served_root_sha256,
                 "release_manifest": prepared,
-                "switch": switched,
-                "command": "ImmutableReleasePublisher.prepare + switch_current",
+                "current_unchanged": True,
+                "command": "ImmutableReleasePublisher.prepare (no CURRENT switch)",
                 "exit_code": 0,
             })
+            if self._production_lifecycle_adapter is not None:
+                validation_binding = \
+                    self._production_lifecycle_adapter.bind_validation_candidate(
+                        os.path.join(self.publisher.release_path(session_id), "app"),
+                        self._target_db_config,
+                    )
+                validation_daemon_reload = \
+                    self._production_lifecycle_adapter.daemon_reload()
+                self.manifest.record("production_validation_runtime_binding", {
+                    "status": "PASSED",
+                    "revision": identity.get("commit_sha"),
+                    "evidence_class": "production_integration",
+                    "binding": validation_binding,
+                    "daemon_reload": validation_daemon_reload,
+                    "credentials_written_to_evidence": False,
+                    "exit_code": 0,
+                })
         except Exception as exc:
             self.log("❌ Immutable release publication failed: {}".format(exc))
             return self._fail(lifecycle, "Immutable release publication failed")
@@ -1865,10 +2171,27 @@ class UpgradeOrchestrator:
                 "process_role": "validation_candidate",
             })
             self.manifest.record("api_start", start_evidence)
-            endpoint = ((runtime_config or {}).get("upgrade") or {}).get("release_endpoint")
+            endpoint = ((runtime_config or {}).get("upgrade") or {}).get(
+                "candidate_release_endpoint"
+            ) or ((runtime_config or {}).get("upgrade") or {}).get(
+                "release_endpoint"
+            )
             endpoint_evidence = self._verify_release_endpoint(endpoint, identity)
-            endpoint_evidence["revision"] = identity.get("commit_sha")
-            self.manifest.record("release_endpoint", endpoint_evidence)
+            endpoint_evidence.update({
+                "revision": identity.get("commit_sha"),
+                "process_role": "validation_candidate",
+            })
+            self.manifest.record("candidate_release_endpoint", endpoint_evidence)
+            if self._production_lifecycle_adapter is not None:
+                ownership = self._production_lifecycle_adapter.validation_process_ownership()
+                validation_ports = self.validation_session.data.get("ports") or []
+                for port in validation_ports:
+                    self.validation_session.add_process(
+                        ownership["pid"], port=port,
+                        listener={"pid": ownership["pid"], "port": int(port)},
+                    )
+                start_evidence["process_ownership"] = ownership
+                self.manifest.record("api_start", start_evidence)
         except Exception as exc:
             self.log("❌ Candidate API verification failed: {}".format(exc))
             return self._fail(lifecycle, "Candidate API verification failed")
@@ -2209,10 +2532,144 @@ class UpgradeOrchestrator:
         # Teardown is a hard release prerequisite.  This runs before the
         # final evidence read and records both the session manifest and the
         # owned-process/port closure result.
-        teardown = self._teardown_validation_session(identity, mode)
+        teardown = self._teardown_validation_session(
+            identity, mode, lifecycle=lifecycle
+        )
         if not teardown or teardown.get("status") != "PASSED":
             self.log("❌ Release NOT_READY: validation session teardown is incomplete.")
             return self._fail(lifecycle, "Validation session teardown failed")
+
+        self.manifest.record("pre_cutover_ready", {
+            "status": "PASSED",
+            "phase": "PRE_CUTOVER_READY",
+            "revision": identity.get("commit_sha"),
+            "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
+            "current_unchanged_until_phase_d": True,
+            "database_target": (self._target_db_config or {}).get("database", ""),
+            "candidate_release_root": self.publisher.release_path(session_id),
+            "command": "candidate gates + validation teardown",
+            "exit_code": 0,
+        })
+        lifecycle.api_started = False
+
+        # Phase D is the only cutover window.  Candidate validation, browser,
+        # performance, audits, and rollback rehearsal have all completed
+        # while CURRENT and the active API were untouched.
+        self.log("[Phase D] Candidate is PRE_CUTOVER_READY; entering short cutover window...")
+        try:
+            freeze_evidence = lifecycle.freeze(identity.get("commit_sha", ""))
+            freeze_evidence["revision"] = identity.get("commit_sha")
+            self.manifest.record("traffic_freeze", freeze_evidence)
+            drain_timeout = float(
+                ((runtime_config or {}).get("upgrade") or {}).get(
+                    "drain_timeout_sec", 30
+                )
+            )
+            drain_evidence = lifecycle.drain(
+                connection, timeout_sec=drain_timeout
+            )
+            drain_evidence["revision"] = identity.get("commit_sha")
+            self.manifest.record("job_drain", drain_evidence)
+
+            cutover_identity = self._reconfirm_cutover_identity(
+                connection, target_connection, db_config,
+                self._target_db_config, previous_release,
+            )
+            cutover_identity.update({
+                "revision": identity.get("commit_sha"),
+                "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
+            })
+            self.manifest.record("cutover_identity_reconfirmation", cutover_identity)
+
+            if self._production_lifecycle_adapter is not None:
+                lifecycle.current_serving_managed = lifecycle._has_active_current_serving_state()
+                lifecycle.current_api_stop_attempted = True
+                stop_evidence = self._production_lifecycle_adapter.stop_service()
+                lifecycle.current_api_stopped = True
+            else:
+                stop_evidence = lifecycle.stop_current_api()
+            stop_evidence.update({
+                "revision": identity.get("commit_sha"),
+                "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
+                "process_role": "pre_upgrade_baseline",
+            })
+            self.manifest.record("api_stop", stop_evidence)
+        except Exception as exc:
+            self.log("❌ Cutover freeze/drain/stop failed: {}".format(exc))
+            return self._fail(lifecycle, "Cutover freeze/drain/stop failed")
+
+        # Flat adoption is deliberately inside Phase D.  It is the first
+        # operation allowed to create CURRENT for a historical Flat install.
+        self.log("[Phase D] Adopting Flat baseline if required and switching CURRENT atomically...")
+        try:
+            adoption = self._ensure_flat_current_baseline(
+                upgrade_config, previous_release
+            )
+            # UpgradeLifecycle snapshots the rollback identity at construction
+            # time.  Flat adoption creates the immutable baseline session only
+            # at this boundary, so publish that generated session into the
+            # lifecycle before any later gate can invoke abort().
+            if adoption and self.previous_published_session_id:
+                lifecycle.previous_release["_published_session_id"] = \
+                    self.previous_published_session_id
+            switched = self.publisher.switch_current(session_id)
+            if switched.get("status") != "PASSED":
+                raise RuntimeError("immutable CURRENT switch did not pass")
+            self._publication_switched = True
+            current_after_switch = self.publisher.validate_current()
+            if current_after_switch.get("status") != "PASSED":
+                raise RuntimeError("CURRENT failed validation after atomic switch")
+            production_runtime = {}
+            if self._production_lifecycle_adapter is not None:
+                release_bindings = self._production_lifecycle_adapter.bind_current_release()
+                self._production_release_bindings_changed = bool(
+                    self._production_lifecycle_adapter.release_bindings_changed
+                )
+                binding = self._production_lifecycle_adapter.bind_candidate_database(
+                    self._target_db_config
+                )
+                self._production_runtime_bound = True
+                daemon_reload = self._production_lifecycle_adapter.daemon_reload()
+                production_runtime = {
+                    "release_bindings": release_bindings,
+                    "binding": binding,
+                    "daemon_reload": daemon_reload,
+                }
+                self.manifest.record("production_runtime_binding", {
+                    "status": "PASSED",
+                    "revision": identity.get("commit_sha"),
+                    "evidence_class": "production_integration",
+                    "release_bindings": release_bindings,
+                    "binding": binding,
+                    "daemon_reload": daemon_reload,
+                    "credentials_written_to_evidence": False,
+                    "exit_code": 0,
+                })
+            self.manifest.record("file_cutover", {
+                "status": "PASSED",
+                "revision": identity.get("commit_sha"),
+                "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
+                "action_count": len(actions),
+                "publication_mode": "immutable_release",
+                "production_candidate_root": self.production_candidate_root,
+                "validation_candidate_root": self.validation_candidate_root,
+                "publish_root": self.publish_root,
+                "release_root": self.publisher.release_path(session_id),
+                "previous_session_id": self.previous_published_session_id,
+                "current_session_id": session_id,
+                "release_validation_session_id": session_id,
+                "candidate_artifact_sha256": self._candidate_artifact_sha256,
+                "served_root_sha256": self._served_root_sha256,
+                "release_manifest": prepared,
+                "switch": switched,
+                "current_validation": current_after_switch,
+                "production_runtime": production_runtime,
+                "command": "ImmutableReleasePublisher.switch_current",
+                "exit_code": 0,
+            })
+        except Exception as exc:
+            self.log("❌ Immutable release cutover failed: {}".format(exc))
+            return self._fail(lifecycle, "Immutable release cutover failed")
 
         # The validation candidate is now gone by construction.  Start the
         # final serving process under a different session/command so a later
@@ -2221,7 +2678,23 @@ class UpgradeOrchestrator:
         lifecycle.api_started = False
         try:
             self._activate_final_serving_session()
-            serving_start = lifecycle.start_serving_api()
+            if self._production_lifecycle_adapter is not None:
+                # The production adapter binds the persistent EnvironmentFile
+                # and restarts the real systemd unit.  The generic staging
+                # command remains available for non-production runs.
+                lifecycle.serving_api_started = True
+                serving_start = self._production_lifecycle_adapter.restart_service()
+                nginx_reload = self._production_lifecycle_adapter.reload_nginx()
+                self.manifest.record("production_nginx_reload", {
+                    "status": "PASSED",
+                    "revision": identity.get("commit_sha"),
+                    "evidence_class": "production_integration",
+                    "nginx": nginx_reload,
+                    "credentials_written_to_evidence": False,
+                    "exit_code": 0,
+                })
+            else:
+                serving_start = lifecycle.start_serving_api()
             serving_start.update({
                 "revision": identity.get("commit_sha"),
                 "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",

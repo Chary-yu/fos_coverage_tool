@@ -734,7 +734,7 @@ def _attestation_payload(identity, payload):
 
 def _build_payload(candidate_root, identity, manifest_path, source_provenance,
                    artifact_role, production_publishable, project_name,
-                   attestation_path=None):
+                   attestation_path=None, excluded_paths=None):
     candidate_root = _real(candidate_root)
     identity_snapshot = _identity_snapshot(identity)
     _verify_checkout_head(candidate_root, identity_snapshot["commit_sha"])
@@ -755,7 +755,9 @@ def _build_payload(candidate_root, identity, manifest_path, source_provenance,
             raise ValueError("candidate artifact is missing {}/".format(directory))
     entries = _inventory(
         candidate_root, manifest_path,
-        excluded_paths=(attestation_path, receipt_path),
+        excluded_paths=(attestation_path, receipt_path) + tuple(
+            excluded_paths or ()
+        ),
     )
     directory_hashes = {
         directory: _directory_hash(entries, directory)
@@ -872,7 +874,7 @@ class CandidateArtifactManifest(object):
     def verify(cls, candidate_root, release_identity, candidate_sha="",
                manifest_path=None, require_trusted_provenance=False,
                expected_artifact_role="", expected_project_name="",
-               require_production_publishable=False):
+               require_production_publishable=False, excluded_paths=None):
         candidate_root = _real(candidate_root)
         manifest, path = cls.load(candidate_root, manifest_path)
         if int(manifest.get("artifact_manifest_version") or 0) != \
@@ -937,6 +939,7 @@ class CandidateArtifactManifest(object):
             descriptor["artifact_role"], descriptor["production_publishable"],
             descriptor["project_name"],
             attestation_path=attestation_path,
+            excluded_paths=excluded_paths,
         )
         for key in (
                 "commit_sha", "build_id", "files", "directory_sha256",

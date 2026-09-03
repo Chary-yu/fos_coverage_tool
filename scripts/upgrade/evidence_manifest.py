@@ -334,6 +334,7 @@ class ProductionEvidenceManifest:
             "updated_at": get_utc_iso(),
             "status": "INITIALIZED",
             "release_decision": "NOT_READY",
+            "upgrade_mode": "",
             "release_identity": {},
             "schema_migration": {},
             "backup_evidence": {},
@@ -540,6 +541,19 @@ class ProductionEvidenceManifest:
         for section in lifecycle_sections:
             if (self.data.get(section) or {}).get("status") != "PASSED":
                 unmet.append("{} lifecycle evidence is not PASSED".format(section))
+        if self.data.get("upgrade_mode") == "production":
+            for section in (
+                    "production_integration_preflight",
+                    "production_application_bundle",
+                    "production_validation_runtime_binding",
+                    "production_runtime_binding",
+                    "production_nginx_reload"):
+                if (self.data.get(section) or {}).get("status") != "PASSED":
+                    unmet.append(
+                        "{} production integration evidence is not PASSED".format(
+                            section
+                        )
+                    )
         if require_traffic_open and (self.data.get("traffic_open") or {}).get("status") != "PASSED":
             unmet.append("traffic_open lifecycle evidence is not PASSED")
 

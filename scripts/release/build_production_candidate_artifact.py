@@ -42,8 +42,9 @@ from app.release_identity import (
     save_release_manifest,
 )
 from app.release_publication import (
-    build_release_manifest, validate_production_candidate_content,
-    current_served_root_binding,
+    build_release_manifest, copy_production_application_bundle,
+    validate_production_application_bundle,
+    validate_production_candidate_content, current_served_root_binding,
 )
 from app.time_utils import utc_iso
 
@@ -364,6 +365,14 @@ def _is_report_html(candidate_root, path):
     )
 
 
+def _is_application_file(candidate_root, path):
+    """Keep runtime-bundle files out of browser Served Root alias checks."""
+    relative = os.path.relpath(
+        os.path.abspath(path), os.path.abspath(candidate_root)
+    ).replace(os.sep, "/")
+    return relative == "app" or relative.startswith("app/")
+
+
 def _verify_candidate_release_assets(candidate_root, contract):
     """Verify exact contract paths and every same-name Served alias."""
     _assert_no_symlinks(candidate_root)
@@ -378,7 +387,8 @@ def _verify_candidate_release_assets(candidate_root, contract):
             "production Candidate release asset path/size/sha256 contract failed"
         )
     for path in _walk_files(candidate_root):
-        if _is_report_html(candidate_root, path):
+        if _is_report_html(candidate_root, path) or \
+                _is_application_file(candidate_root, path):
             # A report named like a root/template release asset is still a
             # report payload.  Refreshing it would erase its report identity
             # metadata (especially during Legacy Flat Adoption).
@@ -395,7 +405,8 @@ def _verify_candidate_release_assets(candidate_root, contract):
     return [
         os.path.relpath(path, candidate_root).replace(os.sep, "/")
         for path in _walk_files(candidate_root)
-        if os.path.basename(path) in contract["by_basename"]
+        if os.path.basename(path) in contract["by_basename"] and not \
+                _is_application_file(candidate_root, path)
     ]
 
 
@@ -411,7 +422,8 @@ def _refresh_release_assets(source_root, candidate_root, contract):
     refreshed = set()
     existing = {}
     for path in _walk_files(candidate_root):
-        if _is_report_html(candidate_root, path):
+        if _is_report_html(candidate_root, path) or \
+                _is_application_file(candidate_root, path):
             continue
         basename = os.path.basename(path)
         if basename not in contract["by_basename"]:
@@ -592,11 +604,16 @@ def build_production_candidate(
     asset_contract = _release_asset_contract(source_repo_root, identity)
     _copy_served_root(served_root, candidate_root)
     _assert_served_root_binding_unchanged(served_root_binding)
+    application_evidence = copy_production_application_bundle(
+        source_repo_root, candidate_root
+    )
+    _assert_served_root_binding_unchanged(served_root_binding)
     refreshed_assets = _refresh_release_assets(
         source_repo_root, candidate_root, asset_contract
     )
     _assert_served_root_binding_unchanged(served_root_binding)
     validate_production_candidate_content(candidate_root, PRODUCTION_PROJECT_NAME)
+    validate_production_application_bundle(candidate_root)
     _reject_validation_fixture(candidate_root)
     provenance = build_git_source_provenance(
         source_repo_root, identity, build_workflow_identity,
@@ -691,6 +708,8 @@ def build_production_candidate(
         "reports_sha256": manifest["reports_sha256"],
         "assets_sha256": manifest["assets_sha256"],
         "registry_sha256": manifest["registry_sha256"],
+        "application_sha256": application_evidence["application_sha256"],
+        "application_file_count": application_evidence["file_count"],
         "refreshed_assets": refreshed_assets,
         "report_count": len(preflight.get("reports") or []),
     }

@@ -15,9 +15,12 @@ import sys
 
 from app.compat.telemetry import record as _record_legacy_usage
 from app.config.runtime_config import load_application_config
+from app.release_identity import resolve_runtime_release_root
 
 
-SCRIPT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+SCRIPT_DIR = resolve_runtime_release_root(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+)
 CONFIG_PATH = os.path.join(SCRIPT_DIR, "coverage_config.json")
 DEFAULT_PROJECT_NAME = "Gemini-NOS"
 

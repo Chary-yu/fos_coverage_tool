@@ -1,0 +1,112 @@
+{
+  "config_schema_version": 2,
+  "runtime_mode": "vnext",
+  "schema_version": 1,
+  "environment": "production",
+  "mysql": {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "user": "coverage_user",
+    "password": "SET_ONLY_IN_COVERAGE_MYSQL_JSON",
+    "database": "coverage_vnext_e9fcc837",
+    "charset": "utf8mb4"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 9528
+  },
+  "auth": {
+    "mode": "reverse_proxy",
+    "user_header": "X-Remote-User",
+    "trusted_proxy_addresses": ["127.0.0.1", "::1"],
+    "allowed_origins": []
+  },
+  "upgrade": {
+    "lifecycle_adapter": "vfoswind",
+    "publish_root": "/home/zcyu/coverage_published",
+    "served_root_path": "/home/zcyu/coverage_published/CURRENT/reports",
+    "target_preparation_mode": "restore_from_verified_backup",
+    "target_mysql": {
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "coverage_user",
+      "password": "SET_ONLY_IN_OPERATOR_SECRET",
+      "database": "coverage_vnext_candidate_RELEASE",
+      "charset": "utf8mb4",
+      "candidate_grant_host": "127.0.0.1",
+      "backup_restore_user": "root",
+      "backup_restore_password": "SET_ONLY_IN_OPERATOR_SECRET"
+    },
+    "release_trust_mode": "offline_operator",
+    "production_candidate_root": "/home/zcyu/coverage_candidate/production",
+    "production_candidate_artifact_manifest": "/home/zcyu/coverage_candidate/production/candidate_artifact_manifest.json",
+    "offline_operator_evidence": "/home/zcyu/coverage_candidate/operator-evidence.json",
+    "offline_operator_source_bundle": "/home/zcyu/coverage_candidate/source.bundle",
+    "offline_operator_repository": "Chary-yu/fos_coverage_tool",
+    "production_host": "vfoswind",
+    "production_baseline_sha": "REPLACE_WITH_CURRENT_RELEASE_SHA",
+    "validation_session_manifest": "/home/zcyu/coverage_candidate/validation-session-{attempt_id}.json",
+    "validation_teardown_evidence_path": "/home/zcyu/coverage_candidate/validation-teardown-{attempt_id}.json",
+    "serving_session_id": "current-serving",
+    "serving_session_manifest": "/home/zcyu/coverage_candidate/serving-session.json",
+    "serving_teardown_evidence_path": "/home/zcyu/coverage_candidate/serving-teardown.json",
+    "current_serving_state_path": "/home/zcyu/coverage_candidate/current-serving.json",
+    "validation_ports": [19528],
+    "validation_residue_roots": ["/home/zcyu/coverage_candidate"],
+    "validation_residue_ports": [19528, 19529, 19530],
+    "validation_residue_session_manifests": [],
+    "validation_residue_session_id": "",
+    "validation_residue_teardown": false,
+    "candidate_release_endpoint": "http://127.0.0.1:19528/api/coverage/release",
+    "candidate_browser_url": "http://127.0.0.1:19528/",
+    "health_endpoint": "http://127.0.0.1:9528/api/coverage/health",
+    "served_root_probe_url": "http://127.0.0.1:9528/coverage/",
+    "served_root_url_prefix": "/coverage/",
+    "served_root_probe_relative_path": "index.html",
+    "candidate_browser_evidence_path": "/home/zcyu/coverage_candidate/browser-{attempt_id}.json",
+    "performance_evidence_path": "/home/zcyu/coverage_candidate/performance-{attempt_id}.json",
+    "rollback_evidence_path": "/home/zcyu/coverage_candidate/rollback-{attempt_id}.json",
+    "flat_served_root": "/home/zcyu/coverage/export0810/onesensor",
+    "flat_release_identity_path": "/home/zcyu/coverage/export0810/onesensor/release_identity.json",
+    "flat_current_adoption_on_cutover": true,
+    "flat_baseline_session_id": "previous-flat-baseline",
+    "production_integration": {
+      "adapter": "vfoswind",
+      "systemd_unit": "onesensor-coverage.service",
+      "systemd_unit_file": "/etc/systemd/system/onesensor-coverage.service",
+      "runtime_environment_file": "/etc/onesensor/coverage-runtime.env",
+      "validation_systemd_unit": "onesensor-coverage-validation.service",
+      "validation_systemd_unit_file": "/etc/systemd/system/onesensor-coverage-validation.service",
+      "validation_runtime_environment_file": "/etc/onesensor/coverage-validation.env",
+      "validation_config_path": "/etc/onesensor/coverage-validation.json",
+      "validation_application_root": "/home/zcyu/coverage_candidate/production/app",
+      "legacy_application_root": "/home/zcyu/coverage/onesensor_code-coverage-tool",
+      "legacy_served_root": "/home/zcyu/coverage/export0810/onesensor",
+      "nginx_config_path": "/etc/nginx/conf.d/onesensor-coverage.conf",
+      "nginx_proxy_pass": "http://127.0.0.1:9528",
+      "commands": {
+        "daemon_reload": ["/bin/systemctl", "daemon-reload"],
+        "service_stop": ["/bin/systemctl", "stop", "onesensor-coverage.service"],
+        "service_restart": ["/bin/systemctl", "restart", "onesensor-coverage.service"],
+        "nginx_test": ["/usr/sbin/nginx", "-t"],
+        "nginx_reload": ["/bin/systemctl", "reload", "nginx"]
+      }
+    },
+    "release_endpoint": "http://127.0.0.1:9528/api/coverage/release",
+    "previous_release_endpoint": "http://127.0.0.1:9528/api/coverage/release",
+    "previous_release": {
+      "commit_sha": "REPLACE_WITH_CURRENT_RELEASE_SHA"
+    },
+    "commands": {
+      "freeze_traffic": ["/usr/local/sbin/onesensor-coverage-freeze"],
+      "drain_jobs": ["/usr/local/sbin/onesensor-coverage-drain"],
+      "stop_current_api": ["/bin/systemctl", "stop", "onesensor-coverage.service"],
+      "stop_validation_api": ["/bin/systemctl", "stop", "onesensor-coverage-validation.service"],
+      "start_validation_api": ["/bin/systemctl", "start", "onesensor-coverage-validation.service"],
+      "start_serving_api": ["/bin/systemctl", "restart", "onesensor-coverage.service"],
+      "stop_serving_api": ["/bin/systemctl", "stop", "onesensor-coverage.service"],
+      "start_previous_api": ["/bin/systemctl", "restart", "onesensor-coverage.service"],
+      "open_traffic": ["/usr/local/sbin/onesensor-coverage-open"]
+    }
+  }
+}

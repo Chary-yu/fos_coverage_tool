@@ -90,6 +90,24 @@ class RuntimeConfigTest(unittest.TestCase):
         self.assertEqual(config["mysql"]["database"], "coverage_vnext_candidate_801")
         self.assertEqual(config["mysql"]["host"], "candidate-db")
 
+    def test_persistent_mysql_environment_binding_selects_serving_database(self):
+        old = os.environ.get("COVERAGE_MYSQL_JSON")
+        os.environ["COVERAGE_MYSQL_JSON"] = json.dumps({
+            "database": "coverage_vnext_candidate",
+            "host": "candidate-db",
+            "user": "coverage_user",
+        })
+        try:
+            config = load_application_config(None, base_dir=os.getcwd())
+        finally:
+            if old is None:
+                os.environ.pop("COVERAGE_MYSQL_JSON", None)
+            else:
+                os.environ["COVERAGE_MYSQL_JSON"] = old
+        self.assertEqual(config["mysql"]["database"], "coverage_vnext_candidate")
+        self.assertEqual(config["mysql"]["host"], "candidate-db")
+        self.assertEqual(config["mysql"]["user"], "coverage_user")
+
     def test_candidate_roots_are_resolved_relative_to_their_declared_base(self):
         with tempfile.TemporaryDirectory(prefix="vnext-config-") as root:
             path = os.path.join(root, "coverage.json")

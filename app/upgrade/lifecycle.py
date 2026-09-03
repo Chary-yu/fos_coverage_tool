@@ -218,6 +218,14 @@ class UpgradeLifecycle:
             raise RuntimeError("start_serving_api failed")
         return result
 
+    def stop_serving_api(self) -> Dict[str, Any]:
+        """Stop the process currently bound to the immutable serving release."""
+        result = self._run_command("stop_serving_api", clear_control_session=True)
+        if result["status"] != "PASSED":
+            raise RuntimeError("stop_serving_api failed")
+        self.serving_api_started = False
+        return result
+
     def open_traffic(self) -> Dict[str, Any]:
         result = self._run_command("open_traffic")
         if result["status"] != "PASSED":

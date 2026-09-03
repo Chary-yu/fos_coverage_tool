@@ -154,6 +154,18 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
             target = os.path.join(root, *relative.split("/"))
             os.makedirs(os.path.dirname(target), exist_ok=True)
             shutil.copyfile(source, target)
+        shutil.copyfile(
+            os.path.join(os.getcwd(), "enhance_coverage.py"),
+            os.path.join(root, "enhance_coverage.py"),
+        )
+        for directory in ("app", "contracts"):
+            shutil.copytree(
+                os.path.join(os.getcwd(), directory),
+                os.path.join(root, directory),
+            )
+        shim = os.path.join(root, "scripts", "compat", "git")
+        os.makedirs(os.path.dirname(shim))
+        shutil.copy2(os.path.join(os.getcwd(), "scripts", "compat", "git"), shim)
         subprocess.check_call(["git", "init", "-q"], cwd=root)
         subprocess.check_call(
             ["git", "config", "user.email", "legacy-adoption@example.invalid"],

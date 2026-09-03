@@ -13,7 +13,7 @@ from app.candidate_artifact import (
 from app.release_identity import DEFAULT_RELEASE_ASSET_RELATIVE_PATHS
 from app.release_publication import (
     build_release_manifest, current_served_root_binding,
-    validate_release_manifest,
+    validate_production_application_bundle, validate_release_manifest,
 )
 from scripts.release.build_production_candidate_artifact import (
     build_production_candidate,
@@ -27,6 +27,22 @@ class ProductionCandidateBuildTest(unittest.TestCase):
             target = os.path.join(root, *relative.split("/"))
             os.makedirs(os.path.dirname(target), exist_ok=True)
             shutil.copyfile(source, target)
+        shutil.copyfile(
+            os.path.join(os.getcwd(), "enhance_coverage.py"),
+            os.path.join(root, "enhance_coverage.py"),
+        )
+        # DEFAULT_RELEASE_ASSET_RELATIVE_PATHS already creates the web/assets
+        # tree in this temporary checkout.  The builder only needs that
+        # merged tree; copying web again would fail on Python 3.6/3.14 where
+        # shutil.copytree has no dirs_exist_ok argument.
+        for directory in ("app", "contracts"):
+            shutil.copytree(
+                os.path.join(os.getcwd(), directory),
+                os.path.join(root, directory),
+            )
+        shim = os.path.join(root, "scripts", "compat", "git")
+        os.makedirs(os.path.dirname(shim))
+        shutil.copy2(os.path.join(os.getcwd(), "scripts", "compat", "git"), shim)
         subprocess.check_call(["git", "init", "-q"], cwd=root)
         subprocess.check_call(
             ["git", "config", "user.email", "test@example.invalid"], cwd=root
@@ -145,6 +161,11 @@ class ProductionCandidateBuildTest(unittest.TestCase):
                 require_trusted_provenance=True,
             )
             self.assertEqual(verified["artifact_sha256"], result["artifact_sha256"])
+            application = validate_production_application_bundle(candidate)
+            self.assertEqual(application["status"], "PASSED")
+            self.assertTrue(os.path.isfile(os.path.join(
+                candidate, "app", "enhance_coverage.py"
+            )))
             with open(os.path.join(candidate, "assets", "coverage_enhance.js"), "rb") as stream:
                 candidate_js = stream.read()
             with open(os.path.join(source, "web", "assets", "js", "coverage_enhance.js"), "rb") as stream:

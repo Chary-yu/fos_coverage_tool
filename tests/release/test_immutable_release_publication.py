@@ -65,6 +65,19 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 "asset_identity": "asset-a",
                 "project_name": "FOS_V6R2",
             }, stream)
+        application = os.path.join(root, "app")
+        for directory in (
+                "app", "web", "contracts", os.path.join("scripts", "compat")):
+            os.makedirs(os.path.join(application, directory))
+        for relative, contents in (
+                ("enhance_coverage.py", "#!/usr/bin/env python3\n"),
+                (os.path.join("app", "__init__.py"), ""),
+                (os.path.join("app", "bootstrap.py"), ""),
+                (os.path.join("scripts", "compat", "git"), "#!/bin/sh\n")):
+            path = os.path.join(application, relative)
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write(contents)
+        os.chmod(os.path.join(application, "scripts", "compat", "git"), 0o755)
 
     def _prepare(self, publisher, source, identity, session_id, **kwargs):
         normalize_candidate_artifact(source)

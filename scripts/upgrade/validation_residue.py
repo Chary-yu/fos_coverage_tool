@@ -8,6 +8,7 @@ identity all bind to the same configured validation attempt.
 from __future__ import print_function
 
 import os
+import json
 import re
 import signal
 import subprocess
@@ -114,6 +115,131 @@ def _listener_inventory():
     return result
 
 
+def _manifest_paths(candidate_roots, session_manifests=None):
+    """Return explicit and discoverable validation-session manifests.
+
+    A process inventory intentionally contains only observations available
+    from procfs/ps.  Ownership is supplied separately by a session manifest;
+    keeping the two inputs separate prevents tests from accidentally proving
+    a record that the real inventory cannot produce.
+    """
+    paths = []
+    for configured in _sequence(session_manifests):
+        if configured:
+            path = _real(configured)
+            if os.path.isfile(path) and not os.path.islink(path):
+                paths.append(path)
+    for root in _configured_residue_paths(candidate_roots):
+        if not os.path.isdir(root):
+            continue
+        for directory, dirs, files in os.walk(root):
+            dirs[:] = [name for name in dirs if not os.path.islink(
+                os.path.join(directory, name)
+            )]
+            for name in files:
+                lowered = name.lower()
+                if not lowered.endswith(".json") or "session" not in lowered:
+                    continue
+                path = os.path.join(directory, name)
+                if not os.path.islink(path):
+                    paths.append(_real(path))
+    return sorted(set(paths))
+
+
+def _manifest_process_inventory(candidate_roots, session_manifests=None):
+    """Extract PID/root/session/port ownership from JSON manifests.
+
+    The parser accepts both :class:`ValidationSession` manifests and the
+    older Gate-E-shaped records.  Malformed or incomplete manifests simply
+    contribute no ownership evidence; the caller will then fail closed.
+    """
+    residue_paths = _configured_residue_paths(candidate_roots)
+    records = []
+    for manifest_path in _manifest_paths(candidate_roots, session_manifests):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as stream:
+                payload = json.load(stream)
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        session = str(
+            payload.get("session_id") or
+            payload.get("validation_session_id") or
+            payload.get("release_validation_session_id") or
+            payload.get("session_identity") or ""
+        ).strip()
+        root_value = (
+            payload.get("candidate_root") or
+            payload.get("candidate_root_path") or
+            payload.get("validation_candidate_root") or
+            payload.get("root") or ""
+        )
+        root = _real(root_value) if root_value else ""
+        if not root:
+            manifest_directory = os.path.dirname(_real(manifest_path))
+            for residue_path in residue_paths:
+                if _inside(residue_path, manifest_directory):
+                    root = residue_path
+                    break
+
+        global_ports = []
+        for value in _sequence(payload.get("ports")):
+            try:
+                global_ports.append(int(value))
+            except (TypeError, ValueError):
+                pass
+        process_values = []
+        raw_processes = payload.get("processes")
+        if isinstance(raw_processes, dict):
+            raw_processes = list(raw_processes.values())
+        for item in _sequence(raw_processes):
+            if isinstance(item, dict):
+                process_values.append(item)
+            else:
+                process_values.append({"pid": item})
+        for value in _sequence(payload.get("pids")):
+            if isinstance(value, dict):
+                process_values.append(value)
+            else:
+                process_values.append({"pid": value})
+        for item in _sequence(payload.get("listeners")):
+            if isinstance(item, dict) and item.get("pid") is not None:
+                process_values.append(item)
+
+        if not process_values:
+            # A manifest without a PID cannot authorize a process, but retain
+            # no synthetic record: a listener PID must be joined to a
+            # manifest PID below rather than inferred from a session string.
+            continue
+        for item in process_values:
+            try:
+                pid = int(item.get("pid"))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            ports = list(global_ports)
+            for key in ("port", "listen_port"):
+                if item.get(key) not in (None, ""):
+                    try:
+                        ports.append(int(item.get(key)))
+                    except (TypeError, ValueError):
+                        pass
+            for listener in _sequence(item.get("listeners")):
+                if isinstance(listener, dict) and listener.get("port") is not None:
+                    try:
+                        ports.append(int(listener.get("port")))
+                    except (TypeError, ValueError):
+                        pass
+            records.append({
+                "pid": pid,
+                "candidate_root": root,
+                "session_identity": session,
+                "ports": sorted(set(ports)),
+                "manifest_path": manifest_path,
+            })
+    return records
+
+
 def _normalize_process(record):
     result = dict(record or {})
     try:
@@ -131,6 +257,66 @@ def _normalize_process(record):
     )
     result["session_identity"] = str(result.get("session_identity") or "")
     return result
+
+
+def _join_process_listeners_and_manifests(processes, listeners, manifests):
+    """Join raw process observations to listener and session ownership data."""
+    listener_ports = {}
+    for listener in listeners or []:
+        try:
+            pid = int(listener.get("pid"))
+            port = int(listener.get("port"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        listener_ports.setdefault(pid, set()).add(port)
+
+    ownership = {}
+    for manifest in manifests or []:
+        try:
+            pid = int(manifest.get("pid"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        ownership.setdefault(pid, []).append(manifest)
+
+    joined = []
+    for original in processes or []:
+        normalized = _normalize_process(original)
+        pid = normalized.get("pid")
+        observed_ports = sorted(listener_ports.get(pid, set()))
+        owned = ownership.get(pid) or []
+        if not observed_ports:
+            # Do not trust a port supplied on a process record.  Real
+            # _process_inventory() never supplies one; the independent
+            # listener inventory is the only port authority.
+            observed_ports = []
+        if owned:
+            for manifest in owned:
+                manifest_ports = set(manifest.get("ports") or [])
+                ports = [port for port in observed_ports
+                         if not manifest_ports or port in manifest_ports]
+                if not ports:
+                    ports = [None]
+                for port in ports:
+                    item = dict(normalized)
+                    item.update({
+                        "candidate_root": manifest.get("candidate_root", ""),
+                        "session_identity": manifest.get("session_identity", ""),
+                        "port": port,
+                        "ownership_manifest": manifest.get("manifest_path", ""),
+                    })
+                    joined.append(item)
+            continue
+
+        # Keep backwards-compatible support for already-enriched callers,
+        # while real procfs records still remain unowned and fail closed.
+        for port in observed_ports or [None]:
+            item = dict(normalized)
+            if not item.get("candidate_root") and not item.get("session_identity"):
+                item["candidate_root"] = ""
+                item["session_identity"] = ""
+            item["port"] = port
+            joined.append(item)
+    return joined
 
 
 def _binding_errors(process, candidate_root, port, session_identity):
@@ -155,7 +341,8 @@ def _binding_errors(process, candidate_root, port, session_identity):
 
 
 def scan_validation_residue(candidate_roots=(), ports=(), session_identity="",
-                            processes=None, listeners=None):
+                            processes=None, listeners=None,
+                            session_manifests=None):
     """Scan configured residue and return a fail-closed ownership decision."""
     residue_paths = _configured_residue_paths(candidate_roots)
     configured_ports = []
@@ -165,13 +352,13 @@ def scan_validation_residue(candidate_roots=(), ports=(), session_identity="",
         except (TypeError, ValueError):
             raise ValueError("validation residue ports must be integers")
     configured_ports = sorted(set(configured_ports))
-    process_records = [
-        _normalize_process(record) for record in (
-            _process_inventory() if processes is None else processes
-        )
-    ]
+    raw_processes = _process_inventory() if processes is None else (processes or [])
     listener_records = list(
         _listener_inventory() if listeners is None else (listeners or [])
+    )
+    process_records = _join_process_listeners_and_manifests(
+        raw_processes, listener_records,
+        _manifest_process_inventory(candidate_roots, session_manifests),
     )
     observations = []
     blocked = []
@@ -257,11 +444,13 @@ def scan_validation_residue(candidate_roots=(), ports=(), session_identity="",
 
 
 def teardown_validation_residue(candidate_roots=(), ports=(), session_identity="",
-                                processes=None, listeners=None, killer=None):
+                                processes=None, listeners=None, killer=None,
+                                session_manifests=None):
     """Terminate only records that passed the complete ownership gate."""
     report = scan_validation_residue(
         candidate_roots, ports, session_identity,
         processes=processes, listeners=listeners,
+        session_manifests=session_manifests,
     )
     if report.get("status") != SAFE_TO_TEARDOWN:
         report["teardown_status"] = BLOCKED
