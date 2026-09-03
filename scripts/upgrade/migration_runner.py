@@ -7,6 +7,7 @@ import heapq
 import json
 import os
 import pickle
+import re
 import sqlite3
 import sys
 import tempfile
@@ -2832,6 +2833,559 @@ def apply_schema(connection, ddl_path, release_sha=""):
     return {"status": "PASSED", "migration_id": migration_id,
             "idempotent": False, "ddl_sha256": ddl_sha256,
             "target_preflight": preflight}
+
+
+VNEXT_RUNTIME_V3_MIGRATION_ID = "coverage-vnext-runtime-v3"
+VNEXT_RUNTIME_V3_SCHEMA_KEY = "coverage_vnext_runtime"
+
+# Keep this contract beside the runner instead of trusting a free-form ALTER
+# file.  The file is still hashed and reviewed, but the runner will reject an
+# operation that is not one of these exact additive changes.  This is what
+# makes a MariaDB 5.5 retry fail closed when a column already exists with the
+# wrong definition.
+VNEXT_RUNTIME_V3_COLUMNS = (
+    ("coverage_reports", "report_mode",
+     "VARCHAR(32) NOT NULL DEFAULT 'LEGACY_STATIC'"),
+)
+
+VNEXT_RUNTIME_V3_INDEXES = ()
+
+
+def _v3_normalize_type(value, sqlite=False):
+    """Normalize the small type vocabulary used by the v3 contract."""
+    text = re.sub(r"\s+", "", str(value or "").strip().lower())
+    text = text.replace("`", "")
+    text = re.sub(r"\bunsigned\b", "", text)
+    text = text.replace("integer", "int")
+    if text.startswith("int("):
+        text = "int"
+    if text.startswith("bigint("):
+        text = "bigint"
+    if text.startswith("tinyint("):
+        text = "tinyint"
+    if sqlite:
+        # SQLite has no VARCHAR length enforcement and reports BIGINT/TINYINT
+        # as INTEGER.  These are the portable spellings in the test schema;
+        # MariaDB still receives the strict type comparison above.
+        if text == "text" or text.startswith("varchar(") or text.startswith("char("):
+            return "text"
+        if text in ("int", "bigint", "tinyint"):
+            return "int"
+        if text == "real" or text.startswith("decimal("):
+            return "real"
+    return text
+
+
+def _v3_normalize_default(value):
+    if value is None:
+        return None
+    text = str(value).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ("'", '"'):
+        text = text[1:-1].replace(text[0] * 2, text[0])
+    return text.lower()
+
+
+def _v3_definition_shape(definition):
+    text = " ".join(str(definition or "").strip().split())
+    type_match = re.match(
+        r"^([A-Za-z]+(?:\s*\(\s*[0-9]+(?:\s*,\s*[0-9]+)?\s*\))?)(?=\s|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if not type_match:
+        raise ValueError("v3 column definition has no type: {}".format(text))
+    type_name = type_match.group(1)
+    not_null = bool(re.search(r"\bNOT\s+NULL\b", text, re.IGNORECASE))
+    default_match = re.search(
+        r"\bDEFAULT\s+(.+?)(?:\s+COMMENT\b|\s+COLLATE\b|$)",
+        text,
+        re.IGNORECASE,
+    )
+    return {
+        "type": type_name,
+        "nullable": not not_null,
+        "has_default": default_match is not None,
+        "default": _v3_normalize_default(
+            default_match.group(1).strip() if default_match else None
+        ),
+    }
+
+
+def _v3_column_observed(connection, table_name, column_name):
+    if is_sqlite(connection):
+        rows = connection.execute(
+            "PRAGMA table_info({})".format(table_name)
+        ).fetchall()
+        for row in rows:
+            if str(row[1]) == column_name:
+                return {
+                    "type": row[2],
+                    "nullable": not bool(int(row[3] or 0)),
+                    "has_default": row[4] is not None,
+                    "default": _v3_normalize_default(row[4]),
+                }
+        return None
+    row = fetchone(connection, """
+        SELECT COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?
+    """, (table_name, column_name))
+    if not row:
+        return None
+    return {
+        "type": row.get("COLUMN_TYPE") or row.get("column_type") or "",
+        "nullable": str(
+            row.get("IS_NULLABLE") or row.get("is_nullable") or ""
+        ).upper() == "YES",
+        "has_default": (
+            row.get("COLUMN_DEFAULT") if "COLUMN_DEFAULT" in row
+            else row.get("column_default")
+        ) is not None,
+        "default": (
+            row.get("COLUMN_DEFAULT") if "COLUMN_DEFAULT" in row
+            else row.get("column_default")
+        ),
+    }
+
+
+def _v3_assert_column_shape(connection, table_name, column_name, definition):
+    observed = _v3_column_observed(connection, table_name, column_name)
+    if not observed:
+        return False
+    expected = _v3_definition_shape(definition)
+    observed_type = _v3_normalize_type(
+        observed.get("type") if isinstance(observed, dict) else "",
+        sqlite=is_sqlite(connection),
+    )
+    expected_type = _v3_normalize_type(expected["type"], sqlite=is_sqlite(connection))
+    type_matches = observed_type == expected_type
+    if is_sqlite(connection) and expected_type in ("varchar(32)", "varchar(64)",
+                                                   "varchar(128)", "char(40)",
+                                                   "char(64)"):
+        type_matches = observed_type in (expected_type, "text")
+    if not type_matches:
+        raise ValueError(
+            "v3 column definition mismatch for {}.{}: expected {}, observed {}".format(
+                table_name, column_name, expected_type, observed_type
+            )
+        )
+    if is_sqlite(connection):
+        observed_nullable = bool(observed.get("nullable"))
+    else:
+        observed_nullable = str(observed.get("IS_NULLABLE") or "").upper() == "YES"
+    if observed_nullable != expected["nullable"]:
+        raise ValueError(
+            "v3 column nullability mismatch for {}.{}".format(
+                table_name, column_name
+            )
+        )
+    observed_default = _v3_normalize_default(observed.get("default"))
+    if expected["has_default"]:
+        if observed_default != expected["default"]:
+            raise ValueError(
+                "v3 column default mismatch for {}.{}: expected {}, observed {}".format(
+                    table_name, column_name, expected["default"], observed_default
+                )
+            )
+    elif observed.get("has_default"):
+        raise ValueError(
+            "v3 column has an unexpected default for {}.{}: {}".format(
+                table_name, column_name, observed_default
+            )
+        )
+    return True
+
+
+def _v3_index_columns(connection, table_name, index_name):
+    if is_sqlite(connection):
+        rows = connection.execute(
+            "PRAGMA index_list({})".format(table_name)
+        ).fetchall()
+        if not any(str(row[1]) == index_name for row in rows):
+            return None
+        index_rows = connection.execute(
+            "PRAGMA index_info({})".format(index_name)
+        ).fetchall()
+        return [str(row[2]) for row in sorted(index_rows, key=lambda item: int(item[0]))]
+    rows = fetchall(connection, """
+        SELECT COLUMN_NAME, SEQ_IN_INDEX
+        FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND INDEX_NAME=?
+        ORDER BY SEQ_IN_INDEX
+    """, (table_name, index_name))
+    if not rows:
+        return None
+    return [str(row.get("COLUMN_NAME") or row.get("column_name") or "")
+            for row in rows]
+
+
+def _v3_assert_index_shape(connection, table_name, index_name, columns):
+    observed = _v3_index_columns(connection, table_name, index_name)
+    if observed is None:
+        return False
+    expected = [str(column).strip() for column in columns]
+    if observed != expected:
+        raise ValueError(
+            "v3 index definition mismatch for {}.{}: expected {}, observed {}".format(
+                table_name, index_name, expected, observed
+            )
+        )
+    return True
+
+
+def _v3_parse_ddl(ddl):
+    """Parse and strictly constrain the v3 ADD COLUMN/INDEX file."""
+    operations = []
+    column_pattern = re.compile(
+        r"^ALTER\s+TABLE\s+`?([A-Za-z0-9_]+)`?\s+ADD\s+COLUMN\s+"
+        r"`?([A-Za-z0-9_]+)`?\s+(.+)$", re.IGNORECASE | re.DOTALL
+    )
+    index_pattern = re.compile(
+        r"^ALTER\s+TABLE\s+`?([A-Za-z0-9_]+)`?\s+ADD\s+"
+        r"(?:INDEX|KEY)\s+`?([A-Za-z0-9_]+)`?\s*\(([^)]+)\)$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for statement in _split_sql(ddl):
+        compact = " ".join(statement.split())
+        match = column_pattern.match(compact)
+        if match:
+            operations.append(("column", match.group(1), match.group(2),
+                               match.group(3).strip()))
+            continue
+        match = index_pattern.match(compact)
+        if match:
+            columns = tuple(
+                item.strip().strip("`") for item in match.group(3).split(",")
+            )
+            if not columns or any(not re.match(r"^[A-Za-z0-9_]+$", item)
+                                  for item in columns):
+                raise ValueError("v3 index column list is invalid")
+            operations.append(("index", match.group(1), match.group(2), columns))
+            continue
+        raise ValueError(
+            "v3 migration permits only ALTER TABLE ADD COLUMN/INDEX: {}".format(
+                compact[:200]
+            )
+        )
+    return operations
+
+
+def _v3_ensure_ledger(connection):
+    # A VNext database can have been initialized by an older core-v2 runner.
+    # ``CREATE TABLE IF NOT EXISTS`` does not add columns on MariaDB, so make
+    # the small ledger compatibility surface explicit before any v3 query
+    # relies on it.  These are migration metadata columns only; no business
+    # table is broadened here.
+    ledger_columns = (
+        ("target_database", "VARCHAR(128) NOT NULL DEFAULT ''"),
+        ("target_runtime_fingerprint", "VARCHAR(255) NOT NULL DEFAULT ''"),
+        ("target_table_inventory_hash", "CHAR(64) NOT NULL DEFAULT ''"),
+        ("target_emptiness_result", "VARCHAR(64) NOT NULL DEFAULT ''"),
+        ("target_preflight_at", "DATETIME NULL"),
+    )
+    if is_sqlite(connection):
+        connection.executescript("""
+            CREATE TABLE IF NOT EXISTS coverage_schema_migrations (
+                migration_id TEXT PRIMARY KEY, schema_key TEXT NOT NULL,
+                from_version INTEGER NOT NULL DEFAULT 0, to_version INTEGER NOT NULL,
+                ddl_sha256 TEXT NOT NULL, state TEXT NOT NULL,
+                started_at TEXT NOT NULL, finished_at TEXT, release_sha TEXT NOT NULL DEFAULT '',
+                error_class TEXT NOT NULL DEFAULT '', target_database TEXT NOT NULL DEFAULT '',
+                target_runtime_fingerprint TEXT NOT NULL DEFAULT '',
+                target_table_inventory_hash TEXT NOT NULL DEFAULT '',
+                target_emptiness_result TEXT NOT NULL DEFAULT '', target_preflight_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS coverage_schema_meta (
+                schema_key TEXT PRIMARY KEY, schema_version INTEGER NOT NULL,
+                applied_at TEXT NOT NULL, release_sha TEXT NOT NULL DEFAULT '',
+                migration_id TEXT NOT NULL DEFAULT ''
+            );
+        """)
+        for column_name, definition in (
+                ("release_sha", "TEXT NOT NULL DEFAULT ''"),
+                ("error_class", "TEXT NOT NULL DEFAULT ''")) + tuple(
+                    (name, "TEXT NOT NULL DEFAULT ''" if name != "target_preflight_at"
+                     else "TEXT") for name, _definition in ledger_columns
+                ):
+            if not _column_exists(connection, "coverage_schema_migrations", column_name):
+                connection.execute(
+                    "ALTER TABLE coverage_schema_migrations ADD COLUMN {} {}".format(
+                        column_name, definition
+                    )
+                )
+        if not _column_exists(connection, "coverage_schema_meta", "migration_id"):
+            connection.execute(
+                "ALTER TABLE coverage_schema_meta ADD COLUMN migration_id TEXT NOT NULL DEFAULT ''"
+            )
+        return
+    cursor = connection.cursor()
+    try:
+        cursor.execute(adapt_sql(connection, """
+            CREATE TABLE IF NOT EXISTS coverage_schema_migrations (
+                migration_id VARCHAR(128) NOT NULL, schema_key VARCHAR(64) NOT NULL,
+                from_version INT NOT NULL DEFAULT 0, to_version INT NOT NULL,
+                ddl_sha256 CHAR(64) NOT NULL, state VARCHAR(16) NOT NULL,
+                started_at DATETIME NOT NULL, finished_at DATETIME NULL,
+                release_sha CHAR(40) NOT NULL DEFAULT '', error_class VARCHAR(128) NOT NULL DEFAULT '',
+                target_database VARCHAR(128) NOT NULL DEFAULT '',
+                PRIMARY KEY (migration_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """))
+        cursor.execute(adapt_sql(connection, """
+            CREATE TABLE IF NOT EXISTS coverage_schema_meta (
+                schema_key VARCHAR(64) NOT NULL, schema_version INT NOT NULL,
+                applied_at DATETIME(6) NOT NULL, release_sha CHAR(40) NOT NULL DEFAULT '',
+                migration_id VARCHAR(128) NOT NULL DEFAULT '', PRIMARY KEY (schema_key)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """))
+    finally:
+        cursor.close()
+    for column_name, definition in ledger_columns:
+        if _column_exists(connection, "coverage_schema_migrations", column_name):
+            continue
+        cursor = connection.cursor()
+        try:
+            cursor.execute(adapt_sql(connection,
+                "ALTER TABLE coverage_schema_migrations ADD COLUMN {} {}".format(
+                    column_name, definition
+                )
+            ))
+        finally:
+            cursor.close()
+    if not _column_exists(connection, "coverage_schema_meta", "migration_id"):
+        cursor = connection.cursor()
+        try:
+            cursor.execute(adapt_sql(connection,
+                "ALTER TABLE coverage_schema_meta ADD COLUMN "
+                "migration_id VARCHAR(128) NOT NULL DEFAULT ''"
+            ))
+        finally:
+            cursor.close()
+
+
+def apply_vnext_schema_v3(connection, ddl_path, release_sha=""):
+    """Apply the additive Existing-VNext runtime schema migration.
+
+    Unlike :func:`apply_schema`, this function deliberately accepts a
+    populated VNext database.  It never creates a missing business table,
+    never runs on a Legacy/UNKNOWN source, and never mutates authoritative
+    rows.  A separate caller is responsible for rebuilding FileState.
+    """
+    with open(ddl_path, "r", encoding="utf-8") as stream:
+        ddl = stream.read()
+    ddl_sha256 = hashlib.sha256(ddl.encode("utf-8")).hexdigest()
+    safe, errors, _warnings = __import__(
+        "scripts.upgrade.schema_preflight", fromlist=["validate_ddl_file"]
+    ).validate_ddl_file(ddl_path)
+    if not safe:
+        raise ValueError("v3 schema preflight rejected DDL: {}".format("; ".join(errors)))
+    operations = _v3_parse_ddl(ddl)
+    expected_operations = [
+        ("column", table, column, definition)
+        for table, column, definition in VNEXT_RUNTIME_V3_COLUMNS
+    ] + [
+        ("index", table, index, columns)
+        for table, index, columns in VNEXT_RUNTIME_V3_INDEXES
+    ]
+    if len(operations) != len(expected_operations):
+        raise ValueError("v3 DDL operation count does not match reviewed contract")
+    expected_columns = set((kind, table, name) for kind, table, name, _ in expected_operations)
+    observed_columns = set((kind, table, name) for kind, table, name, _ in operations)
+    if observed_columns != expected_columns:
+        raise ValueError("v3 DDL operations do not match the reviewed contract")
+    expected_definitions = {
+        ("column", table, column): definition
+        for table, column, definition in VNEXT_RUNTIME_V3_COLUMNS
+    }
+    expected_indexes = {
+        ("index", table, index): tuple(columns)
+        for table, index, columns in VNEXT_RUNTIME_V3_INDEXES
+    }
+    for operation in operations:
+        key = operation[:3]
+        if operation[0] == "column":
+            actual_shape = _v3_definition_shape(operation[3])
+            expected_shape = _v3_definition_shape(expected_definitions[key])
+            if actual_shape != expected_shape:
+                raise ValueError("v3 DDL column definition is not the reviewed definition: {}".format(key))
+        elif tuple(operation[3]) != expected_indexes[key]:
+            raise ValueError("v3 DDL index definition is not the reviewed definition: {}".format(key))
+
+    from scripts.upgrade.database_generation import (
+        UNKNOWN, VNEXT, inspect_database_generation,
+    )
+    generation = inspect_database_generation(connection)
+    if generation.get("generation") != VNEXT:
+        raise ValueError(
+            "Existing-VNext runtime migration requires VNEXT target, got {}".format(
+                generation.get("generation", UNKNOWN)
+            )
+        )
+    required_tables = set(table for _kind, table, _name, _value in operations)
+    missing_tables = sorted(
+        table for table in required_tables if not _table_exists(connection, table)
+    )
+    if missing_tables:
+        raise ValueError(
+            "Existing-VNext target is missing v3 tables: {}".format(
+                ", ".join(missing_tables)
+            )
+        )
+
+    _v3_ensure_ledger(connection)
+    existing = fetchone(connection, """
+        SELECT * FROM coverage_schema_migrations WHERE migration_id=?
+    """, (VNEXT_RUNTIME_V3_MIGRATION_ID,))
+    existing_state = str((existing or {}).get("state") or "").upper()
+    if existing_state == "APPLIED":
+        if str(existing.get("ddl_sha256") or "") != ddl_sha256:
+            raise ValueError("schema migration checksum changed after APPLIED state")
+        for table, column, definition in VNEXT_RUNTIME_V3_COLUMNS:
+            _v3_assert_column_shape(connection, table, column, definition)
+        for table, index, columns in VNEXT_RUNTIME_V3_INDEXES:
+            _v3_assert_index_shape(connection, table, index, columns)
+        connection.commit()
+        return {
+            "status": "PASSED", "migration_id": VNEXT_RUNTIME_V3_MIGRATION_ID,
+            "idempotent": True, "ddl_sha256": ddl_sha256,
+            "generation": VNEXT, "operations_applied": 0,
+        }
+
+    meta = fetchone(connection, """
+        SELECT schema_version FROM coverage_schema_meta
+        WHERE schema_key=?
+    """, (VNEXT_RUNTIME_V3_SCHEMA_KEY,))
+    if meta is None:
+        meta = fetchone(connection, """
+            SELECT schema_version FROM coverage_schema_meta
+            WHERE schema_key=?
+        """, ("coverage_vnext",))
+    from_version = int((meta or {}).get("schema_version") or 2)
+    now = _now()
+    cursor = connection.cursor()
+    try:
+        if existing:
+            cursor.execute(adapt_sql(connection, """
+                UPDATE coverage_schema_migrations
+                SET schema_key=?, from_version=?, to_version=?, ddl_sha256=?,
+                    state='STARTED', started_at=?, finished_at=NULL,
+                    release_sha=?, error_class=''
+                WHERE migration_id=?
+            """), (VNEXT_RUNTIME_V3_SCHEMA_KEY, from_version, 3, ddl_sha256,
+                    now, release_sha or "", VNEXT_RUNTIME_V3_MIGRATION_ID))
+        else:
+            cursor.execute(adapt_sql(connection, """
+                INSERT INTO coverage_schema_migrations(
+                    migration_id, schema_key, from_version, to_version,
+                    ddl_sha256, state, started_at, release_sha
+                ) VALUES (?, ?, ?, 3, ?, 'STARTED', ?, ?)
+            """), (VNEXT_RUNTIME_V3_MIGRATION_ID, VNEXT_RUNTIME_V3_SCHEMA_KEY,
+                    from_version, ddl_sha256, now, release_sha or ""))
+    finally:
+        cursor.close()
+    connection.commit()
+
+    applied_columns = []
+    applied_indexes = []
+    try:
+        for table, column, definition in VNEXT_RUNTIME_V3_COLUMNS:
+            if _v3_assert_column_shape(connection, table, column, definition):
+                continue
+            cursor = connection.cursor()
+            try:
+                cursor.execute(adapt_sql(connection,
+                    "ALTER TABLE {} ADD COLUMN {} {}".format(
+                        table, column, definition
+                    )
+                ))
+            finally:
+                cursor.close()
+            _v3_assert_column_shape(connection, table, column, definition)
+            applied_columns.append("{}.{}".format(table, column))
+        for table, index, columns in VNEXT_RUNTIME_V3_INDEXES:
+            if _v3_assert_index_shape(connection, table, index, columns):
+                continue
+            column_sql = ", ".join(columns)
+            cursor = connection.cursor()
+            try:
+                if is_sqlite(connection):
+                    cursor.execute(
+                        "CREATE INDEX IF NOT EXISTS {} ON {} ({})".format(
+                            index, table, column_sql
+                        )
+                    )
+                else:
+                    cursor.execute(adapt_sql(connection,
+                        "ALTER TABLE {} ADD INDEX {} ({})".format(
+                            table, index, column_sql
+                        )
+                    ))
+            finally:
+                cursor.close()
+            _v3_assert_index_shape(connection, table, index, columns)
+            applied_indexes.append("{}.{}".format(table, index))
+
+        # These are compatibility metadata repairs only.  Authoritative line,
+        # analysis, inheritance, and job facts are not rewritten here.
+        cursor = connection.cursor()
+        try:
+            cursor.execute(adapt_sql(connection, """
+                UPDATE coverage_reports
+                SET report_mode=?
+                WHERE report_mode IS NULL OR report_mode=''
+            """), ("LEGACY_STATIC",))
+        finally:
+            cursor.close()
+        _ensure_legacy_provenance_key_hash(connection)
+        _ensure_incremental_result_key_hash(connection)
+        _ensure_import_failure_key_hash(connection)
+
+        meta = fetchone(connection, """
+            SELECT schema_key FROM coverage_schema_meta WHERE schema_key=?
+        """, (VNEXT_RUNTIME_V3_SCHEMA_KEY,))
+        cursor = connection.cursor()
+        try:
+            if meta:
+                cursor.execute(adapt_sql(connection, """
+                    UPDATE coverage_schema_meta
+                    SET schema_version=?, applied_at=?, release_sha=?, migration_id=?
+                    WHERE schema_key=?
+                """), (3, _now(), release_sha or "", VNEXT_RUNTIME_V3_MIGRATION_ID,
+                        VNEXT_RUNTIME_V3_SCHEMA_KEY))
+            else:
+                cursor.execute(adapt_sql(connection, """
+                    INSERT INTO coverage_schema_meta(
+                        schema_key, schema_version, applied_at, release_sha, migration_id
+                    ) VALUES (?, 3, ?, ?, ?)
+                """), (VNEXT_RUNTIME_V3_SCHEMA_KEY, _now(), release_sha or "",
+                        VNEXT_RUNTIME_V3_MIGRATION_ID))
+            cursor.execute(adapt_sql(connection, """
+                UPDATE coverage_schema_migrations
+                SET state='APPLIED', finished_at=?, release_sha=?, error_class=''
+                WHERE migration_id=?
+            """), (_now(), release_sha or "", VNEXT_RUNTIME_V3_MIGRATION_ID))
+        finally:
+            cursor.close()
+        connection.commit()
+    except Exception as exc:
+        cursor = connection.cursor()
+        try:
+            cursor.execute(adapt_sql(connection, """
+                UPDATE coverage_schema_migrations
+                SET state='FAILED', finished_at=?, release_sha=?, error_class=?
+                WHERE migration_id=?
+            """), (_now(), release_sha or "", type(exc).__name__,
+                    VNEXT_RUNTIME_V3_MIGRATION_ID))
+        finally:
+            cursor.close()
+        connection.commit()
+        raise
+    return {
+        "status": "PASSED", "migration_id": VNEXT_RUNTIME_V3_MIGRATION_ID,
+        "idempotent": False, "ddl_sha256": ddl_sha256, "generation": VNEXT,
+        "operations_applied": len(applied_columns) + len(applied_indexes),
+        "columns_applied": applied_columns, "indexes_applied": applied_indexes,
+    }
 
 
 def validate_migration_database_separation(source_config, target_config,

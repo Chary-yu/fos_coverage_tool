@@ -89,6 +89,11 @@ class UpgradeLifecycleServingTest(unittest.TestCase):
 
                 # B is now the stable CURRENT serving owner.  A C attempt must not
                 # fall back to the old 9528/start_previous_api lifecycle.
+                previous["_previous_runtime_mysql"] = {
+                    "host": "old-db",
+                    "database": "coverage_vnext_e9fcc837",
+                    "user": "coverage",
+                }
                 with open(state_path, "w", encoding="utf-8") as stream:
                     json.dump({
                         "schema_version": 1,
@@ -102,15 +107,23 @@ class UpgradeLifecycleServingTest(unittest.TestCase):
                 with mock.patch.object(
                         second, "_run_command",
                         side_effect=lambda name, **kwargs: (
-                            second_results.append(name) or self._result(name))):
+                            second_results.append((name, kwargs)) or self._result(name))):
                     self.assertEqual(second.stop_current_api()["managed_serving_before_stop"], True)
                     second.active = True
                     second.api_started = True
                     rollback = second.abort()
 
                 self.assertEqual(
-                    second_results,
+                    [item[0] for item in second_results],
                     ["stop_current_api", "stop_validation_api", "start_serving_api"],
+                )
+                restore_kwargs = second_results[-1][1]
+                self.assertFalse(restore_kwargs["use_candidate_runtime"])
+                restored_mysql = json.loads(
+                    restore_kwargs["extra_env"]["COVERAGE_CANDIDATE_MYSQL_JSON"]
+                )
+                self.assertEqual(
+                    restored_mysql["database"], "coverage_vnext_e9fcc837"
                 )
                 self.assertEqual(rollback["status"], "PASSED")
                 self.assertEqual(rollback["restore_endpoint_key"], "release_endpoint")
@@ -121,6 +134,29 @@ class UpgradeLifecycleServingTest(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join(timeout=5)
+
+    def test_abort_before_current_stop_preserves_existing_process(self):
+        with tempfile.TemporaryDirectory(prefix="upgrade-preserve-current-") as root:
+            config, _state_path = self._config(root)
+            config["upgrade"]["commands"]["open_traffic"] = ["open-traffic"]
+            lifecycle = UpgradeLifecycle(
+                root, config, "staging",
+                {"commit_sha": "b" * 40, "_published_session_id": "release-b"},
+            )
+            os.makedirs(os.path.dirname(lifecycle.marker), exist_ok=True)
+            with open(lifecycle.marker, "w") as stream:
+                stream.write("frozen")
+            lifecycle.active = True
+            requested = []
+            with mock.patch.object(
+                    lifecycle, "_run_command",
+                    side_effect=lambda name, **kwargs: (
+                        requested.append((name, kwargs)) or self._result(name))):
+                result = lifecycle.abort()
+            self.assertEqual(result["status"], "PASSED")
+            self.assertTrue(result["current_process_preserved"])
+            self.assertEqual([item[0] for item in requested], ["open_traffic"])
+            self.assertFalse(os.path.exists(lifecycle.marker))
 
 
 if __name__ == "__main__":

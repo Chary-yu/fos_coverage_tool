@@ -28,7 +28,12 @@ if ROOT not in sys.path:
 
 from app.candidate_artifact import (
     CandidateArtifactManifest, PRODUCTION_PROJECT_NAME,
+    OFFLINE_OPERATOR_PROVENANCE_CLASS,
+    RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+    RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+    RELEASE_TRUST_MODES,
     PRODUCTION_RELEASE_ARTIFACT_ROLE, build_git_source_provenance,
+    verify_offline_operator_trust,
 )
 from app.release_identity import (
     ASSET_MANIFEST_VERSION, DEFAULT_RELEASE_ASSET_RELATIVE_PATHS,
@@ -40,6 +45,7 @@ from app.release_publication import (
     build_release_manifest, validate_production_candidate_content,
     current_served_root_binding,
 )
+from app.time_utils import utc_iso
 
 
 _CONTROL_FILES = frozenset((
@@ -85,6 +91,18 @@ def _load_json(path, label):
     if not isinstance(value, dict):
         raise ValueError("{} must be a JSON object".format(label))
     return value
+
+
+def _write_json(path, value):
+    path = os.path.abspath(str(path))
+    parent = os.path.dirname(path)
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent)
+    temporary = "{}.tmp-{}".format(path, os.getpid())
+    with open(temporary, "w", encoding="utf-8") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n")
+    os.replace(temporary, path)
 
 
 def _legacy_adoption_provenance(served_root, served_root_binding):
@@ -442,13 +460,79 @@ def _reject_validation_fixture(candidate_root):
             )
 
 
+def _offline_operator_evidence(
+        candidate_root, provenance, candidate_manifest, output_path, source_bundle_path,
+        repository, production_host, production_baseline_sha,
+        validation_session_id):
+    """Write the explicit operator trust record after Candidate hashing.
+
+    The evidence is intentionally external to the Candidate tree: the
+    Candidate content digest is already final when this record is produced.
+    Publication later verifies the record again against the clean checkout
+    and the copied Candidate.
+    """
+    required = {
+        "offline_operator_evidence_output": output_path,
+        "offline_operator_source_bundle": source_bundle_path,
+        "offline_operator_repository": repository,
+        "production_host": production_host,
+        "production_baseline_sha": production_baseline_sha,
+        "validation_session_id": validation_session_id,
+    }
+    missing = sorted(key for key, value in required.items() if not str(value or "").strip())
+    if missing:
+        raise ValueError(
+            "offline operator build requires: {}".format(", ".join(missing))
+        )
+    source_bundle_path = _real(source_bundle_path)
+    if not os.path.isfile(source_bundle_path) or os.path.islink(source_bundle_path):
+        raise ValueError("offline operator source bundle must be a regular file")
+    production_baseline_sha = str(production_baseline_sha).strip().lower()
+    if not is_valid_commit_sha(production_baseline_sha):
+        raise ValueError("production_baseline_sha must be an exact commit SHA")
+    candidate_root = _real(candidate_root)
+    output_path = os.path.abspath(str(output_path))
+    if candidate_root and _inside(candidate_root, output_path):
+        raise ValueError("offline operator evidence must be outside Candidate root")
+    evidence = {
+        "schema_version": 1,
+        "release_trust_mode": RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+        "trust_class": "OFFLINE_OPERATOR",
+        "repository": str(repository).strip(),
+        "commit_sha": str(provenance.get("source_commit_sha") or "").lower(),
+        "tree_sha": str(provenance.get("source_tree_sha") or "").lower(),
+        "source_bundle_path": source_bundle_path,
+        "source_bundle_sha256": _sha256(source_bundle_path),
+        "candidate_tree_sha256": str(
+            candidate_manifest.get("artifact_sha256") or ""
+        ).lower(),
+        "production_host": str(production_host).strip(),
+        "production_baseline_sha": production_baseline_sha,
+        "build_timestamp": utc_iso(),
+        "validation_session_id": str(validation_session_id).strip(),
+        "protected_builder": "SKIPPED_BY_OPERATOR",
+        "offline_operator_source_integrity": "PASSED",
+    }
+    _write_json(output_path, evidence)
+    return output_path, evidence
+
+
 def build_production_candidate(
         served_root, source_repo_root, production_candidate_root,
         release_identity_output, build_workflow_identity,
         build_workflow_run_id, build_workflow_run_attempt, build_workflow_sha,
         expected_previous_release_sha="", expected_served_root_tree_sha256="",
-        expected_current_identity_sha256="", publish_root=""):
+        expected_current_identity_sha256="", publish_root="",
+        release_trust_mode=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+        offline_operator_evidence_output="", offline_operator_source_bundle="",
+        offline_operator_repository="", production_host="",
+        production_baseline_sha="", validation_session_id=""):
     """Create and validate one production-role Candidate artifact."""
+    release_trust_mode = str(
+        release_trust_mode or RELEASE_TRUST_MODE_PROTECTED_BUILDER
+    ).strip()
+    if release_trust_mode not in RELEASE_TRUST_MODES:
+        raise ValueError("unsupported release_trust_mode")
     if publish_root:
         publish_root = os.path.abspath(str(publish_root))
         derived_served_root = os.path.join(publish_root, "CURRENT")
@@ -519,6 +603,10 @@ def build_production_candidate(
         build_workflow_run_id=build_workflow_run_id,
         build_workflow_run_attempt=build_workflow_run_attempt,
         build_workflow_sha=build_workflow_sha,
+        provenance_class=(
+            OFFLINE_OPERATOR_PROVENANCE_CLASS
+            if release_trust_mode == RELEASE_TRUST_MODE_OFFLINE_OPERATOR else ""
+        ),
     )
     provenance.update(_legacy_adoption_provenance(
         served_root, served_root_binding
@@ -543,6 +631,22 @@ def build_production_candidate(
         production_publishable=True,
         project_name=PRODUCTION_PROJECT_NAME,
     )
+    offline_evidence_path = ""
+    if release_trust_mode == RELEASE_TRUST_MODE_OFFLINE_OPERATOR:
+        offline_evidence_path, offline_evidence = _offline_operator_evidence(
+            candidate_root, provenance, manifest, offline_operator_evidence_output,
+            offline_operator_source_bundle, offline_operator_repository,
+            production_host, production_baseline_sha, validation_session_id,
+        )
+        verify_offline_operator_trust(
+            candidate_root, identity, manifest, source_repo_root,
+            evidence=offline_evidence,
+            source_bundle_path=offline_operator_source_bundle,
+            expected_repository=offline_operator_repository,
+            expected_production_host=production_host,
+            expected_production_baseline_sha=production_baseline_sha,
+            expected_validation_session_id=validation_session_id,
+        )
     # This is a pre-publication validation only.  It does not write a release
     # manifest into the Candidate and therefore cannot create a CURRENT.
     preflight = build_release_manifest(
@@ -578,7 +682,9 @@ def build_production_candidate(
         "candidate_build_attestation": os.path.join(
             candidate_root, "candidate_build_attestation.json"
         ),
-        "receipt_required": True,
+        "receipt_required": release_trust_mode == RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+        "release_trust_mode": release_trust_mode,
+        "offline_operator_evidence": offline_evidence_path,
         "commit_sha": manifest["commit_sha"],
         "build_id": manifest["build_id"],
         "artifact_sha256": manifest["artifact_sha256"],
@@ -602,13 +708,23 @@ def main(argv=None):
     parser.add_argument("--source-repo-root", required=True)
     parser.add_argument("--production-candidate-root", required=True)
     parser.add_argument("--release-identity-output", required=True)
-    parser.add_argument("--build-workflow-identity", required=True)
-    parser.add_argument("--build-workflow-run-id", required=True)
-    parser.add_argument("--build-workflow-run-attempt", required=True)
-    parser.add_argument("--build-workflow-sha", required=True)
+    parser.add_argument("--build-workflow-identity", default="")
+    parser.add_argument("--build-workflow-run-id", default="")
+    parser.add_argument("--build-workflow-run-attempt", default="")
+    parser.add_argument("--build-workflow-sha", default="")
     parser.add_argument("--expected-previous-release-sha", required=True)
     parser.add_argument("--expected-served-root-tree-sha256", required=True)
     parser.add_argument("--expected-current-identity-sha256", required=True)
+    parser.add_argument(
+        "--release-trust-mode", choices=RELEASE_TRUST_MODES,
+        default=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+    )
+    parser.add_argument("--offline-operator-evidence-output", default="")
+    parser.add_argument("--offline-operator-source-bundle", default="")
+    parser.add_argument("--offline-operator-repository", default="")
+    parser.add_argument("--production-host", default="")
+    parser.add_argument("--production-baseline-sha", default="")
+    parser.add_argument("--validation-session-id", default="")
     args = parser.parse_args(argv)
     try:
         result = build_production_candidate(
@@ -620,6 +736,13 @@ def main(argv=None):
             expected_served_root_tree_sha256=args.expected_served_root_tree_sha256,
             expected_current_identity_sha256=args.expected_current_identity_sha256,
             publish_root=args.publish_root,
+            release_trust_mode=args.release_trust_mode,
+            offline_operator_evidence_output=args.offline_operator_evidence_output,
+            offline_operator_source_bundle=args.offline_operator_source_bundle,
+            offline_operator_repository=args.offline_operator_repository,
+            production_host=args.production_host,
+            production_baseline_sha=args.production_baseline_sha,
+            validation_session_id=args.validation_session_id,
         )
     except (OSError, RuntimeError, ValueError, TypeError) as exc:
         raise SystemExit("production Candidate build failed: {}".format(exc))

@@ -26,6 +26,55 @@ from app.time_utils import utc_iso
 _DATABASE_IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
 
 
+def _capture_generation_aware_snapshot(connection):
+    """Capture a backup witness without assuming the Legacy schema.
+
+    The old data-hash helper intentionally knows only the four Legacy tables.
+    A live Existing-VNext database must be captured through the same
+    authoritative, ID-independent snapshot used by its blue/green migration.
+    The ``tables`` compatibility view keeps the backup manifest format useful
+    to existing consumers while preserving the richer VNext semantic hashes.
+    """
+    from scripts.upgrade.database_generation import (
+        LEGACY, UNKNOWN, VNEXT, inspect_database_generation,
+    )
+
+    generation = inspect_database_generation(connection)
+    value = generation.get("generation")
+    if value == LEGACY:
+        snapshot = capture_database_snapshot(connection)
+        snapshot["generation"] = LEGACY
+        return snapshot
+    if value == VNEXT:
+        from scripts.upgrade.existing_vnext_upgrade import (
+            capture_vnext_authoritative_snapshot,
+        )
+        authoritative = capture_vnext_authoritative_snapshot(connection)
+        counts = authoritative.get("counts") or {}
+        hashes = authoritative.get("component_hashes") or {}
+        return {
+            "snapshot_version": authoritative.get("snapshot_version"),
+            "captured_at": utc_iso(),
+            "generation": VNEXT,
+            "semantic_hash": authoritative.get("semantic_hash", ""),
+            "components": authoritative.get("components") or {},
+            "counts": dict(counts),
+            "component_hashes": dict(hashes),
+            "tables": {
+                "coverage_{}".format(component): {
+                    "count": counts.get(component, 0),
+                    "content_hash": hashes.get(component, ""),
+                }
+                for component in sorted(counts)
+            },
+        }
+    raise RuntimeError(
+        "database generation is {} ({})".format(
+            UNKNOWN, generation.get("reason", "unclassified")
+        )
+    )
+
+
 def _is_within(path: str, root: str) -> bool:
     """Return whether *path* is equal to or below *root* after resolution."""
     try:
@@ -336,7 +385,7 @@ def perform_database_backup(
     snapshot = None
     if connection:
         try:
-            snapshot = capture_database_snapshot(connection)
+            snapshot = _capture_generation_aware_snapshot(connection)
             counts = {k: v.get("count", 0) for k, v in snapshot.get("tables", {}).items()}
             with open(counts_file, "w", encoding="utf-8") as f:
                 json.dump(counts, f, indent=2)

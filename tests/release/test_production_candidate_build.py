@@ -8,7 +8,7 @@ import unittest
 
 from app.candidate_artifact import (
     CandidateArtifactManifest, PRODUCTION_PROJECT_NAME,
-    PRODUCTION_RELEASE_ARTIFACT_ROLE,
+    PRODUCTION_RELEASE_ARTIFACT_ROLE, RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
 )
 from app.release_identity import DEFAULT_RELEASE_ASSET_RELATIVE_PATHS
 from app.release_publication import (
@@ -185,6 +185,43 @@ class ProductionCandidateBuildTest(unittest.TestCase):
                 )["status"],
                 "PASSED",
             )
+
+    def test_offline_builder_emits_operator_evidence_without_ci_fields(self):
+        with tempfile.TemporaryDirectory(prefix="production-candidate-offline-") as root:
+            source = os.path.join(root, "source")
+            candidate = os.path.join(root, "production-candidate")
+            os.makedirs(source)
+            self._source_repo(source)
+            served, previous_sha = self._current_served_root(root)
+            bundle = os.path.join(root, "source.bundle")
+            with open(bundle, "wb") as stream:
+                stream.write(b"offline source bundle")
+            evidence_path = os.path.join(root, "operator-evidence.json")
+            result = build_production_candidate(
+                served, source, candidate, os.path.join(root, "identity.json"),
+                "", "", "", "",
+                **self._expected_binding_kwargs(served),
+                release_trust_mode=RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+                offline_operator_evidence_output=evidence_path,
+                offline_operator_source_bundle=bundle,
+                offline_operator_repository="Chary-yu/fos_coverage_tool",
+                production_host="coverage-prod-01",
+                production_baseline_sha=previous_sha,
+                validation_session_id="offline-build-session",
+            )
+            self.assertEqual(result["release_trust_mode"], "offline_operator")
+            self.assertFalse(result["receipt_required"])
+            with open(evidence_path, encoding="utf-8") as stream:
+                evidence = json.load(stream)
+            self.assertEqual(evidence["protected_builder"], "SKIPPED_BY_OPERATOR")
+            self.assertEqual(evidence["trust_class"], "OFFLINE_OPERATOR")
+            with open(result["candidate_artifact_manifest"], encoding="utf-8") as stream:
+                manifest = json.load(stream)
+            self.assertEqual(
+                manifest["source_provenance"]["provenance_class"],
+                "offline-operator",
+            )
+            self.assertEqual(manifest["source_provenance"]["build_workflow_run_id"], "")
 
     def test_builder_rejects_non_production_project_and_validation_fixture_content(self):
         with tempfile.TemporaryDirectory(prefix="production-candidate-reject-") as root:

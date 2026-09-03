@@ -1,17 +1,14 @@
 """
 Manifest-Driven Upgrade & Automated Rollback Orchestrator (Item 27 & 28)
 Executes the production cutover workflow:
-1. PRECHECK: Validates target release identity and repository directories
-2. FREEZE: Drains running background jobs and pauses incoming review mutations
-3. PRE_SNAPSHOT: Captures pre-migration content hashes across core tables
-4. BACKUP: Executes full MySQL dump with SHA256 integrity check
-5. ADDITIVE_MIGRATION: Preflight check & execute schema_v2_additive.sql
-6. BACKFILL: Idempotent backfill of coverage_file_state + reconciliation
-7. DATA_HASH_VERIFY: Compares pre vs post snapshots to guarantee ZERO data loss
-8. TARGETED_TESTS: Executes all 7 phase targeted test suites + browser smoke suite
-9. PERFORMANCE_GATE: Runs 4-tier performance benchmark including Tier D 100k
-10. AUDITS: Runs sidecar, path mapping, and static security audits
-11. EVIDENCE_RECORD: Records all artifact hashes and validates strict production gates.
+1. PRECHECK: Exact release/runtime/trust/deployment identity checks
+2. CLASSIFY: Fail-closed Legacy/VNext and Flat/Immutable state classification
+3. RESIDUE_GATE: Ownership-bound validation-process cleanup gate
+4. BACKUP: Source-only full MySQL dump with SHA256 integrity check
+5. BLUE_GREEN_MIGRATION: Disposable target schema/data migration and Ready Gate
+6. CANDIDATE_RUNTIME: Candidate API, browser and performance validation
+7. ROLLBACK_REHEARSAL: Verifiable old-release/old-database recovery evidence
+8. CUTOVER: One immutable release preparation and atomic CURRENT switch
 """
 
 import os
@@ -42,25 +39,43 @@ from app.release_publication import (
 )
 from app.candidate_artifact import (
     CANDIDATE_ARTIFACT_MANIFEST_NAME, CandidateArtifactManifest,
+    RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+    RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+    RELEASE_TRUST_MODES,
     served_root_provenance_binding, verify_git_source_provenance,
-    verify_trusted_build_policy,
+    verify_offline_operator_trust, verify_trusted_build_policy,
 )
 from app.candidate_build_receipt import (
     ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
     verify_candidate_build_receipt,
 )
-from scripts.diagnostics.data_hash_gate import capture_database_snapshot, verify_data_integrity
 from scripts.upgrade.evidence_manifest import ProductionEvidenceManifest
-from scripts.upgrade.schema_preflight import (
-    ensure_column_information_schema,
-    validate_ddl_file,
-)
+from scripts.upgrade.schema_preflight import validate_ddl_file
 from scripts.diagnostics.path_mapping_audit import audit_path_mappings, audit_lcov_paths
 from scripts.diagnostics.security_scanner import scan_directory
 from scripts.diagnostics.sidecar_registry_audit import audit_sidecar_and_registry
 from scripts.diagnostics.served_root_identity import verify_http_served_root
 from scripts.maintenance.mysql_backup import perform_database_backup
-from scripts.upgrade.migrate_file_state import backfill_all_projects
+from scripts.upgrade.database_generation import (
+    LEGACY, UNKNOWN, VNEXT, inspect_database_generation,
+)
+from scripts.upgrade.existing_vnext_upgrade import upgrade_existing_vnext
+from scripts.upgrade.disposable_target import (
+    DISPOSABLE_TARGET_MODES, EMPTY_NEW_TARGET, PRE_RESTORED_CONSISTENT_BACKUP,
+    RESTORE_FROM_VERIFIED_BACKUP,
+    create_disposable_target_from_backup, create_empty_disposable_target,
+)
+from scripts.upgrade.migration_runner import (
+    apply_schema, migrate_legacy, validate_migration_database_separation,
+)
+from scripts.upgrade.validation_residue import (
+    BLOCKED as RESIDUE_BLOCKED, SAFE_TO_TEARDOWN,
+    scan_validation_residue, teardown_validation_residue,
+)
+from scripts.release.current_adoption import (
+    FLAT, IMMUTABLE_CURRENT, validate_current_or_plan_flat,
+    bootstrap_flat_current,
+)
 from app.upgrade.lifecycle import UpgradeLifecycle
 from scripts.upgrade.validation_session import (
     SESSION_SCHEMA_VERSION, ValidationSession,
@@ -159,27 +174,40 @@ def validate_candidate_publication_preflight(
         trusted_workflow_sha: str, candidate_build_receipt: Optional[str] = "",
         candidate_build_attestation_bundle: Optional[str] = "",
         candidate_build_attestation_repository: Optional[str] = "",
-        candidate_build_attestation_workflow: Optional[str] = "") -> Dict[str, Any]:
+        candidate_build_attestation_workflow: Optional[str] = "",
+        release_trust_mode: str = RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+        offline_operator_evidence: Optional[str] = "",
+        offline_operator_source_bundle: Optional[str] = "",
+        offline_operator_repository: Optional[str] = "",
+        production_host: Optional[str] = "",
+        production_baseline_sha: Optional[str] = "",
+        validation_session_id: Optional[str] = "") -> Dict[str, Any]:
     """Verify all candidate/source/trust inputs before maintenance begins."""
+    release_trust_mode = str(
+        release_trust_mode or RELEASE_TRUST_MODE_PROTECTED_BUILDER
+    ).strip()
+    if release_trust_mode not in RELEASE_TRUST_MODES:
+        raise RuntimeError("unsupported release_trust_mode")
     trusted_workflow_identity = str(trusted_workflow_identity or "").strip()
     trusted_workflow_sha = str(trusted_workflow_sha or "").strip()
-    if not trusted_workflow_identity or not trusted_workflow_sha:
-        raise RuntimeError(
-            "trusted build workflow identity and SHA are required"
-        )
-    if "REPLACE_WITH" in trusted_workflow_sha.upper():
-        raise RuntimeError(
-            "production_candidate_builder_workflow_sha is still a placeholder"
-        )
-    if not is_valid_commit_sha(trusted_workflow_sha):
-        raise RuntimeError(
-            "production_candidate_builder_workflow_sha must be an exact commit SHA"
-        )
-    if not str(candidate_build_attestation_repository or "").strip() or \
-            not str(candidate_build_attestation_workflow or "").strip():
-        raise RuntimeError(
-            "candidate build attestation repository and signer workflow are required"
-        )
+    if release_trust_mode == RELEASE_TRUST_MODE_PROTECTED_BUILDER:
+        if not trusted_workflow_identity or not trusted_workflow_sha:
+            raise RuntimeError(
+                "trusted build workflow identity and SHA are required"
+            )
+        if "REPLACE_WITH" in trusted_workflow_sha.upper():
+            raise RuntimeError(
+                "production_candidate_builder_workflow_sha is still a placeholder"
+            )
+        if not is_valid_commit_sha(trusted_workflow_sha):
+            raise RuntimeError(
+                "production_candidate_builder_workflow_sha must be an exact commit SHA"
+            )
+        if not str(candidate_build_attestation_repository or "").strip() or \
+                not str(candidate_build_attestation_workflow or "").strip():
+            raise RuntimeError(
+                "candidate build attestation repository and signer workflow are required"
+            )
     production_candidate_root = os.path.realpath(
         os.path.abspath(production_candidate_root)
     )
@@ -203,35 +231,72 @@ def validate_candidate_publication_preflight(
     validate_production_candidate_content(
         production_candidate_root, PRODUCTION_PROJECT_NAME
     )
-    provenance = verify_trusted_build_policy(
-        manifest.get("source_provenance") or {},
-        trusted_workflow_identity, trusted_workflow_sha,
-    )
-    observed_source = verify_git_source_provenance(
-        repo_root, release_identity, provenance,
-    )
-    receipt_path = _resolve_candidate_manifest_path(
-        os.path.realpath(os.path.abspath(repo_root)), production_candidate_root,
-        candidate_build_receipt or manifest.get("receipt_path") or
-        "candidate_build_receipt.json",
-    )
-    if not candidate_build_attestation_bundle:
-        raise RuntimeError(
-            "candidate_build_attestation_bundle is required before maintenance"
+    if release_trust_mode == RELEASE_TRUST_MODE_PROTECTED_BUILDER:
+        provenance = verify_trusted_build_policy(
+            manifest.get("source_provenance") or {},
+            trusted_workflow_identity, trusted_workflow_sha,
         )
-    bundle_path = str(candidate_build_attestation_bundle)
-    if not os.path.isabs(bundle_path):
-        bundle_path = os.path.join(
-            os.path.realpath(os.path.abspath(repo_root)), bundle_path
+        observed_source = verify_git_source_provenance(
+            repo_root, release_identity, provenance,
         )
-    bundle_path = os.path.realpath(os.path.abspath(bundle_path))
-    verify_candidate_build_receipt(
-        production_candidate_root, release_identity, manifest, bundle_path,
-        receipt_path=receipt_path,
-        attestation_repository=candidate_build_attestation_repository,
-        attestation_workflow=candidate_build_attestation_workflow,
-        attestation_runner_policy=ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
-    )
+        receipt_path = _resolve_candidate_manifest_path(
+            os.path.realpath(os.path.abspath(repo_root)), production_candidate_root,
+            candidate_build_receipt or manifest.get("receipt_path") or
+            "candidate_build_receipt.json",
+        )
+        if not candidate_build_attestation_bundle:
+            raise RuntimeError(
+                "candidate_build_attestation_bundle is required before maintenance"
+            )
+        bundle_path = str(candidate_build_attestation_bundle)
+        if not os.path.isabs(bundle_path):
+            bundle_path = os.path.join(
+                os.path.realpath(os.path.abspath(repo_root)), bundle_path
+            )
+        bundle_path = os.path.realpath(os.path.abspath(bundle_path))
+        verify_candidate_build_receipt(
+            production_candidate_root, release_identity, manifest, bundle_path,
+            receipt_path=receipt_path,
+            attestation_repository=candidate_build_attestation_repository,
+            attestation_workflow=candidate_build_attestation_workflow,
+            attestation_runner_policy=ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
+        )
+        trust_evidence = {
+            "status": "PASSED",
+            "release_trust_mode": RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+            "protected_builder": "PASSED",
+            "trust_class": "PROTECTED_BUILDER",
+        }
+    else:
+        provenance = manifest.get("source_provenance") or {}
+        offline_repository = str(offline_operator_repository or "").strip()
+        if not offline_repository:
+            raise RuntimeError(
+                "offline_operator_repository is required for offline trust"
+            )
+        evidence_path = str(offline_operator_evidence or "")
+        if evidence_path and not os.path.isabs(evidence_path):
+            evidence_path = os.path.join(
+                os.path.realpath(os.path.abspath(repo_root)), evidence_path
+            )
+        source_bundle = str(offline_operator_source_bundle or "")
+        if source_bundle and not os.path.isabs(source_bundle):
+            source_bundle = os.path.join(
+                os.path.realpath(os.path.abspath(repo_root)), source_bundle
+            )
+        observed_source = verify_offline_operator_trust(
+            production_candidate_root, release_identity, manifest, repo_root,
+            evidence_path=evidence_path,
+            source_bundle_path=source_bundle,
+            expected_repository=offline_repository,
+            expected_production_host=production_host,
+            expected_production_baseline_sha=production_baseline_sha,
+            expected_validation_session_id=validation_session_id,
+        )
+        served_root_binding = served_root_provenance_binding(provenance)
+        trust_evidence = dict(observed_source)
+        receipt_path = ""
+        bundle_path = ""
     served_root_binding = served_root_provenance_binding(
         manifest.get("source_provenance") or {}
     )
@@ -265,6 +330,8 @@ def validate_candidate_publication_preflight(
         "candidate_build_attestation_workflow": str(
             candidate_build_attestation_workflow or ""
         ).strip(),
+        "release_trust": trust_evidence,
+        "release_trust_mode": release_trust_mode,
     }
 
 
@@ -594,6 +661,12 @@ class UpgradeOrchestrator:
         self.logs: List[str] = []
         self._publication_switched = False
         self._previous_release_identity = {}
+        self._release_trust_mode = RELEASE_TRUST_MODE_PROTECTED_BUILDER
+        self._deployment_layout = ""
+        self._current_adoption_plan = None
+        self._database_generation = {}
+        self._target_database_generation = {}
+        self._target_db_config = {}
 
     def _configure_backup_root(self, configured_root: Optional[str]):
         resolved = resolve_backup_root(self.repo_root, configured_root)
@@ -662,6 +735,10 @@ class UpgradeOrchestrator:
         trusted_workflow_sha = str(
             upgrade_config.get("production_candidate_builder_workflow_sha") or ""
         ).strip()
+        self._release_trust_mode = str(
+            upgrade_config.get("release_trust_mode") or
+            RELEASE_TRUST_MODE_PROTECTED_BUILDER
+        ).strip()
         self.candidate_preflight = validate_candidate_publication_preflight(
             self.repo_root, production_candidate_root, identity,
             upgrade_config.get("production_candidate_artifact_manifest", ""),
@@ -670,6 +747,22 @@ class UpgradeOrchestrator:
             upgrade_config.get("production_candidate_attestation_bundle", ""),
             upgrade_config.get("production_candidate_attestation_repository", ""),
             upgrade_config.get("production_candidate_attestation_workflow", ""),
+            release_trust_mode=self._release_trust_mode,
+            offline_operator_evidence=upgrade_config.get(
+                "offline_operator_evidence", ""
+            ),
+            offline_operator_source_bundle=upgrade_config.get(
+                "offline_operator_source_bundle", ""
+            ),
+            offline_operator_repository=upgrade_config.get(
+                "offline_operator_repository", ""
+            ),
+            production_host=upgrade_config.get("production_host", ""),
+            production_baseline_sha=upgrade_config.get("production_baseline_sha") or
+            previous_release.get("commit_sha", ""),
+            validation_session_id=upgrade_config.get(
+                "release_validation_session_id"
+            ) or upgrade_config.get("validation_session_id", ""),
         )
 
         self.production_candidate_root = production_candidate_root
@@ -686,44 +779,63 @@ class UpgradeOrchestrator:
             raise RuntimeError(
                 "upgrade.served_root_path must be the literal publish_root/CURRENT/reports path"
             )
-        self.publisher = ImmutableReleasePublisher(publish_root)
-        current = self.publisher.validate_current()
-        if current.get("status") != "PASSED":
-            raise RuntimeError(
-                "CURRENT does not point to a validated immutable release: {}".format(
-                    "; ".join(current.get("violations") or [])
-                )
-            )
-        current_binding = current_served_root_binding(publish_root)
-        candidate_binding = verify_production_candidate_served_root_binding(
-            self.candidate_preflight.get("source_provenance") or {},
-            current_binding,
+        flat_root = upgrade_config.get("flat_served_root") or upgrade_config.get(
+            "legacy_flat_served_root", ""
         )
-        if str(current.get("commit_sha") or "").lower() != \
-                current_binding["previous_release_commit_sha"]:
-            raise RuntimeError(
-                "publisher.validate_current commit does not match the CURRENT binding"
+        if flat_root and not os.path.isabs(str(flat_root)):
+            flat_root = os.path.join(self.repo_root, str(flat_root))
+        flat_identity = upgrade_config.get("flat_release_identity_path") or \
+            upgrade_config.get("legacy_flat_release_identity_path", "")
+        if flat_identity and not os.path.isabs(str(flat_identity)):
+            flat_identity = os.path.join(self.repo_root, str(flat_identity))
+        deployment = validate_current_or_plan_flat(
+            publish_root, flat_root, flat_identity,
+            previous_release.get("commit_sha", ""),
+        )
+        self._deployment_layout = deployment.get("deployment_layout", "")
+        self.publisher = ImmutableReleasePublisher(
+            publish_root, create_root=self._deployment_layout != FLAT
+        )
+        if self._deployment_layout == IMMUTABLE_CURRENT:
+            current = deployment.get("current") or {}
+            current_binding = deployment.get("current_binding") or {}
+            candidate_binding = verify_production_candidate_served_root_binding(
+                self.candidate_preflight.get("source_provenance") or {},
+                current_binding,
             )
-        if current.get("release_validation_session_id") != \
-                current_binding["release_validation_session_id"]:
-            raise RuntimeError(
-                "publisher.validate_current session does not match the CURRENT binding"
-            )
-        expected_served_root = os.path.join(current_binding["realpath"], "reports")
-        if os.path.realpath(str(current.get("served_root") or "")) != \
-                os.path.realpath(expected_served_root):
-            raise RuntimeError(
-                "publisher.validate_current Served Root does not match the CURRENT binding"
-            )
-        self.candidate_preflight["candidate_served_root_binding"] = candidate_binding
-        self.candidate_preflight["current_served_root_binding"] = current_binding
-        if current.get("commit_sha") != previous_release.get("commit_sha"):
-            raise RuntimeError(
-                "CURRENT release does not match previous_release commit_sha"
-            )
-        self.previous_published_session_id = self.publisher.current_session_id()
-        if not self.previous_published_session_id:
-            raise RuntimeError("CURRENT release-validation session identity is missing")
+            if str(current.get("commit_sha") or "").lower() != \
+                    current_binding["previous_release_commit_sha"]:
+                raise RuntimeError(
+                    "CURRENT commit does not match the CURRENT binding"
+                )
+            if current.get("commit_sha") != previous_release.get("commit_sha"):
+                raise RuntimeError(
+                    "CURRENT release does not match previous_release commit_sha"
+                )
+            self.candidate_preflight["candidate_served_root_binding"] = candidate_binding
+            self.candidate_preflight["current_served_root_binding"] = current_binding
+            self.previous_published_session_id = self.publisher.current_session_id()
+            if not self.previous_published_session_id:
+                raise RuntimeError("CURRENT release-validation session identity is missing")
+        elif self._deployment_layout == FLAT:
+            if not upgrade_config.get("flat_current_adoption_on_cutover"):
+                raise RuntimeError(
+                    "Flat deployment requires explicit flat_current_adoption_on_cutover"
+                )
+            if not str(upgrade_config.get("flat_baseline_session_id") or "").strip():
+                raise RuntimeError(
+                    "Flat deployment requires flat_baseline_session_id"
+                )
+            self._current_adoption_plan = deployment
+            self.candidate_preflight["deployment_layout"] = FLAT
+            self.candidate_preflight["flat_current_adoption"] = deployment
+            # The baseline session is created by the explicit adoption step at
+            # cutover.  It is intentionally not fabricated as CURRENT here.
+            self.previous_published_session_id = str(
+                upgrade_config.get("flat_baseline_session_id") or ""
+            ).strip()
+        else:
+            raise RuntimeError("deployment layout is unknown")
 
         session_id = _new_release_validation_session_id(
             identity.get("commit_sha"),
@@ -841,6 +953,57 @@ class UpgradeOrchestrator:
         os.environ["COVERAGE_VALIDATION_TEARDOWN_EVIDENCE"] = \
             self.validation_teardown_evidence_path
         self._configure_serving_session(upgrade_config, previous_release)
+
+    def _ensure_flat_current_baseline(self, upgrade_config, previous_release):
+        """Perform the explicit Flat adoption at the cutover boundary only."""
+        if self._deployment_layout != FLAT or not self._current_adoption_plan:
+            return None
+        if not upgrade_config.get("flat_current_adoption_on_cutover"):
+            raise RuntimeError(
+                "Flat deployment requires explicit flat_current_adoption_on_cutover"
+            )
+        identity_path = upgrade_config.get("flat_release_identity_path") or \
+            upgrade_config.get("legacy_flat_release_identity_path", "")
+        flat_root = upgrade_config.get("flat_served_root") or upgrade_config.get(
+            "legacy_flat_served_root", ""
+        )
+        if identity_path and not os.path.isabs(str(identity_path)):
+            identity_path = os.path.join(self.repo_root, str(identity_path))
+        if flat_root and not os.path.isabs(str(flat_root)):
+            flat_root = os.path.join(self.repo_root, str(flat_root))
+        baseline_session = str(
+            upgrade_config.get("flat_baseline_session_id") or ""
+        ).strip()
+        if not baseline_session:
+            raise RuntimeError(
+                "flat_baseline_session_id is required for explicit adoption"
+            )
+        result = bootstrap_flat_current(
+            self.publish_root, flat_root, identity_path,
+            previous_release.get("commit_sha", ""), baseline_session,
+            switch=True,
+            api_contract_version=upgrade_config.get("api_contract_version", ""),
+        )
+        if result.get("status") != "PASSED":
+            raise RuntimeError("Flat baseline adoption did not pass")
+        current = self.publisher.validate_current()
+        if current.get("status") != "PASSED":
+            raise RuntimeError("adopted baseline CURRENT failed validation")
+        current_binding = current_served_root_binding(self.publish_root)
+        if current_binding.get("previous_release_commit_sha") != \
+                previous_release.get("commit_sha"):
+            raise RuntimeError("adopted baseline CURRENT commit does not match rollback identity")
+        candidate_binding = verify_production_candidate_served_root_binding(
+            self.candidate_preflight.get("source_provenance") or {},
+            current_binding,
+        )
+        self.candidate_preflight["candidate_served_root_binding"] = candidate_binding
+        self.candidate_preflight["current_served_root_binding"] = current_binding
+        self.previous_published_session_id = self.publisher.current_session_id()
+        self._deployment_layout = IMMUTABLE_CURRENT
+        result["deployment_layout_after_adoption"] = IMMUTABLE_CURRENT
+        self.manifest.record("flat_current_adoption", result)
+        return result
 
     def _configure_serving_session(self, upgrade_config: Dict[str, Any],
                                    previous_release: Dict[str, Any]):
@@ -1117,7 +1280,9 @@ class UpgradeOrchestrator:
     def execute_upgrade(self, dry_run: bool = False, connection=None, db_config=None,
                         mode: str = "staging", deployment_manifest: Optional[str] = None,
                         target_release: Optional[Dict[str, Any]] = None,
-                        runtime_config: Optional[Dict[str, Any]] = None) -> Tuple[bool, str]:
+                        runtime_config: Optional[Dict[str, Any]] = None,
+                        target_connection=None, target_db_config=None,
+                        target_connection_factory=None) -> Tuple[bool, str]:
         """Run complete upgrade procedure."""
         self._runtime_config = dict(runtime_config or {})
         self._upgrade_mode = mode
@@ -1166,9 +1331,98 @@ class UpgradeOrchestrator:
         self._target_identity = dict(identity)
         self.log(f"  Target Release: {identity.get('version')} (Build: {identity.get('build_id')})")
 
+        upgrade_config = (runtime_config or {}).get("upgrade") or {}
+        self._target_db_config = dict(
+            target_db_config or upgrade_config.get("target_mysql") or
+            (runtime_config or {}).get("target_mysql") or {}
+        )
+        if not dry_run and connection is None:
+            return False, "Live source database connection required"
+        target_connection_deferred = (
+            not dry_run and target_connection is None and
+            callable(target_connection_factory)
+        )
+        configured_target_mode = str(
+            upgrade_config.get("target_preparation_mode") or ""
+        ).strip()
+        if configured_target_mode and configured_target_mode not in \
+                DISPOSABLE_TARGET_MODES:
+            return False, "Unknown disposable target preparation mode"
+        if not dry_run and target_connection is not None and \
+                configured_target_mode != PRE_RESTORED_CONSISTENT_BACKUP:
+            return False, (
+                "pre-restored target connections require explicit "
+                "target_preparation_mode=pre_restored_consistent_backup"
+            )
+        if not dry_run and target_connection is None and \
+                not target_connection_deferred:
+            return False, "Disposable target factory or pre-restored target is required"
+        if connection is not None:
+            self._database_generation = inspect_database_generation(connection)
+            if self._database_generation.get("generation") == UNKNOWN:
+                self.manifest.record("database_generation", {
+                    "status": "FAILED", "generation": UNKNOWN,
+                    "evidence_class": "production_database",
+                    "revision": identity.get("commit_sha"),
+                    "reason": self._database_generation.get("reason"),
+                    "tables": self._database_generation.get("tables", []),
+                    "command": "inspect_database_generation(source)",
+                    "exit_code": 1,
+                })
+                return False, "Database generation is UNKNOWN; upgrade blocked"
+            self.manifest.record("database_generation", {
+                "status": "PASSED", "generation": self._database_generation.get("generation"),
+                "evidence_class": "production_database",
+                "revision": identity.get("commit_sha"),
+                "reason": self._database_generation.get("reason"),
+                "tables": self._database_generation.get("tables", []),
+                "command": "inspect_database_generation(source)",
+                "exit_code": 0,
+            })
+            if not dry_run and target_connection is None and \
+                    not target_connection_deferred:
+                return False, "Disposable target database connection is required"
+            if not dry_run and target_connection is None and \
+                    not (self._target_db_config or {}).get("database"):
+                return False, "Disposable target database configuration is required"
+            if target_connection is not None:
+                try:
+                    separation = validate_migration_database_separation(
+                        db_config or {}, self._target_db_config,
+                        source_connection=connection,
+                        target_connection=target_connection,
+                    )
+                except (RuntimeError, ValueError, TypeError) as exc:
+                    self.manifest.record("database_separation", {
+                        "status": "FAILED", "revision": identity.get("commit_sha"),
+                        "evidence_class": "production_database",
+                        "command": "validate_migration_database_separation",
+                        "exit_code": 1, "violations": [str(exc)],
+                    })
+                    return False, "Source/target database separation failed"
+                target_generation = inspect_database_generation(target_connection)
+                self._target_database_generation = target_generation
+                source_generation = self._database_generation.get("generation")
+                target_generation_value = target_generation.get("generation")
+                if source_generation == VNEXT and target_generation_value != VNEXT:
+                    return False, "Existing-VNext target must be a consistent VNext backup"
+                if source_generation == LEGACY and target_generation_value == LEGACY:
+                    return False, "Legacy migration target must be empty/new VNext"
+                self.manifest.record("database_separation", {
+                    "status": "PASSED", "revision": identity.get("commit_sha"),
+                    "evidence_class": "production_database",
+                    "separation": separation,
+                    "target_generation": target_generation,
+                    "command": "validate_migration_database_separation + inspect_database_generation(target)",
+                    "exit_code": 0,
+                })
+
         # Step 2: Schema Preflight
         self.log("[Step 2/10] Running Static DDL Preflight Validation...")
-        ddl_path = os.path.join(self.repo_root, "scripts", "upgrade", "schema_v2_additive.sql")
+        ddl_name = "vnext_schema_v3.sql" if self._database_generation.get(
+            "generation"
+        ) == VNEXT else "vnext_schema.sql"
+        ddl_path = os.path.join(self.repo_root, "scripts", "upgrade", ddl_name)
         safe, errs, warns = validate_ddl_file(ddl_path)
         if not safe:
             self.log(f"❌ Schema preflight failed: {errs}")
@@ -1178,14 +1432,13 @@ class UpgradeOrchestrator:
             "status": "PASSED",
             "revision": identity.get("commit_sha"),
             "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
-            "ddl_script": "schema_v2_additive.sql",
+            "ddl_script": ddl_name,
             "warnings": warns,
-            "command": "validate_ddl_file scripts/upgrade/schema_v2_additive.sql",
+            "command": "validate_ddl_file scripts/upgrade/{}".format(ddl_name),
             "exit_code": 0,
         })
         self.log("✔ Schema preflight check passed (Additive & Idempotent).")
 
-        upgrade_config = (runtime_config or {}).get("upgrade") or {}
         self._configure_backup_root(upgrade_config.get("backup_root"))
         previous_release = upgrade_config.get("previous_release")
         if not isinstance(previous_release, dict) or not previous_release:
@@ -1204,10 +1457,70 @@ class UpgradeOrchestrator:
         except (OSError, RuntimeError, ValueError, TypeError) as exc:
             self.log("❌ Immutable publication/session preflight failed: {}".format(exc))
             return False, "Immutable publication/session preflight failed"
+        self.manifest.record("deployment_layout", {
+            "status": "PASSED",
+            "deployment_layout": self._deployment_layout,
+            "revision": identity.get("commit_sha"),
+            "evidence_class": "production_deployment",
+            "flat_current_adoption": self._current_adoption_plan or {},
+            "command": "validate_current_or_plan_flat",
+            "exit_code": 0,
+        })
+        configured_residue_roots = upgrade_config.get("validation_residue_roots") or []
+        if isinstance(configured_residue_roots, (str, int)):
+            configured_residue_roots = [configured_residue_roots]
+        residue_roots = list(configured_residue_roots)
+        if upgrade_config.get("validation_candidate_root"):
+            residue_roots.append(upgrade_config.get("validation_candidate_root"))
+        residue_ports = upgrade_config.get("validation_residue_ports")
+        if residue_ports is None:
+            residue_ports = upgrade_config.get("validation_ports") or []
+        residue_session = str(
+            upgrade_config.get("validation_residue_session_id") or
+            self.release_validation_session_id
+        ).strip()
+        residue = scan_validation_residue(
+            candidate_roots=residue_roots, ports=residue_ports,
+            session_identity=residue_session,
+        )
+        residue.update({
+            "revision": identity.get("commit_sha"),
+            "evidence_class": "validation_process_ownership",
+            "command": "scan_validation_residue",
+            "exit_code": 0 if residue.get("status") != RESIDUE_BLOCKED else 1,
+        })
+        self.manifest.record("validation_residue_gate", residue)
+        if residue.get("status") == RESIDUE_BLOCKED:
+            self.log("❌ Validation residue gate blocked the upgrade.")
+            return False, "Validation residue gate blocked"
+        if residue.get("status") == SAFE_TO_TEARDOWN and \
+                upgrade_config.get("validation_residue_teardown"):
+            teardown_residue = teardown_validation_residue(
+                candidate_roots=residue_roots, ports=residue_ports,
+                session_identity=residue_session,
+            )
+            teardown_residue.update({
+                "revision": identity.get("commit_sha"),
+                "evidence_class": "validation_process_ownership",
+                "command": "teardown_validation_residue",
+                "exit_code": 0 if teardown_residue.get("teardown_status") == "PASSED" else 1,
+            })
+            self.manifest.record("validation_residue_teardown", teardown_residue)
+            if teardown_residue.get("teardown_status") != "PASSED":
+                return False, "Validation residue teardown blocked"
         lifecycle_previous = dict(previous_release)
         lifecycle_previous["_published_session_id"] = self.previous_published_session_id
+        source_runtime_mysql = dict(db_config or {})
+        if isinstance(source_runtime_mysql.get("mysql"), dict):
+            source_runtime_mysql = dict(source_runtime_mysql["mysql"])
+        lifecycle_previous["_previous_runtime_mysql"] = source_runtime_mysql
+        lifecycle_config = dict(self._runtime_config)
+        lifecycle_upgrade = dict((self._runtime_config.get("upgrade") or {}))
+        if self._target_db_config:
+            lifecycle_upgrade["candidate_runtime_mysql"] = dict(self._target_db_config)
+        lifecycle_config["upgrade"] = lifecycle_upgrade
         lifecycle = UpgradeLifecycle(
-            self.repo_root, runtime_config or {}, mode, lifecycle_previous
+            self.repo_root, lifecycle_config, mode, lifecycle_previous
         )
         try:
             freeze_evidence = lifecycle.freeze(identity.get("commit_sha", ""))
@@ -1260,12 +1573,179 @@ class UpgradeOrchestrator:
             self.log("❌ Mock backup evidence cannot pass a release gate")
             return self._fail(lifecycle, "Mock backup evidence rejected")
 
-        # Step 4: Data Snapshot & Hash Verification
-        self.log("[Step 4/10] Executing Pre/Post Data Hash Integrity Gate...")
-        if connection is None:
-            self.log("❌ No live database connection supplied; synthetic hash evidence is forbidden")
-            return self._fail(lifecycle, "Live database connection required")
-        pre_snapshot = capture_database_snapshot(connection, identity)
+        target_preparation = {}
+        if target_connection_deferred:
+            preparation_mode = str(
+                upgrade_config.get("target_preparation_mode") or ""
+            ).strip()
+            source_generation = self._database_generation.get("generation")
+            if source_generation == VNEXT and preparation_mode != \
+                    RESTORE_FROM_VERIFIED_BACKUP:
+                return self._fail(
+                    lifecycle,
+                    "Existing-VNext requires restore_from_verified_backup target preparation",
+                )
+            if source_generation == LEGACY and preparation_mode != EMPTY_NEW_TARGET:
+                return self._fail(
+                    lifecycle,
+                    "Legacy migration requires empty_new_target preparation",
+                )
+            try:
+                prepared_target = target_connection_factory(
+                    bk_manifest, source_generation,
+                )
+                if isinstance(prepared_target, tuple) and len(prepared_target) == 2:
+                    target_connection, target_preparation = prepared_target
+                elif isinstance(prepared_target, dict) and \
+                        "connection" in prepared_target:
+                    target_connection = prepared_target.get("connection")
+                    target_preparation = dict(
+                        prepared_target.get("evidence") or {}
+                    )
+                else:
+                    target_connection = prepared_target
+                if target_connection is None:
+                    raise RuntimeError(
+                        "target_connection_factory returned no target connection"
+                    )
+                if not isinstance(target_preparation, dict):
+                    target_preparation = {}
+                target_generation = inspect_database_generation(target_connection)
+                self._target_database_generation = target_generation
+                separation = validate_migration_database_separation(
+                    db_config or {}, self._target_db_config,
+                    source_connection=connection,
+                    target_connection=target_connection,
+                )
+                target_generation_value = target_generation.get("generation")
+                if source_generation == VNEXT and target_generation_value != VNEXT:
+                    raise RuntimeError(
+                        "restored Existing-VNext target is not classified as VNEXT"
+                    )
+                if source_generation == LEGACY and target_generation_value == LEGACY:
+                    raise RuntimeError(
+                        "empty Legacy migration target unexpectedly contains Legacy schema"
+                    )
+                target_preparation.update({
+                    "status": "PASSED",
+                    "source_generation": source_generation,
+                    "target_generation": target_generation,
+                    "database_separation": separation,
+                    "command": "create disposable target + restore/empty-target probe",
+                    "exit_code": 0,
+                })
+                self.manifest.record("disposable_target", target_preparation)
+                self.manifest.record("database_separation", {
+                    "status": "PASSED", "revision": identity.get("commit_sha"),
+                    "evidence_class": "blue_green_database",
+                    "separation": separation,
+                    "target_generation": target_generation,
+                    "command": "validate_migration_database_separation + inspect_database_generation(target)",
+                    "exit_code": 0,
+                })
+            except Exception as exc:
+                self.log("❌ Disposable target preparation failed: {}".format(exc))
+                return self._fail(lifecycle, "Disposable target preparation failed")
+        elif target_connection is not None:
+            # A caller may deliberately provision the target out of band.  It
+            # still has to identify itself as a separate database and its
+            # semantic backup consistency is checked by the migration below.
+            target_preparation = {
+                "status": "PASSED",
+                "preparation_mode": str(
+                    upgrade_config.get("target_preparation_mode") or
+                    PRE_RESTORED_CONSISTENT_BACKUP
+                ).strip(),
+                "target_database": (self._target_db_config or {}).get("database", ""),
+                "target_connection_supplied": True,
+                "target_retained_for_candidate": True,
+            }
+            self.manifest.record("disposable_target", target_preparation)
+
+        # Step 4: Blue/green database migration and authoritative fact gate.
+        # The source is only inspected/backed up.  Every DDL/DML operation is
+        # sent to the disposable target connection.
+        self.log("[Step 4/10] Migrating the disposable database target...")
+        if connection is None or target_connection is None:
+            return self._fail(
+                lifecycle, "Source and disposable target database connections are required"
+            )
+        source_generation = self._database_generation.get("generation")
+        try:
+            if source_generation == VNEXT:
+                migration_report = upgrade_existing_vnext(
+                    connection, target_connection,
+                    release_sha=identity.get("commit_sha", ""),
+                    schema_path=ddl_path,
+                )
+            elif source_generation == LEGACY:
+                target_schema_path = os.path.join(
+                    self.repo_root, "scripts", "upgrade", "vnext_schema.sql"
+                )
+                core_result = apply_schema(
+                    target_connection, target_schema_path,
+                    release_sha=identity.get("commit_sha", ""),
+                )
+                migration_report = migrate_legacy(
+                    connection, target_connection,
+                    anomaly_path=upgrade_config.get("migration_anomaly_path") or None,
+                    release_sha=identity.get("commit_sha", ""),
+                )
+                migration_report["target_core_schema"] = core_result
+            else:
+                raise RuntimeError("database generation is UNKNOWN")
+            if migration_report.get("status") != "PASSED":
+                raise RuntimeError(
+                    "migration returned non-PASSED status: {}".format(
+                        migration_report
+                    )
+                )
+        except Exception as exc:
+            self.log("❌ Disposable target migration failed: {}".format(exc))
+            return self._fail(lifecycle, "Disposable target migration failed")
+        self.manifest.record("schema_migration", {
+            "preflight_safe": True, "status": "PASSED",
+            "revision": identity.get("commit_sha"),
+            "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
+            "database_generation": source_generation,
+            "source_database": (db_config or {}).get("database", ""),
+            "target_database": (self._target_db_config or {}).get("database", ""),
+            "migration": migration_report,
+            "command": "Existing-VNext runtime-v3 or Legacy-to-VNext on disposable target",
+            "exit_code": 0,
+        })
+        integrity = migration_report.get("authoritative_data_integrity") or {}
+        if source_generation == LEGACY:
+            integrity = {
+                "status": "PASSED" if migration_report.get(
+                    "authoritative_semantic_match"
+                ) else "FAILED",
+                "source_semantic_hash": migration_report.get("source_semantic_hash", ""),
+                "target_semantic_hash": migration_report.get("target_semantic_hash", ""),
+                "differences": migration_report.get("semantic_mismatch_components", []),
+            }
+        integrity_status = integrity.get("status")
+        self.manifest.record("data_hash_verification", {
+            "verified": integrity_status == "PASSED",
+            "status": integrity_status or "FAILED",
+            "evidence_class": "blue_green_database",
+            "revision": identity.get("commit_sha"),
+            "source_semantic_hash": integrity.get("source_semantic_hash", ""),
+            "target_semantic_hash": integrity.get("target_semantic_hash", ""),
+            "differences": integrity.get("differences", []),
+            "source_read_only_stability": migration_report.get(
+                "source_read_only_stability", {}
+            ),
+            "command": "authoritative VNext semantic snapshot comparison",
+            "exit_code": 0 if integrity_status == "PASSED" else 1,
+        })
+        if integrity_status != "PASSED":
+            return self._fail(lifecycle, "Authoritative data integrity verification failed")
+        self.log("✔ Disposable target migration and authoritative data gate passed.")
+
+        # Only after the disposable target is proven do we touch the lifecycle
+        # boundary for an eventual cutover.  A failed migration never stops
+        # the current serving PID.
         try:
             stop_evidence = lifecycle.stop_current_api()
             stop_evidence.update({
@@ -1277,52 +1757,6 @@ class UpgradeOrchestrator:
         except Exception as exc:
             self.log("❌ API stop failed: {}".format(exc))
             return self._fail(lifecycle, "API stop failed")
-        # Apply only the reviewed additive DDL, then backfill the derived table
-        # and reconcile it against authoritative facts.  No source-of-truth
-        # table is ever written by the backfill.
-        try:
-            with open(ddl_path, "r", encoding="utf-8") as ddl_stream:
-                ddl_sql = ddl_stream.read()
-            ddl_sql = re.sub(r"(?m)^\s*--.*$", "", ddl_sql)
-            with connection.cursor() as cursor:
-                for statement in (part.strip() for part in ddl_sql.split(";") if part.strip()):
-                    cursor.execute(statement)
-            connection.commit()
-            ensure_column_information_schema(
-                connection,
-                "coverage_project_state",
-                "file_state_version",
-                "BIGINT NOT NULL DEFAULT 0",
-            )
-            backfill_report = backfill_all_projects(connection)
-        except Exception as exc:
-            self.log("❌ Additive migration/backfill failed: {}".format(exc))
-            return self._fail(lifecycle, "Migration/backfill failed")
-        self.manifest.record("schema_migration", {
-            "preflight_safe": True, "status": "PASSED",
-            "revision": identity.get("commit_sha"),
-            "evidence_class": "staging_cutover" if mode == "staging" else "production_cutover",
-            "backfill": backfill_report,
-            "command": "schema_v2_additive.sql + backfill_all_projects",
-            "exit_code": 0,
-        })
-        post_snapshot = capture_database_snapshot(connection, identity)
-        verified, violations = verify_data_integrity(pre_snapshot, post_snapshot)
-        self.manifest.record("data_hash_verification", {
-            "verified": verified,
-            "status": "PASSED" if verified else "FAILED",
-            "evidence_class": "production_database",
-            "revision": identity.get("commit_sha"),
-            "pre_snapshot": pre_snapshot,
-            "post_snapshot": post_snapshot,
-            "reconciliation_status": "MATCHED" if verified else "FAILED",
-            "violations": violations,
-            "command": "capture_database_snapshot + verify_data_integrity",
-            "exit_code": 0 if verified else 1,
-        })
-        if not verified:
-            return self._fail(lifecycle, "Data integrity verification failed")
-        self.log("✔ Data integrity verification passed: 0 row decreases, 0 hash mismatches.")
 
         # The deployment manifest remains a review record, while publication
         # itself is exclusively an immutable artifact preparation followed by
@@ -1330,7 +1764,23 @@ class UpgradeOrchestrator:
         # rewritten by the production upgrade path.
         self.log("[Cutover] Preparing immutable release and switching CURRENT atomically...")
         try:
+            adoption = self._ensure_flat_current_baseline(
+                upgrade_config, previous_release
+            )
+            # UpgradeLifecycle snapshots the rollback identity at construction
+            # time.  Flat adoption creates the immutable baseline session only
+            # at this boundary, so publish that generated session into the
+            # lifecycle before any later gate can invoke abort().
+            if adoption and self.previous_published_session_id:
+                lifecycle.previous_release["_published_session_id"] = \
+                    self.previous_published_session_id
             session_id = self.validation_session.data.get("session_id")
+            offline_evidence = upgrade_config.get("offline_operator_evidence", "")
+            offline_bundle = upgrade_config.get("offline_operator_source_bundle", "")
+            if offline_evidence and not os.path.isabs(str(offline_evidence)):
+                offline_evidence = os.path.join(self.repo_root, str(offline_evidence))
+            if offline_bundle and not os.path.isabs(str(offline_bundle)):
+                offline_bundle = os.path.join(self.repo_root, str(offline_bundle))
             prepared = self.publisher.prepare(
                 self.production_candidate_root,
                 identity,
@@ -1359,6 +1809,16 @@ class UpgradeOrchestrator:
                 candidate_build_attestation_workflow=self.candidate_preflight.get(
                     "candidate_build_attestation_workflow", ""
                 ),
+                release_trust_mode=self._release_trust_mode,
+                offline_operator_evidence=offline_evidence,
+                offline_operator_source_bundle=offline_bundle,
+                offline_operator_repository=upgrade_config.get(
+                    "offline_operator_repository", ""
+                ),
+                production_host=upgrade_config.get("production_host", ""),
+                production_baseline_sha=upgrade_config.get("production_baseline_sha") or
+                previous_release.get("commit_sha", ""),
+                validation_session_id=session_id,
             )
             switched = self.publisher.switch_current(session_id)
             if switched.get("status") != "PASSED":
@@ -1415,15 +1875,26 @@ class UpgradeOrchestrator:
 
         # Step 5: Run Targeted Unit Test Suites
         self.log("[Step 5/10] Executing Targeted Unit Test Suites (Phases 0-6)...")
-        test_modules = [
-            "tests.database.test_phase0_baseline",
-            "tests.test_phase1_directory",
-            "tests.code_detail.test_phase2_core",
-            "tests.test_phase3_jobs_export",
-            "tests.progress.test_phase4_progress",
-            "tests.incremental.test_phase5_inject_path",
-            "tests.code_detail.test_phase6_sidecar"
-        ]
+        configured_test_modules = upgrade_config.get("targeted_test_modules")
+        if isinstance(configured_test_modules, str):
+            configured_test_modules = [
+                item.strip() for item in configured_test_modules.split(",")
+                if item.strip()
+            ]
+        test_modules = list(configured_test_modules or (
+            "tests.vnext.test_existing_vnext_upgrade",
+            "tests.vnext.test_legacy_migration_contract",
+            "tests.release.test_offline_operator_trust",
+            "tests.release.test_current_adoption",
+            "tests.upgrade.test_validation_residue",
+            "tests.database.test_vnext_backup_snapshot",
+            "tests.release.test_immutable_release_publication",
+            "tests.release.test_production_candidate_build",
+            "tests.vnext.test_runtime_config",
+            "tests.release.test_upgrade_manifest",
+        ))
+        if not test_modules:
+            return self._fail(lifecycle, "No targeted test modules configured")
         
         test_results = {}
         for tm in test_modules:
@@ -1830,19 +2301,75 @@ if __name__ == "__main__":
         backup_root=(config.get("upgrade") or {}).get("backup_root")
     )
     mysql_config = config.get("mysql", config)
+    upgrade_config = config.get("upgrade") or {}
+    target_mysql = upgrade_config.get("target_mysql") or config.get("target_mysql")
+    if not isinstance(target_mysql, dict) or not target_mysql.get("database"):
+        print(
+            "Live upgrade requires an explicit disposable upgrade.target_mysql database",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     connection = None
+    target_connection = None
+    target_connection_holder = {}
+    target_connection_factory = None
+    target_preparation_mode = str(
+        upgrade_config.get("target_preparation_mode") or ""
+    ).strip()
+    if target_preparation_mode not in DISPOSABLE_TARGET_MODES:
+        print(
+            "Live upgrade requires an explicit disposable target_preparation_mode",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     try:
         connection = connect_live_database(mysql_config)
+        if target_preparation_mode in (
+                RESTORE_FROM_VERIFIED_BACKUP, EMPTY_NEW_TARGET):
+            def _prepare_target(backup_manifest, source_generation):
+                if source_generation == VNEXT and \
+                        target_preparation_mode != RESTORE_FROM_VERIFIED_BACKUP:
+                    raise RuntimeError(
+                        "Existing-VNext target preparation mode is invalid"
+                    )
+                if source_generation == LEGACY and \
+                        target_preparation_mode != EMPTY_NEW_TARGET:
+                    raise RuntimeError(
+                        "Legacy target preparation mode is invalid"
+                    )
+                if target_preparation_mode == RESTORE_FROM_VERIFIED_BACKUP:
+                    evidence = create_disposable_target_from_backup(
+                        backup_manifest, mysql_config, target_mysql,
+                    )
+                else:
+                    evidence = create_empty_disposable_target(
+                        mysql_config, target_mysql,
+                    )
+                prepared_connection = connect_live_database(target_mysql)
+                target_connection_holder["connection"] = prepared_connection
+                return prepared_connection, evidence
+            target_connection_factory = _prepare_target
+        else:
+            target_connection = connect_live_database(target_mysql)
         success, status = orchestrator.execute_upgrade(
             dry_run=False, mode=args.mode, connection=connection,
             db_config=dict(mysql_config, auth_mode=(config.get("auth") or {}).get("mode", "reverse_proxy")),
             deployment_manifest=args.deployment_manifest, target_release=target,
             runtime_config=config,
+            target_connection=target_connection,
+            target_db_config=dict(target_mysql),
+            target_connection_factory=target_connection_factory,
         )
     except Exception as exc:
         print("Live upgrade connection/orchestration failed: {}".format(exc), file=sys.stderr)
         success, status = False, "LIVE_UPGRADE_FAILED"
     finally:
+        target_to_close = target_connection or target_connection_holder.get("connection")
+        if target_to_close is not None:
+            try:
+                target_to_close.close()
+            except Exception:
+                pass
         if connection is not None:
             try:
                 connection.close()

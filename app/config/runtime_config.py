@@ -90,6 +90,17 @@ def load_application_config(path: Optional[str] = None, base_dir: Optional[str] 
             raise ValueError("runtime config root must be an object")
     result = _merge(defaults, raw_loaded) if configured_path else defaults
     result = _apply_compatibility_aliases(result)
+    candidate_mysql_json = os.environ.get("COVERAGE_CANDIDATE_MYSQL_JSON", "").strip()
+    if candidate_mysql_json:
+        try:
+            candidate_mysql = json.loads(candidate_mysql_json)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("COVERAGE_CANDIDATE_MYSQL_JSON is invalid: {}".format(exc))
+        if not isinstance(candidate_mysql, dict) or not candidate_mysql.get("database"):
+            raise ValueError(
+                "COVERAGE_CANDIDATE_MYSQL_JSON must contain a database object"
+            )
+        result["mysql"] = _merge(result.get("mysql") or {}, candidate_mysql)
     result["_config_metadata"] = {
         "path": configured_path or "",
         "source_config_schema_version": int(

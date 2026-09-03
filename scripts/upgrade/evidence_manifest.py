@@ -509,8 +509,14 @@ class ProductionEvidenceManifest:
             
         # 4. Data Hash Verification
         dhv = self.data.get("data_hash_verification", {})
-        if not dhv.get("verified") or dhv.get("evidence_class") != "production_database":
+        if not dhv.get("verified") or dhv.get("evidence_class") not in (
+                "production_database", "blue_green_database"):
             unmet.append("Data hash verification gate is not verified")
+        if dhv.get("evidence_class") == "blue_green_database":
+            if not dhv.get("source_semantic_hash") or not dhv.get("target_semantic_hash"):
+                unmet.append("Blue/green data hash evidence is missing source/target semantic hashes")
+            if dhv.get("source_semantic_hash") != dhv.get("target_semantic_hash"):
+                unmet.append("Blue/green source and target semantic hashes differ")
             
         # 5. Schema Preflight
         sm = self.data.get("schema_migration", {})

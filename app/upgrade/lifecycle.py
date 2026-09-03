@@ -43,6 +43,8 @@ class UpgradeLifecycle:
         self.api_started = False
         self.serving_api_started = False
         self.current_serving_managed = False
+        self.current_api_stopped = False
+        self.current_api_stop_attempted = False
         self.traffic_opened = False
         self.previous_release = dict(previous_release or {})
 
@@ -50,7 +52,8 @@ class UpgradeLifecycle:
         return dict((self.config.get("upgrade") or {}).get("commands") or {})
 
     def _run_command(self, name: str, clear_control_session: bool = False,
-                     extra_env: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+                     extra_env: Optional[Dict[str, str]] = None,
+                     use_candidate_runtime: bool = True) -> Dict[str, Any]:
         command = self._commands().get(name)
         if not command:
             raise RuntimeError("upgrade lifecycle command '{}' is not configured".format(name))
@@ -76,6 +79,18 @@ class UpgradeLifecycle:
                     "COVERAGE_SERVING_SERVED_ROOT_SHA256",
             ):
                 command_env.pop(key, None)
+        # A child process must never inherit a candidate DB binding by
+        # accident.  Candidate starts opt in below; rollback starts pass
+        # ``use_candidate_runtime=False`` and may explicitly bind the old DB.
+        command_env.pop("COVERAGE_CANDIDATE_MYSQL_JSON", None)
+        if use_candidate_runtime and name in ("start_validation_api", "start_serving_api"):
+            candidate_mysql = ((self.config.get("upgrade") or {}).get(
+                "candidate_runtime_mysql"
+            ) or {})
+            if candidate_mysql:
+                command_env["COVERAGE_CANDIDATE_MYSQL_JSON"] = json.dumps(
+                    candidate_mysql, ensure_ascii=False, sort_keys=True
+                )
         if extra_env:
             command_env.update({str(key): str(value) for key, value in extra_env.items()})
         result = subprocess.run(argv, cwd=self.repo_root, stdout=subprocess.PIPE,
@@ -169,9 +184,11 @@ class UpgradeLifecycle:
     def stop_current_api(self) -> Dict[str, Any]:
         """Stop the stable CURRENT serving process, never the validation API."""
         self.current_serving_managed = self._has_active_current_serving_state()
+        self.current_api_stop_attempted = True
         result = self._run_command("stop_current_api", clear_control_session=True)
         if result["status"] != "PASSED":
             raise RuntimeError("stop_current_api failed")
+        self.current_api_stopped = True
         result["managed_serving_before_stop"] = self.current_serving_managed
         return result
 
@@ -240,6 +257,44 @@ class UpgradeLifecycle:
                 raise RuntimeError("traffic re-freeze failed during rollback")
             self.traffic_opened = False
 
+        # Before the blue/green target has passed, the stable process is still
+        # serving the old database.  A failed backup/target/migration must
+        # preserve that process; starting a second "previous" API here would
+        # create a duplicate owner and would not be a rollback.
+        if not self.current_api_stopped and not self.serving_api_started:
+            if self.current_api_stop_attempted:
+                raise RuntimeError(
+                    "current API stop outcome is unknown; refusing automatic rollback"
+                )
+            if self.active or os.path.isfile(self.marker):
+                if not self._commands().get("open_traffic"):
+                    raise RuntimeError(
+                        "upgrade lifecycle command 'open_traffic' is not configured"
+                    )
+                reopen_result = self._run_command(
+                    "open_traffic", clear_control_session=True,
+                    use_candidate_runtime=False,
+                )
+                results.append(reopen_result)
+                if reopen_result["status"] != "PASSED":
+                    raise RuntimeError("traffic reopen failed while preserving current API")
+                self.traffic_opened = False
+            try:
+                os.remove(self.marker)
+            except FileNotFoundError:
+                pass
+            self.active = False
+            return {
+                "status": "PASSED",
+                "evidence_class": evidence_class,
+                "command": results,
+                "exit_code": 0,
+                "previous_release_verified": False,
+                "current_process_preserved": True,
+                "restore_endpoint": "",
+                "restore_endpoint_key": "",
+            }
+
         restore_managed_serving = self.serving_api_started or self.current_serving_managed
 
         if self.serving_api_started:
@@ -267,8 +322,16 @@ class UpgradeLifecycle:
                 restore_env["COVERAGE_SERVING_RELEASE_SESSION_ID"] = self.previous_release.get(
                     "_published_session_id"
                 )
+            previous_mysql = self.previous_release.get(
+                "_previous_runtime_mysql"
+            ) or self.config.get("mysql") or {}
+            if previous_mysql:
+                restore_env["COVERAGE_CANDIDATE_MYSQL_JSON"] = json.dumps(
+                    previous_mysql, ensure_ascii=False, sort_keys=True
+                )
             previous_result = self._run_command(
-                "start_serving_api", clear_control_session=True, extra_env=restore_env
+                "start_serving_api", clear_control_session=True,
+                extra_env=restore_env, use_candidate_runtime=False,
             )
             previous_result["process_role"] = "production_serving_restored"
         else:

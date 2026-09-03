@@ -28,9 +28,13 @@ from app.candidate_artifact import (
     CANDIDATE_ARTIFACT_MANIFEST_NAME, CandidateArtifactManifest,
     CANDIDATE_BUILD_RECEIPT_NAME,
     PRODUCTION_PROJECT_NAME, PRODUCTION_RELEASE_ARTIFACT_ROLE,
+    OFFLINE_OPERATOR_PROVENANCE_CLASS,
+    RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+    RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+    RELEASE_TRUST_MODES,
     SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS, TRUSTED_CI_PROVENANCE_CLASS,
     served_root_provenance_binding, verify_git_source_provenance,
-    verify_trusted_build_policy,
+    verify_offline_operator_trust, verify_trusted_build_policy,
 )
 from app.candidate_build_receipt import (
     ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
@@ -513,7 +517,8 @@ def _inventory_hash(entries):
 
 def build_release_manifest(release_root, release_identity, session_id,
                            api_contract_version="", candidate_sha="",
-                           published_root=None, candidate_artifact_manifest=None):
+                           published_root=None, candidate_artifact_manifest=None,
+                           release_trust=None):
     """Build and validate the manifest for an already prepared release root."""
     release_root = _real(release_root)
     published_root = _real(published_root or release_root)
@@ -561,6 +566,8 @@ def build_release_manifest(release_root, release_identity, session_id,
         "files": all_files,
         "generated_at": utc_iso(),
     }
+    if release_trust:
+        manifest["release_trust"] = dict(release_trust)
     if candidate_artifact_manifest:
         artifact_role = str(
             candidate_artifact_manifest.get("artifact_role") or ""
@@ -683,6 +690,18 @@ def validate_release_manifest(release_root, manifest=None, expected_session_id="
         violations.append("release-validation session mismatch")
     if int(manifest.get("schema_version") or 0) != RELEASE_MANIFEST_SCHEMA_VERSION:
         violations.append("unsupported release manifest schema")
+    release_trust = manifest.get("release_trust") or {}
+    if release_trust:
+        trust_mode = str(release_trust.get("release_trust_mode") or "").strip()
+        if trust_mode not in RELEASE_TRUST_MODES:
+            violations.append("release trust mode is invalid")
+        elif trust_mode == RELEASE_TRUST_MODE_OFFLINE_OPERATOR:
+            if release_trust.get("protected_builder") != "SKIPPED_BY_OPERATOR" or \
+                    release_trust.get("offline_operator_source_integrity") != "PASSED" or \
+                    release_trust.get("trust_class") != "OFFLINE_OPERATOR":
+                violations.append("offline operator trust evidence is incomplete")
+        elif release_trust.get("protected_builder") not in ("PASSED", "VERIFIED"):
+            violations.append("protected builder trust evidence is incomplete")
     actual_commit = str(manifest.get("commit_sha") or "")
     if not is_valid_commit_sha(actual_commit):
         violations.append("release manifest commit_sha is not exact")
@@ -1130,10 +1149,14 @@ def _verify_trusted_build_workflow(provenance, workflow_identity,
 class ImmutableReleasePublisher(object):
     """Prepare immutable releases and atomically switch/rollback CURRENT."""
 
-    def __init__(self, publish_root):
+    def __init__(self, publish_root, create_root=True):
         self.publish_root = _real(publish_root)
         self.releases_root = os.path.join(self.publish_root, "releases")
         self.current_path = os.path.join(self.publish_root, "CURRENT")
+        if create_root and not os.path.isdir(self.releases_root):
+            os.makedirs(self.releases_root)
+
+    def _ensure_releases_root(self):
         if not os.path.isdir(self.releases_root):
             os.makedirs(self.releases_root)
 
@@ -1147,7 +1170,12 @@ class ImmutableReleasePublisher(object):
                 trusted_build_workflow_sha="", candidate_build_receipt="",
                 candidate_build_attestation_bundle="",
                 candidate_build_attestation_repository="",
-                candidate_build_attestation_workflow=""):
+                candidate_build_attestation_workflow="",
+                release_trust_mode=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+                offline_operator_evidence="", offline_operator_source_bundle="",
+                offline_operator_repository="",
+                production_host="", production_baseline_sha="",
+                validation_session_id=""):
         """Prepare a Candidate produced by a verified trusted CI checkout.
 
         ``source_repo_root`` is deliberately mandatory for this generic
@@ -1168,6 +1196,13 @@ class ImmutableReleasePublisher(object):
             candidate_build_attestation_bundle=candidate_build_attestation_bundle,
             candidate_build_attestation_repository=candidate_build_attestation_repository,
             candidate_build_attestation_workflow=candidate_build_attestation_workflow,
+            release_trust_mode=release_trust_mode,
+            offline_operator_evidence=offline_operator_evidence,
+            offline_operator_source_bundle=offline_operator_source_bundle,
+            offline_operator_repository=offline_operator_repository,
+            production_host=production_host,
+            production_baseline_sha=production_baseline_sha,
+            validation_session_id=validation_session_id,
             allow_bootstrap=False,
         )
 
@@ -1198,6 +1233,11 @@ class ImmutableReleasePublisher(object):
                  candidate_build_attestation_bundle="",
                  candidate_build_attestation_repository="",
                  candidate_build_attestation_workflow="",
+                 release_trust_mode=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+                 offline_operator_evidence="", offline_operator_source_bundle="",
+                 offline_operator_repository="",
+                 production_host="", production_baseline_sha="",
+                 validation_session_id="",
                  allow_bootstrap=False):
         session_id = _validate_session_id(session_id)
         final_root = self.release_path(session_id)
@@ -1222,46 +1262,79 @@ class ImmutableReleasePublisher(object):
             validate_production_candidate_content(source_root)
         provenance = verified_candidate_manifest.get("source_provenance") or {}
         provenance_class = str(provenance.get("provenance_class") or "")
+        trust_evidence = {}
         if allow_bootstrap:
             if provenance_class != SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS:
                 raise ValueError(
                     "bootstrap publisher requires served-root-bootstrap provenance"
                 )
         else:
-            if provenance_class != TRUSTED_CI_PROVENANCE_CLASS:
-                raise ValueError(
-                    "generic publisher accepts trusted-ci-build provenance only"
+            release_trust_mode = str(
+                release_trust_mode or RELEASE_TRUST_MODE_PROTECTED_BUILDER
+            ).strip()
+            if release_trust_mode not in RELEASE_TRUST_MODES:
+                raise ValueError("unsupported release trust mode")
+            if release_trust_mode == RELEASE_TRUST_MODE_OFFLINE_OPERATOR:
+                if provenance_class != OFFLINE_OPERATOR_PROVENANCE_CLASS:
+                    raise ValueError(
+                        "offline operator publication requires offline-operator provenance"
+                    )
+                if not source_repo_root:
+                    raise ValueError(
+                        "source_repo_root is required for offline operator publication"
+                    )
+                trust_evidence = verify_offline_operator_trust(
+                    source_root, release_identity, verified_candidate_manifest,
+                    source_repo_root, evidence_path=offline_operator_evidence,
+                    source_bundle_path=offline_operator_source_bundle,
+                    expected_repository=offline_operator_repository,
+                    expected_production_host=production_host,
+                    expected_production_baseline_sha=production_baseline_sha,
+                    expected_validation_session_id=validation_session_id,
                 )
-            if not source_repo_root:
-                raise ValueError(
-                    "source_repo_root is required for trusted-ci-build publication"
+                served_root_provenance_binding(provenance)
+            else:
+                if provenance_class != TRUSTED_CI_PROVENANCE_CLASS:
+                    raise ValueError(
+                        "generic publisher accepts trusted-ci-build provenance only"
+                    )
+                if not source_repo_root:
+                    raise ValueError(
+                        "source_repo_root is required for trusted-ci-build publication"
+                    )
+                _verify_trusted_build_workflow(
+                    provenance, trusted_build_workflow_identity,
+                    trusted_build_workflow_sha,
                 )
-            _verify_trusted_build_workflow(
-                provenance, trusted_build_workflow_identity,
-                trusted_build_workflow_sha,
-            )
-            verify_git_source_provenance(
-                source_repo_root, release_identity,
-                provenance,
-            )
-            served_root_provenance_binding(provenance)
-            receipt_path = candidate_build_receipt or os.path.join(
-                _real(source_root),
-                str(verified_candidate_manifest.get("receipt_path") or
-                    "candidate_build_receipt.json").replace("/", os.sep),
-            )
-            if not candidate_build_attestation_bundle:
-                raise ValueError(
-                    "candidate_build_attestation_bundle is required for trusted publication"
+                verify_git_source_provenance(
+                    source_repo_root, release_identity,
+                    provenance,
                 )
-            verify_candidate_build_receipt(
-                source_root, release_identity, verified_candidate_manifest,
-                candidate_build_attestation_bundle,
-                receipt_path=receipt_path,
-                attestation_repository=candidate_build_attestation_repository,
-                attestation_workflow=candidate_build_attestation_workflow,
-                attestation_runner_policy=ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
-            )
+                served_root_provenance_binding(provenance)
+                receipt_path = candidate_build_receipt or os.path.join(
+                    _real(source_root),
+                    str(verified_candidate_manifest.get("receipt_path") or
+                        "candidate_build_receipt.json").replace("/", os.sep),
+                )
+                if not candidate_build_attestation_bundle:
+                    raise ValueError(
+                        "candidate_build_attestation_bundle is required for trusted publication"
+                    )
+                verify_candidate_build_receipt(
+                    source_root, release_identity, verified_candidate_manifest,
+                    candidate_build_attestation_bundle,
+                    receipt_path=receipt_path,
+                    attestation_repository=candidate_build_attestation_repository,
+                    attestation_workflow=candidate_build_attestation_workflow,
+                    attestation_runner_policy=ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
+                )
+                trust_evidence = {
+                    "status": "PASSED",
+                    "release_trust_mode": RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+                    "protected_builder": "PASSED",
+                    "trust_class": "PROTECTED_BUILDER",
+                }
+        self._ensure_releases_root()
         staging = tempfile.mkdtemp(prefix=".release-{}-".format(session_id),
                                    dir=self.releases_root)
         try:
@@ -1294,28 +1367,42 @@ class ImmutableReleasePublisher(object):
                         "copied Candidate is not a served-root-bootstrap artifact"
                     )
             else:
-                _verify_trusted_build_workflow(
-                    copied_provenance, trusted_build_workflow_identity,
-                    trusted_build_workflow_sha,
-                )
-                verify_git_source_provenance(
-                    source_repo_root, release_identity,
-                    copied_provenance,
-                )
-                served_root_provenance_binding(copied_provenance)
-                copied_receipt_path = os.path.join(
-                    staging,
-                    str(copied_candidate_manifest.get("receipt_path") or
-                        "candidate_build_receipt.json").replace("/", os.sep),
-                )
-                verify_candidate_build_receipt(
-                    staging, release_identity, copied_candidate_manifest,
-                    candidate_build_attestation_bundle,
-                    receipt_path=copied_receipt_path,
-                    attestation_repository=candidate_build_attestation_repository,
-                    attestation_workflow=candidate_build_attestation_workflow,
-                    attestation_runner_policy=ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
-                )
+                if release_trust_mode == RELEASE_TRUST_MODE_OFFLINE_OPERATOR:
+                    copied_trust = verify_offline_operator_trust(
+                        staging, release_identity, copied_candidate_manifest,
+                        source_repo_root, evidence_path=offline_operator_evidence,
+                        source_bundle_path=offline_operator_source_bundle,
+                        expected_repository=offline_operator_repository,
+                        expected_production_host=production_host,
+                        expected_production_baseline_sha=production_baseline_sha,
+                        expected_validation_session_id=validation_session_id,
+                    )
+                    if copied_trust.get("candidate_tree_sha256") != \
+                            trust_evidence.get("candidate_tree_sha256"):
+                        raise ValueError("copied Candidate offline trust hash changed")
+                else:
+                    _verify_trusted_build_workflow(
+                        copied_provenance, trusted_build_workflow_identity,
+                        trusted_build_workflow_sha,
+                    )
+                    verify_git_source_provenance(
+                        source_repo_root, release_identity,
+                        copied_provenance,
+                    )
+                    served_root_provenance_binding(copied_provenance)
+                    copied_receipt_path = os.path.join(
+                        staging,
+                        str(copied_candidate_manifest.get("receipt_path") or
+                            "candidate_build_receipt.json").replace("/", os.sep),
+                    )
+                    verify_candidate_build_receipt(
+                        staging, release_identity, copied_candidate_manifest,
+                        candidate_build_attestation_bundle,
+                        receipt_path=copied_receipt_path,
+                        attestation_repository=candidate_build_attestation_repository,
+                        attestation_workflow=candidate_build_attestation_workflow,
+                        attestation_runner_policy=ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
+                    )
             if copied_candidate_manifest.get("artifact_sha256") != \
                     verified_candidate_manifest.get("artifact_sha256"):
                 raise ValueError("copied Candidate artifact bytes do not match manifest")
@@ -1327,6 +1414,7 @@ class ImmutableReleasePublisher(object):
                 candidate_sha=candidate_sha,
                 published_root=final_root,
                 candidate_artifact_manifest=verified_candidate_manifest,
+                release_trust=trust_evidence,
             )
             report_manifest = {
                 "schema_version": REPORT_MANIFEST_SCHEMA_VERSION,
@@ -1362,6 +1450,7 @@ class ImmutableReleasePublisher(object):
 
     def switch_current(self, session_id):
         session_id = _validate_session_id(session_id)
+        self._ensure_releases_root()
         target = self.release_path(session_id)
         checked = validate_release_manifest(target, expected_session_id=session_id)
         if checked["status"] != "PASSED":

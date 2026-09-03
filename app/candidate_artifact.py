@@ -15,6 +15,7 @@ import json
 import os
 import re
 import subprocess
+from datetime import datetime
 
 from app.release_identity import build_asset_manifest, is_valid_commit_sha
 from app.time_utils import utc_iso
@@ -29,8 +30,16 @@ CANDIDATE_BUILD_RECEIPT_NAME = "candidate_build_receipt.json"
 PROVENANCE_SCHEMA_VERSION = 1
 TRUSTED_CI_PROVENANCE_CLASS = "trusted-ci-build"
 SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS = "served-root-bootstrap"
+OFFLINE_OPERATOR_PROVENANCE_CLASS = "offline-operator"
 TRUSTED_PROVENANCE_CLASSES = (
     TRUSTED_CI_PROVENANCE_CLASS, SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS,
+    OFFLINE_OPERATOR_PROVENANCE_CLASS,
+)
+RELEASE_TRUST_MODE_PROTECTED_BUILDER = "protected_builder"
+RELEASE_TRUST_MODE_OFFLINE_OPERATOR = "offline_operator"
+RELEASE_TRUST_MODES = (
+    RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+    RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
 )
 VALIDATION_FIXTURE_ARTIFACT_ROLE = "validation_fixture"
 PRODUCTION_RELEASE_ARTIFACT_ROLE = "production_release"
@@ -272,18 +281,31 @@ def _source_provenance(value, require_artifact_sha=False,
         raise ValueError("candidate artifact source provenance is required")
     provenance = dict(value)
     provenance.setdefault("provenance_schema_version", PROVENANCE_SCHEMA_VERSION)
-    provenance.setdefault(
-        "build_workflow_run_id", provenance.get("build_workflow_identity")
-    )
-    provenance.setdefault("build_workflow_run_attempt", "1")
+    provenance_class = str(provenance.get("provenance_class") or "").strip()
+    if provenance_class == OFFLINE_OPERATOR_PROVENANCE_CLASS:
+        # Offline trust is an explicit operator class, not a partially filled
+        # CI receipt.  Supply only a stable local identity; the external
+        # evidence still has to bind the source and Candidate bytes.
+        provenance.setdefault(
+            "build_workflow_identity", OFFLINE_OPERATOR_PROVENANCE_CLASS
+        )
+        provenance.setdefault("build_workflow_run_id", "")
+        provenance.setdefault("build_workflow_run_attempt", "")
+    else:
+        provenance.setdefault(
+            "build_workflow_run_id", provenance.get("build_workflow_identity")
+        )
+        provenance.setdefault("build_workflow_run_attempt", "1")
     provenance.setdefault("build_workflow_sha", "")
     provenance.setdefault(
         "build_input_manifest_sha256", provenance.get("source_manifest_sha256")
     )
     required = (
         "provenance_class", "source_commit_sha", "source_tree_sha",
-        "build_workflow_identity", "source_manifest_sha256",
+        "source_manifest_sha256",
     )
+    if provenance_class != OFFLINE_OPERATOR_PROVENANCE_CLASS:
+        required += ("build_workflow_identity",)
     missing = [key for key in required if provenance.get(key) in (None, "")]
     if missing:
         raise ValueError(
@@ -316,10 +338,18 @@ def _source_provenance(value, require_artifact_sha=False,
                     provenance.get("provenance_class")
                 )
             )
-        required_trusted = (
-            "build_workflow_run_id", "build_workflow_sha",
-            "build_workflow_run_attempt", "build_input_manifest_sha256",
-        )
+        if provenance.get("provenance_class") == OFFLINE_OPERATOR_PROVENANCE_CLASS:
+            # Offline operator trust is deliberately not a disguised GitHub
+            # builder claim.  The external operator evidence binds the
+            # repository/commit/tree, source bundle and Candidate digest; the
+            # local source manifest remains useful integrity input but no CI
+            # workflow/run/attestation fields are required here.
+            required_trusted = ("build_input_manifest_sha256",)
+        else:
+            required_trusted = (
+                "build_workflow_run_id", "build_workflow_sha",
+                "build_workflow_run_attempt", "build_input_manifest_sha256",
+            )
         missing = [key for key in required_trusted
                    if provenance.get(key) in (None, "")]
         if missing:
@@ -327,7 +357,8 @@ def _source_provenance(value, require_artifact_sha=False,
                 "trusted candidate artifact provenance is missing: " +
                 ", ".join(missing)
             )
-        if not is_valid_commit_sha(provenance.get("build_workflow_sha")):
+        if provenance.get("provenance_class") != OFFLINE_OPERATOR_PROVENANCE_CLASS and \
+                not is_valid_commit_sha(provenance.get("build_workflow_sha")):
             raise ValueError("trusted candidate artifact build_workflow_sha is invalid")
         if not _SHA256.fullmatch(str(provenance.get("build_input_manifest_sha256"))):
             raise ValueError(
@@ -398,22 +429,37 @@ def served_root_provenance_binding(provenance):
 
 def build_git_source_provenance(source_repo_root, release_identity,
                                 build_workflow_identity, build_workflow_run_id="",
-                                build_workflow_sha="", build_workflow_run_attempt=""):
+                                build_workflow_sha="", build_workflow_run_attempt="",
+                                provenance_class=""):
     """Capture immutable source checkout provenance for a packaged artifact."""
     source_repo_root = _real(source_repo_root)
     if not os.path.exists(os.path.join(source_repo_root, ".git")):
         raise ValueError("source-repo-root must contain .git metadata")
+    selected_class = str(provenance_class or "").strip()
+    if selected_class and selected_class not in (
+            TRUSTED_CI_PROVENANCE_CLASS, OFFLINE_OPERATOR_PROVENANCE_CLASS):
+        raise ValueError("unsupported Git source provenance class")
     workflow = str(build_workflow_identity or "").strip()
+    if not workflow and selected_class == OFFLINE_OPERATOR_PROVENANCE_CLASS:
+        workflow = OFFLINE_OPERATOR_PROVENANCE_CLASS
     if not workflow:
         raise ValueError("build_workflow_identity is required")
-    workflow_run_id = str(build_workflow_run_id or workflow).strip()
-    workflow_run_attempt = str(build_workflow_run_attempt or "1").strip()
+    workflow_run_id = str(
+        build_workflow_run_id or ("" if selected_class == OFFLINE_OPERATOR_PROVENANCE_CLASS
+                                  else workflow)
+    ).strip()
+    workflow_run_attempt = str(
+        build_workflow_run_attempt or ("" if selected_class == OFFLINE_OPERATOR_PROVENANCE_CLASS
+                                       else "1")
+    ).strip()
     workflow_sha = str(build_workflow_sha or "").strip()
     if workflow_sha and not is_valid_commit_sha(workflow_sha):
         raise ValueError("build_workflow_sha must be an exact commit SHA")
-    if workflow_sha and not _WORKFLOW_RUN_ID.fullmatch(workflow_run_id):
+    if workflow_sha and selected_class != OFFLINE_OPERATOR_PROVENANCE_CLASS and \
+            not _WORKFLOW_RUN_ID.fullmatch(workflow_run_id):
         raise ValueError("build_workflow_run_id must be a positive numeric ID")
-    if workflow_sha and not _WORKFLOW_RUN_ID.fullmatch(workflow_run_attempt):
+    if workflow_sha and selected_class != OFFLINE_OPERATOR_PROVENANCE_CLASS and \
+            not _WORKFLOW_RUN_ID.fullmatch(workflow_run_attempt):
         raise ValueError(
             "build_workflow_run_attempt must be a positive numeric ID"
         )
@@ -452,7 +498,7 @@ def build_git_source_provenance(source_repo_root, release_identity,
     })
     return {
         "provenance_class": (
-            TRUSTED_CI_PROVENANCE_CLASS if workflow_sha else "git-checkout"
+            selected_class or (TRUSTED_CI_PROVENANCE_CLASS if workflow_sha else "git-checkout")
         ),
         "provenance_schema_version": PROVENANCE_SCHEMA_VERSION,
         "source_commit_sha": head,
@@ -477,6 +523,7 @@ def verify_git_source_provenance(source_repo_root, release_identity,
         build_workflow_run_id=expected["build_workflow_run_id"],
         build_workflow_sha=expected["build_workflow_sha"],
         build_workflow_run_attempt=expected["build_workflow_run_attempt"],
+        provenance_class=expected.get("provenance_class") or "",
     )
     for key in (
             "provenance_class", "provenance_schema_version", "source_commit_sha",
@@ -491,6 +538,157 @@ def verify_git_source_provenance(source_repo_root, release_identity,
                 )
             )
     return observed
+
+
+def _offline_evidence_timestamp_is_valid(value):
+    text = str(value or "").strip()
+    if not text:
+        return False
+    candidates = (text, text.rstrip("Z"), text.replace("T", " ").split("+", 1)[0])
+    for candidate in candidates:
+        for fmt in (
+                "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            try:
+                datetime.strptime(candidate, fmt)
+                return True
+            except ValueError:
+                continue
+    return False
+
+
+def _offline_required_hash(value, field, length=64):
+    text = str(value or "").strip().lower()
+    pattern = _SHA256 if length == 64 else _GIT_TREE_SHA
+    if not pattern.fullmatch(text) or text == "0" * length:
+        raise ValueError("offline operator evidence {} is invalid".format(field))
+    return text
+
+
+def verify_offline_operator_trust(
+        candidate_root, release_identity, candidate_manifest,
+        source_repo_root, evidence=None, evidence_path="",
+        source_bundle_path="", expected_repository="",
+        expected_production_host="", expected_production_baseline_sha="",
+        expected_validation_session_id=""):
+    """Verify the explicit, non-GitHub trust contract for an operator build.
+
+    This path is intentionally independent from the protected-builder receipt
+    verifier.  It never upgrades its result to CI trust; the returned evidence
+    records that the protected builder was skipped by an operator.
+    """
+    if evidence is None:
+        if not evidence_path:
+            raise ValueError("offline operator evidence is required")
+        try:
+            with open(_real(evidence_path), "r", encoding="utf-8") as stream:
+                evidence = json.load(stream)
+        except (OSError, ValueError, TypeError) as exc:
+            raise ValueError("offline operator evidence is unreadable: {}".format(exc))
+    if not isinstance(evidence, dict):
+        raise ValueError("offline operator evidence must be a JSON object")
+    declared_mode = str(evidence.get("release_trust_mode") or "").strip()
+    if declared_mode != RELEASE_TRUST_MODE_OFFLINE_OPERATOR:
+        raise ValueError("offline operator evidence is marked as protected_builder")
+    declared_class = str(evidence.get("trust_class") or "").strip()
+    if declared_class != "OFFLINE_OPERATOR":
+        raise ValueError("offline operator evidence has the wrong trust_class")
+    if evidence.get("protected_builder") != "SKIPPED_BY_OPERATOR":
+        raise ValueError("offline operator evidence must mark protected_builder as skipped")
+    if evidence.get("offline_operator_source_integrity") != "PASSED":
+        raise ValueError("offline operator source integrity evidence is incomplete")
+
+    provenance = dict((candidate_manifest or {}).get("source_provenance") or {})
+    if provenance.get("provenance_class") != OFFLINE_OPERATOR_PROVENANCE_CLASS:
+        raise ValueError("offline operator publication requires offline-operator provenance")
+    observed_source = verify_git_source_provenance(
+        source_repo_root, release_identity, provenance
+    )
+    repository = str(evidence.get("repository") or "").strip()
+    if not repository:
+        raise ValueError("offline operator evidence repository is required")
+    if expected_repository and repository != str(expected_repository).strip():
+        raise ValueError("offline operator repository does not match policy")
+    commit_sha = _offline_required_hash(evidence.get("commit_sha"), "commit_sha", length=40)
+    tree_sha = _offline_required_hash(evidence.get("tree_sha"), "tree_sha", length=40)
+    if commit_sha != str(release_identity.get("commit_sha") or "").lower():
+        raise ValueError("offline operator commit_sha does not match release identity")
+    if commit_sha != str(observed_source.get("source_commit_sha") or "").lower():
+        raise ValueError("offline operator commit_sha does not match source checkout")
+    if tree_sha != str(observed_source.get("source_tree_sha") or "").lower():
+        raise ValueError("offline operator tree_sha does not match source checkout")
+
+    declared_bundle = str(evidence.get("source_bundle_path") or "").strip()
+    expected_bundle = str(source_bundle_path or "").strip()
+    if expected_bundle:
+        expected_bundle = _real(expected_bundle)
+        if declared_bundle and _real(declared_bundle) != expected_bundle:
+            raise ValueError(
+                "offline operator source bundle path does not match policy"
+            )
+        bundle = expected_bundle
+    else:
+        bundle = declared_bundle
+    if not bundle:
+        raise ValueError("offline operator source_bundle_path is required")
+    bundle = _real(bundle)
+    if not os.path.isfile(bundle) or os.path.islink(bundle):
+        raise ValueError("offline operator source bundle must be a regular file")
+    bundle_sha = _offline_required_hash(
+        evidence.get("source_bundle_sha256"), "source_bundle_sha256"
+    )
+    observed_bundle_sha = _sha256(bundle)
+    if observed_bundle_sha.lower() != bundle_sha:
+        raise ValueError("offline operator source bundle SHA256 mismatch")
+
+    candidate_sha = _offline_required_hash(
+        evidence.get("candidate_tree_sha256"), "candidate_tree_sha256"
+    )
+    manifest_sha = str(
+        (candidate_manifest or {}).get("artifact_sha256") or
+        (candidate_manifest or {}).get("candidate_artifact_sha256") or ""
+    ).lower()
+    if candidate_sha != manifest_sha:
+        raise ValueError("offline operator candidate content SHA256 mismatch")
+
+    production_host = str(evidence.get("production_host") or "").strip()
+    if not production_host:
+        raise ValueError("offline operator production_host is required")
+    if expected_production_host and production_host != str(expected_production_host).strip():
+        raise ValueError("offline operator production host does not match policy")
+    baseline_sha = _offline_required_hash(
+        evidence.get("production_baseline_sha"), "production_baseline_sha", length=40
+    )
+    if expected_production_baseline_sha and baseline_sha != \
+            str(expected_production_baseline_sha).strip().lower():
+        raise ValueError("offline operator production baseline SHA mismatch")
+    session_id = str(evidence.get("validation_session_id") or "").strip()
+    if not session_id:
+        raise ValueError("offline operator validation_session_id is required")
+    if expected_validation_session_id and session_id != \
+            str(expected_validation_session_id).strip():
+        raise ValueError("offline operator validation session mismatch")
+    if not _offline_evidence_timestamp_is_valid(evidence.get("build_timestamp")):
+        raise ValueError("offline operator build_timestamp is invalid")
+    return {
+        "status": "PASSED",
+        "release_trust_mode": RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+        "protected_builder": "SKIPPED_BY_OPERATOR",
+        "offline_operator_source_integrity": "PASSED",
+        "trust_class": "OFFLINE_OPERATOR",
+        "repository": repository,
+        "commit_sha": commit_sha,
+        "tree_sha": tree_sha,
+        "source_commit_sha": commit_sha,
+        "source_tree_sha": tree_sha,
+        "source_bundle_path": bundle,
+        "source_bundle_sha256": observed_bundle_sha,
+        "candidate_tree_sha256": candidate_sha,
+        "production_host": production_host,
+        "production_baseline_sha": baseline_sha,
+        "build_timestamp": str(evidence.get("build_timestamp")),
+        "validation_session_id": session_id,
+    }
 
 
 def _verify_checkout_head(candidate_root, commit_sha):
