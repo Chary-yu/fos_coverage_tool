@@ -6,6 +6,7 @@ import unittest
 import zipfile
 
 from app.bootstrap import VNextRuntime
+from app.api.auth import AUTH_MUTATION_PROBE_PATH
 from app.code_detail.sidecar_store import SidecarStore
 from app.services.analysis_service import AnalysisService
 from app.services.export_service import ExportService
@@ -111,6 +112,36 @@ class VNextApiExportSecurityTest(unittest.TestCase):
             headers=headers, remote_address="10.0.0.5",
         )
         self.assertEqual(status, 503)
+
+    def test_auth_mutation_probe_requires_identity_and_never_writes_database(self):
+        runtime = self._runtime({
+            "mode": "reverse_proxy",
+            "trusted_proxy_addresses": ["10.0.0.5"],
+            "user_header": "X-Remote-User",
+        })
+        app = runtime.application()
+        before = self.connection.execute(
+            "SELECT COUNT(*) FROM coverage_projects"
+        ).fetchone()[0]
+        status, _payload = app.dispatch(
+            "POST", AUTH_MUTATION_PROBE_PATH,
+            remote_address="10.0.0.5",
+        )
+        self.assertEqual(status, 401)
+        status, payload = app.dispatch(
+            "POST", AUTH_MUTATION_PROBE_PATH,
+            headers={"X-Remote-User": "alice"},
+            remote_address="10.0.0.5",
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["mutation_probe"])
+        self.assertEqual(payload["probe_path"], AUTH_MUTATION_PROBE_PATH)
+        self.assertEqual(payload["authenticated_user"], "alice")
+        self.assertFalse(payload["database_mutation"])
+        after = self.connection.execute(
+            "SELECT COUNT(*) FROM coverage_projects"
+        ).fetchone()[0]
+        self.assertEqual(after, before)
 
     def test_non_loopback_bind_protects_data_reads(self):
         runtime = self._runtime({

@@ -159,14 +159,17 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
                 },
             }, stream)
         with open(nginx, "w", encoding="utf-8") as stream:
+            auth_lines = "" if flat else (
+                "  auth_basic Coverage;\n"
+                "  auth_basic_user_file /etc/nginx/.coverage_htpasswd;\n"
+                "  proxy_set_header X-Remote-User $remote_user;\n"
+            )
             stream.write(
                 "location /coverage/ {{\n"
                 "  alias {}/;\n"
                 "  proxy_pass http://127.0.0.1:9528;\n"
-                "  auth_basic Coverage;\n"
-                "  auth_basic_user_file /etc/nginx/.coverage_htpasswd;\n"
-                "  proxy_set_header X-Remote-User $remote_user;\n"
-                "}}\n".format(current_reports)
+                "{}"
+                "}}\n".format(current_reports, auth_lines)
             )
         if flat:
             os.remove(environment)
@@ -329,24 +332,83 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Nginx alias"):
             VfoswindProductionLifecycle(publish, config).preflight()
 
-    def test_missing_identity_bridge_fails_closed_before_flat_bootstrap(self):
+    def test_flat_bootstrap_accepts_legacy_without_identity_bridge_and_stages_one(self):
         _root, publish, config, _environment = self._fixture(flat=True)
-        with open(config["nginx_config_path"], "w", encoding="utf-8") as stream:
+        adapter = VfoswindProductionLifecycle(
+            publish, config,
+            command_runner=lambda argv: CompletedProcess(argv, 0, b"", b""),
+        )
+        preflight = adapter.preflight(
+            expected_database="coverage_vnext_old",
+            runtime_mysql={
+                "database": "coverage_vnext_old",
+                "user": "coverage_user",
+            },
+            candidate_ports=[19528],
+        )
+        self.assertEqual(preflight["legacy_nginx_baseline"]["status"], "PASSED")
+        self.assertFalse(preflight["legacy_nginx_baseline"]["auth_bridge_present"])
+        self.assertEqual(preflight["auth_bridge"]["status"], "PASSED")
+        self.assertIn(
+            "proxy_set_header X-Remote-User $remote_user;",
+            adapter.bootstrap_plan["managed_nginx"],
+        )
+        self.assertIn("auth_basic Coverage;", adapter.bootstrap_plan["managed_nginx"])
+
+    def test_flat_bootstrap_with_candidate_gateway_does_not_require_legacy_auth(self):
+        root, publish, config, _environment = self._fixture(flat=True)
+        gateway_path = os.path.join(root.name, "candidate-gateway.conf")
+        gateway_reports = os.path.join(publish, "VALIDATION_CURRENT", "reports")
+        browser_url = "https://candidate.example.invalid/coverage/report.html"
+        with open(gateway_path, "w", encoding="utf-8") as stream:
             stream.write(
-                "location /coverage/ {{\n"
-                "  alias {}/;\n"
-                "  proxy_pass http://127.0.0.1:9528;\n"
-                "}}\n".format(config["legacy_served_root"])
+                "server {{\n"
+                "  location /coverage/ {{\n"
+                "    alias {}/;\n"
+                "    try_files $uri $uri/ =404;\n"
+                "  }}\n"
+                "  location /api/coverage {{\n"
+                "    auth_basic Coverage;\n"
+                "    auth_basic_user_file /etc/nginx/.coverage_htpasswd;\n"
+                "    proxy_pass http://127.0.0.1:19528;\n"
+                "    proxy_set_header X-Remote-User $remote_user;\n"
+                "  }}\n"
+                "}}\n".format(gateway_reports)
             )
-        with self.assertRaisesRegex(RuntimeError, "auth_(basic|request)"):
-            VfoswindProductionLifecycle(publish, config).preflight(
-                expected_database="coverage_vnext_old",
-                runtime_mysql={
-                    "database": "coverage_vnext_old",
-                    "user": "coverage_user",
-                },
-                candidate_ports=[19528],
-            )
+        config["candidate_gateway"] = {
+            "config_path": gateway_path,
+            "browser_url": browser_url,
+            "static_location": "/coverage/",
+            "api_location": "/api/coverage",
+            "reports_root": gateway_reports,
+            "proxy_pass": "http://127.0.0.1:19528",
+        }
+        with open(config["nginx_config_path"], encoding="utf-8") as stream:
+            legacy_nginx = stream.read()
+        self.assertNotIn("auth_basic", legacy_nginx)
+        adapter = VfoswindProductionLifecycle(
+            publish, config,
+            command_runner=lambda argv: CompletedProcess(argv, 0, b"", b""),
+        )
+        preflight = adapter.preflight(
+            expected_database="coverage_vnext_old",
+            runtime_mysql={
+                "database": "coverage_vnext_old",
+                "user": "coverage_user",
+            },
+            candidate_ports=[19528],
+            candidate_gateway_required=True,
+            candidate_browser_url=browser_url,
+            auth_config={
+                "mode": "reverse_proxy",
+                "user_header": "X-Remote-User",
+                "trusted_proxy_addresses": ["127.0.0.1"],
+            },
+        )
+        self.assertEqual(preflight["status"], "PASSED")
+        self.assertEqual(preflight["candidate_gateway"]["status"], "PASSED")
+        self.assertFalse(preflight["legacy_nginx_baseline"]["auth_bridge_present"])
+        self.assertEqual(preflight["auth_bridge"]["status"], "PASSED")
 
     def test_identity_bridge_in_static_location_does_not_protect_api_location(self):
         _root, publish, config, _environment = self._fixture()
@@ -525,6 +587,10 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
             nginx = stream.read()
         self.assertIn("WorkingDirectory={}/CURRENT/app".format(publish), unit)
         self.assertIn("alias {}/CURRENT/reports/;".format(publish), nginx)
+        self.assertIn("auth_basic Coverage;", nginx)
+        self.assertIn(
+            "proxy_set_header X-Remote-User $remote_user;", nginx
+        )
         restored = adapter.restore_previous_release_bindings()
         self.assertEqual(restored["status"], "PASSED")
         self.assertEqual(

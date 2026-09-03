@@ -12,7 +12,7 @@ try:
 except ImportError:  # pragma: no cover - unavailable on some platforms
     resource = None
 
-from app.api.auth import MutationAuthorizer
+from app.api.auth import AUTH_MUTATION_PROBE_PATH, MutationAuthorizer
 from app.api.router import Router
 from app.api.serialization import to_jsonable
 from app.api.endpoints import analysis as analysis_endpoint
@@ -66,6 +66,10 @@ class VNextApplication(object):
         self.router.add("GET", r"^/api/coverage/health$", self.health)
         self.router.add("GET", r"^/api/coverage/metrics$", self.metrics)
         self.router.add("GET", r"^/api/coverage/release$", self.release)
+        self.router.add(
+            "POST", r"^/api/coverage/auth/mutation-probe$",
+            self.auth_mutation_probe,
+        )
         self.router.add("GET", r"^/api/coverage/projects$", self.projects)
         self.router.add("GET", r"^/api/coverage/projects/([^/]+)/scans$", self.scans)
         self.router.add("GET", r"^/api/coverage/scans/([^/]+)/inheritance/pending$", self.inheritance_pending)
@@ -213,6 +217,23 @@ class VNextApplication(object):
 
     def release(self, query, body, headers, remote_address):
         return 200, release_endpoint.payload(self)
+
+    def auth_mutation_probe(self, query, body, headers, remote_address):
+        """Prove auth-to-backend identity without opening a write transaction.
+
+        This endpoint is intentionally a POST-shaped control so the external
+        Candidate Gateway exercises the same MutationAuthorizer path as a
+        real mutation.  It must never call a repository or acquire a write
+        connection; the response contract is the only observable effect.
+        """
+        del query, body
+        identity = self._require_mutation(headers, remote_address)
+        return 200, {
+            "mutation_probe": True,
+            "probe_path": AUTH_MUTATION_PROBE_PATH,
+            "authenticated_user": identity,
+            "database_mutation": False,
+        }
 
     def routes(self, query, body, headers, remote_address):
         self._require_operator(headers, remote_address)

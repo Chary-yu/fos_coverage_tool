@@ -37,6 +37,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from app.release_identity import is_valid_commit_sha, verify_release_identity
+from app.api.auth import AUTH_MUTATION_PROBE_PATH
 from app.release_publication import (
     ImmutableReleasePublisher, PRODUCTION_PROJECT_NAME,
     PRODUCTION_RELEASE_ARTIFACT_ROLE, current_served_root_binding,
@@ -796,6 +797,24 @@ def _validate_candidate_authenticated_mutation_evidence(
         errors.append("Candidate authenticated mutation probe is missing")
     if mutation.get("status") != "PASSED":
         errors.append("Candidate authenticated mutation probe is not PASSED")
+    if mutation.get("method") != "POST" or \
+            mutation.get("endpoint") != AUTH_MUTATION_PROBE_PATH:
+        errors.append(
+            "Candidate authenticated mutation must use the dedicated zero-write probe endpoint"
+        )
+    if mutation.get("probe_contract_observed") is not True:
+        errors.append(
+            "Candidate authenticated mutation probe contract was not observed by the backend"
+        )
+    if mutation.get("backend_identity_observed") is not True or \
+            mutation.get("authenticated_user_present") is not True:
+        errors.append(
+            "Candidate authenticated mutation probe did not observe a non-empty backend identity"
+        )
+    if mutation.get("database_mutation") is not False:
+        errors.append(
+            "Candidate authenticated mutation probe must prove zero database mutation"
+        )
     status_code = mutation.get("authenticated_status_code")
     if type(status_code) is not int or status_code < 200 or status_code >= 300:
         errors.append("Candidate authenticated mutation did not return a successful HTTP status")
@@ -816,6 +835,12 @@ def _validate_candidate_authenticated_mutation_evidence(
     errors.extend(_validate_candidate_gateway_endpoint(
         mutation_url, candidate_url, "Candidate authenticated mutation mutation_url"
     ))
+    mutation_parsed = urlparse(str(mutation_url or "").strip())
+    if mutation_parsed.path != AUTH_MUTATION_PROBE_PATH or \
+            mutation_parsed.query or mutation_parsed.fragment:
+        errors.append(
+            "Candidate authenticated mutation mutation_url must exactly use the dedicated zero-write probe endpoint"
+        )
 
     if not path or not os.path.isfile(path):
         errors.append("Candidate authenticated mutation evidence artifact is missing")

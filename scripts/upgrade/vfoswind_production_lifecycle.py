@@ -9,8 +9,9 @@ the immutable ``CURRENT`` switch:
 * Nginx must serve ``publish_root/CURRENT/reports``;
 * the separately loaded Candidate Gateway must serve
   ``publish_root/VALIDATION_CURRENT/reports`` and proxy the isolated API;
-* the production and Candidate Nginx configs must contain an explicit
-  authentication boundary and trusted ``X-Remote-User`` bridge;
+* the managed production and Candidate Nginx configs must contain an explicit
+  authentication boundary and trusted ``X-Remote-User`` bridge (the legacy
+  Flat file is observed as-is during first adoption);
 * the persistent EnvironmentFile must bind the serving process to the
   selected database;
 * daemon-reload, service restart, ``nginx -t``, and Nginx reload are explicit
@@ -396,10 +397,11 @@ class VfoswindProductionLifecycle(object):
             raise RuntimeError(
                 "production auth_bridge.auth_source is required for auth_request/external_sso"
             )
-        if mode == "basic_auth" and source and not source.startswith("/"):
-            raise RuntimeError(
-                "production basic_auth auth_source must be an absolute htpasswd path"
-            )
+        if mode == "basic_auth":
+            if not source or not source.startswith("/"):
+                raise RuntimeError(
+                    "production basic_auth auth_source must be an absolute htpasswd path"
+                )
         return {
             "mode": mode,
             "user_header": user_header,
@@ -409,11 +411,11 @@ class VfoswindProductionLifecycle(object):
         }
 
     @staticmethod
-    def _location_block(text, location):
-        """Return one exact Nginx location block, including nested braces."""
+    def _location_span(text, location):
+        """Return the byte offsets of one exact Nginx location block."""
         location = str(location or "").strip()
         if not location:
-            return str(text or "")
+            return 0, len(str(text or ""))
         content = str(text or "")
         match = re.search(
             r"(?m)^[ \t]*location[ \t]+(?:=[ \t]*)?{}[ \t]*\{{".format(
@@ -446,13 +448,96 @@ class VfoswindProductionLifecycle(object):
             elif character == "}":
                 depth -= 1
                 if depth == 0:
-                    return content[match.start():index + 1]
+                    return match.start(), index + 1
         raise RuntimeError(
             "Nginx API location {} has unbalanced braces".format(location)
         )
 
+    @classmethod
+    def _location_block(cls, text, location):
+        """Return one exact Nginx location block, including nested braces."""
+        start, end = cls._location_span(text, location)
+        return str(text or "")[start:end]
+
     def _api_location(self):
         return str(self.config.get("api_location") or "/api/coverage").strip()
+
+    def _render_auth_bridge(self, text, label, location=""):
+        """Render the configured auth bridge into a disposable Nginx binding.
+
+        A legacy Flat config is allowed to have no identity bridge because it
+        is the currently serving configuration.  The managed configuration
+        written at cutover is different: it must contain the complete,
+        operator-selected authentication boundary.  Render that boundary
+        into the staged bytes before nginx -t, so the live Flat file remains
+        untouched until Phase D.
+        """
+        bridge = self._auth_bridge_config()
+        content = str(text or "")
+        start, end = self._location_span(content, location)
+        block = content[start:end]
+        header = re.escape(bridge["user_header"])
+        # Remove only directives owned by this contract.  Existing unrelated
+        # proxy headers and location directives remain byte-for-byte intact.
+        for pattern in (
+                r"(?mi)^[ \t]*auth_basic[ \t]+[^;]+;[ \t]*(?:\n|$)",
+                r"(?mi)^[ \t]*auth_basic_user_file[ \t]+[^;]+;[ \t]*(?:\n|$)",
+                r"(?mi)^[ \t]*auth_request[ \t]+[^;]+;[ \t]*(?:\n|$)",
+                r"(?mi)^[ \t]*proxy_set_header[ \t]+{}[ \t]+[^;]+;[ \t]*(?:\n|$)".format(
+                    header
+                ),
+        ):
+            block = re.sub(pattern, "", block)
+        if bridge["auth_directive"] == "auth_basic":
+            auth_lines = [
+                "auth_basic Coverage;",
+                "auth_basic_user_file {};".format(bridge["auth_source"]),
+            ]
+        else:
+            auth_lines = [
+                "auth_request {};".format(bridge["auth_source"]),
+            ]
+        auth_lines.append(
+            "proxy_set_header {} {};".format(
+                bridge["user_header"], bridge["identity_expression"]
+            )
+        )
+        opening = block.find("{")
+        if opening < 0:
+            raise RuntimeError("{} Nginx location has no opening brace".format(label))
+        insertion = "\n" + "\n".join(
+            "  {}".format(line) for line in auth_lines
+        ) + "\n"
+        block = block[:opening + 1] + insertion + block[opening + 1:]
+        return content[:start] + block + content[end:]
+
+    def _validate_flat_legacy_nginx_baseline(
+            self, text, legacy_served_root, expected_proxy=""):
+        """Validate only the currently served Flat binding.
+
+        The old production file is an observation point, not the managed
+        target.  In particular, it is valid for it to lack the new auth
+        bridge; requiring that bridge here would make the first adoption
+        impossible and would invite an out-of-band production edit.
+        """
+        if not self._contains_alias(text, legacy_served_root):
+            raise RuntimeError(
+                "legacy Nginx alias is not bound to the recorded Flat reports root"
+            )
+        expected_proxy = str(expected_proxy or "").strip()
+        if expected_proxy and expected_proxy not in str(text or ""):
+            raise RuntimeError(
+                "legacy Nginx proxy_pass does not match the production binding"
+            )
+        self._location_block(text, self._api_location())
+        return {
+            "status": "PASSED",
+            "auth_bridge_required": False,
+            "auth_bridge_present": False,
+            "read_only": True,
+            "command": "validate legacy Flat alias/proxy/API binding only",
+            "exit_code": 0,
+        }
 
     def _validate_auth_bridge(self, text, label, location=""):
         """Validate the actual Nginx identity boundary, not config metadata."""
@@ -982,7 +1067,11 @@ class VfoswindProductionLifecycle(object):
                 managed_nginx, self.current_reports):
             raise RuntimeError("Flat bootstrap could not render the managed Nginx CURRENT alias")
         managed_auth_bridge = None
-        if self.config.get("auth_bridge") or self.config.get("candidate_gateway"):
+        if auth_config or self.config.get("auth_bridge") or self.config.get(
+                "candidate_gateway"):
+            managed_nginx = self._render_auth_bridge(
+                managed_nginx, "managed production", self._api_location()
+            )
             managed_auth_bridge = self._validate_auth_bridge(
                 managed_nginx, "managed production", self._api_location()
             )
@@ -1108,20 +1197,18 @@ class VfoswindProductionLifecycle(object):
         self._validate_legacy_runtime_unit(unit_text, legacy_application_root)
         nginx_path = self._legacy_nginx_path()
         nginx_text = self._read_file(nginx_path, "legacy_nginx_config")
-        if not self._contains_alias(nginx_text, legacy_served_root):
-            raise RuntimeError("legacy Nginx alias is not bound to the recorded Flat reports root")
-        legacy_auth_bridge = None
+        expected_proxy = str(self.config.get("nginx_proxy_pass") or "").strip()
+        legacy_baseline = self._validate_flat_legacy_nginx_baseline(
+            nginx_text, legacy_served_root, expected_proxy=expected_proxy
+        )
         if candidate_gateway_required or self.config.get("auth_bridge"):
             if candidate_gateway_required and not auth_config:
                 raise RuntimeError(
                     "production Candidate runtime auth config is required"
                 )
-            legacy_auth_bridge = self._validate_auth_bridge(
-                nginx_text, "legacy production", self._api_location()
-            )
-        expected_proxy = str(self.config.get("nginx_proxy_pass") or "").strip()
-        if expected_proxy and expected_proxy not in nginx_text:
-            raise RuntimeError("legacy Nginx proxy_pass does not match the production binding")
+            # The selected bridge is rendered and validated against the
+            # managed staged config in _build_flat_bootstrap_plan.  The old
+            # Flat config is deliberately not required to have it yet.
 
         runtime = _runtime_mysql_config(runtime_mysql)
         if expected_database and runtime.get("database", "").lower() != str(
@@ -1166,7 +1253,7 @@ class VfoswindProductionLifecycle(object):
         plan["runtime_application_user"] = runtime.get("user", "")
         plan["application"] = application_evidence
         plan["runtime_auth"] = self._validate_runtime_auth_config(auth_config)
-        plan["legacy_auth_bridge"] = legacy_auth_bridge or {}
+        plan["legacy_nginx_baseline"] = legacy_baseline
         plan["candidate_gateway"] = candidate_gateway or {}
         plan["read_only"] = True
         plan["command"] = "read legacy vfoswind bindings + render managed bootstrap + static checks"
@@ -1199,7 +1286,12 @@ class VfoswindProductionLifecycle(object):
             "rollback_bytes_verified": plan["rollback_bytes_verified"],
             "systemd_analyze": systemd_check,
             "nginx_test": nginx_check,
-            "auth_bridge": legacy_auth_bridge or {},
+            # ``auth_bridge`` describes the staged managed target.  The old
+            # Flat baseline is reported separately because it may not yet
+            # contain the bridge that will be installed at cutover.
+            "auth_bridge": plan.get("managed_auth_bridge") or {},
+            "legacy_nginx_baseline": legacy_baseline,
+            "legacy_auth_bridge": legacy_baseline,
             "runtime_auth": plan["runtime_auth"],
             "candidate_gateway": candidate_gateway or {},
             "read_only": True,

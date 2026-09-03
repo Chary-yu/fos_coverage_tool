@@ -14,16 +14,27 @@ import hashlib
 import platform
 import socket
 from typing import Dict, Any, List, Tuple, Optional
+try:
+    from urllib.parse import urlparse
+except ImportError:  # pragma: no cover - Python 2 compatibility
+    from urlparse import urlparse
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from app.api.auth import AUTH_MUTATION_PROBE_PATH
 from app.time_utils import utc_iso
 
 
 def get_utc_iso():
     return utc_iso()
+
+
+def _is_exact_auth_probe_url(value):
+    parsed = urlparse(str(value or "").strip())
+    return parsed.path == AUTH_MUTATION_PROBE_PATH and not parsed.query and \
+        not parsed.fragment
 
 MANIFEST_FILENAME = "production_evidence_manifest.json"
 _SUCCESS_STATUS = "UPGRADE_" + "SUCCESS"
@@ -651,6 +662,12 @@ class ProductionEvidenceManifest:
                     auth_probe.get("real_http") is not True or \
                     auth_probe.get("identity_propagated") is not True or \
                     mutation.get("status") != "PASSED" or \
+                    mutation.get("method") != "POST" or \
+                    mutation.get("endpoint") != AUTH_MUTATION_PROBE_PATH or \
+                    mutation.get("probe_contract_observed") is not True or \
+                    mutation.get("backend_identity_observed") is not True or \
+                    mutation.get("authenticated_user_present") is not True or \
+                    mutation.get("database_mutation") is not False or \
                     type(mutation.get("authenticated_status_code")) is not int or \
                     not 200 <= mutation.get("authenticated_status_code") < 300 or \
                     mutation.get("unauthenticated_status_code") not in (401, 403):
@@ -673,6 +690,10 @@ class ProductionEvidenceManifest:
                     "candidate_url"):
                 unmet.append(
                     "Candidate authenticated mutation URL is not exact to browser evidence"
+                )
+            if not _is_exact_auth_probe_url(auth_probe.get("mutation_url")):
+                unmet.append(
+                    "Candidate authenticated mutation URL is not the dedicated zero-write probe endpoint"
                 )
             if (
                     str(auth_probe.get("auth_mode") or "").strip().lower() !=
@@ -973,7 +994,13 @@ class ProductionEvidenceManifest:
                     auth_probe.get("synthetic") is not False or \
                     auth_probe.get("real_http") is not True or \
                     auth_probe.get("identity_propagated") is not True or \
-                    mutation.get("status") != "PASSED":
+                    mutation.get("status") != "PASSED" or \
+                    mutation.get("method") != "POST" or \
+                    mutation.get("endpoint") != AUTH_MUTATION_PROBE_PATH or \
+                    mutation.get("probe_contract_observed") is not True or \
+                    mutation.get("backend_identity_observed") is not True or \
+                    mutation.get("authenticated_user_present") is not True or \
+                    mutation.get("database_mutation") is not False:
                 unmet.append(
                     "candidate authenticated mutation evidence is not PASSED"
                 )
@@ -996,6 +1023,10 @@ class ProductionEvidenceManifest:
             if not auth_probe.get("user_header"):
                 unmet.append(
                     "candidate authenticated mutation user header is missing"
+                )
+            if not _is_exact_auth_probe_url(auth_probe.get("mutation_url")):
+                unmet.append(
+                    "candidate authenticated mutation URL is not the dedicated zero-write probe endpoint"
                 )
             if auth_probe.get("gateway_config_sha256") != gateway.get(
                     "config_sha256"

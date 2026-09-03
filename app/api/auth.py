@@ -6,6 +6,7 @@ from app.upgrade.lifecycle import writes_are_frozen
 
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+AUTH_MUTATION_PROBE_PATH = "/api/coverage/auth/mutation-probe"
 
 
 def _public_bind(config):

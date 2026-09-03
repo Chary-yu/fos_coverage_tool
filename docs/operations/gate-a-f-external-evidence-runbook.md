@@ -191,17 +191,19 @@ Candidate validation port；`VALIDATION_CURRENT` 由升级器在 Phase B 原子�
 本次 immutable release，并在 validation teardown 时恢复。生产 `CURRENT` 不在
 这一步改变。
 
-Candidate Gateway 和正式 production Nginx 都必须配置真实的认证边界
+Candidate Gateway 和即将写入的 managed production Nginx 都必须配置真实的认证边界
 （`auth_request` 或明确选择的 `auth_basic`），再通过可信 Nginx 变量转发
 `X-Remote-User`。禁止写死用户，也禁止把客户端提交的同名 header 原样转发。
+首次 Flat 接管时，现有旧 Nginx 只作为只读 alias/proxy 基线；它可以暂时没有
+身份桥。升级器会在临时 staged managed 配置中生成并执行 `nginx -t`，不会在
+进入 Phase D 前修改旧配置。
 在 PRE_CUTOVER_READY 前另行执行：
 
 ```bash
 python scripts/diagnostics/candidate_authenticated_mutation_probe.py \
   --candidate-url 'https://<candidate-host>/coverage/coverage_candidate.gcov.html' \
   --release-url 'https://<candidate-host>/api/coverage/release' \
-  --mutation-url 'https://<candidate-host>/api/coverage/projects' \
-  --mutation-body-file /secure/evidence/gate-e/mutation-body.json \
+  --mutation-url 'https://<candidate-host>/api/coverage/auth/mutation-probe' \
   --expected-revision "$CANDIDATE_COMMIT_SHA" \
   --release-validation-session-id "$RELEASE_VALIDATION_SESSION_ID" \
   --candidate-artifact-sha256 "$CANDIDATE_ARTIFACT_SHA256" \
@@ -212,9 +214,12 @@ python scripts/diagnostics/candidate_authenticated_mutation_probe.py \
   --output /secure/evidence/gate-e/auth-mutation.json
 ```
 
-该探针必须同时得到未认证 mutation 的 401/403 和认证 mutation 的 2xx；证据
-只保存 header 名，不保存凭据。升级器会 exact 校验 revision、attempt、发布
-hash、Gateway 配置 hash 和 `reverse_proxy` 身份桥，缺失即不进入 Phase D。
+该探针必须同时得到未认证 mutation probe 的 401/403 和认证 probe 的 2xx，
+并且认证响应必须回显非空后端身份、声明 `database_mutation=false`。探针只
+保存 header 名，不保存凭据，也不会调用项目/扫描写入 API。`mutation_url`
+必须精确为 `/api/coverage/auth/mutation-probe`；升级器会 exact 校验 revision、
+attempt、发布 hash、Gateway 配置 hash 和 `reverse_proxy` 身份桥，缺失即不
+进入 Phase D。
 
 生产配置中的 `auth_bridge` 只是契约，不会替操作员选择认证产品，也不会把
 `X-Remote-User` 写死为某个用户。必须明确选择 `basic_auth`、`auth_request` 或

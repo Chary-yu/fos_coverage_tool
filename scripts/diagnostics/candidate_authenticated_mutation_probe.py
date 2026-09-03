@@ -2,9 +2,11 @@
 
 This probe is intentionally operator-run.  It never stores credential/header
 values in the evidence envelope.  The positive request is sent through the
-external Candidate Gateway and the same mutation is first sent without the
-credentials; a 401/403 negative control plus a successful positive request is
-the minimum evidence consumed by the production upgrade controller.
+external Candidate Gateway to the dedicated, zero-write mutation probe
+endpoint; the same endpoint is first sent without credentials.  A 401/403
+negative control plus a successful positive response that echoes a backend
+identity is the minimum evidence consumed by the production upgrade
+controller.
 """
 
 from __future__ import print_function
@@ -30,6 +32,7 @@ if ROOT not in sys.path:
 
 from app.release_identity import is_valid_commit_sha
 from app.time_utils import utc_iso
+from app.api.auth import AUTH_MUTATION_PROBE_PATH
 
 
 def _parse_headers(values):
@@ -82,6 +85,19 @@ def _endpoint_errors(value, candidate_url, label):
         errors.append("{} must not embed credentials".format(label))
     if not str(parsed.path or "").lower().startswith("/api/"):
         errors.append("{} must point at a Candidate Gateway API path".format(label))
+    return errors
+
+
+def _mutation_endpoint_errors(value, candidate_url):
+    """Validate the only endpoint allowed to be exercised by this probe."""
+    errors = _endpoint_errors(value, candidate_url, "mutation_url")
+    parsed = urlparse(str(value or "").strip())
+    if str(parsed.path or "") != AUTH_MUTATION_PROBE_PATH:
+        errors.append(
+            "mutation_url must be the dedicated zero-write auth mutation probe endpoint"
+        )
+    if parsed.query or parsed.fragment:
+        errors.append("mutation_url must not contain a query or fragment")
     return errors
 
 
@@ -150,10 +166,16 @@ def _backend_identity_observed(payload):
     return False
 
 
+def _authenticated_user_present(payload):
+    value = payload if isinstance(payload, dict) else {}
+    return bool(str(value.get("authenticated_user") or "").strip())
+
+
 def run_probe(candidate_url, release_url, mutation_url, body, headers,
               expected_revision, session_id, artifact_sha, served_sha,
               auth_mode, user_header, identity_source, gateway_sha,
               timeout=20):
+    del body  # The dedicated endpoint accepts no application mutation body.
     started = utc_iso()
     errors = []
     if _origin(candidate_url) is None:
@@ -165,7 +187,8 @@ def run_probe(candidate_url, release_url, mutation_url, body, headers,
         if not candidate_path.endswith((".html", ".htm")):
             errors.append("candidate_url must identify a static HTML document")
     errors.extend(_endpoint_errors(release_url, candidate_url, "release_url"))
-    errors.extend(_endpoint_errors(mutation_url, candidate_url, "mutation_url"))
+    mutation_errors = _mutation_endpoint_errors(mutation_url, candidate_url)
+    errors.extend(mutation_errors)
     release_status, release_payload, release_error = _request(
         release_url, "GET", headers, timeout=timeout
     )
@@ -192,25 +215,73 @@ def run_probe(candidate_url, release_url, mutation_url, body, headers,
             "authorization", "cookie", "proxy-authorization",
         )
     }
-    unauth_status, _unauth_payload, _unauth_error = _request(
-        mutation_url, "POST", unauthenticated_headers, body=body, timeout=timeout
-    )
-    if unauth_status not in (401, 403):
-        errors.append(
-            "unauthenticated Candidate mutation control returned HTTP {}".format(
-                unauth_status or "no response"
-            )
+    # Never send a POST to an arbitrary path.  The exact endpoint check above
+    # is a data-safety boundary: even a malformed operator command must not
+    # turn this diagnostic into a real project/scan mutation.
+    unauth_status = 0
+    authenticated_status = 0
+    authenticated_payload = None
+    authenticated_error = ""
+    backend_identity_observed = False
+    authenticated_user_present = False
+    probe_contract_observed = False
+    zero_database_mutation = False
+    if not mutation_errors:
+        unauth_status, _unauth_payload, _unauth_error = _request(
+            mutation_url, "POST", unauthenticated_headers, body={}, timeout=timeout
         )
+        if unauth_status not in (401, 403):
+            errors.append(
+                "unauthenticated Candidate mutation control returned HTTP {}".format(
+                    unauth_status or "no response"
+                )
+            )
 
-    authenticated_status, authenticated_payload, authenticated_error = _request(
-        mutation_url, "POST", headers, body=body, timeout=timeout
-    )
-    if authenticated_status < 200 or authenticated_status >= 300:
-        errors.append(
-            "authenticated Candidate mutation returned HTTP {}".format(
-                authenticated_status or "no response"
-            )
+        authenticated_status, authenticated_payload, authenticated_error = _request(
+            mutation_url, "POST", headers, body={}, timeout=timeout
         )
+        if authenticated_status < 200 or authenticated_status >= 300:
+            errors.append(
+                "authenticated Candidate mutation returned HTTP {}".format(
+                    authenticated_status or "no response"
+                )
+            )
+        backend_identity_observed = _backend_identity_observed(
+            authenticated_payload
+        )
+        authenticated_user_present = _authenticated_user_present(
+            authenticated_payload
+        )
+        probe_contract_observed = isinstance(authenticated_payload, dict) and \
+            authenticated_payload.get("mutation_probe") is True and \
+            authenticated_payload.get("probe_path") == AUTH_MUTATION_PROBE_PATH
+        zero_database_mutation = isinstance(authenticated_payload, dict) and \
+            authenticated_payload.get("database_mutation") is False
+        if not probe_contract_observed:
+            errors.append(
+                "authenticated Candidate response is not the dedicated mutation probe contract"
+            )
+        if not authenticated_user_present:
+            errors.append(
+                "authenticated Candidate mutation probe did not observe a non-empty authenticated_user"
+            )
+        if not backend_identity_observed:
+            errors.append(
+                "authenticated Candidate mutation probe did not observe a backend identity"
+            )
+        if not zero_database_mutation:
+            errors.append(
+                "authenticated Candidate mutation probe did not prove zero database mutation"
+            )
+    else:
+        errors.append("refusing to POST because mutation_url is not the dedicated probe endpoint")
+    if unauth_status not in (401, 403):
+        if not mutation_errors:
+            errors.append(
+                "unauthenticated Candidate mutation control returned HTTP {}".format(
+                    unauth_status or "no response"
+                )
+            )
     if authenticated_error and authenticated_status == 0:
         errors.append(
             "authenticated Candidate mutation request failed: {}".format(
@@ -219,7 +290,10 @@ def run_probe(candidate_url, release_url, mutation_url, body, headers,
         )
     identity_propagated = (
         unauth_status in (401, 403) and
-        200 <= authenticated_status < 300
+        200 <= authenticated_status < 300 and
+        probe_contract_observed and backend_identity_observed and
+        authenticated_user_present and
+        zero_database_mutation
     )
     if not identity_propagated:
         errors.append("Candidate Gateway did not prove identity propagation")
@@ -248,12 +322,14 @@ def run_probe(candidate_url, release_url, mutation_url, body, headers,
             "status": "PASSED" if identity_propagated and
             200 <= authenticated_status < 300 else "FAILED",
             "method": "POST",
+            "endpoint": AUTH_MUTATION_PROBE_PATH,
             "mutation_url": mutation_url,
             "unauthenticated_status_code": unauth_status,
             "authenticated_status_code": authenticated_status,
-            "backend_identity_observed": _backend_identity_observed(
-                authenticated_payload
-            ),
+            "probe_contract_observed": probe_contract_observed,
+            "backend_identity_observed": backend_identity_observed,
+            "authenticated_user_present": authenticated_user_present,
+            "database_mutation": False if zero_database_mutation else None,
             "credentials_recorded": False,
         },
         "release_probe": {
@@ -280,7 +356,10 @@ def main(argv=None):
     parser.add_argument("--candidate-url", required=True)
     parser.add_argument("--release-url", required=True)
     parser.add_argument("--mutation-url", required=True)
-    parser.add_argument("--mutation-body-file", required=True)
+    parser.add_argument(
+        "--mutation-body-file", default="",
+        help="deprecated; if supplied it must contain an empty JSON object",
+    )
     parser.add_argument("--expected-revision", required=True)
     parser.add_argument("--release-validation-session-id", required=True)
     parser.add_argument("--candidate-artifact-sha256", required=True)
@@ -302,8 +381,14 @@ def main(argv=None):
             parser.error("--{} must be a non-zero SHA256".format(
                 field.replace("_", "-")
             ))
-    with open(args.mutation_body_file, "r", encoding="utf-8") as stream:
-        body = json.load(stream)
+    body = {}
+    if args.mutation_body_file:
+        with open(args.mutation_body_file, "r", encoding="utf-8") as stream:
+            body = json.load(stream)
+        if body not in ({}, None):
+            parser.error(
+                "--mutation-body-file must contain {} because the probe is zero-write"
+            )
     headers = _parse_headers(args.header)
     evidence = run_probe(
         args.candidate_url, args.release_url, args.mutation_url, body, headers,
