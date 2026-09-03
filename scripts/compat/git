@@ -1,5 +1,5 @@
 #!/bin/sh
-set -u
+set -eu
 
 REAL_GIT="${FOS_REAL_GIT:-/usr/bin/git}"
 
