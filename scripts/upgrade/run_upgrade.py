@@ -154,6 +154,23 @@ def _resolve_attempt_path(repo_root: str, configured: Optional[str], field: str,
     return os.path.realpath("{}.{}{}".format(stem, attempt_id, extension))
 
 
+def _resolve_revision_path(repo_root: str, configured: Optional[str], field: str,
+                           revision: str) -> str:
+    """Resolve an evidence path bound to one exact Candidate revision.
+
+    CI fixture evidence is reusable across validation attempts, but it must
+    never be silently reused across Candidate SHAs.  ``{commit_sha}`` is the
+    only supported interpolation so the operator can keep one immutable file
+    per exact source revision.
+    """
+    if not configured:
+        raise RuntimeError("upgrade.{} is required".format(field))
+    raw = str(configured)
+    if "{commit_sha}" in raw:
+        raw = raw.replace("{commit_sha}", str(revision or ""))
+    return _resolve_upgrade_path(repo_root, raw, field)
+
+
 def _resolve_candidate_manifest_path(repo_root: str, candidate_root: str,
                                      configured: Optional[str]) -> str:
     """Resolve a Candidate manifest relative to its configured owner.
@@ -616,6 +633,56 @@ def _validate_candidate_browser_evidence(path: str, payload: Dict[str, Any],
     return errors, normalized
 
 
+def _validate_ci_browser_fixture_evidence(
+        path: str, payload: Dict[str, Any], identity: Dict[str, Any],
+        expected_source_tree_sha: str = "") -> List[str]:
+    """Validate exact-SHA CI fixture evidence consumed by production.
+
+    Production hosts intentionally do not need Node/npm.  The fixture lane is
+    executed in CI and transferred as a hashed JSON artifact.  This record is
+    only regression evidence; the external real Candidate Chromium evidence
+    remains the production browser authority.
+    """
+    errors = []
+    if not isinstance(payload, dict):
+        return ["CI browser fixture evidence is not a JSON object"]
+    revision = identity.get("commit_sha")
+    if payload.get("status") != "PASSED":
+        errors.append("CI browser fixture evidence status is not PASSED")
+    if payload.get("evidence_class") != "browser_fixture_regression":
+        errors.append("CI browser fixture evidence class is invalid")
+    if payload.get("revision") != revision:
+        errors.append("CI browser fixture evidence revision does not match Candidate")
+    if payload.get("workflow_sha") != revision:
+        errors.append("CI browser fixture workflow SHA does not match Candidate")
+    if not expected_source_tree_sha or not is_valid_commit_sha(
+            expected_source_tree_sha
+    ):
+        errors.append("Candidate source tree SHA is unavailable for CI fixture binding")
+    elif payload.get("source_tree_sha") != expected_source_tree_sha:
+        errors.append("CI browser fixture source tree SHA does not match Candidate")
+    if payload.get("candidate_revision") != revision:
+        errors.append("CI browser fixture candidate revision does not match Candidate")
+    if payload.get("exit_code") != 0:
+        errors.append("PASSED CI browser fixture evidence must have exit_code=0")
+    if payload.get("synthetic") is not True:
+        errors.append("CI browser fixture evidence must be marked synthetic")
+    if payload.get("local_execution") is not False:
+        errors.append("production must not locally execute the CI browser fixture")
+    if payload.get("evidence_origin") != "github_actions" or \
+            payload.get("ci_provider") != "github_actions":
+        errors.append("CI browser fixture evidence must identify GitHub Actions")
+    if not str(payload.get("repository") or "").strip():
+        errors.append("CI browser fixture repository identity is missing")
+    for field in ("workflow_run_id", "workflow_run_attempt"):
+        value = str(payload.get(field) or "").strip()
+        if not re.fullmatch(r"[1-9][0-9]*", value):
+            errors.append("CI browser fixture {} is invalid".format(field))
+    if not path or not os.path.isfile(path):
+        errors.append("CI browser fixture evidence artifact is missing")
+    return errors
+
+
 def connect_live_database(db_config: Dict[str, Any]):
     """Create the live DB-API connection required by a non-dry-run upgrade."""
     try:
@@ -655,6 +722,7 @@ class UpgradeOrchestrator:
         self.serving_session_id = ""
         self.release_validation_session_id = ""
         self.previous_published_session_id = ""
+        self.ci_browser_fixture_evidence_path = ""
         self.candidate_browser_evidence_path = ""
         self.rollback_evidence_path = ""
         self.performance_evidence_path = ""
@@ -872,6 +940,17 @@ class UpgradeOrchestrator:
             raise RuntimeError("validation session id is invalid: {}".format(exc))
         self.release_validation_session_id = session_id
         self._previous_release_identity = dict(previous_release)
+
+        if self._upgrade_mode == "production":
+            self.ci_browser_fixture_evidence_path = _resolve_revision_path(
+                self.repo_root,
+                upgrade_config.get("ci_browser_fixture_evidence_path") or
+                os.environ.get("COVERAGE_CI_BROWSER_FIXTURE_EVIDENCE", ""),
+                "ci_browser_fixture_evidence_path",
+                identity.get("commit_sha", ""),
+            )
+        else:
+            self.ci_browser_fixture_evidence_path = ""
 
         self.validation_session_manifest_path = _resolve_attempt_path(
             self.repo_root,
@@ -1361,6 +1440,108 @@ class UpgradeOrchestrator:
         }
         self.manifest.record("pre_cutover_ready", payload)
         return passed, unmet
+
+    def _browser_fixture_regression_evidence(
+            self, mode: str, upgrade_config: Dict[str, Any],
+            identity: Dict[str, Any]) -> Dict[str, Any]:
+        """Return browser fixture evidence without running CI tools in production.
+
+        The production host may intentionally have no Node/npm installation.
+        In that mode only an exact-SHA CI artifact is consumed.  Staging keeps
+        the local smoke/Playwright regression, but command lookup failures are
+        converted into an ordinary failed evidence record for ``_fail``.
+        """
+        if mode == "production":
+            path = self.ci_browser_fixture_evidence_path
+            payload = {}
+            errors = []
+            if not path or not os.path.isfile(path):
+                errors.append(
+                    "upgrade.ci_browser_fixture_evidence_path must point to "
+                    "exact-SHA CI evidence"
+                )
+            else:
+                try:
+                    with open(path, "r", encoding="utf-8") as stream:
+                        payload = json.load(stream)
+                except (OSError, ValueError, TypeError) as exc:
+                    errors.append(
+                        "CI browser fixture evidence is unreadable: {}".format(exc)
+                    )
+            if not errors:
+                errors.extend(_validate_ci_browser_fixture_evidence(
+                    path,
+                    payload,
+                    identity,
+                    expected_source_tree_sha=str(
+                        (self.candidate_preflight or {}).get("source_tree_sha") or ""
+                    ),
+                ))
+            result = dict(payload) if isinstance(payload, dict) else {}
+            result.update({
+                "status": "PASSED" if not errors else "FAILED",
+                "revision": identity.get("commit_sha"),
+                "evidence_class": "browser_fixture_regression",
+                "source": "exact_sha_ci",
+                "local_execution": False,
+                "command": result.get("command") or
+                "consume exact-SHA GitHub Actions browser fixture evidence",
+                "exit_code": 0 if not errors else 1,
+                "artifact_path": path if path and os.path.isfile(path) else "",
+                "violations": errors,
+            })
+            return result
+
+        commands = (
+            ["node", "test_lazy_collapse_browser_smoke.js"],
+            ["npm", "run", "test:browser", "--", "--reporter=line"],
+        )
+        for command in commands:
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=self.repo_root,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                return {
+                    "status": "FAILED",
+                    "revision": identity.get("commit_sha"),
+                    "evidence_class": "browser_fixture_regression",
+                    "synthetic": True,
+                    "local_execution": True,
+                    "suite": "node_and_playwright_fixture",
+                    "command": " ".join(command),
+                    "exit_code": 127,
+                    "violations": [
+                        "browser fixture command could not be executed: {}".format(exc)
+                    ],
+                }
+            if result.returncode != 0:
+                error_text = result.stderr.decode("utf-8", errors="ignore")
+                return {
+                    "status": "FAILED",
+                    "revision": identity.get("commit_sha"),
+                    "evidence_class": "browser_fixture_regression",
+                    "synthetic": True,
+                    "local_execution": True,
+                    "suite": "node_and_playwright_fixture",
+                    "command": " ".join(command),
+                    "exit_code": result.returncode,
+                    "violations": [error_text[-4000:] or "fixture command failed"],
+                }
+        return {
+            "status": "PASSED",
+            "revision": identity.get("commit_sha"),
+            "evidence_class": "browser_fixture_regression",
+            "synthetic": True,
+            "local_execution": True,
+            "suite": "node_and_playwright_fixture",
+            "command": "node test_lazy_collapse_browser_smoke.js && "
+            "npm run test:browser -- --reporter=line",
+            "exit_code": 0,
+        }
 
     def _cleanup_target_database(self):
         """Remove only the disposable target after a failed attempt."""
@@ -2451,8 +2632,23 @@ class UpgradeOrchestrator:
             test_env = dict(os.environ)
             test_env["COVERAGE_REGISTRY_DIR"] = isolated_registry
             try:
-                res = subprocess.run(cmd, cwd=self.repo_root, env=test_env,
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                try:
+                    res = subprocess.run(cmd, cwd=self.repo_root, env=test_env,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    test_results[tm] = {
+                        "status": "FAILED",
+                        "revision": identity.get("commit_sha"),
+                        "evidence_class": "unit",
+                        "command": "{} -m unittest {}".format(sys.executable, tm),
+                        "exit_code": 127,
+                        "violations": [
+                            "targeted test command could not be executed: {}".format(exc)
+                        ],
+                    }
+                    self.manifest.record("targeted_tests", test_results)
+                    self.log("❌ Targeted test command could not be executed: {}".format(exc))
+                    return self._fail(lifecycle, "Test {} could not be executed".format(tm))
             finally:
                 shutil.rmtree(isolated_registry, ignore_errors=True)
             if res.returncode != 0:
@@ -2468,35 +2664,32 @@ class UpgradeOrchestrator:
             
         self.manifest.record("targeted_tests", test_results)
 
-        # Step 6: Run Node DOM & Event-loop Smoke Suite
-        self.log("[Step 6/10] Executing Browser DOM & Event-loop Smoke Suite (5 Scenarios)...")
-        b_res = subprocess.run(["node", "test_lazy_collapse_browser_smoke.js"], cwd=self.repo_root, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if b_res.returncode != 0:
-            err_text = b_res.stderr.decode("utf-8", errors="ignore")
-            self.log(f"❌ Browser smoke suite failed: {err_text}")
-            return self._fail(lifecycle, "Browser smoke suite failed")
-        # This Playwright suite is a fixture regression only.  It must never
-        # be recorded as evidence of the externally served Candidate.
-        browser_cmd = ["npm", "run", "test:browser", "--", "--reporter=line"]
-        browser_fixture = subprocess.run(
-            browser_cmd, cwd=self.repo_root, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        # Step 6: Consume CI fixture evidence or run the staging-only fixture.
+        # Production vfoswind hosts are not required to have Node/npm.  The
+        # external real Candidate browser evidence below remains mandatory.
+        if mode == "production":
+            self.log(
+                "[Step 6/10] Consuming exact-SHA CI Browser Fixture Evidence "
+                "(Node/npm not executed on production host)..."
+            )
+        else:
+            self.log(
+                "[Step 6/10] Executing Browser DOM & Event-loop Smoke Suite "
+                "(5 Scenarios)..."
+            )
+        fixture_evidence = self._browser_fixture_regression_evidence(
+            mode, upgrade_config, identity
         )
-        fixture_status = "PASSED" if browser_fixture.returncode == 0 else "FAILED"
-        self.manifest.record("browser_fixture_regression", {
-            "status": fixture_status,
-            "revision": identity.get("commit_sha"),
-            "evidence_class": "browser_fixture_regression",
-            "synthetic": True,
-            "suite": "tests/browser/coverage_real_browser.spec.js",
-            "command": " ".join(browser_cmd),
-            "exit_code": browser_fixture.returncode,
-        })
-        if browser_fixture.returncode != 0:
-            err_text = browser_fixture.stderr.decode("utf-8", errors="ignore")
-            self.log("❌ Browser fixture regression failed: {}".format(err_text))
-            return self._fail(lifecycle, "Browser fixture regression failed")
-        self.log("✔ Browser fixture regression passed.")
+        self.manifest.record("browser_fixture_regression", fixture_evidence)
+        if fixture_evidence.get("status") != "PASSED":
+            violations = fixture_evidence.get("violations") or []
+            self.log(
+                "❌ Browser fixture regression evidence rejected: {}".format(
+                    "; ".join(str(item) for item in violations)
+                )
+            )
+            return self._fail(lifecycle, "Browser fixture regression evidence rejected")
+        self.log("✔ Browser fixture regression evidence passed.")
 
         # Production authority is an external artifact generated by
         # real_browser_evidence.js against the actual Candidate URL.  The
@@ -2701,6 +2894,13 @@ class UpgradeOrchestrator:
         # Step 9: Security Vulnerability Scanner
         self.log("[Step 9/10] Running Static Security Vulnerability Scanner...")
         sec_res = scan_directory(self.repo_root)
+        configured_auth = (runtime_config or {}).get("auth") or {}
+        configured_auth_mode = configured_auth.get("mode")
+        if configured_auth_mode in (None, ""):
+            configured_auth_mode = (db_config or {}).get("auth_mode")
+        if configured_auth_mode in (None, ""):
+            configured_auth_mode = "unknown" if mode == "production" else "reverse_proxy"
+        configured_auth_mode = str(configured_auth_mode).strip().lower()
         self.manifest.record("security_audit", {
             "scanned_files": sec_res["scanned_files"],
             "critical_count": sec_res["critical_count"],
@@ -2709,7 +2909,7 @@ class UpgradeOrchestrator:
             ,"status": "PASSED" if sec_res["is_safe"] else "FAILED"
             ,"revision": identity.get("commit_sha")
             ,"evidence_class": "integration"
-            ,"auth_mode": (db_config or {}).get("auth_mode", "reverse_proxy")
+            ,"auth_mode": configured_auth_mode
             ,"command": "scan_directory"
             ,"exit_code": 0 if sec_res["is_safe"] else 1
         })

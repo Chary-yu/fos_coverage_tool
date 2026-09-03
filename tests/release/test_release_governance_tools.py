@@ -36,6 +36,9 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("gate-dod-status.json", workflow)
         self.assertIn("release_readiness.py", workflow)
         self.assertIn("release-readiness.json", workflow)
+        self.assertIn("browser-fixture-regression:", workflow)
+        self.assertIn("build_browser_fixture_evidence.py", workflow)
+        self.assertIn("browser-fixture-regression-${{ github.sha }}", workflow)
         self.assertIn("actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808", workflow)
         self.assertIn("fetch-depth: 0", workflow)
 
@@ -51,7 +54,8 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
                 "semantic-migration-regression",
                 "mysql55-compatibility",
                 "py36-compat",
-                "specialist-regression"):
+                "specialist-regression",
+                "browser-fixture-regression"):
             self.assertIn("- {}".format(lane), workflow)
         with open("requirements-py36.txt", encoding="utf-8") as stream:
             requirements = stream.read()

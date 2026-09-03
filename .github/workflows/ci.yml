@@ -759,6 +759,7 @@ jobs:
       - mysql55-compatibility
       - py36-compat
       - specialist-regression
+      - browser-fixture-regression
     runs-on: ubuntu-latest
     steps:
       - name: Require all Candidate source lanes to pass
@@ -767,13 +768,15 @@ jobs:
           MYSQL55_RESULT: ${{ needs.mysql55-compatibility.result }}
           PY36_RESULT: ${{ needs.py36-compat.result }}
           SPECIALIST_RESULT: ${{ needs.specialist-regression.result }}
+          BROWSER_FIXTURE_RESULT: ${{ needs.browser-fixture-regression.result }}
         run: |
           set -eu
           for result in \
             "semantic-migration-regression=$SEMANTIC_MIGRATION_RESULT" \
             "mysql55-compatibility=$MYSQL55_RESULT" \
             "py36-compat=$PY36_RESULT" \
-            "specialist-regression=$SPECIALIST_RESULT"; do
+            "specialist-regression=$SPECIALIST_RESULT" \
+            "browser-fixture-regression=$BROWSER_FIXTURE_RESULT"; do
             lane="${result%%=*}"
             status="${result#*=}"
             echo "$lane: $status"
@@ -796,6 +799,53 @@ jobs:
         with:
           node-version: '20'
       - run: node test_lazy_collapse_browser_smoke.js
+
+  browser-fixture-regression:
+    name: Browser fixture regression (exact SHA evidence)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+      - name: Install fixture dependencies
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+      - name: Run Node and Playwright fixture regression
+        run: |
+          set -eu
+          node test_lazy_collapse_browser_smoke.js
+          npm run test:browser -- --reporter=line
+      - name: Write exact-SHA CI fixture evidence
+        env:
+          CANDIDATE_REVISION: ${{ github.sha }}
+          CI_REPOSITORY: ${{ github.repository }}
+          CI_WORKFLOW_RUN_ID: ${{ github.run_id }}
+          CI_WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -eu
+          mkdir -p .artifacts/browser-fixture
+          python scripts/diagnostics/build_browser_fixture_evidence.py \
+            --revision "$CANDIDATE_REVISION" \
+            --source-tree-sha "$(git rev-parse HEAD^{tree})" \
+            --workflow-sha "$CANDIDATE_REVISION" \
+            --repository "$CI_REPOSITORY" \
+            --workflow-run-id "$CI_WORKFLOW_RUN_ID" \
+            --workflow-run-attempt "$CI_WORKFLOW_RUN_ATTEMPT" \
+            --output .artifacts/browser-fixture/browser-fixture-evidence.json
+      - name: Upload exact-SHA CI fixture evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: browser-fixture-regression-${{ github.sha }}
+          path: .artifacts/browser-fixture/browser-fixture-evidence.json
+          if-no-files-found: error
 
   real-browser-e2e:
     name: Real browser fixture E2E (not Candidate evidence)

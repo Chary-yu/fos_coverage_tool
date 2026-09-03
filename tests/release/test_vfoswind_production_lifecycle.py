@@ -35,6 +35,10 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
             integration["bootstrap"]["nginx_probe_mode"],
             "temporary_main_include",
         )
+        self.assertIn(
+            "{commit_sha}",
+            config["upgrade"]["ci_browser_fixture_evidence_path"],
+        )
 
     def _fixture(self, flat=False):
         root = tempfile.TemporaryDirectory(prefix="vfoswind-lifecycle-")

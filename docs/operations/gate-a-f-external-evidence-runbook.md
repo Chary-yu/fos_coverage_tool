@@ -230,6 +230,13 @@ served release identity、真实 HTTP、Chromium、artifact SHA、当前
 `synthetic=false`，否则 Final Gate 保持 `NOT_READY`。三类外部 evidence 的路径都必须
 按 attempt 隔离；即使两个 attempt 使用同一 Candidate SHA，也不能复用旧 JSON。
 
+生产 vfoswind 主机不需要安装 Node/npm，也不在本机重跑 fixture。CI 的
+`browser-fixture-regression` job 会上传 `browser-fixture-evidence.json`；将该文件复制到
+`upgrade.ci_browser_fixture_evidence_path`（支持 `{commit_sha}`）后，升级器会严格校验
+exact commit、source tree、GitHub Actions repository/run/attempt、`exit_code=0` 和
+artifact SHA。缺失或不匹配时在 PRE_CUTOVER_READY 前失败；外部真实 Candidate
+Chromium evidence 仍不可省略。
+
 ## 首次接管：建立 immutable previous baseline
 
 尚未建立合法 `publish_root/CURRENT` 的旧环境必须先执行一次显式 bootstrap；正常

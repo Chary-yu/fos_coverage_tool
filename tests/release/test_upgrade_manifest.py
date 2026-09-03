@@ -15,11 +15,13 @@ from scripts.upgrade.cutover_controller import CutoverController
 from scripts.upgrade.run_upgrade import (
     _new_release_validation_session_id, _resolve_attempt_path,
     _validate_candidate_browser_evidence,
+    _validate_ci_browser_fixture_evidence,
     UpgradeOrchestrator,
     validate_candidate_publication_preflight,
     verify_production_candidate_served_root_binding,
 )
 from scripts.upgrade.evidence_manifest import ProductionEvidenceManifest
+from scripts.diagnostics.build_browser_fixture_evidence import build_evidence
 
 
 class TestUpgradeManifest(unittest.TestCase):
@@ -324,6 +326,80 @@ class TestUpgradeManifest(unittest.TestCase):
                 manifest.data["pre_cutover_ready"]["status"], "FAILED"
             )
 
+    def test_production_auth_disabled_blocks_pre_cutover_before_phase_d(self):
+        with tempfile.TemporaryDirectory(prefix="pre-cutover-auth-") as root:
+            data = self._pre_cutover_data()
+            data["security_audit"]["auth_mode"] = "disabled"
+            manifest = self._manifest_for_pre_cutover(root, data)
+            orchestrator = UpgradeOrchestrator(repo_root=root)
+            orchestrator.manifest = manifest
+            phase_d_methods = []
+            ready, unmet = orchestrator._validate_pre_cutover_ready(
+                manifest.data["release_identity"], "production"
+            )
+            if ready:
+                phase_d_methods.extend(("freeze", "stop_current", "switch_current"))
+            self.assertFalse(ready)
+            self.assertEqual(phase_d_methods, [])
+            self.assertTrue(any("authentication" in item for item in unmet), unmet)
+            self.assertEqual(
+                manifest.data["pre_cutover_ready"]["status"], "FAILED"
+            )
+
+    def test_production_browser_fixture_consumes_ci_evidence_without_node_or_npm(self):
+        revision = "a" * 40
+        tree = "b" * 40
+        with tempfile.TemporaryDirectory(prefix="ci-browser-fixture-") as root:
+            evidence_path = os.path.join(root, "fixture.json")
+            with open(evidence_path, "w", encoding="utf-8") as stream:
+                json.dump(build_evidence(
+                    revision, tree, "Chary-yu/fos_coverage_tool", "123", "1",
+                ), stream)
+            orchestrator = UpgradeOrchestrator(repo_root=root)
+            orchestrator.ci_browser_fixture_evidence_path = evidence_path
+            orchestrator.candidate_preflight = {"source_tree_sha": tree}
+            with mock.patch("scripts.upgrade.run_upgrade.subprocess.run") as runner:
+                result = orchestrator._browser_fixture_regression_evidence(
+                    "production", {}, {"commit_sha": revision}
+                )
+            runner.assert_not_called()
+            self.assertEqual(result["status"], "PASSED")
+            self.assertFalse(result["local_execution"])
+            self.assertEqual(result["source"], "exact_sha_ci")
+
+    def test_production_browser_fixture_rejects_wrong_ci_revision(self):
+        revision = "a" * 40
+        tree = "b" * 40
+        with tempfile.TemporaryDirectory(prefix="ci-browser-mismatch-") as root:
+            evidence_path = os.path.join(root, "fixture.json")
+            payload = build_evidence(
+                "c" * 40, tree, "Chary-yu/fos_coverage_tool", "123", "1",
+            )
+            with open(evidence_path, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream)
+            with open(evidence_path, "r", encoding="utf-8") as stream:
+                loaded = json.load(stream)
+            errors = _validate_ci_browser_fixture_evidence(
+                evidence_path,
+                loaded,
+                {"commit_sha": revision},
+                expected_source_tree_sha=tree,
+            )
+            self.assertTrue(any("revision" in item for item in errors), errors)
+
+    def test_staging_missing_node_enters_failed_fixture_evidence(self):
+        with tempfile.TemporaryDirectory(prefix="staging-browser-missing-node-") as root:
+            orchestrator = UpgradeOrchestrator(repo_root=root)
+            with mock.patch(
+                    "scripts.upgrade.run_upgrade.subprocess.run",
+                    side_effect=FileNotFoundError("node")):
+                result = orchestrator._browser_fixture_regression_evidence(
+                    "staging", {}, {"commit_sha": "a" * 40}
+                )
+            self.assertEqual(result["status"], "FAILED")
+            self.assertEqual(result["exit_code"], 127)
+            self.assertIn("node", result["command"])
+
     def test_candidate_preflight_rejects_workflow_sha_placeholder_before_maintenance(self):
         with self.assertRaisesRegex(RuntimeError, "still a placeholder"):
             validate_candidate_publication_preflight(
@@ -391,7 +467,7 @@ class TestUpgradeManifest(unittest.TestCase):
         validation = source.index("lifecycle.start_validation_api()")
         candidate_endpoint = source.index('"candidate_release_endpoint"')
         targeted = source.index("# Step 5: Run Targeted Unit Test Suites")
-        browser = source.index("# Step 6: Run Node DOM & Event-loop Smoke Suite")
+        browser = source.index("# Step 6: Consume CI fixture evidence or run the staging-only fixture.")
         pre_cutover_gate = source.index("self._validate_pre_cutover_ready(identity, mode)")
         freeze = source.index("lifecycle.freeze(identity.get(\"commit_sha\", \"\"))")
         stop = source.index("lifecycle.stop_current_api()")

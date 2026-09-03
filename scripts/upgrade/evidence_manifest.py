@@ -651,6 +651,16 @@ class ProductionEvidenceManifest:
                 int(security.get("critical_count") or 0) != 0 or \
                 int(security.get("high_count") or 0) != 0:
             unmet.append("security audit has unresolved findings")
+        if require_production_integration and str(
+                security.get("auth_mode") or ""
+        ).strip().lower() == "disabled":
+            # ``disabled`` may be useful for a loopback-only internal
+            # harness, but it cannot certify a production cutover.  This
+            # check belongs to PRE_CUTOVER_READY so a later final-gate
+            # failure cannot occur after service/CURRENT mutation.
+            unmet.append(
+                "production authentication policy rejects auth_mode=disabled"
+            )
 
         endpoint = record("candidate_release_endpoint")
         if endpoint.get("process_role") != "validation_candidate":
@@ -974,7 +984,9 @@ class ProductionEvidenceManifest:
         # 7. Security Audit
         sec = self.data.get("security_audit", {})
         if (not sec.get("is_safe") or sec.get("critical_count", 0) > 0
-                or sec.get("high_count", 0) > 0 or sec.get("auth_mode") == "disabled"):
+                or sec.get("high_count", 0) > 0 or str(
+                    sec.get("auth_mode") or ""
+                ).strip().lower() == "disabled"):
             unmet.append(f"Security audit has unresolved findings: Critical={sec.get('critical_count')}, High={sec.get('high_count')}")
             
         # 8. Performance Benchmark

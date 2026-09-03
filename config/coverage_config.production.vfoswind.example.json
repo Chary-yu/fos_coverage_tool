@@ -62,6 +62,7 @@
     "validation_residue_teardown": false,
     "candidate_release_endpoint": "http://127.0.0.1:19528/api/coverage/release",
     "candidate_browser_url": "http://127.0.0.1:19528/",
+    "ci_browser_fixture_evidence_path": "/home/zcyu/coverage_candidate/browser-fixture-{commit_sha}.json",
     "health_endpoint": "http://127.0.0.1:9528/api/coverage/health",
     "served_root_probe_url": "http://127.0.0.1:9528/coverage/",
     "served_root_url_prefix": "/coverage/",
