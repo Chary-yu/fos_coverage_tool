@@ -1,0 +1,111 @@
+name: Assistant exact source bundle c0b88ceb
+
+on:
+  push:
+    branches:
+      - assistant-source-bundle-c0b88ceb
+    paths:
+      - .github/workflows/assistant-source-bundle-c0b88ceb.yml
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-source-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download exact-SHA browser fixture evidence
+        uses: actions/download-artifact@v4
+        with:
+          name: browser-fixture-regression-c0b88ceb05bbe3047812b0b1b35320ac6a6d1be0
+          path: transfer/ci
+          run-id: 33755401407
+          github-token: ${{ github.token }}
+
+      - name: Build exact Git source bundle
+        shell: bash
+        env:
+          TARGET_SHA: c0b88ceb05bbe3047812b0b1b35320ac6a6d1be0
+          TARGET_TREE: b2c366808779ff077a2c28332e1841283719dcc4
+          BASELINE_SHA: e9fcc837a1ac9847f3966fc8ddb2aed92ca473fc
+          CI_RUN_ID: '33755401407'
+          CI_ARTIFACT_NAME: browser-fixture-regression-c0b88ceb05bbe3047812b0b1b35320ac6a6d1be0
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse "${TARGET_SHA}^{tree}")" = "${TARGET_TREE}"
+          git branch -f transfer-target "${TARGET_SHA}"
+          git branch -f transfer-baseline "${BASELINE_SHA}"
+
+          mkdir -p transfer/ci
+          git bundle create transfer/repository.bundle refs/heads/transfer-target refs/heads/transfer-baseline
+          git bundle verify transfer/repository.bundle
+          (
+            cd transfer/ci
+            sha256sum -c browser-fixture-evidence.json.sha256
+          )
+
+          REPOSITORY_BUNDLE_SHA256="$(sha256sum transfer/repository.bundle | awk '{print $1}')"
+          BROWSER_FIXTURE_SHA256="$(sha256sum transfer/ci/browser-fixture-evidence.json | awk '{print $1}')"
+          export REPOSITORY_BUNDLE_SHA256 BROWSER_FIXTURE_SHA256
+
+          python3 - <<'PY'
+          import json
+          import os
+          manifest = {
+              "schema_version": 1,
+              "repository": "Chary-yu/fos_coverage_tool",
+              "repository_url": "https://github.com/Chary-yu/fos_coverage_tool.git",
+              "target_sha": os.environ["TARGET_SHA"],
+              "target_tree": os.environ["TARGET_TREE"],
+              "baseline_sha": os.environ["BASELINE_SHA"],
+              "ci_run_id": int(os.environ["CI_RUN_ID"]),
+              "ci_artifact_name": os.environ["CI_ARTIFACT_NAME"],
+              "repository_bundle_sha256": os.environ["REPOSITORY_BUNDLE_SHA256"],
+              "browser_fixture_sha256": os.environ["BROWSER_FIXTURE_SHA256"],
+          }
+          with open("transfer/SOURCE_MANIFEST.json", "w", encoding="utf-8") as stream:
+              json.dump(manifest, stream, sort_keys=True, indent=2)
+              stream.write("\n")
+          PY
+
+          tar -C transfer -czf fos_source_bundle_c0b88ceb.tar.gz \
+            SOURCE_MANIFEST.json \
+            repository.bundle \
+            ci/browser-fixture-evidence.json \
+            ci/browser-fixture-evidence.json.sha256
+          sha256sum fos_source_bundle_c0b88ceb.tar.gz > fos_source_bundle_c0b88ceb.tar.gz.sha256
+
+          rm -rf verify-source
+          mkdir verify-source
+          tar -xzf fos_source_bundle_c0b88ceb.tar.gz -C verify-source
+          test "$(sha256sum verify-source/repository.bundle | awk '{print $1}')" = "${REPOSITORY_BUNDLE_SHA256}"
+          (
+            cd verify-source/ci
+            sha256sum -c browser-fixture-evidence.json.sha256
+          )
+          rm -rf verify-target verify-baseline
+          git clone verify-source/repository.bundle verify-target
+          git -C verify-target checkout --detach transfer-target
+          test "$(git -C verify-target rev-parse HEAD)" = "${TARGET_SHA}"
+          test "$(git -C verify-target rev-parse 'HEAD^{tree}')" = "${TARGET_TREE}"
+          test -z "$(git -C verify-target status --porcelain --untracked-files=all)"
+          git clone verify-source/repository.bundle verify-baseline
+          git -C verify-baseline checkout --detach transfer-baseline
+          test "$(git -C verify-baseline rev-parse HEAD)" = "${BASELINE_SHA}"
+          test -z "$(git -C verify-baseline status --porcelain --untracked-files=all)"
+
+      - name: Upload source bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: fos-source-bundle-c0b88ceb
+          path: |
+            fos_source_bundle_c0b88ceb.tar.gz
+            fos_source_bundle_c0b88ceb.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
