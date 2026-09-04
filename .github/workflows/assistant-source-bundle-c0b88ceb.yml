@@ -109,3 +109,5 @@ jobs:
             fos_source_bundle_c0b88ceb.tar.gz.sha256
           if-no-files-found: error
           retention-days: 7
+
+# trigger-build: 2026-09-04
