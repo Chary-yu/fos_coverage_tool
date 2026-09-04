@@ -39,11 +39,11 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse "${TARGET_SHA}^{tree}")" = "${TARGET_TREE}"
-          git branch -f transfer-target "${TARGET_SHA}"
-          git branch -f transfer-baseline "${BASELINE_SHA}"
+          git tag -f transfer-target "${TARGET_SHA}"
+          git tag -f transfer-baseline "${BASELINE_SHA}"
 
           mkdir -p transfer/ci
-          git bundle create transfer/repository.bundle refs/heads/transfer-target refs/heads/transfer-baseline
+          git bundle create transfer/repository.bundle refs/tags/transfer-target refs/tags/transfer-baseline
           git bundle verify transfer/repository.bundle
           (
             cd transfer/ci
@@ -81,7 +81,7 @@ jobs:
             ci/browser-fixture-evidence.json.sha256
           sha256sum fos_source_bundle_c0b88ceb.tar.gz > fos_source_bundle_c0b88ceb.tar.gz.sha256
 
-          rm -rf verify-source
+          rm -rf verify-source verify-target verify-baseline
           mkdir verify-source
           tar -xzf fos_source_bundle_c0b88ceb.tar.gz -C verify-source
           test "$(sha256sum verify-source/repository.bundle | awk '{print $1}')" = "${REPOSITORY_BUNDLE_SHA256}"
@@ -89,7 +89,6 @@ jobs:
             cd verify-source/ci
             sha256sum -c browser-fixture-evidence.json.sha256
           )
-          rm -rf verify-target verify-baseline
           git clone verify-source/repository.bundle verify-target
           git -C verify-target checkout --detach transfer-target
           test "$(git -C verify-target rev-parse HEAD)" = "${TARGET_SHA}"
@@ -110,4 +109,4 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-# trigger-build: 2026-09-04
+# trigger-build: tag-ref-compatible
