@@ -42,8 +42,8 @@ from app.release_identity import (
     save_release_manifest,
 )
 from app.release_publication import (
-    build_release_manifest, copy_production_application_bundle,
-    validate_production_application_bundle,
+    PRODUCTION_APPLICATION_BUNDLE_DIRECTORY, build_release_manifest,
+    copy_production_application_bundle, validate_production_application_bundle,
     validate_production_candidate_content, current_served_root_binding,
 )
 from app.time_utils import utc_iso
@@ -317,7 +317,10 @@ def _copy_served_root(served_root, candidate_root):
     candidate_root = _real(candidate_root)
     _assert_no_symlinks(served_root)
     for name in sorted(os.listdir(served_root)):
-        if name in _CONTROL_FILES:
+        if name in _CONTROL_FILES or \
+                name == PRODUCTION_APPLICATION_BUNDLE_DIRECTORY:
+            # CURRENT/app belongs to the previous release.  The Candidate
+            # runtime must come only from the pinned target source checkout.
             continue
         source = os.path.join(served_root, name)
         target = os.path.join(candidate_root, name)

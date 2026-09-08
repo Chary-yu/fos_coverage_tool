@@ -207,6 +207,36 @@ class ProductionCandidateBuildTest(unittest.TestCase):
                 "PASSED",
             )
 
+    def test_builder_replaces_previous_application_bundle_from_target_source(self):
+        with tempfile.TemporaryDirectory(
+                prefix="production-candidate-app-replace-") as root:
+            source = os.path.join(root, "source")
+            candidate = os.path.join(root, "production-candidate")
+            os.makedirs(source)
+            self._source_repo(source)
+            served, _ = self._current_served_root(
+                root,
+                extra_files=(
+                    ("app/enhance_coverage.py", "old application"),
+                    ("app/stale_previous_release.txt", "stale"),
+                ),
+            )
+            result = build_production_candidate(
+                served, source, candidate, os.path.join(root, "identity.json"),
+                *self._provenance_args(),
+                **self._expected_binding_kwargs(served)
+            )
+            self.assertEqual(result["status"], "PASSED")
+            self.assertFalse(os.path.exists(os.path.join(
+                candidate, "app", "stale_previous_release.txt"
+            )))
+            with open(os.path.join(
+                    candidate, "app", "enhance_coverage.py"), "rb") as stream:
+                candidate_entrypoint = stream.read()
+            with open(os.path.join(source, "enhance_coverage.py"), "rb") as stream:
+                source_entrypoint = stream.read()
+            self.assertEqual(candidate_entrypoint, source_entrypoint)
+
     def test_offline_builder_emits_operator_evidence_without_ci_fields(self):
         with tempfile.TemporaryDirectory(prefix="production-candidate-offline-") as root:
             source = os.path.join(root, "source")
