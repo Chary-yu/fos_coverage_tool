@@ -2095,6 +2095,8 @@ class UpgradeOrchestrator:
             ),
             "report_count": inputs.get("report_count"),
             "report_modes": inputs.get("report_modes"),
+            "report_mode_source": inputs.get("report_mode_source"),
+            "report_mode_column_present": inputs.get("report_mode_column_present"),
             "report_mode_conflict": inputs.get("report_mode_conflict"),
             "expected_classification": classification_signature(expected),
             "classification_matches_expected": not bool(errors),

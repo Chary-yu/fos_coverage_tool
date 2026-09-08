@@ -9,7 +9,7 @@ from __future__ import print_function
 
 import re
 
-from app.db.repositories.base import fetchall, fetchone
+from app.db.repositories.base import fetchall, fetchone, is_sqlite
 
 
 LEGACY_REPORT_COMPATIBLE = "LEGACY_REPORT_COMPATIBLE"
@@ -232,6 +232,45 @@ def validate_path_mapping_evidence(classification, evidence):
     return errors
 
 
+def _table_columns(connection, table_name):
+    """Return lower-cased table columns on SQLite and MariaDB 5.5."""
+    name = str(table_name or "").strip()
+    if not re.match(r"^[A-Za-z0-9_]+$", name):
+        raise ValueError("invalid table name for schema inspection")
+    if is_sqlite(connection):
+        rows = fetchall(connection, "PRAGMA table_info({})".format(name))
+        return set(str(row.get("name") or "").strip().lower() for row in rows)
+    rows = fetchall(connection, """
+        SELECT COLUMN_NAME AS column_name
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+        ORDER BY ORDINAL_POSITION
+    """, (name,))
+    return set(str(row.get("column_name") or "").strip().lower() for row in rows)
+
+
+def _legacy_report_mode_from_row(row):
+    """Classify a pre-runtime-v3 report without fabricating VNext identity.
+
+    The e9 production baseline predates ``coverage_reports.report_mode``.
+    Match the existing ReportRegistry compatibility rule: promotion to VNext
+    is permitted only when the complete identity tuple is already present;
+    otherwise the historical row remains LEGACY_STATIC.
+    """
+    row = dict(row or {})
+    try:
+        sidecar_schema = int(row.get("sidecar_schema") or 0)
+    except (TypeError, ValueError):
+        sidecar_schema = 0
+    complete_vnext_identity = bool(
+        str(row.get("report_root") or "").strip() and
+        str(row.get("asset_identity") or "").strip() and
+        sidecar_schema > 0 and
+        row.get("scan_id") is not None
+    )
+    return VNEXT_ARTIFACT_READY if complete_vnext_identity else LEGACY_STATIC
+
+
 def _repository_identity_complete(rows):
     rows = list(rows or [])
     if not rows:
@@ -279,17 +318,43 @@ def collect_release_gate_inputs(connection, project_name, release_mode,
         WHERE scan_id=?
         ORDER BY repository_name, id
     """, (scan_id,))
-    reports = fetchall(connection, """
-        SELECT id, report_id, report_mode
-        FROM coverage_reports
-        WHERE scan_id=?
-        ORDER BY id
-    """, (scan_id,))
-    report_modes = sorted(set(
-        _canonical_mode(row.get("report_mode"))
-        for row in reports
-        if _canonical_mode(row.get("report_mode"))
-    ))
+    report_columns = _table_columns(connection, "coverage_reports")
+    if "report_mode" in report_columns:
+        reports = fetchall(connection, """
+            SELECT id, scan_id, report_id, report_mode
+            FROM coverage_reports
+            WHERE scan_id=?
+            ORDER BY id
+        """, (scan_id,))
+        report_modes = sorted(set(
+            _canonical_mode(row.get("report_mode"))
+            for row in reports
+            if _canonical_mode(row.get("report_mode"))
+        ))
+        report_mode_source = "explicit_column"
+    else:
+        required_legacy_columns = set((
+            "id", "scan_id", "report_id", "report_root",
+            "sidecar_schema", "asset_identity",
+        ))
+        missing = sorted(required_legacy_columns - report_columns)
+        if missing:
+            raise RuntimeError(
+                "coverage_reports legacy mode classification lacks columns: {}".format(
+                    ", ".join(missing)
+                )
+            )
+        reports = fetchall(connection, """
+            SELECT id, scan_id, report_id, report_root,
+                   sidecar_schema, asset_identity
+            FROM coverage_reports
+            WHERE scan_id=?
+            ORDER BY id
+        """, (scan_id,))
+        report_modes = sorted(set(
+            _legacy_report_mode_from_row(row) for row in reports
+        ))
+        report_mode_source = "legacy_pre_v3_identity_tuple"
     report_mode_conflict = len(report_modes) > 1
     report_mode = report_modes[0] if len(report_modes) == 1 else "UNKNOWN"
     payload = {
@@ -305,6 +370,8 @@ def collect_release_gate_inputs(connection, project_name, release_mode,
         "report_count": len(reports),
         "report_modes": report_modes,
         "report_mode": report_mode,
+        "report_mode_source": report_mode_source,
+        "report_mode_column_present": "report_mode" in report_columns,
         "report_mode_conflict": report_mode_conflict,
         "release_mode": release_mode,
         "claims_vnext_code_detail": bool(claims_vnext_code_detail),

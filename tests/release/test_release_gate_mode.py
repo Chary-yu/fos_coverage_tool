@@ -21,7 +21,7 @@ from scripts.upgrade.run_upgrade import UpgradeOrchestrator
 
 
 class ReleaseGateModeTest(unittest.TestCase):
-    def _connection(self):
+    def _connection(self, legacy_report_schema=False):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         connection.executescript("""
@@ -42,13 +42,27 @@ class ReleaseGateModeTest(unittest.TestCase):
                 commit_sha TEXT, identity_verified INTEGER NOT NULL DEFAULT 0,
                 identity_provenance TEXT NOT NULL DEFAULT ''
             );
-            CREATE TABLE coverage_reports(
-                id INTEGER PRIMARY KEY, scan_id INTEGER NOT NULL,
-                report_id TEXT NOT NULL, report_mode TEXT NOT NULL
-            );
             INSERT INTO coverage_projects(id, project_name)
             VALUES (1, 'FOS_V6R2');
         """)
+        if legacy_report_schema:
+            connection.executescript("""
+                CREATE TABLE coverage_reports(
+                    id INTEGER PRIMARY KEY, scan_id INTEGER NOT NULL,
+                    report_id TEXT NOT NULL, report_root TEXT NOT NULL DEFAULT '',
+                    source_signature TEXT NOT NULL DEFAULT '',
+                    sidecar_schema INTEGER NOT NULL DEFAULT 0,
+                    asset_identity TEXT NOT NULL DEFAULT '',
+                    generated_at TEXT
+                );
+            """)
+        else:
+            connection.executescript("""
+                CREATE TABLE coverage_reports(
+                    id INTEGER PRIMARY KEY, scan_id INTEGER NOT NULL,
+                    report_id TEXT NOT NULL, report_mode TEXT NOT NULL
+                );
+            """)
         return connection
 
     def _insert_scan(self, connection, scan_id=1, scan_type="legacy_migrated",
@@ -74,14 +88,33 @@ class ReleaseGateModeTest(unittest.TestCase):
                 "git" if repo_identity else "",
             ),
         )
+        columns = {row[1] for row in connection.execute(
+            "PRAGMA table_info(coverage_reports)"
+        ).fetchall()}
         for index, mode in enumerate(report_modes):
-            connection.execute(
-                """INSERT INTO coverage_reports(
-                       id, scan_id, report_id, report_mode
-                   ) VALUES (?, ?, ?, ?)""",
-                (scan_id * 10 + index, scan_id,
-                 "report-{}-{}".format(scan_id, index), mode),
-            )
+            report_id = "report-{}-{}".format(scan_id, index)
+            if "report_mode" in columns:
+                connection.execute(
+                    """INSERT INTO coverage_reports(
+                           id, scan_id, report_id, report_mode
+                       ) VALUES (?, ?, ?, ?)""",
+                    (scan_id * 10 + index, scan_id, report_id, mode),
+                )
+            elif mode == "VNEXT_ARTIFACT_READY":
+                connection.execute(
+                    """INSERT INTO coverage_reports(
+                           id, scan_id, report_id, report_root, sidecar_schema,
+                           asset_identity
+                       ) VALUES (?, ?, ?, ?, ?, ?)""",
+                    (scan_id * 10 + index, scan_id, report_id,
+                     "/reports/{}".format(report_id), 3, "asset-{}".format(report_id)),
+                )
+            else:
+                connection.execute(
+                    """INSERT INTO coverage_reports(id, scan_id, report_id)
+                       VALUES (?, ?, ?)""",
+                    (scan_id * 10 + index, scan_id, report_id),
+                )
         connection.commit()
 
     def test_current_legacy_static_identity_gap_is_deferred(self):
@@ -97,6 +130,46 @@ class ReleaseGateModeTest(unittest.TestCase):
         self.assertEqual(result["vnext_report_gate"], VNEXT_REPORT_DEFERRED)
         self.assertFalse(result["report_identity_fabricated"])
         self.assertFalse(result["blocked"])
+
+    def test_pre_v3_report_schema_legacy_row_is_classified_legacy_static(self):
+        connection = self._connection(legacy_report_schema=True)
+        self.addCleanup(connection.close)
+        self._insert_scan(connection)
+        inputs, result = classify_current_release_gate_mode(
+            connection, "FOS_V6R2", LEGACY_REPORT_COMPATIBLE, False
+        )
+        self.assertFalse(inputs["report_mode_column_present"])
+        self.assertEqual(
+            inputs["report_mode_source"], "legacy_pre_v3_identity_tuple"
+        )
+        self.assertEqual(inputs["report_mode"], "LEGACY_STATIC")
+        self.assertEqual(result["path_mapping_gate"], PATH_MAPPING_DEFERRED)
+        self.assertEqual(result["vnext_report_gate"], VNEXT_REPORT_DEFERRED)
+        self.assertFalse(result["blocked"])
+
+    def test_pre_v3_report_schema_complete_identity_is_vnext(self):
+        connection = self._connection(legacy_report_schema=True)
+        self.addCleanup(connection.close)
+        self._insert_scan(connection, report_modes=("VNEXT_ARTIFACT_READY",))
+        inputs, result = classify_current_release_gate_mode(
+            connection, "FOS_V6R2", LEGACY_REPORT_COMPATIBLE, False
+        )
+        self.assertFalse(inputs["report_mode_column_present"])
+        self.assertEqual(inputs["report_mode"], "VNEXT_ARTIFACT_READY")
+        self.assertEqual(result["vnext_report_gate"], VNEXT_REPORT_REQUIRED)
+        self.assertEqual(result["path_mapping_gate"], BLOCKED_IDENTITY_INCOMPLETE)
+        self.assertTrue(result["blocked"])
+
+    def test_explicit_report_mode_column_remains_authoritative(self):
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        self._insert_scan(connection)
+        inputs, result = classify_current_release_gate_mode(
+            connection, "FOS_V6R2", LEGACY_REPORT_COMPATIBLE, False
+        )
+        self.assertTrue(inputs["report_mode_column_present"])
+        self.assertEqual(inputs["report_mode_source"], "explicit_column")
+        self.assertEqual(result["vnext_report_gate"], VNEXT_REPORT_DEFERRED)
 
     def test_authoritative_identity_forces_strict_path_mapping(self):
         connection = self._connection()
