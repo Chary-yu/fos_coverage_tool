@@ -3,7 +3,7 @@ name: R8 Production Compatibility Regression
 on:
   push:
     branches:
-      - r8-source-consolidation-c0b88ceb
+      - main
   workflow_dispatch:
 
 permissions:
