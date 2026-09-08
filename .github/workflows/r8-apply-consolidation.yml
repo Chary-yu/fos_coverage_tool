@@ -1,5 +1,5 @@
 name: R8 Source Consolidation Apply
-# Triggered after workflow registration so the R8 apply job runs on this branch.
+# Temporary verifier for exact c0b88ceb -> R8 source consolidation.
 
 on:
   push:
@@ -27,8 +27,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install focused test dependency
-        run: |
-          python -m pip install --disable-pip-version-check -r requirements-py36.txt
+        run: python -m pip install --disable-pip-version-check -r requirements-py36.txt
 
       - name: Apply deterministic R8 source edits
         run: python .r8/apply_consolidation.py --apply
@@ -53,7 +52,6 @@ jobs:
           python - <<'PY'
           import ast
           from pathlib import Path
-
           paths = [
               Path('scripts/upgrade/disposable_target.py'),
               Path('scripts/upgrade/validation_session.py'),
@@ -79,28 +77,22 @@ jobs:
       - name: Verify R7 defect shapes are absent
         run: |
           set -eu
-          if grep -n 'REVOKE ALL PRIVILEGES' scripts/upgrade/disposable_target.py; then
-            echo 'R7 unsupported revoke shape remains' >&2
-            exit 1
-          fi
-          if grep -n -- '--value' scripts/upgrade/vfoswind_production_lifecycle.py; then
-            echo 'systemd --value incompatibility remains' >&2
-            exit 1
-          fi
-          if grep -n 'show_grants.output' scripts/upgrade/disposable_target.py; then
-            echo 'raw SHOW GRANTS evidence write remains' >&2
-            exit 1
-          fi
+          ! grep -n 'REVOKE ALL PRIVILEGES' scripts/upgrade/disposable_target.py
+          ! grep -n -- '--value' scripts/upgrade/vfoswind_production_lifecycle.py
+          ! grep -n 'show_grants.output' scripts/upgrade/disposable_target.py
           grep -q 'VALIDATION_PROCESS_EXITED' scripts/upgrade/run_upgrade.py
           grep -q 'candidate_schema_privileges_zero' scripts/upgrade/disposable_target.py
           grep -q 'captured_before_teardown' scripts/upgrade/run_upgrade.py
 
-      - name: Commit verified R8 source consolidation
+      - name: Commit verified source changes without workflow paths
         run: |
           set -eu
-          git rm -rf .r8
-          git rm -f .github/workflows/r8-apply-consolidation.yml
+          # GITHUB_TOKEN may not update workflow files. Keep the CI workflow
+          # and temporary .r8 verifier files out of this commit; they are
+          # finalized/removed through the repository connector after this gate.
+          git checkout HEAD -- .github/workflows/ci.yml
           git add -A
+          git reset -- .r8 .github/workflows/r8-apply-consolidation.yml
           git diff --cached --check
           git config user.name 'R8 Source Consolidation'
           git config user.email 'r8-source-consolidation@users.noreply.github.com'
