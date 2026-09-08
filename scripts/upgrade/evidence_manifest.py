@@ -25,6 +25,10 @@ if ROOT not in sys.path:
 
 from app.api.auth import AUTH_MUTATION_PROBE_PATH
 from app.time_utils import utc_iso
+from scripts.upgrade.release_gate_mode import (
+    validate_classification_record, validate_path_mapping_evidence,
+    validate_vnext_report_evidence,
+)
 
 
 def get_utc_iso():
@@ -355,6 +359,7 @@ class ProductionEvidenceManifest:
             "candidate_browser_evidence": {},
             "candidate_authenticated_mutation": {},
             "candidate_gateway_preflight": {},
+            "release_gate_classification": {},
             "path_mapping_audit": {},
             "sidecar_audit": {},
             "security_audit": {},
@@ -714,10 +719,44 @@ class ProductionEvidenceManifest:
                 performance.get("served_root_sha256") != expected_served_root:
             unmet.append("Performance A/B evidence is not exact to this Candidate")
 
-        path_mapping = record("path_mapping_audit")
-        if path_mapping.get("is_valid") is not True or \
-                path_mapping.get("input_kind") != "repository_lcov":
-            unmet.append("path mapping audit is not a valid repository+LCOV PASS")
+        classification = self.data.get("release_gate_classification") or {}
+        if require_production_integration:
+            classification = record("release_gate_classification")
+            unmet.extend(validate_classification_record(
+                classification, require_expected_binding=True,
+                required_stage="step8_reconfirmation",
+            ))
+            unmet.extend(validate_vnext_report_evidence(
+                classification, self.data.get("candidate_release_prepared") or {}
+            ))
+            path_mapping = record("path_mapping_audit", required=False)
+            if path_mapping.get("revision") != revision:
+                unmet.append("path mapping evidence revision is missing or mismatched")
+            if path_mapping.get("exit_code") != 0:
+                unmet.append("path mapping evidence exit_code is not 0")
+            unmet.extend(
+                validate_path_mapping_evidence(classification, path_mapping)
+            )
+        elif classification:
+            # Staging may opt into the same classifier, but existing staging
+            # fixtures without classification retain the historical strict
+            # repository+LCOV rule below.
+            unmet.extend(validate_classification_record(classification))
+            path_mapping = record("path_mapping_audit", required=False)
+            if path_mapping.get("revision") != revision:
+                unmet.append("path mapping evidence revision is missing or mismatched")
+            if path_mapping.get("exit_code") != 0:
+                unmet.append("path mapping evidence exit_code is not 0")
+            unmet.extend(
+                validate_path_mapping_evidence(classification, path_mapping)
+            )
+        else:
+            path_mapping = record("path_mapping_audit")
+            if path_mapping.get("is_valid") is not True or \
+                    path_mapping.get("input_kind") != "repository_lcov":
+                unmet.append(
+                    "path mapping audit is not a valid repository+LCOV PASS"
+                )
         sidecar = record("sidecar_audit")
         if sidecar.get("is_safe") is not True:
             unmet.append("sidecar audit is not safe")
@@ -954,12 +993,55 @@ class ProductionEvidenceManifest:
         if not sa.get("is_safe"):
             unmet.append(f"Sidecar audit found safety violations: corrupted={sa.get('corrupted_registries')}, orphan={sa.get('orphaned_cache_count')}")
 
-        # 6b. Path mapping must have real, explainable input and no violations.
+        # 6b. Path Mapping follows the exact runtime classification.  A
+        # Legacy-compatible deferment is explicit evidence and is never
+        # relabelled as PASSED.
         pma = self.data.get("path_mapping_audit", {})
-        if pma.get("status") != "PASSED" or not pma.get("is_valid"):
-            unmet.append("Path mapping audit is missing, unavailable, or invalid")
-        if pma.get("input_kind") != "repository_lcov":
-            unmet.append("Path mapping audit is not backed by repository + LCOV inputs")
+        gate_classification = self.data.get("release_gate_classification") or {}
+        if self.data.get("upgrade_mode") == "production":
+            if not gate_classification:
+                unmet.append("production release gate classification is missing")
+            else:
+                if gate_classification.get("revision") != revision:
+                    unmet.append(
+                        "release gate classification revision is missing or mismatched"
+                    )
+                if gate_classification.get("exit_code") != 0:
+                    unmet.append("release gate classification exit_code is not 0")
+                unmet.extend(
+                    validate_classification_record(
+                        gate_classification, require_expected_binding=True,
+                        required_stage="step8_reconfirmation",
+                    )
+                )
+                for field in (
+                        "name", "started_at", "finished_at", "host",
+                        "environment", "command"):
+                    if not gate_classification.get(field):
+                        unmet.append(
+                            "release gate classification is missing provenance field {}".format(
+                                field
+                            )
+                        )
+                unmet.extend(validate_vnext_report_evidence(
+                    gate_classification,
+                    self.data.get("candidate_release_prepared") or {},
+                ))
+                unmet.extend(
+                    validate_path_mapping_evidence(gate_classification, pma)
+                )
+        elif gate_classification:
+            unmet.extend(validate_classification_record(gate_classification))
+            unmet.extend(validate_path_mapping_evidence(gate_classification, pma))
+        else:
+            if pma.get("status") != "PASSED" or not pma.get("is_valid"):
+                unmet.append(
+                    "Path mapping audit is missing, unavailable, or invalid"
+                )
+            if pma.get("input_kind") != "repository_lcov":
+                unmet.append(
+                    "Path mapping audit is not backed by repository + LCOV inputs"
+                )
 
         lifecycle_sections = ("traffic_freeze", "job_drain", "api_stop", "api_start",
                               "release_endpoint", "file_cutover")

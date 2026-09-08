@@ -94,6 +94,11 @@ from app.upgrade.lifecycle import UpgradeLifecycle
 from scripts.upgrade.validation_session import (
     SESSION_SCHEMA_VERSION, ValidationSession,
 )
+from scripts.upgrade.release_gate_mode import (
+    PATH_MAPPING_DEFERRED, PATH_MAPPING_REQUIRED,
+    classify_current_release_gate_mode, classification_signature,
+    compare_expected_classification,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1052,6 +1057,8 @@ class UpgradeOrchestrator:
         self.rollback_evidence_path = ""
         self.performance_evidence_path = ""
         self.candidate_preflight = {}
+        self._release_gate_classification = {}
+        self._release_gate_inputs = {}
         self._candidate_artifact_sha256 = ""
         self._served_root_sha256 = ""
         self._target_identity = {}
@@ -2016,6 +2023,103 @@ class UpgradeOrchestrator:
             self.manifest.data["status"] = "UNMET_GATES"
         self.manifest.save()
 
+    @staticmethod
+    def _rollback_read_snapshot(connection):
+        rollback = getattr(connection, "rollback", None)
+        if callable(rollback):
+            rollback()
+
+    def _refresh_release_gate_classification(
+            self, connection, identity, upgrade_config, stage):
+        """Re-read current Scan/report identity and fail closed on drift.
+
+        Production must carry an expected classification from reviewed
+        readiness.  The source DB is re-read immediately before mutation and
+        again before the path/report gate so a stale tool cannot silently
+        reuse an earlier Legacy deferment.
+        """
+        if connection is None:
+            raise RuntimeError("production release gate classification requires source DB")
+        release_mode = str(upgrade_config.get("release_mode") or "").strip().upper()
+        if not release_mode:
+            raise RuntimeError("upgrade.release_mode is required in production")
+        if "claims_vnext_code_detail" not in upgrade_config:
+            raise RuntimeError(
+                "upgrade.claims_vnext_code_detail must be explicit in production"
+            )
+        claims_vnext = upgrade_config.get("claims_vnext_code_detail")
+        if type(claims_vnext) is not bool:
+            raise RuntimeError(
+                "upgrade.claims_vnext_code_detail must be a JSON boolean"
+            )
+        expected = upgrade_config.get("expected_release_gate_classification")
+        if not isinstance(expected, dict) or not expected:
+            raise RuntimeError(
+                "upgrade.expected_release_gate_classification is required in production"
+            )
+        project_name = str(
+            upgrade_config.get("release_gate_project_name") or
+            PRODUCTION_PROJECT_NAME
+        ).strip()
+        try:
+            self._rollback_read_snapshot(connection)
+            inputs, actual = classify_current_release_gate_mode(
+                connection, project_name, release_mode, claims_vnext
+            )
+        finally:
+            # Close the read snapshot so a later reconfirmation observes a
+            # fresh production view under MariaDB's default REPEATABLE READ.
+            self._rollback_read_snapshot(connection)
+
+        errors = compare_expected_classification(expected, actual)
+        previous = classification_signature(self._release_gate_classification) \
+            if self._release_gate_classification else {}
+        if previous and previous != classification_signature(actual):
+            errors.append(
+                "release-gate classification changed during upgrade attempt"
+            )
+        record = dict(actual)
+        record.update({
+            "status": "FAILED" if actual.get("blocked") or errors else "PASSED",
+            "revision": identity.get("commit_sha"),
+            "evidence_class": "production_database",
+            "classification_stage": str(stage),
+            "project_name": inputs.get("project_name"),
+            "scan_id": inputs.get("scan_id"),
+            "scan_status": inputs.get("scan_status"),
+            "info_file_name_present": bool(inputs.get("info_file_name")),
+            "info_sha256_present": bool(inputs.get("info_sha256")),
+            "repository_count": inputs.get("repository_count"),
+            "repository_identity_complete": inputs.get(
+                "repository_identity_complete"
+            ),
+            "report_count": inputs.get("report_count"),
+            "report_modes": inputs.get("report_modes"),
+            "report_mode_conflict": inputs.get("report_mode_conflict"),
+            "expected_classification": classification_signature(expected),
+            "classification_matches_expected": not bool(errors),
+            "violations": list(errors),
+            "command": "read current Scan/report identity + classify release gates",
+            "exit_code": 1 if actual.get("blocked") or errors else 0,
+        })
+        self.manifest.record("release_gate_classification", record)
+        self._release_gate_inputs = dict(inputs)
+        self._release_gate_classification = dict(actual)
+        if errors:
+            raise RuntimeError(
+                "RELEASE_GATE_CLASSIFICATION_MISMATCH: {}".format(
+                    "; ".join(errors)
+                )
+            )
+        if actual.get("blocked"):
+            raise RuntimeError(
+                "release gate classification blocked: path={}, report={}".format(
+                    actual.get("path_mapping_gate"),
+                    actual.get("vnext_report_gate"),
+                )
+            )
+        return actual
+
     def _validate_pre_cutover_ready(self, identity, mode):
         """Record a hard PRE_CUTOVER_READY decision before Phase D.
 
@@ -2716,6 +2820,15 @@ class UpgradeOrchestrator:
                     "command": "validate_migration_database_separation + inspect_database_generation(target)",
                     "exit_code": 0,
                 })
+
+        if mode == "production":
+            try:
+                self._refresh_release_gate_classification(
+                    connection, identity, upgrade_config, "pre_mutation"
+                )
+            except (RuntimeError, ValueError, TypeError) as exc:
+                self.log("❌ Production release-gate classification failed: {}".format(exc))
+                return False, "Production release-gate classification failed"
 
         # Step 2: Schema Preflight
         self.log("[Step 2/10] Running Static DDL Preflight Validation...")
@@ -3616,71 +3729,113 @@ class UpgradeOrchestrator:
 
         # Step 8: Run Path Mapping & Sidecar Audits
         self.log("[Step 8/10] Running Path Mapping & Sidecar Integrity Audits...")
-        known = []
-        configured_sources = (((runtime_config or {}).get("upgrade") or {}).get("path_mapping_source_paths") or [])
-        source_roots = [self.repo_root] if not configured_sources else [
-            os.path.realpath(str(p) if os.path.isabs(str(p)) else os.path.join(self.repo_root, str(p)))
-            for p in configured_sources
-        ]
-        for source_root in source_roots:
-            if not os.path.exists(source_root):
-                raise RuntimeError("configured path-mapping source does not exist: {}".format(source_root))
-            if os.path.isfile(source_root):
-                candidates = [source_root]
-            else:
-                candidates = []
-                for root, dirs, files in os.walk(source_root):
-                    dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "__pycache__", ".artifacts")]
-                    candidates.extend(os.path.join(root, name) for name in files)
-            for candidate in candidates:
-                if os.path.splitext(candidate)[1].lower() in (".c", ".h", ".cc", ".cpp", ".hpp"):
-                    if source_root == self.repo_root:
-                        known.append(os.path.relpath(candidate, self.repo_root).replace(os.sep, "/"))
-                    else:
-                        known.append(os.path.relpath(candidate, source_root).replace(os.sep, "/"))
-        known = sorted(set(known))
-        queries = []
-        if known:
-            first = known[0]
-            queries.append((first, "exact"))
-            # LCOV/external path identities containing parent traversal are
-            # rejected by the canonical resolver rather than folded into a
-            # different path.
-            queries.append(("../" + first, "invalid_path"))
-            queries.append((os.path.basename(first), "basename_only_rejected"))
-            queries.append(("__missing__/not-present.c", "miss"))
-        p_audit = audit_path_mappings(known, queries)
-        if not known:
-            p_audit.update({"is_valid": False, "violations": ["No repository source paths were available for audit"]})
-        lcov_paths = (((runtime_config or {}).get("upgrade") or {}).get("path_mapping_lcov_paths") or [])
-        lcov_files = [
-            os.path.realpath(str(path) if os.path.isabs(str(path)) else os.path.join(self.repo_root, str(path)))
-            for path in lcov_paths
-        ]
-        if lcov_files:
-            if any(not os.path.isfile(path) for path in lcov_files):
-                p_audit.update({
-                    "is_valid": False,
-                    "violations": list(p_audit.get("violations", [])) + ["Configured LCOV audit input is missing"],
-                    "input_kind": "repository_lcov",
-                })
-            else:
-                lcov_audit = audit_lcov_paths(known, lcov_files)
-                p_audit.update(lcov_audit)
-                p_audit["input_kind"] = "repository_lcov"
-                p_audit["is_valid"] = bool(p_audit.get("is_valid") and lcov_audit.get("is_valid"))
-                p_audit["violations"] = list(p_audit.get("violations", [])) + list(lcov_audit.get("violations", []))
+        classification = {}
+        if mode == "production":
+            try:
+                classification = self._refresh_release_gate_classification(
+                    connection, identity, upgrade_config, "step8_reconfirmation"
+                )
+            except (RuntimeError, ValueError, TypeError) as exc:
+                self.log("❌ Release-gate classification reconfirmation failed: {}".format(exc))
+                return self._fail(
+                    lifecycle, "Release-gate classification reconfirmation failed"
+                )
+
+        if classification.get("path_mapping_gate") == PATH_MAPPING_DEFERRED:
+            p_audit = {
+                "status": "DEFERRED",
+                "gate_status": PATH_MAPPING_DEFERRED,
+                "is_valid": False,
+                "input_kind": "legacy_identity_gap",
+                "report_identity_fabricated": False,
+                "revision": identity.get("commit_sha"),
+                "evidence_class": "integration",
+                "reason": (
+                    "historical legacy_migrated Scan lacks authoritative "
+                    "LCOV/repository identity and release is explicitly "
+                    "LEGACY_REPORT_COMPATIBLE"
+                ),
+                "command": "release gate classifier: explicit Legacy deferment",
+                "exit_code": 0,
+            }
+            self.manifest.record("path_mapping_audit", p_audit)
+            self.log(
+                "  ✔ Path Mapping Gate: {} (not PASS)".format(
+                    PATH_MAPPING_DEFERRED
+                )
+            )
         else:
-            p_audit["input_kind"] = "repository_paths_only"
-        p_audit.update({
-            "status": "PASSED" if p_audit.get("is_valid") else "FAILED",
-            "revision": identity.get("commit_sha"),
-            "evidence_class": "integration",
-            "command": "audit_path_mappings (repository/LCOV path inventory)",
-            "exit_code": 0 if p_audit.get("is_valid") else 1,
-        })
-        self.manifest.record("path_mapping_audit", p_audit)
-        self.log(f"  ✔ Path Mapping Audit: is_valid={p_audit['is_valid']}")
+            if mode == "production" and classification.get(
+                    "path_mapping_gate") != PATH_MAPPING_REQUIRED:
+                return self._fail(
+                    lifecycle, "Path Mapping gate is blocked or unclassified"
+                )
+            known = []
+            configured_sources = (((runtime_config or {}).get("upgrade") or {}).get("path_mapping_source_paths") or [])
+            source_roots = [self.repo_root] if not configured_sources else [
+                os.path.realpath(str(p) if os.path.isabs(str(p)) else os.path.join(self.repo_root, str(p)))
+                for p in configured_sources
+            ]
+            for source_root in source_roots:
+                if not os.path.exists(source_root):
+                    raise RuntimeError("configured path-mapping source does not exist: {}".format(source_root))
+                if os.path.isfile(source_root):
+                    candidates = [source_root]
+                else:
+                    candidates = []
+                    for root, dirs, files in os.walk(source_root):
+                        dirs[:] = [d for d in dirs if d not in (".git", "node_modules", "__pycache__", ".artifacts")]
+                        candidates.extend(os.path.join(root, name) for name in files)
+                for candidate in candidates:
+                    if os.path.splitext(candidate)[1].lower() in (".c", ".h", ".cc", ".cpp", ".hpp"):
+                        if source_root == self.repo_root:
+                            known.append(os.path.relpath(candidate, self.repo_root).replace(os.sep, "/"))
+                        else:
+                            known.append(os.path.relpath(candidate, source_root).replace(os.sep, "/"))
+            known = sorted(set(known))
+            queries = []
+            if known:
+                first = known[0]
+                queries.append((first, "exact"))
+                # LCOV/external path identities containing parent traversal are
+                # rejected by the canonical resolver rather than folded into a
+                # different path.
+                queries.append(("../" + first, "invalid_path"))
+                queries.append((os.path.basename(first), "basename_only_rejected"))
+                queries.append(("__missing__/not-present.c", "miss"))
+            p_audit = audit_path_mappings(known, queries)
+            if not known:
+                p_audit.update({"is_valid": False, "violations": ["No repository source paths were available for audit"]})
+            lcov_paths = (((runtime_config or {}).get("upgrade") or {}).get("path_mapping_lcov_paths") or [])
+            lcov_files = [
+                os.path.realpath(str(path) if os.path.isabs(str(path)) else os.path.join(self.repo_root, str(path)))
+                for path in lcov_paths
+            ]
+            if lcov_files:
+                if any(not os.path.isfile(path) for path in lcov_files):
+                    p_audit.update({
+                        "is_valid": False,
+                        "violations": list(p_audit.get("violations", [])) + ["Configured LCOV audit input is missing"],
+                        "input_kind": "repository_lcov",
+                    })
+                else:
+                    lcov_audit = audit_lcov_paths(known, lcov_files)
+                    p_audit.update(lcov_audit)
+                    p_audit["input_kind"] = "repository_lcov"
+                    p_audit["is_valid"] = bool(p_audit.get("is_valid") and lcov_audit.get("is_valid"))
+                    p_audit["violations"] = list(p_audit.get("violations", [])) + list(lcov_audit.get("violations", []))
+            else:
+                p_audit["input_kind"] = "repository_paths_only"
+            p_audit.update({
+                "status": "PASSED" if p_audit.get("is_valid") else "FAILED",
+                "gate_status": PATH_MAPPING_REQUIRED,
+                "revision": identity.get("commit_sha"),
+                "evidence_class": "integration",
+                "command": "audit_path_mappings (repository/LCOV path inventory)",
+                "exit_code": 0 if p_audit.get("is_valid") else 1,
+            })
+            self.manifest.record("path_mapping_audit", p_audit)
+            self.log(f"  ✔ Path Mapping Audit: is_valid={p_audit['is_valid']}")
 
         s_audit = audit_sidecar_and_registry([self.repo_root, "/opt/coverage_tool"])
         s_audit.update({

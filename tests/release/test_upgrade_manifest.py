@@ -23,6 +23,11 @@ from scripts.upgrade.run_upgrade import (
     verify_production_candidate_served_root_binding,
 )
 from scripts.upgrade.evidence_manifest import ProductionEvidenceManifest
+from scripts.upgrade.release_gate_mode import (
+    LEGACY_REPORT_COMPATIBLE, PATH_MAPPING_DEFERRED, PATH_MAPPING_REQUIRED,
+    classification_signature,
+    classify_release_gate_mode,
+)
 from scripts.diagnostics.build_browser_fixture_evidence import build_evidence
 
 
@@ -66,6 +71,9 @@ class TestUpgradeManifest(unittest.TestCase):
                 release_validation_session_id=session,
                 candidate_artifact_sha256=artifact,
                 served_root_sha256=served,
+                release_manifest={
+                    "report_modes": ["VNEXT_ARTIFACT_READY"],
+                },
             ),
             "data_hash_verification": dict(
                 passed, verified=True,
@@ -184,8 +192,32 @@ class TestUpgradeManifest(unittest.TestCase):
                 candidate_artifact_sha256=artifact,
                 served_root_sha256=served,
             ),
+            "release_gate_classification": dict(
+                passed, scan_type="native", legacy_migrated=False,
+                report_mode="VNEXT_ARTIFACT_READY", release_mode="FULL_VNEXT",
+                authoritative_lcov_repository_identity=True,
+                claims_vnext_code_detail=True,
+                path_mapping_gate=PATH_MAPPING_REQUIRED,
+                vnext_report_gate="REQUIRED",
+                report_identity_fabricated=False, blocked=False,
+                classification_stage="step8_reconfirmation",
+                classification_matches_expected=True,
+                expected_classification={
+                    "scan_type": "native",
+                    "legacy_migrated": False,
+                    "report_mode": "VNEXT_ARTIFACT_READY",
+                    "release_mode": "FULL_VNEXT",
+                    "authoritative_lcov_repository_identity": True,
+                    "claims_vnext_code_detail": True,
+                    "path_mapping_gate": PATH_MAPPING_REQUIRED,
+                    "vnext_report_gate": "REQUIRED",
+                    "report_identity_fabricated": False,
+                    "blocked": False,
+                },
+            ),
             "path_mapping_audit": dict(
                 passed, is_valid=True, input_kind="repository_lcov",
+                gate_status=PATH_MAPPING_REQUIRED,
             ),
             "sidecar_audit": dict(passed, is_safe=True),
             "security_audit": dict(
@@ -386,6 +418,84 @@ class TestUpgradeManifest(unittest.TestCase):
             self.assertEqual(
                 manifest.data["pre_cutover_ready"]["status"], "FAILED"
             )
+
+    def test_legacy_deferred_path_mapping_can_pass_pre_cutover_without_fake_pass(self):
+        with tempfile.TemporaryDirectory(prefix="pre-cutover-legacy-defer-") as root:
+            data = self._pre_cutover_data()
+            classification = classify_release_gate_mode({
+                "scan_type": "legacy_migrated",
+                "legacy_migrated": True,
+                "report_mode": "LEGACY_STATIC",
+                "release_mode": LEGACY_REPORT_COMPATIBLE,
+                "repository_identity_complete": False,
+                "claims_vnext_code_detail": False,
+            })
+            data["release_gate_classification"] = dict(
+                classification, status="PASSED", revision="a" * 40, exit_code=0,
+                classification_stage="step8_reconfirmation",
+                classification_matches_expected=True,
+                expected_classification=classification_signature(classification),
+            )
+            data["candidate_release_prepared"]["release_manifest"] = {
+                "report_modes": ["LEGACY_STATIC"],
+            }
+            data["path_mapping_audit"] = {
+                "status": "DEFERRED",
+                "revision": "a" * 40,
+                "exit_code": 0,
+                "gate_status": PATH_MAPPING_DEFERRED,
+                "is_valid": False,
+                "input_kind": "legacy_identity_gap",
+                "report_identity_fabricated": False,
+            }
+            manifest = self._manifest_for_pre_cutover(root, data)
+            orchestrator = UpgradeOrchestrator(repo_root=root)
+            orchestrator.manifest = manifest
+            ready, unmet = orchestrator._validate_pre_cutover_ready(
+                manifest.data["release_identity"], "production"
+            )
+            self.assertTrue(ready, unmet)
+            self.assertEqual(
+                manifest.data["path_mapping_audit"]["status"], "DEFERRED"
+            )
+
+    def test_legacy_deferred_path_mapping_fake_pass_is_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="pre-cutover-legacy-fake-") as root:
+            data = self._pre_cutover_data()
+            classification = classify_release_gate_mode({
+                "scan_type": "legacy_migrated",
+                "legacy_migrated": True,
+                "report_mode": "LEGACY_STATIC",
+                "release_mode": LEGACY_REPORT_COMPATIBLE,
+                "repository_identity_complete": False,
+                "claims_vnext_code_detail": False,
+            })
+            data["release_gate_classification"] = dict(
+                classification, status="PASSED", revision="a" * 40, exit_code=0,
+                classification_stage="step8_reconfirmation",
+                classification_matches_expected=True,
+                expected_classification=classification_signature(classification),
+            )
+            data["candidate_release_prepared"]["release_manifest"] = {
+                "report_modes": ["LEGACY_STATIC"],
+            }
+            data["path_mapping_audit"] = {
+                "status": "PASSED",
+                "revision": "a" * 40,
+                "exit_code": 0,
+                "gate_status": PATH_MAPPING_DEFERRED,
+                "is_valid": True,
+                "input_kind": "legacy_identity_gap",
+                "report_identity_fabricated": False,
+            }
+            manifest = self._manifest_for_pre_cutover(root, data)
+            orchestrator = UpgradeOrchestrator(repo_root=root)
+            orchestrator.manifest = manifest
+            ready, unmet = orchestrator._validate_pre_cutover_ready(
+                manifest.data["release_identity"], "production"
+            )
+            self.assertFalse(ready)
+            self.assertTrue(any("DEFERRED" in item for item in unmet), unmet)
 
     def test_production_auth_disabled_blocks_pre_cutover_before_phase_d(self):
         with tempfile.TemporaryDirectory(prefix="pre-cutover-auth-") as root:
