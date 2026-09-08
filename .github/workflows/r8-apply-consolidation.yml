@@ -1,4 +1,5 @@
 name: R8 Source Consolidation Apply
+# Triggered after workflow registration so the R8 apply job runs on this branch.
 
 on:
   push:
