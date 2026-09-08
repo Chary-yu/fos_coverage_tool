@@ -1,0 +1,92 @@
+name: R8 Production Compatibility Regression
+
+on:
+  push:
+    branches:
+      - r8-source-consolidation-c0b88ceb
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mariadb55-python36:
+    name: MariaDB 5.5 scoped cleanup + Python 3.6
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb@sha256:8665c074af5a5fb7e04b9570fcf8551e9d82955182be50375d5013838d4f9137 # 5.5.64
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: mysql
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=18
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Bind regression to exact R8 commit
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+
+      - name: Run scoped Candidate grant/revoke on real MariaDB 5.5
+        run: |
+          set -o pipefail
+          python -m pip install --disable-pip-version-check -r requirements-py36.txt
+          mkdir -p .artifacts/r8-compat
+          python scripts/diagnostics/mariadb55_candidate_grant_cleanup.py \
+            --host 127.0.0.1 --port 3306 --user root --password root \
+            --require-version-prefix 5.5 \
+            | tee .artifacts/r8-compat/mariadb55-python312.json
+
+      - name: Run the same cleanup under Python 3.6
+        run: |
+          set -o pipefail
+          docker run --rm --network host -i \
+            -v "$PWD:/workspace" -w /workspace \
+            python@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc \
+            bash -s <<'PY' | tee .artifacts/r8-compat/mariadb55-python36.json
+          set -e
+          python -m pip install --no-cache-dir -r requirements-py36.txt >/dev/null 2>&1
+          python -c "import pymysql; assert pymysql.__version__ == '0.10.1', pymysql.__version__"
+          python scripts/diagnostics/mariadb55_candidate_grant_cleanup.py \
+            --host 127.0.0.1 --port 3306 --user root --password root \
+            --require-version-prefix 5.5
+          PY
+
+      - name: Verify compatibility evidence
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          for name in ('mariadb55-python312.json', 'mariadb55-python36.json'):
+              evidence = json.loads(Path('.artifacts/r8-compat', name).read_text())
+              assert evidence['status'] == 'PASSED'
+              assert evidence['database_version'].startswith('5.5')
+              assert evidence['candidate_privileges_zero'] is True
+              assert evidence['non_candidate_grants_conserved'] is True
+              assert evidence['revoke_uses_explicit_privileges'] is True
+              assert evidence['credentials_recorded'] is False
+          PY
+
+      - name: Upload R8 compatibility evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: r8-production-compat-${{ github.sha }}
+          path: .artifacts/r8-compat
+          if-no-files-found: error
