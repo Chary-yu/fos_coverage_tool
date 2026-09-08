@@ -1,0 +1,307 @@
+name: R8 SRC-022 pre-v3 report-mode fix once
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fix:
+    if: github.event.head_commit.message == 'chore: apply R8-SRC-022 pre-v3 report-mode fix'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact main
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Apply deterministic source edits
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit('%s replacement count=%s expected=1' % (path, count))
+              p.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          path = 'scripts/upgrade/release_gate_mode.py'
+          replace_once(
+              path,
+              'from app.db.repositories.base import fetchall, fetchone\n',
+              'from app.db.repositories.base import fetchall, fetchone, is_sqlite\n',
+          )
+
+          marker = '\n\ndef _repository_identity_complete(rows):\n'
+          helpers = '''\n\ndef _table_columns(connection, table_name):
+              """Return lower-cased table columns on SQLite and MariaDB 5.5."""
+              name = str(table_name or "").strip()
+              if not re.match(r"^[A-Za-z0-9_]+$", name):
+                  raise ValueError("invalid table name for schema inspection")
+              if is_sqlite(connection):
+                  rows = fetchall(connection, "PRAGMA table_info({})".format(name))
+                  return set(str(row.get("name") or "").strip().lower() for row in rows)
+              rows = fetchall(connection, """
+                  SELECT COLUMN_NAME AS column_name
+                  FROM information_schema.COLUMNS
+                  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+                  ORDER BY ORDINAL_POSITION
+              """, (name,))
+              return set(str(row.get("column_name") or "").strip().lower() for row in rows)
+
+
+          def _legacy_report_mode_from_row(row):
+              """Classify a pre-runtime-v3 report without fabricating VNext identity.
+
+              The e9 production baseline predates ``coverage_reports.report_mode``.
+              Match the existing ReportRegistry compatibility rule: promotion to VNext
+              is permitted only when the complete identity tuple is already present;
+              otherwise the historical row remains LEGACY_STATIC.
+              """
+              row = dict(row or {})
+              try:
+                  sidecar_schema = int(row.get("sidecar_schema") or 0)
+              except (TypeError, ValueError):
+                  sidecar_schema = 0
+              complete_vnext_identity = bool(
+                  str(row.get("report_root") or "").strip() and
+                  str(row.get("asset_identity") or "").strip() and
+                  sidecar_schema > 0 and
+                  row.get("scan_id") is not None
+              )
+              return VNEXT_ARTIFACT_READY if complete_vnext_identity else LEGACY_STATIC
+          '''
+          replace_once(path, marker, helpers + marker)
+
+          old = '''    reports = fetchall(connection, """
+                  SELECT id, report_id, report_mode
+                  FROM coverage_reports
+                  WHERE scan_id=?
+                  ORDER BY id
+              """, (scan_id,))
+              report_modes = sorted(set(
+                  _canonical_mode(row.get("report_mode"))
+                  for row in reports
+                  if _canonical_mode(row.get("report_mode"))
+              ))
+          '''
+          new = '''    report_columns = _table_columns(connection, "coverage_reports")
+              if "report_mode" in report_columns:
+                  reports = fetchall(connection, """
+                      SELECT id, scan_id, report_id, report_mode
+                      FROM coverage_reports
+                      WHERE scan_id=?
+                      ORDER BY id
+                  """, (scan_id,))
+                  report_modes = sorted(set(
+                      _canonical_mode(row.get("report_mode"))
+                      for row in reports
+                      if _canonical_mode(row.get("report_mode"))
+                  ))
+                  report_mode_source = "explicit_column"
+              else:
+                  required_legacy_columns = set((
+                      "id", "scan_id", "report_id", "report_root",
+                      "sidecar_schema", "asset_identity",
+                  ))
+                  missing = sorted(required_legacy_columns - report_columns)
+                  if missing:
+                      raise RuntimeError(
+                          "coverage_reports legacy mode classification lacks columns: {}".format(
+                              ", ".join(missing)
+                          )
+                      )
+                  reports = fetchall(connection, """
+                      SELECT id, scan_id, report_id, report_root,
+                             sidecar_schema, asset_identity
+                      FROM coverage_reports
+                      WHERE scan_id=?
+                      ORDER BY id
+                  """, (scan_id,))
+                  report_modes = sorted(set(
+                      _legacy_report_mode_from_row(row) for row in reports
+                  ))
+                  report_mode_source = "legacy_pre_v3_identity_tuple"
+          '''
+          replace_once(path, old, new)
+          replace_once(
+              path,
+              '        "report_mode": report_mode,\n        "report_mode_conflict": report_mode_conflict,\n',
+              '        "report_mode": report_mode,\n        "report_mode_source": report_mode_source,\n        "report_mode_column_present": "report_mode" in report_columns,\n        "report_mode_conflict": report_mode_conflict,\n',
+          )
+
+          path = 'scripts/upgrade/run_upgrade.py'
+          replace_once(
+              path,
+              '            "report_count": inputs.get("report_count"),\n            "report_modes": inputs.get("report_modes"),\n            "report_mode_conflict": inputs.get("report_mode_conflict"),\n',
+              '            "report_count": inputs.get("report_count"),\n            "report_modes": inputs.get("report_modes"),\n            "report_mode_source": inputs.get("report_mode_source"),\n            "report_mode_column_present": inputs.get("report_mode_column_present"),\n            "report_mode_conflict": inputs.get("report_mode_conflict"),\n',
+          )
+
+          path = 'tests/release/test_release_gate_mode.py'
+          replace_once(path, '    def _connection(self):\n', '    def _connection(self, legacy_report_schema=False):\n')
+          replace_once(
+              path,
+              '''            CREATE TABLE coverage_reports(
+                          id INTEGER PRIMARY KEY, scan_id INTEGER NOT NULL,
+                          report_id TEXT NOT NULL, report_mode TEXT NOT NULL
+                      );
+                      INSERT INTO coverage_projects(id, project_name)
+                      VALUES (1, 'FOS_V6R2');
+                  """)
+                  return connection
+          ''',
+              '''            INSERT INTO coverage_projects(id, project_name)
+                      VALUES (1, 'FOS_V6R2');
+                  """)
+                  if legacy_report_schema:
+                      connection.executescript("""
+                          CREATE TABLE coverage_reports(
+                              id INTEGER PRIMARY KEY, scan_id INTEGER NOT NULL,
+                              report_id TEXT NOT NULL, report_root TEXT NOT NULL DEFAULT '',
+                              source_signature TEXT NOT NULL DEFAULT '',
+                              sidecar_schema INTEGER NOT NULL DEFAULT 0,
+                              asset_identity TEXT NOT NULL DEFAULT '',
+                              generated_at TEXT
+                          );
+                      """)
+                  else:
+                      connection.executescript("""
+                          CREATE TABLE coverage_reports(
+                              id INTEGER PRIMARY KEY, scan_id INTEGER NOT NULL,
+                              report_id TEXT NOT NULL, report_mode TEXT NOT NULL
+                          );
+                      """)
+                  return connection
+          ''',
+          )
+          replace_once(
+              path,
+              '''        for index, mode in enumerate(report_modes):
+                      connection.execute(
+                          """INSERT INTO coverage_reports(
+                                 id, scan_id, report_id, report_mode
+                             ) VALUES (?, ?, ?, ?)""",
+                          (scan_id * 10 + index, scan_id,
+                           "report-{}-{}".format(scan_id, index), mode),
+                      )
+                  connection.commit()
+          ''',
+              '''        columns = {row[1] for row in connection.execute(
+                      "PRAGMA table_info(coverage_reports)"
+                  ).fetchall()}
+                  for index, mode in enumerate(report_modes):
+                      report_id = "report-{}-{}".format(scan_id, index)
+                      if "report_mode" in columns:
+                          connection.execute(
+                              """INSERT INTO coverage_reports(
+                                     id, scan_id, report_id, report_mode
+                                 ) VALUES (?, ?, ?, ?)""",
+                              (scan_id * 10 + index, scan_id, report_id, mode),
+                          )
+                      elif mode == "VNEXT_ARTIFACT_READY":
+                          connection.execute(
+                              """INSERT INTO coverage_reports(
+                                     id, scan_id, report_id, report_root, sidecar_schema,
+                                     asset_identity
+                                 ) VALUES (?, ?, ?, ?, ?, ?)""",
+                              (scan_id * 10 + index, scan_id, report_id,
+                               "/reports/{}".format(report_id), 3, "asset-{}".format(report_id)),
+                          )
+                      else:
+                          connection.execute(
+                              """INSERT INTO coverage_reports(id, scan_id, report_id)
+                                 VALUES (?, ?, ?)""",
+                              (scan_id * 10 + index, scan_id, report_id),
+                          )
+                  connection.commit()
+          ''',
+          )
+          anchor = '''    def test_authoritative_identity_forces_strict_path_mapping(self):
+          '''
+          tests = '''    def test_pre_v3_report_schema_legacy_row_is_classified_legacy_static(self):
+              connection = self._connection(legacy_report_schema=True)
+              self.addCleanup(connection.close)
+              self._insert_scan(connection)
+              inputs, result = classify_current_release_gate_mode(
+                  connection, "FOS_V6R2", LEGACY_REPORT_COMPATIBLE, False
+              )
+              self.assertFalse(inputs["report_mode_column_present"])
+              self.assertEqual(
+                  inputs["report_mode_source"], "legacy_pre_v3_identity_tuple"
+              )
+              self.assertEqual(inputs["report_mode"], "LEGACY_STATIC")
+              self.assertEqual(result["path_mapping_gate"], PATH_MAPPING_DEFERRED)
+              self.assertEqual(result["vnext_report_gate"], VNEXT_REPORT_DEFERRED)
+              self.assertFalse(result["blocked"])
+
+              def test_pre_v3_report_schema_complete_identity_is_vnext(self):
+                  connection = self._connection(legacy_report_schema=True)
+                  self.addCleanup(connection.close)
+                  self._insert_scan(connection, report_modes=("VNEXT_ARTIFACT_READY",))
+                  inputs, result = classify_current_release_gate_mode(
+                      connection, "FOS_V6R2", LEGACY_REPORT_COMPATIBLE, False
+                  )
+                  self.assertFalse(inputs["report_mode_column_present"])
+                  self.assertEqual(inputs["report_mode"], "VNEXT_ARTIFACT_READY")
+                  self.assertEqual(result["vnext_report_gate"], VNEXT_REPORT_REQUIRED)
+                  self.assertEqual(result["path_mapping_gate"], BLOCKED_IDENTITY_INCOMPLETE)
+                  self.assertTrue(result["blocked"])
+
+              def test_explicit_report_mode_column_remains_authoritative(self):
+                  connection = self._connection()
+                  self.addCleanup(connection.close)
+                  self._insert_scan(connection)
+                  inputs, result = classify_current_release_gate_mode(
+                      connection, "FOS_V6R2", LEGACY_REPORT_COMPATIBLE, False
+                  )
+                  self.assertTrue(inputs["report_mode_column_present"])
+                  self.assertEqual(inputs["report_mode_source"], "explicit_column")
+                  self.assertEqual(result["vnext_report_gate"], VNEXT_REPORT_DEFERRED)
+
+          '''
+          replace_once(path, anchor, tests + anchor)
+          PY
+
+      - name: Run R8-SRC-022 targeted validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/validate_release_gate_regressions.py
+          python3 -m unittest \
+            tests.release.test_release_gate_mode \
+            tests.release.test_upgrade_manifest
+          python3 - <<'PY'
+          import ast
+          for path in (
+              'scripts/upgrade/release_gate_mode.py',
+              'scripts/upgrade/run_upgrade.py',
+          ):
+              with open(path, 'r', encoding='utf-8') as stream:
+                  ast.parse(stream.read(), filename=path, feature_version=(3, 6))
+          print('PY36_GRAMMAR=PASS')
+          PY
+          git diff --check
+
+      - name: Commit source fix and remove one-time workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -f .github/workflows/r8-src-022-pre-v3-report-mode-fix-once.yml
+          git add scripts/upgrade/release_gate_mode.py \
+                  scripts/upgrade/run_upgrade.py \
+                  tests/release/test_release_gate_mode.py \
+                  .github/workflows/r8-src-022-pre-v3-report-mode-fix-once.yml
+          git diff --cached --check
+          git commit -m "fix: support pre-v3 report-mode gate classification"
+          git push origin HEAD:main
