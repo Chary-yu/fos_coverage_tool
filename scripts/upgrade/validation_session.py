@@ -194,6 +194,10 @@ class ValidationSession(object):
             "created_at": utc_iso(),
             "expires_at": str(expires_at or ""),
             "evidence_paths": sorted(set(str(path) for path in (evidence_paths or []))),
+            "validation_status": "NOT_STARTED",
+            "validation_failure_stage": "",
+            "validation_started_at": "",
+            "validation_ready_at": "",
             "teardown_status": "NOT_STARTED",
             "teardown_evidence": {},
         })
@@ -218,6 +222,24 @@ class ValidationSession(object):
 
     def save(self):
         _atomic_write(self.manifest_path, self.data)
+
+    def mark_validation(self, status, failure_stage=""):
+        """Persist Candidate validation outcome independently from teardown."""
+        normalized = str(status or "").strip().upper()
+        if normalized not in ("NOT_STARTED", "STARTING", "PASSED", "FAILED"):
+            raise ValueError("invalid validation status: {}".format(status))
+        self.data["validation_status"] = normalized
+        self.data["validation_failure_stage"] = str(failure_stage or "")
+        if normalized == "STARTING" and not self.data.get("validation_started_at"):
+            self.data["validation_started_at"] = utc_iso()
+        if normalized == "PASSED":
+            self.data["validation_ready_at"] = utc_iso()
+            self.data["validation_failure_stage"] = ""
+        self.save()
+        return {
+            "status": normalized,
+            "failure_stage": self.data.get("validation_failure_stage", ""),
+        }
 
     def add_process(self, pid, port=None, listener=None):
         pid = int(pid)

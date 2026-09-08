@@ -14,6 +14,7 @@ rebuild, Candidate runtime checks, and rollback rehearsal.
 from __future__ import print_function
 
 import gzip
+import hashlib
 import os
 import re
 import subprocess
@@ -181,6 +182,72 @@ def _parse_mysql_principal(value):
     return user, host
 
 
+def _redact_grant_line(value):
+    """Return a grant line that is safe to persist in release evidence."""
+    text = str(value or "")
+    # MariaDB 5.5 may include password verifiers in SHOW GRANTS output.
+    # Preserve the privilege/database structure while removing credential data.
+    text = re.sub(
+        r"(?i)(IDENTIFIED\s+BY\s+PASSWORD\s+)(?:'[^']*'|\S+)",
+        r"\1'<REDACTED>'", text,
+    )
+    text = re.sub(
+        r"(?i)(IDENTIFIED\s+BY\s+)(?:'[^']*'|\S+)",
+        r"\1'<REDACTED>'", text,
+    )
+    return text
+
+
+def _grant_fingerprint(lines):
+    """Hash exact transient grant text without persisting credential values."""
+    payload = "\n".join(sorted(set(str(item) for item in (lines or []))))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _candidate_revoke_sql(target_database, user, grant_host, privileges):
+    """Build MariaDB-5.5-safe inverse SQL for exactly this run's GRANT."""
+    target_database = _target_name(target_database)
+    normalized = []
+    for value in privileges or ():
+        privilege = str(value or "").strip().upper()
+        if privilege not in _PRIVILEGE_TOKENS:
+            raise ValueError(
+                "unsupported disposable target revoke privilege: {}".format(privilege)
+            )
+        if privilege not in normalized:
+            normalized.append(privilege)
+    if not normalized:
+        raise ValueError("disposable target revoke privileges are required")
+    return "REVOKE {} ON `{}`.* FROM {}".format(
+        ", ".join(normalized), target_database, _principal_sql(user, grant_host)
+    )
+
+
+def _schema_privileges(client, common, env, target_database, user, host):
+    """Return exact schema privileges for one account/database as normalized names."""
+    grantee = "'{}'@'{}'".format(
+        str(user).replace("'", "''"), str(host).replace("'", "''")
+    )
+    result = _run_client(
+        client, common, env,
+        "SELECT PRIVILEGE_TYPE FROM INFORMATION_SCHEMA.SCHEMA_PRIVILEGES "
+        "WHERE GRANTEE = {} AND TABLE_SCHEMA = {} ORDER BY PRIVILEGE_TYPE".format(
+            _sql_string(grantee), _sql_string(target_database)
+        ),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Candidate schema privilege verification failed: {}".format(
+                result.stderr.decode("utf-8", errors="replace")
+            )
+        )
+    return sorted(set(
+        line.strip().upper() for line in result.stdout.decode(
+            "utf-8", errors="replace"
+        ).splitlines() if line.strip()
+    ))
+
+
 def _target_database_grants(snapshot, target_database):
     """Return grants on this exact disposable database, if any already exist."""
     normalized_database = str(target_database).strip().replace("`", "").upper()
@@ -253,17 +320,20 @@ def _principal_snapshot(client, common, env, user, host):
                 grants.stderr.decode("utf-8", errors="replace")
             )
         )
-    grant_lines = sorted(set(
+    raw_grant_lines = sorted(set(
         line.strip() for line in grants.stdout.decode(
             "utf-8", errors="replace"
         ).splitlines() if line.strip()
     ))
-    if not grant_lines:
+    if not raw_grant_lines:
         raise RuntimeError(
             "approved application principal {} has no observable grants".format(
                 "{}@{}".format(user, host)
             )
         )
+    safe_grant_lines = sorted(set(
+        _redact_grant_line(line) for line in raw_grant_lines
+    ))
     return {
         "status": "PASSED",
         "user": user,
@@ -271,20 +341,21 @@ def _principal_snapshot(client, common, env, user, host):
         "account": "{}@{}".format(user, host),
         "exists_exactly_once": True,
         "rows": rows,
-        "grants": grant_lines,
+        "grants": safe_grant_lines,
+        "grant_fingerprint_sha256": _grant_fingerprint(raw_grant_lines),
+        "credential_values_recorded": False,
     }
 
 
 def _revoke_candidate_database_grant(
         admin_client, admin_common, admin_env, target_database,
-        user, grant_host, pre_grant_snapshot):
-    """Remove only this run's database grant and prove account restoration."""
-    principal = _principal_sql(user, grant_host)
+        user, grant_host, pre_grant_snapshot, privileges):
+    """Remove only this run's grant and prove MariaDB-5.5-safe restoration."""
+    revoke_sql = _candidate_revoke_sql(
+        target_database, user, grant_host, privileges
+    )
     revoke = _run_client(
-        admin_client, admin_common, admin_env,
-        "REVOKE ALL PRIVILEGES, GRANT OPTION ON `{}`.* FROM {}".format(
-            target_database, principal
-        ),
+        admin_client, admin_common, admin_env, revoke_sql
     )
     if revoke.returncode != 0:
         raise RuntimeError(
@@ -292,11 +363,31 @@ def _revoke_candidate_database_grant(
                 revoke.stderr.decode("utf-8", errors="replace")
             )
         )
+    remaining = _schema_privileges(
+        admin_client, admin_common, admin_env, target_database, user, grant_host
+    )
+    if remaining:
+        raise RuntimeError(
+            "Candidate database privileges remain after scoped revoke: {}".format(
+                ", ".join(remaining)
+            )
+        )
     restored = _principal_snapshot(
         admin_client, admin_common, admin_env, user, grant_host
     )
-    expected = sorted(set(pre_grant_snapshot.get("grants") or []))
-    if restored.get("grants") != expected:
+    expected_safe = sorted(set(pre_grant_snapshot.get("grants") or []))
+    expected_fingerprint = str(
+        pre_grant_snapshot.get("grant_fingerprint_sha256") or ""
+    )
+    fingerprint_matches = bool(expected_fingerprint) and \
+        restored.get("grant_fingerprint_sha256") == expected_fingerprint
+    if expected_fingerprint:
+        restored_ok = fingerprint_matches
+    else:
+        # Backward-compatible comparison for in-memory test fixtures while
+        # new production evidence always carries the exact transient hash.
+        restored_ok = restored.get("grants") == expected_safe
+    if not restored_ok:
         raise RuntimeError(
             "application principal grant state did not restore after Candidate revoke"
         )
@@ -304,8 +395,14 @@ def _revoke_candidate_database_grant(
         "status": "PASSED",
         "account": "{}@{}".format(user, grant_host),
         "database": target_database,
+        "revoked_privileges": list(privileges),
+        "candidate_schema_privileges_after_revoke": remaining,
+        "candidate_schema_privileges_zero": True,
         "restored_pre_grant_snapshot": True,
-        "command": "REVOKE ALL PRIVILEGES, GRANT OPTION ON `<candidate_db>`.* FROM <approved_account>",
+        "non_candidate_grants_conserved": True,
+        "grant_fingerprint_verified": fingerprint_matches if expected_fingerprint else None,
+        "command": "REVOKE <exact_candidate_privileges> ON `<candidate_db>`.* FROM <approved_account>",
+        "credentials_written_to_evidence": False,
         "exit_code": 0,
     }
 
@@ -531,7 +628,13 @@ def _grant_and_probe_candidate_access(
                 "status": "PASSED",
                 "database": target_database,
                 "account": "{}@{}".format(user, grant_host),
-                "output": grants_text[-4000:],
+                "grant_count": len([
+                    line for line in grants_text.splitlines() if line.strip()
+                ]),
+                "grant_fingerprint_sha256": _grant_fingerprint(
+                    [line.strip() for line in grants_text.splitlines() if line.strip()]
+                ),
+                "credential_values_recorded": False,
                 "exit_code": grants.returncode,
             },
             "capability_probe": {
@@ -548,7 +651,7 @@ def _grant_and_probe_candidate_access(
             try:
                 _revoke_candidate_database_grant(
                     admin_client, admin_common, admin_env, target_database,
-                    user, grant_host, pre_grant_snapshot,
+                    user, grant_host, pre_grant_snapshot, privileges,
                 )
             except Exception as restore_exc:
                 raise RuntimeError(
@@ -896,14 +999,23 @@ def cleanup_disposable_target(target_config, preparation_evidence):
         raise RuntimeError(
             "disposable target cleanup lacks exact pre-grant account snapshot"
         )
-    user, grant_host, _privileges = _candidate_account(target)
+    user, grant_host, configured_privileges = _candidate_account(target)
+    granted_privileges = list(candidate_access.get("granted_privileges") or [])
+    if not granted_privileges:
+        raise RuntimeError(
+            "disposable target cleanup lacks exact granted privilege evidence"
+        )
+    if set(granted_privileges) != set(configured_privileges):
+        raise RuntimeError(
+            "disposable target cleanup privilege evidence does not match current policy"
+        )
     admin = dict(target)
     client, common, env = _client_settings(admin)
     if not client:
         raise RuntimeError("mariadb/mysql client is unavailable for disposable target cleanup")
     revoke = _revoke_candidate_database_grant(
         client, common, env, target_database, user, grant_host,
-        candidate_access["pre_grant_privilege_snapshot"],
+        candidate_access["pre_grant_privilege_snapshot"], granted_privileges,
     )
     drop = _run_client(
         client, common, env, "DROP DATABASE `{}`".format(target_database)

@@ -6,7 +6,8 @@ from subprocess import CompletedProcess
 from unittest import mock
 
 from scripts.upgrade.disposable_target import (
-    _grant_and_probe_candidate_access, cleanup_disposable_target,
+    _candidate_revoke_sql, _grant_and_probe_candidate_access,
+    _redact_grant_line, cleanup_disposable_target,
     create_disposable_target_from_backup, probe_candidate_connection_access,
     validate_disposable_target_config,
 )
@@ -281,7 +282,7 @@ class DisposableTargetTest(unittest.TestCase):
                     "coverage_vnext_candidate_801",
                     source={"user": "coverage", "application_grant_host": "db"},
                 )
-        self.assertTrue(any(sql.startswith("REVOKE ALL PRIVILEGES") for sql in calls))
+        self.assertTrue(any(sql.startswith("REVOKE SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, CREATE TEMPORARY TABLES") for sql in calls))
         self.assertGreaterEqual(
             sum(sql.startswith("SHOW GRANTS FOR") for sql in calls), 2
         )
@@ -377,6 +378,8 @@ class DisposableTargetTest(unittest.TestCase):
                 return CompletedProcess([], 0, b"coverage\tdb\n", b"")
             if sql.startswith("SHOW GRANTS FOR"):
                 return CompletedProcess([], 0, pre_grant, b"")
+            if sql.startswith("SELECT PRIVILEGE_TYPE FROM INFORMATION_SCHEMA.SCHEMA_PRIVILEGES"):
+                return CompletedProcess([], 0, b"", b"")
             if sql.startswith("SELECT SCHEMA_NAME"):
                 return CompletedProcess([], 0, b"", b"")
             return CompletedProcess([], 0, b"", b"")
@@ -386,6 +389,10 @@ class DisposableTargetTest(unittest.TestCase):
             "target_database": "coverage_vnext_candidate_801",
             "candidate_access": {
                 "grant_applied_by_run": True,
+                "granted_privileges": [
+                    "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE",
+                    "ALTER", "INDEX", "CREATE TEMPORARY TABLES",
+                ],
                 "pre_grant_privilege_snapshot": {
                     "grants": ["GRANT USAGE ON *.* TO 'coverage'@'db'"]
                 },
@@ -399,8 +406,49 @@ class DisposableTargetTest(unittest.TestCase):
                     side_effect=run_client):
             result = cleanup_disposable_target(self._approved_target(), evidence)
         self.assertEqual(result["status"], "PASSED")
-        self.assertTrue(any(sql.startswith("REVOKE ALL PRIVILEGES") for sql in calls))
+        self.assertTrue(any(sql.startswith("REVOKE SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, CREATE TEMPORARY TABLES") for sql in calls))
         self.assertTrue(any(sql.startswith("DROP DATABASE") for sql in calls))
+
+
+    def test_mariadb55_revoke_sql_is_explicit_and_scoped(self):
+        sql = _candidate_revoke_sql(
+            "coverage_vnext_candidate_801", "coverage", "db",
+            [
+                "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE",
+                "ALTER", "INDEX", "CREATE TEMPORARY TABLES",
+            ],
+        )
+        self.assertTrue(sql.startswith(
+            "REVOKE SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, "
+            "CREATE TEMPORARY TABLES ON `coverage_vnext_candidate_801`.* FROM "
+        ))
+        self.assertNotIn("ALL PRIVILEGES", sql)
+        self.assertNotIn("GRANT OPTION", sql)
+        self.assertIn("'coverage'@'db'", sql)
+
+    def test_show_grants_password_verifier_is_redacted_before_evidence(self):
+        raw = (
+            "GRANT USAGE ON *.* TO 'coverage'@'db' IDENTIFIED BY PASSWORD "
+            "'*0123456789ABCDEF'"
+        )
+        safe = _redact_grant_line(raw)
+        self.assertNotIn("0123456789ABCDEF", safe)
+        self.assertIn("<REDACTED>", safe)
+        self.assertIn("GRANT USAGE", safe)
+
+    def test_cleanup_requires_exact_granted_privilege_evidence(self):
+        evidence = {
+            "target_database_created_by_this_run": True,
+            "target_database": "coverage_vnext_candidate_801",
+            "candidate_access": {
+                "grant_applied_by_run": True,
+                "pre_grant_privilege_snapshot": {
+                    "grants": ["GRANT USAGE ON *.* TO 'coverage'@'db'"]
+                },
+            },
+        }
+        with self.assertRaisesRegex(RuntimeError, "exact granted privilege"):
+            cleanup_disposable_target(self._approved_target(), evidence)
 
 
 if __name__ == "__main__":

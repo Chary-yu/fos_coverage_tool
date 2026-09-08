@@ -24,6 +24,7 @@ cutover path after Candidate validation has reached PRE_CUTOVER_READY.
 from __future__ import print_function
 
 import json
+import hashlib
 import ipaddress
 import os
 import re
@@ -43,6 +44,48 @@ _RUNTIME_KEYS = (
     "host", "port", "user", "password", "database", "charset",
     "connect_timeout",
 )
+
+
+def _sha256_path(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _redact_diagnostic_text(value):
+    """Redact credential-bearing diagnostics before they enter evidence."""
+    text = str(value or "")
+    text = re.sub(
+        r"(?i)(IDENTIFIED\s+BY\s+PASSWORD\s+)(?:'[^']*'|\S+)",
+        r"\1'<REDACTED>'", text,
+    )
+    text = re.sub(
+        r"(?i)(IDENTIFIED\s+BY\s+)(?:'[^']*'|\S+)",
+        r"\1'<REDACTED>'", text,
+    )
+    text = re.sub(
+        r"(?i)((?:password|passwd|secret|token|authorization|cookie)\s*[:=]\s*)"
+        r"(?:'[^']*'|\"[^\"]*\"|[^\s,;]+)",
+        r"\1<REDACTED>", text,
+    )
+    return text
+
+
+def _redact_config_value(value, key=""):
+    secret = re.compile(
+        r"password|passwd|secret|token|authorization|cookie|api[_-]?key|private[_-]?key",
+        re.I,
+    )
+    if secret.search(str(key or "")):
+        return "<REDACTED>"
+    if isinstance(value, dict):
+        return {item_key: _redact_config_value(item_value, item_key)
+                for item_key, item_value in value.items()}
+    if isinstance(value, list):
+        return [_redact_config_value(item, key) for item in value]
+    return value
 
 
 def _literal(path):
@@ -182,6 +225,7 @@ class VfoswindProductionLifecycle(object):
         self.validation_gateway_bound = False
         self._validation_gateway_previous_link = None
         self._validation_gateway_target = ""
+        self._validation_application_root = ""
 
     @staticmethod
     def _default_command_runner(argv):
@@ -1968,6 +2012,7 @@ class VfoswindProductionLifecycle(object):
         except Exception:
             self.restore_validation_candidate_binding()
             raise
+        self._validation_application_root = application_root
         self.validation_binding_changed = True
         return {
             "status": "PASSED",
@@ -1989,6 +2034,7 @@ class VfoswindProductionLifecycle(object):
         if self._previous_validation_unit is None and \
                 self._previous_validation_environment is None:
             bootstrap_restore = self._restore_bootstrap_validation_bindings()
+            self._validation_application_root = ""
             return {
                 "status": "PASSED", "skipped": True,
                 "reason": "no_validation_candidate_binding",
@@ -2008,6 +2054,7 @@ class VfoswindProductionLifecycle(object):
             )
         bootstrap_restore = self._restore_bootstrap_validation_bindings()
         self.validation_binding_changed = False
+        self._validation_application_root = ""
         return {
             "status": "PASSED",
             "adapter": ADAPTER_NAME,
@@ -2018,27 +2065,194 @@ class VfoswindProductionLifecycle(object):
             "exit_code": 0,
         }
 
-    def validation_process_ownership(self):
-        """Return the systemd MainPID for session-manifest ownership joining."""
-        if not self.validation_unit:
-            raise RuntimeError("validation systemd unit is required")
-        probe = self.config.get("validation_main_pid_probe") or [
-            "systemctl", "show", self.validation_unit,
-            "--property=MainPID", "--value",
+    def validation_runtime_preflight(self):
+        """Run target-Python import/config smoke before starting systemd."""
+        application_root = str(self._validation_application_root or "").strip()
+        if not application_root:
+            raise RuntimeError("validation Candidate application root is not bound")
+        unit_text = self._validation_unit_definition()
+        exec_lines = [
+            line.strip().split("=", 1)[1].strip()
+            for line in unit_text.splitlines()
+            if line.strip().startswith("ExecStart=") and "=" in line
         ]
-        argv = _argv(probe, "validation_main_pid_probe")
-        result = self.command_runner(argv)
-        if result.returncode != 0:
+        if len(exec_lines) != 1:
+            raise RuntimeError("validation systemd unit must have exactly one ExecStart")
+        exec_argv = shlex.split(exec_lines[0])
+        if not exec_argv:
+            raise RuntimeError("validation systemd ExecStart is empty")
+        python_executable = exec_argv[0]
+        environment_text = self._read_file(
+            self.validation_environment_file,
+            "validation_runtime_environment_file",
+        )
+        environment_values = parse_environment_file(environment_text)
+        if environment_values.get("COVERAGE_CONFIG_PATH") != self.validation_config_path:
             raise RuntimeError(
-                "validation systemd MainPID probe failed: {}".format(
-                    result.stderr.decode("utf-8", errors="replace")
+                "validation preflight config path does not match EnvironmentFile"
+            )
+        process_environment = os.environ.copy()
+        process_environment.update(environment_values)
+        script = (
+            "import json, os, sys; "
+            "root=sys.argv[1]; cfg=sys.argv[2]; "
+            "sys.path.insert(0, root); "
+            "from app.config.runtime_config import load_application_config; "
+            "from app.release_identity import get_current_release_identity, resolve_runtime_release_root; "
+            "runtime_root=resolve_runtime_release_root(root); "
+            "config=load_application_config(cfg, base_dir=runtime_root); "
+            "identity=get_current_release_identity(runtime_root); "
+            "import app.bootstrap; import app.api.application; "
+            "print(json.dumps({'status':'PASSED','runtime_mode':config.get('runtime_mode'),"
+            "'database':(config.get('mysql') or {}).get('database',''),"
+            "'runtime_root':runtime_root,'commit_sha':identity.get('commit_sha','')}))"
+        )
+        command = [
+            python_executable, "-c", script,
+            application_root, self.validation_config_path,
+        ]
+        result = subprocess.run(
+            command, cwd=application_root, env=process_environment,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        stderr = _redact_diagnostic_text(
+            result.stderr.decode("utf-8", errors="replace")
+        )
+        payload = {}
+        if result.returncode == 0:
+            try:
+                payload = json.loads(stdout.strip().splitlines()[-1])
+            except (IndexError, TypeError, ValueError):
+                payload = {}
+        if result.returncode != 0 or payload.get("status") != "PASSED":
+            raise RuntimeError(
+                "validation target-runtime preflight failed: {}".format(
+                    stderr[-2000:] or "invalid preflight output"
                 )
             )
-        values = result.stdout.decode("utf-8", errors="replace").split()
-        try:
-            pid = int(values[-1]) if values else 0
-        except (TypeError, ValueError):
-            pid = 0
+        return {
+            "status": "PASSED",
+            "adapter": ADAPTER_NAME,
+            "python_executable": python_executable,
+            "validation_application_root": application_root,
+            "validation_config_path": self.validation_config_path,
+            "runtime_mode": payload.get("runtime_mode"),
+            "database": payload.get("database"),
+            "runtime_root": payload.get("runtime_root"),
+            "commit_sha": payload.get("commit_sha"),
+            "command": "target Python release identity + import + runtime config smoke",
+            "credentials_written_to_evidence": False,
+            "exit_code": 0,
+        }
+
+    def validation_runtime_status(self):
+        """Return systemd-219-safe Candidate runtime state without mutation."""
+        if not self.validation_unit:
+            raise RuntimeError("validation systemd unit is required")
+        probe = self.config.get("validation_status_probe") or [
+            "systemctl", "show", self.validation_unit,
+            "-p", "LoadState", "-p", "ActiveState", "-p", "SubState",
+            "-p", "MainPID", "-p", "ExecMainPID", "-p", "ExecMainCode",
+            "-p", "ExecMainStatus", "-p", "Result",
+        ]
+        argv = _argv(probe, "validation_status_probe")
+        result = self.command_runner(argv)
+        stdout = result.stdout.decode("utf-8", errors="replace")
+        stderr = _redact_diagnostic_text(
+            result.stderr.decode("utf-8", errors="replace")
+        )
+        fields = {}
+        for line in stdout.splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                fields[key.strip()] = value.strip()
+        def as_int(name):
+            try:
+                return int(fields.get(name) or 0)
+            except (TypeError, ValueError):
+                return 0
+        raw_main_pid = as_int("MainPID")
+        exec_main_pid = as_int("ExecMainPID")
+        main_pid = raw_main_pid or exec_main_pid
+        exec_status = as_int("ExecMainStatus")
+        active_state = fields.get("ActiveState", "")
+        result_state = fields.get("Result", "")
+        sub_state = fields.get("SubState", "")
+        process_exited = (
+            active_state == "failed" or
+            result_state in ("exit-code", "signal", "core-dump", "timeout") or
+            (result_state not in ("", "success") and exec_status != 0) or
+            (
+                raw_main_pid <= 1 and exec_main_pid > 1 and
+                active_state in ("inactive", "failed") and
+                sub_state in ("dead", "failed", "exited")
+            )
+        )
+        return {
+            "status": "PASSED" if result.returncode == 0 else "FAILED",
+            "validation_systemd_unit": self.validation_unit,
+            "load_state": fields.get("LoadState", ""),
+            "active_state": active_state,
+            "sub_state": sub_state,
+            "main_pid": main_pid,
+            "exec_main_pid": exec_main_pid,
+            "exec_main_code": fields.get("ExecMainCode", ""),
+            "exec_main_status": exec_status,
+            "result": result_state,
+            "process_exited": process_exited,
+            "command": argv,
+            "stderr": stderr[-2000:],
+            "credentials_written_to_evidence": False,
+            "exit_code": result.returncode,
+        }
+
+    def validation_process_ownership(self):
+        """Return MainPID using syntax compatible with production systemd 219."""
+        if not self.validation_unit:
+            raise RuntimeError("validation systemd unit is required")
+        configured = self.config.get("validation_main_pid_probe")
+        if configured:
+            argv = _argv(configured, "validation_main_pid_probe")
+            result = self.command_runner(argv)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    "validation systemd MainPID probe failed: {}".format(
+                        _redact_diagnostic_text(
+                            result.stderr.decode("utf-8", errors="replace")
+                        )
+                    )
+                )
+            text = result.stdout.decode("utf-8", errors="replace").strip()
+            if "=" in text:
+                text = text.rsplit("=", 1)[-1].strip()
+            values = text.split()
+            try:
+                pid = int(values[-1]) if values else 0
+            except (TypeError, ValueError):
+                pid = 0
+            command = argv
+        else:
+            argv = [
+                "systemctl", "show", self.validation_unit, "-p", "MainPID"
+            ]
+            result = self.command_runner(argv)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    "validation systemd MainPID probe failed: {}".format(
+                        _redact_diagnostic_text(
+                            result.stderr.decode("utf-8", errors="replace")
+                        )
+                    )
+                )
+            text = result.stdout.decode("utf-8", errors="replace").strip()
+            if text.startswith("MainPID="):
+                text = text.split("=", 1)[1].strip()
+            try:
+                pid = int(text or 0)
+            except (TypeError, ValueError):
+                pid = 0
+            command = argv
         if pid <= 1:
             raise RuntimeError(
                 "validation systemd MainPID probe returned no owned process"
@@ -2047,9 +2261,83 @@ class VfoswindProductionLifecycle(object):
             "status": "PASSED",
             "validation_systemd_unit": self.validation_unit,
             "pid": pid,
-            "command": argv,
+            "command": command,
+            "credentials_written_to_evidence": False,
             "exit_code": 0,
         }
+
+    def validation_failure_snapshot(self, max_journal_lines=200):
+        """Capture failure evidence before validation teardown removes bindings."""
+        snapshot = {
+            "status": "PASSED",
+            "adapter": ADAPTER_NAME,
+            "validation_systemd_unit": self.validation_unit,
+            "credentials_written_to_evidence": False,
+        }
+        violations = []
+        try:
+            snapshot["runtime_status"] = self.validation_runtime_status()
+        except Exception as exc:
+            violations.append("runtime status capture failed: {}".format(exc))
+        try:
+            unit_text = self._validation_unit_definition()
+            snapshot["unit"] = {
+                "sha256": hashlib.sha256(
+                    unit_text.encode("utf-8")
+                ).hexdigest(),
+                "text": _redact_diagnostic_text(unit_text),
+            }
+        except Exception as exc:
+            violations.append("validation unit capture failed: {}".format(exc))
+        if self.validation_config_path and os.path.isfile(self.validation_config_path):
+            try:
+                with open(self.validation_config_path, "r", encoding="utf-8") as stream:
+                    config_payload = json.load(stream)
+                snapshot["config"] = {
+                    "path": self.validation_config_path,
+                    "sha256": _sha256_path(self.validation_config_path),
+                    "payload": _redact_config_value(config_payload),
+                }
+            except Exception as exc:
+                violations.append("validation config capture failed: {}".format(exc))
+        if self.validation_environment_file and os.path.isfile(
+                self.validation_environment_file):
+            try:
+                stat = os.stat(self.validation_environment_file)
+                snapshot["environment_file"] = {
+                    "path": self.validation_environment_file,
+                    "sha256": _sha256_path(self.validation_environment_file),
+                    "size": int(stat.st_size),
+                    "mode": int(stat.st_mode & 0o777),
+                    "content_recorded": False,
+                }
+            except Exception as exc:
+                violations.append("validation environment metadata failed: {}".format(exc))
+        try:
+            probe = self.config.get("validation_journal_probe") or [
+                "journalctl", "-u", self.validation_unit, "-n",
+                str(int(max_journal_lines)), "--no-pager", "-l",
+            ]
+            argv = _argv(probe, "validation_journal_probe")
+            journal = self.command_runner(argv)
+            snapshot["journal"] = {
+                "command": argv,
+                "exit_code": journal.returncode,
+                "stdout": _redact_diagnostic_text(
+                    journal.stdout.decode("utf-8", errors="replace")
+                )[-20000:],
+                "stderr": _redact_diagnostic_text(
+                    journal.stderr.decode("utf-8", errors="replace")
+                )[-4000:],
+            }
+            if journal.returncode != 0:
+                violations.append("validation journal capture failed")
+        except Exception as exc:
+            violations.append("validation journal capture failed: {}".format(exc))
+        if violations:
+            snapshot["status"] = "PARTIAL"
+            snapshot["violations"] = violations
+        return snapshot
 
     def bind_current_release(self):
         """Bind Flat vfoswind files to the immutable CURRENT release.

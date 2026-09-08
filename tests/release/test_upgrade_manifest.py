@@ -165,6 +165,9 @@ class TestUpgradeManifest(unittest.TestCase):
                 passed, bootstrap_ready=True, read_only=True,
             ),
             "production_application_bundle": dict(passed),
+            "validation_runtime_preflight": dict(
+                passed, credentials_written_to_evidence=False,
+            ),
             "production_validation_runtime_binding": dict(
                 passed,
                 binding={"target_database": "coverage_vnext_candidate_test"},
@@ -195,7 +198,8 @@ class TestUpgradeManifest(unittest.TestCase):
             "api_start": dict(passed, process_role="validation_candidate"),
             "validation_session_manifest": dict(
                 passed, session_id=session, candidate_sha=revision,
-                artifact_sha256="f" * 64,
+                artifact_sha256="f" * 64, validation_status="PASSED",
+                validation_failure_stage="",
             ),
             "validation_teardown": dict(
                 passed, session_id=session, pids_closed=True,

@@ -21,6 +21,7 @@ import subprocess
 import logging
 import argparse
 import re
+import socket
 import urllib.request
 import shutil
 import tempfile
@@ -132,6 +133,39 @@ def _resolve_upgrade_literal_path(repo_root: str, configured: Optional[str],
     if not os.path.isabs(value):
         value = os.path.join(repo_root, value)
     return os.path.normpath(os.path.abspath(value))
+
+
+class CandidateValidationError(RuntimeError):
+    """Stable Candidate readiness failure with a machine-readable stage."""
+
+    def __init__(self, stage, message):
+        RuntimeError.__init__(self, message)
+        self.stage = str(stage or "VALIDATION_FAILED")
+
+
+def _state_token(value):
+    token = re.sub(r"[^A-Z0-9]+", "_", str(value or "").upper()).strip("_")
+    return token[:80] or "UNKNOWN"
+
+
+def _endpoint_tcp_ready(endpoint, timeout=1.0):
+    parsed = urlparse(str(endpoint or "").strip())
+    host = parsed.hostname
+    if not host:
+        return False
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    connection = None
+    try:
+        connection = socket.create_connection((host, int(port)), timeout=float(timeout))
+        return True
+    except OSError:
+        return False
+    finally:
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
 
 
 def _new_release_validation_session_id(commit_sha: str,
@@ -1042,6 +1076,8 @@ class UpgradeOrchestrator:
         self._production_lifecycle_adapter = None
         self._production_runtime_bound = False
         self._production_release_bindings_changed = False
+        self.upgrade_state_path = ""
+        self._last_failure_stage = ""
 
     def _configure_backup_root(self, configured_root: Optional[str]):
         resolved = resolve_backup_root(self.repo_root, configured_root)
@@ -1231,6 +1267,17 @@ class UpgradeOrchestrator:
             raise RuntimeError("validation session id is invalid: {}".format(exc))
         self.release_validation_session_id = session_id
         self._previous_release_identity = dict(previous_release)
+        configured_state_path = str(
+            upgrade_config.get("upgrade_state_path") or ""
+        ).strip()
+        if configured_state_path:
+            if "{attempt_id}" in configured_state_path:
+                configured_state_path = configured_state_path.replace(
+                    "{attempt_id}", session_id
+                )
+            self.upgrade_state_path = _resolve_upgrade_path(
+                self.repo_root, configured_state_path, "upgrade_state_path"
+            )
 
         if self._upgrade_mode == "production":
             browser_url_errors = _validate_external_candidate_browser_url(
@@ -1762,6 +1809,13 @@ class UpgradeOrchestrator:
             "command": "ValidationSession.load",
             "exit_code": 0,
             "artifact_path": self.validation_session_manifest_path,
+            "validation_status": session_record.get(
+                "validation_status", "NOT_STARTED"
+            ),
+            "validation_failure_stage": session_record.get(
+                "validation_failure_stage", ""
+            ),
+            "teardown_status": result.get("status", "FAILED"),
         })
         self.manifest.record("validation_session_manifest", session_record)
         self._validation_teardown_result = result
@@ -1788,6 +1842,167 @@ class UpgradeOrchestrator:
         os.environ["COVERAGE_SERVING_TEARDOWN_EVIDENCE"] = self.serving_teardown_evidence_path
         os.environ["COVERAGE_SERVING_STATE_PATH"] = self.serving_state_path
         os.environ["COVERAGE_SERVING_RELEASE_SESSION_ID"] = self.release_validation_session_id
+
+    def _write_upgrade_state(self, state, failure_stage="", failure_reason=""):
+        """Persist one atomic operator-facing upgrade state when configured."""
+        if not self.upgrade_state_path:
+            return None
+        payload = {
+            "schema_version": 1,
+            "state": str(state or ""),
+            "target_sha": str(self._target_identity.get("commit_sha") or ""),
+            "release_validation_session_id": str(
+                self.release_validation_session_id or ""
+            ),
+            "failure_stage": str(failure_stage or ""),
+            "failure_reason": str(failure_reason or "")[:1000],
+            "updated_at": time.time(),
+        }
+        path = os.path.abspath(self.upgrade_state_path)
+        directory = os.path.dirname(path)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory)
+        temporary = "{}.tmp-{}-{}".format(
+            path, os.getpid(), int(time.time() * 1000000)
+        )
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2, sort_keys=True)
+            stream.write("\n")
+            stream.flush()
+            try:
+                os.fsync(stream.fileno())
+            except OSError:
+                pass
+        os.replace(temporary, path)
+        return payload
+
+    def _capture_validation_failure(self, stage, exc):
+        """Freeze Candidate failure evidence before teardown mutates the host."""
+        stage = str(stage or "VALIDATION_FAILED")
+        self._last_failure_stage = stage
+        if self.validation_session is not None:
+            self.validation_session.mark_validation("FAILED", stage)
+        snapshot = {}
+        capture_status = "NOT_AVAILABLE"
+        if self._production_lifecycle_adapter is not None:
+            try:
+                snapshot = self._production_lifecycle_adapter.validation_failure_snapshot()
+                capture_status = snapshot.get("status") or "PASSED"
+            except Exception as capture_exc:
+                snapshot = {
+                    "status": "FAILED",
+                    "violations": [
+                        "validation failure snapshot failed: {}".format(
+                            type(capture_exc).__name__
+                        )
+                    ],
+                    "credentials_written_to_evidence": False,
+                }
+                capture_status = "FAILED"
+        payload = {
+            "status": "FAILED",
+            "revision": self._target_identity.get("commit_sha", ""),
+            "evidence_class": "production_integration"
+            if self._upgrade_mode == "production" else "staging_cutover",
+            "failure_stage": stage,
+            "error_class": type(exc).__name__,
+            "diagnostic_capture_status": capture_status,
+            "diagnostic": snapshot,
+            "captured_before_teardown": True,
+            "credentials_written_to_evidence": False,
+            "exit_code": 1,
+        }
+        self.manifest.record("validation_failure", payload)
+        return payload
+
+    def _wait_candidate_validation_ready(self, endpoint, identity, start_evidence):
+        """Wait for process -> TCP -> exact release identity without racey probes."""
+        upgrade = ((self._runtime_config or {}).get("upgrade") or {})
+        timeout = max(1.0, float(upgrade.get("validation_start_timeout_sec", 30)))
+        interval = max(0.05, float(upgrade.get("validation_poll_interval_sec", 0.25)))
+        deadline = time.time() + timeout
+        last_status = {}
+        last_error = ""
+        tcp_observed = False
+        owned_pid = 0
+        if self.validation_session is not None:
+            self.validation_session.mark_validation("STARTING")
+        while time.time() <= deadline:
+            if self._production_lifecycle_adapter is not None:
+                try:
+                    last_status = self._production_lifecycle_adapter.validation_runtime_status()
+                except Exception as exc:
+                    raise CandidateValidationError(
+                        "VALIDATION_STATUS_PROBE_FAILED",
+                        "validation runtime status probe failed: {}".format(
+                            type(exc).__name__
+                        ),
+                    )
+                if last_status.get("status") != "PASSED":
+                    raise CandidateValidationError(
+                        "VALIDATION_STATUS_PROBE_FAILED",
+                        "validation runtime status probe returned FAILED",
+                    )
+                if last_status.get("process_exited"):
+                    raise CandidateValidationError(
+                        "VALIDATION_PROCESS_EXITED",
+                        "validation process exited before readiness "
+                        "(ActiveState={}, SubState={}, Result={}, "
+                        "ExecMainStatus={})".format(
+                            last_status.get("active_state") or "",
+                            last_status.get("sub_state") or "",
+                            last_status.get("result") or "",
+                            last_status.get("exec_main_status"),
+                        ),
+                    )
+                pid = int(last_status.get("main_pid") or 0)
+                if pid > 1 and pid != owned_pid:
+                    owned_pid = pid
+                    if self.validation_session is not None:
+                        # Register the process immediately.  Listener ownership
+                        # is added only after TCP + HTTP identity are ready.
+                        self.validation_session.add_process(pid)
+            if _endpoint_tcp_ready(endpoint, timeout=min(1.0, interval)):
+                tcp_observed = True
+                try:
+                    endpoint_evidence = self._verify_release_endpoint(
+                        endpoint, identity, timeout=min(2.0, max(1.0, interval * 4))
+                    )
+                    if self.validation_session is not None:
+                        ports = self.validation_session.data.get("ports") or []
+                        if owned_pid > 1:
+                            for port in ports:
+                                self.validation_session.add_process(
+                                    owned_pid, port=port,
+                                    listener={"pid": owned_pid, "port": int(port)},
+                                )
+                        self.validation_session.mark_validation("PASSED")
+                    start_evidence["process_ownership"] = {
+                        "pid": owned_pid,
+                        "runtime_status": last_status,
+                    }
+                    start_evidence["tcp_ready"] = True
+                    start_evidence["readiness_wait_sec"] = round(
+                        max(0.0, timeout - max(0.0, deadline - time.time())), 3
+                    )
+                    return endpoint_evidence
+                except RuntimeError as exc:
+                    last_error = str(exc)
+                    if "release endpoint mismatch:" in last_error or \
+                            "did not return a release identity" in last_error:
+                        raise CandidateValidationError(
+                            "VALIDATION_RELEASE_IDENTITY_MISMATCH", last_error
+                        )
+            time.sleep(interval)
+        if self._production_lifecycle_adapter is not None and owned_pid <= 1:
+            stage = "VALIDATION_START_TIMEOUT"
+        elif not tcp_observed:
+            stage = "VALIDATION_PORT_NOT_LISTENING"
+        else:
+            stage = "VALIDATION_HTTP_FAILED"
+        raise CandidateValidationError(
+            stage, last_error or "Candidate validation did not become ready within timeout"
+        )
 
     def log(self, msg: str):
         print(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -2102,6 +2317,14 @@ class UpgradeOrchestrator:
 
     def _fail(self, lifecycle: Optional[UpgradeLifecycle], message: str) -> Tuple[bool, str]:
         self._mark_not_ready()
+        failure_stage = self._last_failure_stage or _state_token(message)
+        try:
+            self._write_upgrade_state(
+                "FAILED_{}".format(_state_token(failure_stage)),
+                failure_stage=failure_stage, failure_reason=message,
+            )
+        except Exception as exc:
+            self.log("❌ Upgrade state persistence failed: {}".format(exc))
         # If a vfoswind serving process has already been started with the new
         # persistent DB binding, stop it before restoring CURRENT and the old
         # EnvironmentFile.  This keeps rollback from restarting a process with
@@ -2212,6 +2435,14 @@ class UpgradeOrchestrator:
                             target_cleanup
                         )
                     )
+                    try:
+                        self._write_upgrade_state(
+                            "DATA_SAFETY_HOLD",
+                            failure_stage="DISPOSABLE_TARGET_CLEANUP",
+                            failure_reason="disposable target cleanup failed",
+                        )
+                    except Exception:
+                        pass
                 else:
                     self.manifest.record("disposable_target_cleanup", {
                         "status": "PASSED",
@@ -2227,12 +2458,21 @@ class UpgradeOrchestrator:
                     exc
                 )
             )
+            try:
+                self._write_upgrade_state(
+                    "DATA_SAFETY_HOLD",
+                    failure_stage="DISPOSABLE_TARGET_CLEANUP",
+                    failure_reason="disposable target cleanup failed",
+                )
+            except Exception:
+                pass
         return False, message
 
-    def _verify_release_endpoint(self, endpoint: str, identity: Dict[str, Any]) -> Dict[str, Any]:
+    def _verify_release_endpoint(self, endpoint: str, identity: Dict[str, Any],
+                                 timeout: float = 10) -> Dict[str, Any]:
         if not endpoint:
             raise RuntimeError("upgrade.release_endpoint is required")
-        with urllib.request.urlopen(endpoint, timeout=10) as response:
+        with urllib.request.urlopen(endpoint, timeout=timeout) as response:
             if int(getattr(response, "status", 200)) != 200:
                 raise RuntimeError("release endpoint returned HTTP {}".format(response.status))
             payload = json.loads(response.read().decode("utf-8"))
@@ -2517,6 +2757,7 @@ class UpgradeOrchestrator:
         except (OSError, RuntimeError, ValueError, TypeError) as exc:
             self.log("❌ Immutable publication/session preflight failed: {}".format(exc))
             return False, "Immutable publication/session preflight failed"
+        self._write_upgrade_state("RUNNING")
         if mode == "production":
             production_integration = upgrade_config.get(
                 "production_integration"
@@ -3084,6 +3325,25 @@ class UpgradeOrchestrator:
             return self._fail(lifecycle, "Immutable release publication failed")
 
         try:
+            self._write_upgrade_state("CANDIDATE_VALIDATING")
+            if self.validation_session is not None:
+                self.validation_session.mark_validation("STARTING")
+            if self._production_lifecycle_adapter is not None:
+                runtime_preflight = \
+                    self._production_lifecycle_adapter.validation_runtime_preflight()
+                if str(runtime_preflight.get("commit_sha") or "").lower() != str(
+                        identity.get("commit_sha") or "").lower():
+                    raise CandidateValidationError(
+                        "VALIDATION_RUNTIME_IDENTITY_MISMATCH",
+                        "validation target-runtime release identity does not match Candidate",
+                    )
+                runtime_preflight.update({
+                    "revision": identity.get("commit_sha"),
+                    "evidence_class": "production_integration",
+                })
+                self.manifest.record(
+                    "validation_runtime_preflight", runtime_preflight
+                )
             start_evidence = lifecycle.start_validation_api()
             start_evidence.update({
                 "revision": identity.get("commit_sha"),
@@ -3096,24 +3356,31 @@ class UpgradeOrchestrator:
             ) or ((runtime_config or {}).get("upgrade") or {}).get(
                 "release_endpoint"
             )
-            endpoint_evidence = self._verify_release_endpoint(endpoint, identity)
+            endpoint_evidence = self._wait_candidate_validation_ready(
+                endpoint, identity, start_evidence
+            )
             endpoint_evidence.update({
                 "revision": identity.get("commit_sha"),
                 "process_role": "validation_candidate",
             })
             self.manifest.record("candidate_release_endpoint", endpoint_evidence)
-            if self._production_lifecycle_adapter is not None:
-                ownership = self._production_lifecycle_adapter.validation_process_ownership()
-                validation_ports = self.validation_session.data.get("ports") or []
-                for port in validation_ports:
-                    self.validation_session.add_process(
-                        ownership["pid"], port=port,
-                        listener={"pid": ownership["pid"], "port": int(port)},
-                    )
-                start_evidence["process_ownership"] = ownership
-                self.manifest.record("api_start", start_evidence)
+            self.manifest.record("api_start", start_evidence)
+            self._write_upgrade_state("CANDIDATE_READY")
         except Exception as exc:
-            self.log("❌ Candidate API verification failed: {}".format(exc))
+            stage = getattr(exc, "stage", "")
+            if not stage:
+                if self.manifest.data.get("validation_runtime_preflight", {}).get(
+                        "status") != "PASSED" and \
+                        self._production_lifecycle_adapter is not None:
+                    stage = "VALIDATION_RUNTIME_PREFLIGHT_FAILED"
+                else:
+                    stage = "VALIDATION_START_COMMAND_FAILED"
+            self._capture_validation_failure(stage, exc)
+            self.log(
+                "❌ Candidate API verification failed [{}]: {}".format(
+                    stage, exc
+                )
+            )
             return self._fail(lifecycle, "Candidate API verification failed")
 
         # Step 5: Run Targeted Unit Test Suites
@@ -3539,11 +3806,13 @@ class UpgradeOrchestrator:
             )
             return self._fail(lifecycle, "PRE_CUTOVER_READY hard gate failed")
         lifecycle.api_started = False
+        self._write_upgrade_state("PRE_CUTOVER_READY")
 
         # Phase D is the only cutover window.  Candidate validation, browser,
         # performance, audits, and rollback rehearsal have all completed
         # while CURRENT and the active API were untouched.
         self.log("[Phase D] Candidate is PRE_CUTOVER_READY; entering short cutover window...")
+        self._write_upgrade_state("CUTTING_OVER")
         self._phase_d_entered = True
         try:
             freeze_evidence = lifecycle.freeze(identity.get("commit_sha", ""))
@@ -3747,6 +4016,7 @@ class UpgradeOrchestrator:
             self.log("❌ Traffic open failed; keeping writes frozen: {}".format(exc))
             return self._fail(lifecycle, "Traffic open failed")
 
+        self._write_upgrade_state("READY")
         self.log("=== Upgrade Verification Completed Successfully ===")
         self.log("Release gate passed: all required evidence is authentic and exact.")
         return True, "RELEASE_GATE_PASSED"

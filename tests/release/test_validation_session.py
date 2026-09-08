@@ -107,6 +107,31 @@ class ValidationSessionTest(unittest.TestCase):
                 "PASSED",
             )
 
+    def test_validation_outcome_is_separate_from_teardown_status(self):
+        with tempfile.TemporaryDirectory(prefix="validation-outcome-") as root:
+            manifest_path = os.path.join(root, "session.json")
+            session = ValidationSession.create(
+                manifest_path, "outcome-session", candidate_sha="a" * 40,
+                baseline_sha="b" * 40, ports=[19528],
+            )
+            self.assertEqual(session.data["validation_status"], "NOT_STARTED")
+            session.mark_validation("STARTING")
+            session.mark_validation("FAILED", "VALIDATION_PROCESS_EXITED")
+            loaded = ValidationSession.load(manifest_path)
+            self.assertEqual(loaded.data["validation_status"], "FAILED")
+            self.assertEqual(
+                loaded.data["validation_failure_stage"],
+                "VALIDATION_PROCESS_EXITED",
+            )
+            with mock.patch(
+                    "scripts.upgrade.validation_session._port_listeners",
+                    return_value=[]):
+                teardown = loaded.teardown(timeout=0)
+            self.assertEqual(teardown["status"], "PASSED")
+            persisted = ValidationSession.load(manifest_path).data
+            self.assertEqual(persisted["validation_status"], "FAILED")
+            self.assertEqual(persisted["teardown_status"], "PASSED")
+
     def test_pid_reuse_is_reported_as_teardown_failure_without_signaling(self):
         with tempfile.TemporaryDirectory(prefix="validation-session-reuse-") as root:
             manifest_path = os.path.join(root, "session.json")

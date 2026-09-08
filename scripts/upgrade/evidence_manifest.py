@@ -645,6 +645,9 @@ class ProductionEvidenceManifest:
             unmet.append("real Candidate browser evidence is not release eligible")
 
         if require_production_integration:
+            runtime_preflight = record("validation_runtime_preflight")
+            if runtime_preflight.get("credentials_written_to_evidence") is not False:
+                unmet.append("validation runtime preflight credential boundary is not explicit")
             gateway = record("candidate_gateway_preflight")
             if gateway.get("read_only") is not True or \
                     not gateway.get("config_sha256") or \
@@ -752,6 +755,10 @@ class ProductionEvidenceManifest:
                 session.get("candidate_sha") != revision or \
                 not session.get("artifact_sha256"):
             unmet.append("validation session identity/hash is not exact")
+        if session.get("validation_status") != "PASSED":
+            unmet.append("Candidate validation_status is not PASSED before cutover")
+        if session.get("validation_failure_stage"):
+            unmet.append("Candidate validation failure stage is not empty before cutover")
         teardown = record("validation_teardown")
         if teardown.get("session_id") != expected_session or \
                 teardown.get("pids_closed") is not True or \
@@ -1092,6 +1099,10 @@ class ProductionEvidenceManifest:
         validation_session = self.data.get("validation_session_manifest") or {}
         if validation_session.get("status") != "PASSED":
             unmet.append("validation_session_manifest is not PASSED")
+        if validation_session.get("validation_status") != "PASSED":
+            unmet.append("Candidate validation_status is not PASSED")
+        if validation_session.get("validation_failure_stage"):
+            unmet.append("Candidate validation_failure_stage must be empty after PASS")
         if not validation_session.get("session_id"):
             unmet.append("validation_session_manifest session_id is missing")
         if validation_session.get("candidate_sha") != revision:

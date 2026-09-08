@@ -279,6 +279,8 @@ class TestEvidenceAuthenticity(unittest.TestCase):
                 "status": "PASSED", "revision": revision,
                 "session_id": "candidate-session",
                 "candidate_sha": revision, "baseline_sha": "b" * 40,
+                "validation_status": "PASSED",
+                "validation_failure_stage": "",
             }
             manifest.data["validation_teardown"] = {
                 "status": "PASSED", "revision": revision,
@@ -290,6 +292,31 @@ class TestEvidenceAuthenticity(unittest.TestCase):
             self.assertFalse(passed)
             self.assertIn("validation_teardown requires pids_closed=true", unmet)
             self.assertEqual(manifest.data["release_decision"], "NOT_READY")
+
+    def test_validation_teardown_pass_does_not_override_validation_failure(self):
+        with tempfile.TemporaryDirectory() as root:
+            manifest = ProductionEvidenceManifest(root)
+            revision = "a" * 40
+            manifest.data["release_identity"] = {
+                "version": "v", "commit_sha": revision, "build_id": "b"
+            }
+            manifest.data["validation_session_manifest"] = {
+                "status": "PASSED", "revision": revision,
+                "session_id": "candidate-session",
+                "candidate_sha": revision, "baseline_sha": "b" * 40,
+                "validation_status": "FAILED",
+                "validation_failure_stage": "VALIDATION_PROCESS_EXITED",
+            }
+            manifest.data["validation_teardown"] = {
+                "status": "PASSED", "revision": revision,
+                "session_id": "candidate-session",
+                "pids_closed": True, "ports_closed": True,
+                "ports_probe_ok": True,
+            }
+            passed, unmet = manifest.validate_final_gate()
+            self.assertFalse(passed)
+            self.assertTrue(any("validation_status" in item for item in unmet))
+            self.assertTrue(any("validation_failure_stage" in item for item in unmet))
 
     def test_evidence_manifest_v2_binds_record_to_revision_and_artifact_sha(self):
         with tempfile.TemporaryDirectory() as root:

@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import unittest
 from subprocess import CompletedProcess
+from unittest import mock
 
 from scripts.upgrade.vfoswind_production_lifecycle import (
     VfoswindProductionLifecycle, parse_environment_file,
@@ -287,7 +288,7 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
         def runner(argv):
             calls.append(list(argv))
             if argv[:2] == ["systemctl", "show"]:
-                return CompletedProcess(argv, 0, b"4321\n", b"")
+                return CompletedProcess(argv, 0, b"MainPID=4321\n", b"")
             return CompletedProcess(argv, 0, b"", b"")
 
         adapter = VfoswindProductionLifecycle(
@@ -322,8 +323,139 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
             self.assertEqual(stream.read(), before_environment)
         self.assertEqual(calls, [[
             "systemctl", "show", "onesensor-coverage-validation.service",
-            "--property=MainPID", "--value",
+            "-p", "MainPID",
         ]])
+
+    def test_validation_target_python_preflight_uses_bound_candidate_config(self):
+        root, publish, config, _environment = self._fixture()
+        source_application = config["validation_application_root"]
+        candidate_application = os.path.join(root.name, "candidate-preflight-app")
+        shutil.copytree(source_application, candidate_application)
+        adapter = VfoswindProductionLifecycle(
+            publish, config,
+            command_runner=lambda argv: CompletedProcess(argv, 0, b"", b""),
+        )
+        adapter.bind_validation_candidate(
+            candidate_application,
+            {
+                "host": "db", "port": 3306,
+                "user": "coverage_user", "password": "candidate-secret",
+                "database": "coverage_vnext_candidate",
+            },
+        )
+        completed = CompletedProcess(
+            [], 0,
+            b'{"status":"PASSED","runtime_mode":"vnext","database":"coverage_vnext_candidate","runtime_root":"/release","commit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}\n',
+            b"",
+        )
+        with mock.patch(
+                "scripts.upgrade.vfoswind_production_lifecycle.subprocess.run",
+                return_value=completed) as run_process:
+            evidence = adapter.validation_runtime_preflight()
+        self.assertEqual(evidence["status"], "PASSED")
+        self.assertEqual(evidence["runtime_mode"], "vnext")
+        self.assertEqual(evidence["database"], "coverage_vnext_candidate")
+        self.assertEqual(evidence["runtime_root"], "/release")
+        self.assertEqual(evidence["commit_sha"], "a" * 40)
+        kwargs = run_process.call_args.kwargs
+        self.assertEqual(kwargs["cwd"], candidate_application)
+        self.assertEqual(
+            kwargs["env"]["COVERAGE_CONFIG_PATH"],
+            config["validation_config_path"],
+        )
+        self.assertIn("COVERAGE_MYSQL_JSON", kwargs["env"])
+        self.assertNotIn("candidate-secret", json.dumps(evidence))
+
+    def test_validation_runtime_status_uses_systemd219_safe_properties(self):
+        _root, publish, config, _environment = self._fixture()
+        calls = []
+
+        def runner(argv):
+            calls.append(list(argv))
+            if argv[:2] == ["systemctl", "show"]:
+                return CompletedProcess(
+                    argv, 0,
+                    b"LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+                    b"MainPID=0\nExecMainPID=1234\nExecMainCode=1\n"
+                    b"ExecMainStatus=1\nResult=exit-code\n",
+                    b"",
+                )
+            return CompletedProcess(argv, 0, b"", b"")
+
+        adapter = VfoswindProductionLifecycle(
+            publish, config, command_runner=runner
+        )
+        status = adapter.validation_runtime_status()
+        self.assertTrue(status["process_exited"])
+        self.assertEqual(status["exec_main_pid"], 1234)
+        self.assertEqual(status["exec_main_status"], 1)
+        command = calls[0]
+        self.assertNotIn("--value", command)
+        self.assertIn("-p", command)
+        self.assertIn("ExecMainStatus", command)
+
+    def test_validation_runtime_status_classifies_clean_early_exit(self):
+        _root, publish, config, _environment = self._fixture()
+
+        def runner(argv):
+            if argv[:2] == ["systemctl", "show"]:
+                return CompletedProcess(
+                    argv, 0,
+                    b"LoadState=loaded\nActiveState=inactive\nSubState=dead\n"
+                    b"MainPID=0\nExecMainPID=4321\nExecMainCode=1\n"
+                    b"ExecMainStatus=0\nResult=success\n",
+                    b"",
+                )
+            return CompletedProcess(argv, 0, b"", b"")
+
+        adapter = VfoswindProductionLifecycle(
+            publish, config, command_runner=runner
+        )
+        status = adapter.validation_runtime_status()
+        self.assertTrue(status["process_exited"])
+        self.assertEqual(status["active_state"], "inactive")
+        self.assertEqual(status["sub_state"], "dead")
+        self.assertEqual(status["exec_main_pid"], 4321)
+        self.assertEqual(status["result"], "success")
+
+    def test_validation_failure_snapshot_redacts_credentials_and_keeps_env_content_out(self):
+        _root, publish, config, _environment = self._fixture()
+        with open(config["validation_runtime_environment_file"], "w", encoding="utf-8") as stream:
+            stream.write("MYSQL_PASSWORD=super-secret\n")
+        config_path = os.path.join(_root.name, "validation-config.json")
+        with open(config_path, "w", encoding="utf-8") as stream:
+            json.dump({"mysql": {"password": "super-secret"}}, stream)
+        config["validation_config_path"] = config_path
+
+        def runner(argv):
+            if argv[:2] == ["systemctl", "show"]:
+                return CompletedProcess(
+                    argv, 0,
+                    b"LoadState=loaded\nActiveState=failed\nSubState=failed\n"
+                    b"MainPID=0\nExecMainPID=1234\nExecMainCode=1\n"
+                    b"ExecMainStatus=1\nResult=exit-code\n", b"",
+                )
+            if argv and argv[0] == "journalctl":
+                return CompletedProcess(
+                    argv, 0,
+                    b"GRANT USAGE ON *.* TO 'coverage'@'localhost' "
+                    b"IDENTIFIED BY PASSWORD '*ABCDEF'\npassword=plain-secret\n",
+                    b"",
+                )
+            if argv[:2] == ["systemctl", "cat"]:
+                return CompletedProcess(argv, 0, b"[Service]\nExecStart=/bin/true\n", b"")
+            return CompletedProcess(argv, 0, b"", b"")
+
+        adapter = VfoswindProductionLifecycle(
+            publish, config, command_runner=runner
+        )
+        snapshot = adapter.validation_failure_snapshot()
+        encoded = json.dumps(snapshot, sort_keys=True)
+        self.assertNotIn("ABCDEF", encoded)
+        self.assertNotIn("plain-secret", encoded)
+        self.assertNotIn("super-secret", encoded)
+        self.assertIn("<REDACTED>", encoded)
+        self.assertFalse(snapshot["environment_file"]["content_recorded"])
 
     def test_wrong_served_root_binding_fails_closed(self):
         _root, publish, config, _environment = self._fixture()
