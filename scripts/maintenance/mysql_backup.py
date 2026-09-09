@@ -17,6 +17,9 @@ import hashlib
 import subprocess
 import shutil
 import re
+import tempfile
+from datetime import date, datetime, time
+from decimal import Decimal
 from typing import Dict, Any, Optional, Tuple
 
 from scripts.diagnostics.data_hash_gate import capture_database_snapshot
@@ -24,6 +27,71 @@ from app.time_utils import utc_iso
 
 
 _DATABASE_IDENTIFIER = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,63}$")
+_JSON_SCALAR_TYPES = (str, int, float, bool, type(None))
+
+
+def _json_safe(value):
+    """Return a recursively JSON-native evidence value.
+
+    Database drivers may expose authoritative values as ``datetime``/``date``/
+    ``time``/``Decimal``/``bytes`` objects.  The VNext semantic-hash contract
+    already canonicalizes those values before hashing; backup evidence must use
+    the same stable textual representations before it crosses a JSON persistence
+    boundary.  Unsupported values fail closed instead of being stringified
+    accidentally.
+    """
+    if isinstance(value, (datetime, date, time, Decimal)):
+        return str(value)
+    if isinstance(value, bytes):
+        return value.hex()
+    if isinstance(value, dict):
+        normalized = {}
+        for key, item in value.items():
+            if not isinstance(key, (str, int, float, bool, type(None))):
+                raise TypeError(
+                    "unsupported backup evidence key type: {}".format(
+                        type(key).__name__
+                    )
+                )
+            normalized[key] = _json_safe(item)
+        return normalized
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, _JSON_SCALAR_TYPES):
+        return value
+    raise TypeError(
+        "unsupported backup evidence value: {}".format(type(value).__name__)
+    )
+
+
+def _atomic_write_json(path, payload):
+    """Atomically persist JSON so serialization failure cannot leave a partial file."""
+    path = os.path.abspath(path)
+    directory = os.path.dirname(path)
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory)
+    fd, temporary = tempfile.mkstemp(
+        prefix=".{}-tmp-".format(os.path.basename(path)),
+        dir=directory or None,
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, ensure_ascii=False)
+            stream.write("\n")
+            stream.flush()
+            try:
+                os.fsync(stream.fileno())
+            except OSError:
+                pass
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+        raise
 
 
 def _capture_generation_aware_snapshot(connection):
@@ -285,6 +353,7 @@ def _restore_into_empty_database(
                 success = False
     return success, result, error
 
+
 def compute_file_sha256(filepath: str) -> str:
     """Compute SHA256 checksum of any file."""
     hasher = hashlib.sha256()
@@ -348,6 +417,7 @@ def verify_mysql_backup(
             return False, result, restore_error or "backup restore verification failed"
     return True, result, None
 
+
 def perform_database_backup(
     db_config: Dict[str, Any],
     backup_dir: str,
@@ -367,20 +437,20 @@ def perform_database_backup(
                 .format(os.path.abspath(backup_dir))
             )
     os.makedirs(backup_dir, exist_ok=True)
-    
+
     host = config.get("host", "127.0.0.1")
     port = config.get("port", 3306)
     user = config.get("user", "root")
     password = config.get("password", "")
     database = config.get("database", "coverage_tool")
-    
+
     full_sql_gz = os.path.join(backup_dir, "full.sql.gz")
     schema_sql = os.path.join(backup_dir, "schema.sql")
     sha256_file = os.path.join(backup_dir, "full.sql.gz.sha256")
     counts_file = os.path.join(backup_dir, "critical-counts.json")
     hashes_file = os.path.join(backup_dir, "critical-content-hashes.json")
     manifest_file = os.path.join(backup_dir, "backup-manifest.json")
-    
+
     # 1. Capture snapshot if connection provided
     snapshot = None
     if connection:
@@ -394,7 +464,7 @@ def perform_database_backup(
                 json.dump(hashes, f, indent=2)
         except Exception as e:
             return False, {}, f"Failed to capture pre-backup data snapshot: {e}"
-            
+
     # 2. Check mysqldump binary
     has_mysqldump = False
     try:
@@ -402,7 +472,7 @@ def perform_database_backup(
         has_mysqldump = (res.returncode == 0)
     except Exception:
         pass
-        
+
     # A unit-test harness that did not provide a live connection must remain a
     # mock even when a system mysqldump happens to be installed.  Production
     # callers always pass a live connection and therefore cannot enter this
@@ -443,7 +513,7 @@ def perform_database_backup(
                 if proc.returncode != 0:
                     err = proc.stderr.read().decode("utf-8", errors="ignore")
                     return False, {}, f"mysqldump failed with code {proc.returncode}: {err}"
-                    
+
             schema_cmd = [
                 "mysqldump",
                 f"--host={host}",
@@ -459,7 +529,7 @@ def perform_database_backup(
                     return False, {}, f"mysqldump schema-only failed: {err}"
         except Exception as e:
             return False, {}, f"Exception during mysqldump: {e}"
-            
+
     # 3. Compute SHA256 of full.sql.gz
     if not os.path.isfile(full_sql_gz) or os.path.getsize(full_sql_gz) == 0:
         return False, {}, "full.sql.gz was not created or is 0 bytes"
@@ -469,11 +539,11 @@ def perform_database_backup(
                 pass
     except Exception as exc:
         return False, {}, "full.sql.gz failed decompression verification: {}".format(exc)
-        
+
     gz_sha256 = compute_file_sha256(full_sql_gz)
     with open(sha256_file, "w", encoding="utf-8") as f:
         f.write(f"{gz_sha256}  full.sql.gz\n")
-        
+
     verified_dump, verification, verification_error = verify_mysql_backup(
         full_sql_gz,
         schema_sql,
@@ -521,7 +591,11 @@ def perform_database_backup(
             manifest["mysqldump_version"] = (version_res.stdout or version_res.stderr).decode("utf-8", errors="replace").strip()
         except Exception:
             manifest["mysqldump_version"] = "unknown"
-    with open(manifest_file, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-        
+
+    try:
+        manifest = _json_safe(manifest)
+        _atomic_write_json(manifest_file, manifest)
+    except (OSError, TypeError, ValueError) as exc:
+        return False, {}, "backup manifest serialization failed: {}".format(exc)
+
     return True, manifest, None
