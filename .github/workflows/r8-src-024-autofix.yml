@@ -34,9 +34,15 @@ jobs:
       - name: Apply deterministic R8-SRC-024 repair
         run: |
           set -eu
-          base64 -d .github/r8-src-024-transform.b64 | gzip -dc > /tmp/r8_transform.py
+          cat .github/r8-src-024-transform.part1 .github/r8-src-024-transform.part2 \
+            | base64 -d | gzip -dc > /tmp/r8_transform.py
           python -m py_compile /tmp/r8_transform.py
           python /tmp/r8_transform.py
+          rm -f \
+            .github/r8-src-024-transform.b64 \
+            .github/r8-src-024-transform.part1 \
+            .github/r8-src-024-transform.part2 \
+            .github/workflows/r8-src-024-autofix.yml
 
       - name: Verify touched runtime syntax and Python 3.6 grammar
         run: |
@@ -75,6 +81,8 @@ jobs:
           git diff --check
           git status --short
           test ! -e .github/r8-src-024-transform.b64
+          test ! -e .github/r8-src-024-transform.part1
+          test ! -e .github/r8-src-024-transform.part2
           test ! -e .github/workflows/r8-src-024-autofix.yml
 
       - name: Commit verified R8-SRC-024 source repair
