@@ -1,4 +1,4 @@
-# R8-SRC-024 block-level transport audit and repair executor.
+# R8-SRC-024 exact transport repair + focused verification.
 name: R8 SRC 024 Autofix
 
 on:
@@ -24,47 +24,20 @@ jobs:
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: '3.12'
-      - name: Audit transform transport bytes
+      - name: Reconstruct and verify transform bytes
         run: |
           python - <<'PY'
           import hashlib
           from pathlib import Path
           expected = [
-          '5475b1c4be3574a67c738a990e3daacbd492b43249a4a9b755e3b66bed2565a4',
-          'a07a3f70c7ddfb6035cd970b6f32d55557d371cc780fe00a613f3a48461e8e0a',
-          '8911ea8d99241572544f22606858751c70426aad3813102a2366e7fc2777ada3',
-          '422d40d670389d75fd8e207ce71d7893bdd9e22335fb523bc83093dff3913452',
-          '4f32fea73f70cfebbefcc9a3d38a5261a08404c27022f37bbef7aa0dfe919caa',
-          'c0b89f755542f66dd1e11b1d64d0f268d5d105252e003607f519db847778c880',
-          'da4ef78e36bc1750874df4cd212d9ef6c63864c14f62f0769d0b6774057e8e8a',
-          'e6cb9b90b3b6e7c0fe42a14b60c33dc9d450c9553c7a368a5ec8de6b4e259cf8',
-          '2d428d6e12b5a98c257a6a1f7e29d281ce19392c3f275ecc2690e1818edec8ce',
-          'e03e08b236c2853233c775f077d3ba7ca10033d86124723fceb939f4b811aabe',
-          '2b48329287482da7ff6194c776fd60020c760b1c2aca9d072f7095f2dfd4fd02',
-          '105c0dbe52e6b0ce606433a60fe380efb18873f01eb53c180da42319b18e9db7',
-          '84df5914b0213caec3c066af4dfcb1dcb66c9ad5ac71b0152a881397c2f60dc5',
-          'b0663b79ef35a084d1af2997de1e7fc3fc796e6720a0edee0143b00a63e1397a',
-          'dda05c2c0159649e91deecd182d2495ce02d8513cfcf8d83e6034920922e30cd',
-          'e9f68f1c6b7d2f2af3fb4cc7a1d67bc79cd9ae9515f6409c25ae02f3bfca84a1',
-          '4589979b272338adabd89932743c4061537f3ce81722958977f9c8915a3e6e99',
-          '3570892d0d09efb28e305ad4aeeeb40e4a5e4ba300571622318d778d12b3166e',
-          '9ec772886e6af325b1d064117c3e71486b930a15071e60b91c099c495e6a782e',
-          'a013efaace72aafaeb82cd410531a246de97f632d9f5d9362f84c3cb11679ee7',
-          '1bcb3dba06cc28b3c0bc02588c055c060d1d2d563c96ee65a0939d1daa0297a7',
-          '041082ba2ff80217f3821205a303631c7faf842821ca1bb1d7588c485725f977',
-          'a0e8b9a0f9658cadb510d79999b670bd65119f9abd355a6fed720b3d5a249698',
-          'debcb339e7fb45871e501473b6c376b3be87c1eca1ce17b83d2164f666da8280',
-          'bf0e3f233182cdc1dd44292935c517a509edf5d1ce7eebe9793d2bd969ba5d5c',
-          'd7250d1f673e065f6afb2d664bf5b31039f719a45836ae4a7759ca04a27a89bc',
-          '254b2e23b5e7f2838f27c3089caf05ed7e8de961a1054bf4255c29bf4237a01f',
-          '21fec6fbcef2c8f535f3fa5a0a8bea4ecfc548af32bce0669148f35726efeaa6',
-          'bb255bde5a9d378d192db2c664d0e93890596b7b32cc5eea0e865070e5ca03bc',
-          'b5039768ef9a382c56af643fa6df1c159bc98a4128f001ede68d97e8f06810a1',
-          'bfb4c3b56a28ad7f738374a51daf2533a7a4e24569b4015df3a7d966956d1750',
-          '41213245f071d9bbdd67636cef21006c87b005e13fd54954d650c98c64d98b6f',
-          'de124241bb3692daee6f50685e7697b371962135c614795d7bd4c4547ae1d3db']
-          data = b''.join(Path('.github/r8-src-024-transform.seg%02d' % i).read_bytes() for i in range(8))
-          print('TOTAL_BYTES=%d' % len(data))
+          '5475b1c4be3574a67c738a990e3daacbd492b43249a4a9b755e3b66bed2565a4','a07a3f70c7ddfb6035cd970b6f32d55557d371cc780fe00a613f3a48461e8e0a','8911ea8d99241572544f22606858751c70426aad3813102a2366e7fc2777ada3','422d40d670389d75fd8e207ce71d7893bdd9e22335fb523bc83093dff3913452','4f32fea73f70cfebbefcc9a3d38a5261a08404c27022f37bbef7aa0dfe919caa','c0b89f755542f66dd1e11b1d64d0f268d5d105252e003607f519db847778c880','da4ef78e36bc1750874df4cd212d9ef6c63864c14f62f0769d0b6774057e8e8a','e6cb9b90b3b6e7c0fe42a14b60c33dc9d450c9553c7a368a5ec8de6b4e259cf8','2d428d6e12b5a98c257a6a1f7e29d281ce19392c3f275ecc2690e1818edec8ce','e03e08b236c2853233c775f077d3ba7ca10033d86124723fceb939f4b811aabe','2b48329287482da7ff6194c776fd60020c760b1c2aca9d072f7095f2dfd4fd02','105c0dbe52e6b0ce606433a60fe380efb18873f01eb53c180da42319b18e9db7','84df5914b0213caec3c066af4dfcb1dcb66c9ad5ac71b0152a881397c2f60dc5','b0663b79ef35a084d1af2997de1e7fc3fc796e6720a0edee0143b00a63e1397a','dda05c2c0159649e91deecd182d2495ce02d8513cfcf8d83e6034920922e30cd','e9f68f1c6b7d2f2af3fb4cc7a1d67bc79cd9ae9515f6409c25ae02f3bfca84a1','4589979b272338adabd89932743c4061537f3ce81722958977f9c8915a3e6e99','3570892d0d09efb28e305ad4aeeeb40e4a5e4ba300571622318d778d12b3166e','9ec772886e6af325b1d064117c3e71486b930a15071e60b91c099c495e6a782e','a013efaace72aafaeb82cd410531a246de97f632d9f5d9362f84c3cb11679ee7','1bcb3dba06cc28b3c0bc02588c055c060d1d2d563c96ee65a0939d1daa0297a7','041082ba2ff80217f3821205a303631c7faf842821ca1bb1d7588c485725f977','a0e8b9a0f9658cadb510d79999b670bd65119f9abd355a6fed720b3d5a249698','debcb339e7fb45871e501473b6c376b3be87c1eca1ce17b83d2164f666da8280','bf0e3f233182cdc1dd44292935c517a509edf5d1ce7eebe9793d2bd969ba5d5c','d7250d1f673e065f6afb2d664bf5b31039f719a45836ae4a7759ca04a27a89bc','254b2e23b5e7f2838f27c3089caf05ed7e8de961a1054bf4255c29bf4237a01f','21fec6fbcef2c8f535f3fa5a0a8bea4ecfc548af32bce0669148f35726efeaa6','bb255bde5a9d378d192db2c664d0e93890596b7b32cc5eea0e865070e5ca03bc','b5039768ef9a382c56af643fa6df1c159bc98a4128f001ede68d97e8f06810a1','bfb4c3b56a28ad7f738374a51daf2533a7a4e24569b4015df3a7d966956d1750','41213245f071d9bbdd67636cef21006c87b005e13fd54954d650c98c64d98b6f','de124241bb3692daee6f50685e7697b371962135c614795d7bd4c4547ae1d3db']
+          data = bytearray(b''.join(Path('.github/r8-src-024-transform.seg%02d' % i).read_bytes() for i in range(8)))
+          block3 = b'S8T/BP1AbwXxvlllc5DbmzKdzLd1gcKIOgA+mwQApKuHaInGjiY+mfg7zq7cAH1dDJXn0dOgUV6+dOyntPlejbDAvFW8KYs5LCQm7CZbmEQ8F6+7v4V9GckWrbK7NHrz4jvYOWAA2WqlbaEMCwHD7n79AI+wFev2OiXr8sHcNeDFQBEQsENEQT1KP8xTWIHDtw8bsZuMtZ1lZG08AtXvk1WV2uRC8KhkWSIEfsa9DKh/eTUi+9LaUWJoEacfQFOoCDFqQ0BiGiQ+FxgfgL4ilUufxaeUmWSxcIkO/4NJmr0q8hSsQXhdmqcl/SlUqcjSj/xmCj8EO4Vsp/syg/2MjCeBg2tCgSl3tyyq+wyGlSySTQ1zvCmzO6FnoNktlLQuS45h4MAW2zkti1W2TOcP81X6ZEYduyD+Dnz8Luc/bpMK3RNEo/YG/Pc17DDffC3ayxGL39jF0Y6DsTT1nQp1h/vkIa6TEliLNs7GxHNaJxuUSSz8ikK2Fz3+D5I8m4vZ'
+          if len(block3) != 512:
+              raise SystemExit('replacement block length=%d' % len(block3))
+          data[3*512:4*512] = block3
+          if len(data) != 16648:
+              raise SystemExit('unexpected transport length=%d' % len(data))
           bad = []
           for i, want in enumerate(expected):
               got = hashlib.sha256(data[i*512:(i+1)*512]).hexdigest()
@@ -73,6 +46,7 @@ jobs:
                   print('BAD_BLOCK=%d GOT=%s WANT=%s' % (i, got, want))
           if bad:
               raise SystemExit('transport mismatch blocks: %s' % ','.join(map(str,bad)))
+          Path('/tmp/r8_transform.b64').write_bytes(data)
           print('TRANSPORT_BLOCKS=PASS')
           PY
       - name: Install focused dependencies
@@ -83,7 +57,7 @@ jobs:
       - name: Apply deterministic repair
         run: |
           set -eu
-          cat .github/r8-src-024-transform.seg0{0,1,2,3,4,5,6,7} | base64 -d | gzip -dc > /tmp/r8_transform.py
+          base64 -d /tmp/r8_transform.b64 | gzip -dc > /tmp/r8_transform.py
           python -m py_compile /tmp/r8_transform.py
           python /tmp/r8_transform.py
           rm -f .github/r8-src-024-transform.b64 .github/r8-src-024-transform.part1 .github/r8-src-024-transform.part2 .github/r8-src-024-transform.seg0{0,1,2,3,4,5,6,7} .github/workflows/r8-src-024-autofix.yml
