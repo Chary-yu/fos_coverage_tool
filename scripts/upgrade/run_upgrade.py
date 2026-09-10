@@ -99,6 +99,7 @@ from scripts.upgrade.release_gate_mode import (
     classify_current_release_gate_mode, classification_signature,
     compare_expected_classification,
 )
+from scripts.upgrade.performance_evidence import join_release_performance
 
 logger = logging.getLogger(__name__)
 
@@ -1210,6 +1211,15 @@ class UpgradeOrchestrator:
             publish_root, flat_root, flat_identity,
             previous_release.get("commit_sha", ""),
         )
+        if deployment.get("deployment_layout") == FLAT and \
+                deployment.get("status") != "PASSED":
+            raise RuntimeError(
+                "Flat deployment source binding is incomplete: {}".format(
+                    "; ".join((deployment.get("flat_source_binding") or {}).get(
+                        "binding_violations", []
+                    ))
+                )
+            )
         self._deployment_layout = deployment.get("deployment_layout", "")
         self.publisher = ImmutableReleasePublisher(
             publish_root, create_root=self._deployment_layout != FLAT
@@ -1255,6 +1265,20 @@ class UpgradeOrchestrator:
             self._current_adoption_plan = deployment
             self.candidate_preflight["deployment_layout"] = FLAT
             self.candidate_preflight["flat_current_adoption"] = deployment
+            candidate_flat_binding = (
+                self.candidate_preflight.get("source_provenance") or {}
+            ).get("flat_source_binding")
+            expected_flat_binding = deployment.get("flat_source_binding")
+            if not isinstance(candidate_flat_binding, dict) or not isinstance(
+                    expected_flat_binding, dict):
+                raise RuntimeError(
+                    "Flat deployment requires deterministic Candidate source binding"
+                )
+            if candidate_flat_binding != expected_flat_binding:
+                raise RuntimeError(
+                    "Candidate Flat source binding does not match the planned Flat Root"
+                )
+            self.candidate_preflight["flat_source_binding"] = expected_flat_binding
             # The baseline session is created by the explicit adoption step at
             # cutover.  It is intentionally not fabricated as CURRENT here.
             self.previous_published_session_id = str(
@@ -1520,6 +1544,9 @@ class UpgradeOrchestrator:
             switch=True,
             api_contract_version=upgrade_config.get("api_contract_version", ""),
             application_root=application_root,
+            expected_source_binding=(self._current_adoption_plan or {}).get(
+                "flat_source_binding"
+            ),
         )
         if result.get("status") != "PASSED":
             raise RuntimeError("Flat baseline adoption did not pass")
@@ -1530,11 +1557,23 @@ class UpgradeOrchestrator:
         if current_binding.get("previous_release_commit_sha") != \
                 previous_release.get("commit_sha"):
             raise RuntimeError("adopted baseline CURRENT commit does not match rollback identity")
-        candidate_binding = verify_production_candidate_served_root_binding(
-            self.candidate_preflight.get("source_provenance") or {},
-            current_binding,
+        candidate_flat_binding = (
+            self.candidate_preflight.get("source_provenance") or {}
+        ).get("flat_source_binding")
+        expected_flat_binding = (self._current_adoption_plan or {}).get(
+            "flat_source_binding"
         )
-        self.candidate_preflight["candidate_served_root_binding"] = candidate_binding
+        if not isinstance(candidate_flat_binding, dict) or \
+                candidate_flat_binding != expected_flat_binding:
+            raise RuntimeError(
+                "Candidate Flat source binding does not match bootstrap evidence"
+            )
+        # The immutable baseline contains generated publication metadata, so
+        # its complete Served Root tree hash is intentionally not compared to
+        # the historical Flat Root.  The deterministic source binding above
+        # is the authoritative identity across this bootstrap boundary.
+        self.candidate_preflight["candidate_flat_source_binding"] = \
+            candidate_flat_binding
         self.candidate_preflight["current_served_root_binding"] = current_binding
         self.previous_published_session_id = self.publisher.current_session_id()
         self._deployment_layout = IMMUTABLE_CURRENT
@@ -2022,6 +2061,67 @@ class UpgradeOrchestrator:
         if self.manifest.data.get("status") == "UPGRADE_SUCCESS":
             self.manifest.data["status"] = "UNMET_GATES"
         self.manifest.save()
+
+    def _require_operator_browser_observation(self, upgrade_config, identity):
+        """Pause for the human browser observation required by R8.
+
+        The prompt is an acknowledgement only.  The release gate still reads
+        and validates the independent real HTTP/Chromium evidence artifact;
+        typing the acknowledgement can never manufacture that artifact.
+        """
+        if not upgrade_config.get("operator_browser_pause"):
+            return True
+        url = str(upgrade_config.get("candidate_browser_url") or "").strip()
+        self.log("PRODUCTION_MUTATION=NONE until APPLY R8")
+        print("Candidate browser URL: {}".format(url))
+        print(
+            "Open this URL in ordinary Chrome/Edge, confirm the exact Candidate "
+            "identity and report, then type: BROWSER READY"
+        )
+        try:
+            answer = input("Browser observation confirmation: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        observed = answer == "BROWSER READY"
+        self.manifest.record("operator_browser_observation", {
+            "status": "PASSED" if observed else "FAILED",
+            "revision": identity.get("commit_sha"),
+            "evidence_class": "operator_browser_observation",
+            "candidate_browser_url": url,
+            "confirmation": answer if observed else "",
+            "command": "human browser observation acknowledgement",
+            "exit_code": 0 if observed else 1,
+            "synthetic": False,
+        })
+        return observed
+
+    def _require_production_mutation_confirmation(self, upgrade_config, identity):
+        """Require an explicit phrase immediately before the Phase-D boundary."""
+        if self._upgrade_mode != "production" or not upgrade_config.get(
+                "require_apply_confirmation", True):
+            return True
+        print(
+            "PRE_CUTOVER_READY is complete. No production mutation has occurred."
+        )
+        self.log("PRODUCTION_MUTATION=NONE; awaiting APPLY R8")
+        print("Type exactly 'APPLY R8' to enter the production mutation boundary.")
+        try:
+            answer = input("Production mutation confirmation: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        confirmed = answer == "APPLY R8"
+        self.manifest.record("production_mutation_boundary", {
+            "status": "PASSED" if confirmed else "FAILED",
+            "revision": identity.get("commit_sha"),
+            "evidence_class": "production_cutover",
+            "production_mutation": "AUTHORIZED" if confirmed else "NONE",
+            "confirmation": answer if confirmed else "",
+            "phase_d_entered": False,
+            "command": "operator confirmation gate: APPLY R8",
+            "exit_code": 0 if confirmed else 1,
+            "synthetic": False,
+        })
+        return confirmed
 
     @staticmethod
     def _rollback_read_snapshot(connection):
@@ -3594,6 +3694,11 @@ class UpgradeOrchestrator:
         # real_browser_evidence.js against the actual Candidate URL.  The
         # fixture command above is intentionally not consulted for this gate.
         self.log("[Step 6b/10] Validating external real Candidate browser evidence...")
+        if not self._require_operator_browser_observation(upgrade_config, identity):
+            self.log("❌ Operator browser observation was not confirmed.")
+            return self._fail(
+                lifecycle, "Operator browser observation was not confirmed"
+            )
         browser_evidence_path = self.candidate_browser_evidence_path
         expected_browser_url = str(upgrade_config.get("candidate_browser_url") or "")
         browser_payload = {}
@@ -3678,6 +3783,52 @@ class UpgradeOrchestrator:
         perf_cmd = "validate release_performance_ab artifact {}".format(perf_artifact or "<missing>")
         perf_res = {}
         perf_errors = []
+        performance_sources = upgrade_config.get("performance_source_artifacts") or {}
+        if performance_sources:
+            if not isinstance(performance_sources, dict):
+                perf_errors.append(
+                    "upgrade.performance_source_artifacts must be an object"
+                )
+            else:
+                baseline_source = performance_sources.get("baseline")
+                candidate_source = performance_sources.get("candidate")
+                if not baseline_source or not candidate_source:
+                    perf_errors.append(
+                        "performance_source_artifacts requires baseline and candidate"
+                    )
+                else:
+                    baseline_source = str(baseline_source)
+                    candidate_source = str(candidate_source)
+                    if not os.path.isabs(baseline_source):
+                        baseline_source = os.path.join(self.repo_root, baseline_source)
+                    if not os.path.isabs(candidate_source):
+                        candidate_source = os.path.join(self.repo_root, candidate_source)
+                    try:
+                        join_release_performance(
+                            baseline_source, candidate_source,
+                            previous_release.get("commit_sha", ""),
+                            identity.get("commit_sha", ""),
+                            str(performance_sources.get("workload_hash") or
+                                upgrade_config.get("performance_workload_hash") or ""),
+                            perf_artifact,
+                            release_validation_session_id=self.release_validation_session_id,
+                            candidate_artifact_sha256=self._candidate_artifact_sha256,
+                            served_root_sha256=self._served_root_sha256,
+                            max_regression_percent=float(
+                                performance_sources.get(
+                                    "max_regression_percent",
+                                    upgrade_config.get(
+                                        "performance_max_regression_percent", 20
+                                    ),
+                                )
+                            ),
+                        )
+                    except (OSError, TypeError, ValueError, RuntimeError) as exc:
+                        perf_errors.append(
+                            "exact-revision performance source join failed: {}".format(
+                                exc
+                            )
+                        )
         if not perf_artifact or not os.path.isfile(perf_artifact):
             perf_errors.append("upgrade.performance_evidence_path must point to a release A/B artifact")
         else:
@@ -3964,6 +4115,11 @@ class UpgradeOrchestrator:
             return self._fail(lifecycle, "PRE_CUTOVER_READY hard gate failed")
         lifecycle.api_started = False
         self._write_upgrade_state("PRE_CUTOVER_READY")
+        if not self._require_production_mutation_confirmation(upgrade_config, identity):
+            self.log("❌ Production mutation boundary was not authorized.")
+            return self._fail(
+                lifecycle, "Production mutation boundary was not authorized"
+            )
 
         # Phase D is the only cutover window.  Candidate validation, browser,
         # performance, audits, and rollback rehearsal have all completed
