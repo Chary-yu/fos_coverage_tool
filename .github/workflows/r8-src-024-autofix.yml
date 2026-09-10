@@ -39,14 +39,29 @@ jobs:
           from pathlib import Path
           path = Path('/tmp/r8_transform.py')
           lines = path.read_text(encoding='utf-8').splitlines()
-          matches = [
-              index for index, line in enumerate(lines)
-              if 'adapter resume state field' in line
-              and '_validation_application_root' in line
-          ]
+
+          matches = [i for i, line in enumerate(lines)
+                     if 'adapter resume state field' in line
+                     and '_validation_application_root' in line]
           if len(matches) != 1:
-              raise SystemExit('transform anchor line count={}'.format(len(matches)))
+              raise SystemExit('adapter transform anchor line count={}'.format(len(matches)))
           lines[matches[0]] = '''text = replace_once(text, '        self._validation_gateway_target = ""\\n        self._validation_application_root = ""\\n\\n    @staticmethod\\n', '        self._validation_gateway_target = ""\\n        self._validation_application_root = ""\\n        self.validation_resume_state_path = ""\\n\\n    @staticmethod\\n', 'adapter resume state field')'''
+
+          matches = [i for i, line in enumerate(lines)
+                     if line.startswith("path_anchor = ")
+                     and 'validation_teardown_evidence_path = teardown_path' in line]
+          if len(matches) != 1:
+              raise SystemExit('handoff path anchor declaration count={}'.format(len(matches)))
+          lines[matches[0]] = '''path_anchor = '        if self.validation_teardown_evidence_path == self.validation_session_manifest_path:\\n' '''.rstrip()
+
+          matches = [i for i, line in enumerate(lines)
+                     if 'attempt-scoped handoff paths' in line
+                     and 'path_anchor' in line
+                     and 'path_block' in line]
+          if len(matches) != 1:
+              raise SystemExit('handoff path insertion line count={}'.format(len(matches)))
+          lines[matches[0]] = "text = insert_before(text, path_anchor, path_block, 'attempt-scoped handoff paths')"
+
           path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
           PY
           python -m py_compile /tmp/r8_transform.py
