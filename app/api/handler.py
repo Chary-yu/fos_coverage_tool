@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler
 from urllib.parse import parse_qs, urlsplit
 
 from app.api.serialization import dumps, loads
+from app.api.airgapped_release_validation import dispatch as dispatch_release_validation
 
 
 logger = logging.getLogger(__name__)
@@ -21,9 +22,22 @@ class RequestTooLarge(ValueError):
 class VNextHTTPRequestHandler(BaseHTTPRequestHandler):
     application = None
 
+    def _send_html(self, status, html):
+        data = str(html or "").encode("utf-8")
+        self.send_response(int(status))
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(data)
+        return len(data)
+
     def _send(self, status, payload):
         if isinstance(payload, dict) and payload.get("__download__"):
             return self._send_download(status, payload)
+        if isinstance(payload, dict) and "__html__" in payload:
+            return self._send_html(status, payload.get("__html__"))
         data = dumps(payload).encode("utf-8")
         self.send_response(int(status))
         self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -87,9 +101,17 @@ class VNextHTTPRequestHandler(BaseHTTPRequestHandler):
         else:
             try:
                 path, query, body = self._request()
-                status, payload = self.application.dispatch(
-                    method, path, query, body, self.headers, self.client_address[0]
+                special = dispatch_release_validation(
+                    self.application, method, path, query, body,
+                    self.headers, self.client_address[0]
                 )
+                if special is None:
+                    status, payload = self.application.dispatch(
+                        method, path, query, body, self.headers,
+                        self.client_address[0]
+                    )
+                else:
+                    status, payload = special
             except RequestTooLarge:
                 status, payload = 413, {
                     "error": "request_too_large",
