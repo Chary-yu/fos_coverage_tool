@@ -20,7 +20,8 @@ if ROOT not in sys.path:
 
 from app.release_publication import current_served_root_binding
 from scripts.release.prepare_legacy_flat_adoption import (
-    _validate_release_identity,
+    _bind_release_assets, _source_total_size, _source_tree_sha256,
+    _validate_flat_root, _validate_release_identity,
     prepare_legacy_flat_adoption,
 )
 from scripts.release.bootstrap_previous_release import bootstrap as bootstrap_baseline
@@ -91,6 +92,36 @@ def classify_deployment(publish_root, flat_served_root=""):
     }
 
 
+def current_flat_source_binding(flat_served_root, release_identity_path,
+                                expected_commit_sha):
+    """Return a deterministic, read-only identity for a legacy Flat root.
+
+    Immutable CURRENT includes generated publication-control metadata, so its
+    full tree digest is intentionally not reproducible across two independent
+    bootstrap attempts.  A Flat-to-immutable upgrade instead binds the
+    Candidate to the authoritative legacy source bytes plus the exact baseline
+    release identity.  The same binding is recomputed immediately before the
+    real bootstrap/cutover.
+    """
+    flat_root, entries, _html_entries = _validate_flat_root(flat_served_root)
+    identity_path = _real(release_identity_path)
+    identity = _validate_identity(identity_path, expected_commit_sha)
+    # Enforce the complete target release-asset contract while computing the
+    # source identity; a plausible directory with unrelated files must fail.
+    _bind_release_assets(entries, identity)
+    return {
+        "previous_release_commit_sha": str(expected_commit_sha).lower(),
+        "legacy_source_root_realpath": flat_root,
+        "legacy_source_tree_sha256": _source_tree_sha256(entries),
+        "legacy_source_file_count": len(entries),
+        "legacy_source_total_size": _source_total_size(entries),
+        "legacy_release_identity_sha256": hashlib.sha256(json.dumps(
+            identity, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")
+        ).encode("utf-8")).hexdigest(),
+    }
+
+
 def plan_flat_current_adoption(publish_root, flat_served_root,
                                release_identity_path, expected_commit_sha):
     """Validate the inputs for adoption while leaving the layout untouched."""
@@ -103,7 +134,10 @@ def plan_flat_current_adoption(publish_root, flat_served_root,
         return dict(classification, adoption_action="NOOP_CURRENT_ALREADY_EXISTS")
     if classification.get("deployment_layout") != FLAT:
         raise ValueError("Flat adoption requires a real Flat Served Root")
-    identity = _validate_identity(release_identity_path, expected_commit_sha)
+    flat_binding = current_flat_source_binding(
+        classification["flat_served_root"], release_identity_path,
+        expected_commit_sha,
+    )
     return {
         "status": "PASSED", "deployment_layout": FLAT,
         "adoption_action": "BOOTSTRAP_IMMUTABLE_BASELINE",
@@ -111,10 +145,10 @@ def plan_flat_current_adoption(publish_root, flat_served_root,
         "flat_served_root": classification["flat_served_root"],
         "release_identity_path": _real(release_identity_path),
         "expected_commit_sha": str(expected_commit_sha).lower(),
-        "release_identity_sha256": hashlib.sha256(json.dumps(
-            identity, ensure_ascii=False, sort_keys=True,
-            separators=(",", ":")
-        ).encode("utf-8")).hexdigest(),
+        "release_identity_sha256": flat_binding[
+            "legacy_release_identity_sha256"
+        ],
+        "flat_source_binding": flat_binding,
         "current_path": classification["current_path"],
         "switch_performed": False,
     }
