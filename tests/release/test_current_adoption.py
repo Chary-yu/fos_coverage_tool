@@ -7,7 +7,8 @@ from unittest import mock
 
 from scripts.release.current_adoption import (
     FLAT, IMMUTABLE_CURRENT, bootstrap_flat_current,
-    classify_deployment, plan_flat_current_adoption,
+    classify_deployment, current_flat_source_binding,
+    plan_flat_current_adoption,
 )
 
 
@@ -19,10 +20,15 @@ class CurrentAdoptionStateTest(unittest.TestCase):
             identity_path = os.path.join(root, "flat-release.json")
             os.makedirs(flat)
             expected_sha = "a" * 40
+            asset_bytes = b"x"
+            with open(os.path.join(flat, "coverage_progress.js"), "wb") as stream:
+                stream.write(asset_bytes)
+            with open(os.path.join(flat, "index.html"), "w") as stream:
+                stream.write("<html><body>legacy</body></html>")
             assets = [{
                 "path": "coverage_progress.js",
-                "size": 1,
-                "sha256": "1" * 64,
+                "size": len(asset_bytes),
+                "sha256": hashlib.sha256(asset_bytes).hexdigest(),
             }]
             asset_hash = hashlib.sha256(json.dumps(
                 assets, ensure_ascii=False, sort_keys=True,
@@ -56,6 +62,65 @@ class CurrentAdoptionStateTest(unittest.TestCase):
             )
             self.assertEqual(no_switch["deployment_layout"], FLAT)
             self.assertFalse(os.path.lexists(os.path.join(publish, "CURRENT")))
+
+    def test_flat_source_binding_is_deterministic_and_detects_byte_changes(self):
+        with tempfile.TemporaryDirectory(prefix="flat-source-binding-") as root:
+            flat = os.path.join(root, "flat")
+            os.makedirs(flat)
+            identity_path = os.path.join(root, "release-identity.json")
+            expected_sha = "a" * 40
+            asset_bytes = b"asset"
+            asset_sha = hashlib.sha256(asset_bytes).hexdigest()
+            with open(os.path.join(flat, "coverage_progress.js"), "wb") as stream:
+                stream.write(asset_bytes)
+            report_path = os.path.join(flat, "index.html")
+            with open(report_path, "w") as stream:
+                stream.write("<html><body>one</body></html>")
+            assets = [{
+                "path": "coverage_progress.js",
+                "size": len(asset_bytes),
+                "sha256": asset_sha,
+            }]
+            asset_hash = hashlib.sha256(json.dumps(
+                assets, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":")
+            ).encode("utf-8")).hexdigest()
+            with open(identity_path, "w") as stream:
+                json.dump({
+                    "version": "legacy-baseline",
+                    "commit_sha": expected_sha,
+                    "build_id": "baseline",
+                    "asset_hash": asset_hash,
+                    "schema_version": 1,
+                    "asset_manifest_version": 1,
+                    "asset_count": len(assets),
+                    "asset_manifest_hash": asset_hash,
+                    "asset_manifest": assets,
+                }, stream)
+
+            first = current_flat_source_binding(
+                flat, identity_path, expected_sha
+            )
+            second = current_flat_source_binding(
+                flat, identity_path, expected_sha
+            )
+            self.assertEqual(first, second)
+            self.assertEqual(
+                first["previous_release_commit_sha"], expected_sha
+            )
+            self.assertEqual(
+                first["legacy_source_root_realpath"], os.path.realpath(flat)
+            )
+
+            with open(report_path, "w") as stream:
+                stream.write("<html><body>two</body></html>")
+            changed = current_flat_source_binding(
+                flat, identity_path, expected_sha
+            )
+            self.assertNotEqual(
+                first["legacy_source_tree_sha256"],
+                changed["legacy_source_tree_sha256"],
+            )
 
     def test_existing_current_is_a_noop_and_is_not_bootstrapped_again(self):
         with tempfile.TemporaryDirectory(prefix="current-adoption-noop-") as root:
