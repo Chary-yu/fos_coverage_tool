@@ -35,6 +35,16 @@ jobs:
         run: |
           set -eu
           base64 -d .github/r8-src-024-transform.b64 | gzip -dc > /tmp/r8_transform.py
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('/tmp/r8_transform.py')
+          text = path.read_text(encoding='utf-8')
+          old = "text = replace_once(text, '        self._validation_application_root = \\\"\\\"\\\\n', '        self._validation_application_root = \\\"\\\"\\\\n        self.validation_resume_state_path = \\\"\\\"\\\\n', 'adapter resume state field')"
+          new = "text = replace_once(text, '        self._validation_gateway_target = \\\"\\\"\\\\n        self._validation_application_root = \\\"\\\"\\\\n\\\\n    @staticmethod\\\\n', '        self._validation_gateway_target = \\\"\\\"\\\\n        self._validation_application_root = \\\"\\\"\\\\n        self.validation_resume_state_path = \\\"\\\"\\\\n\\\\n    @staticmethod\\\\n', 'adapter resume state field')"
+          if old not in text:
+              raise SystemExit('transform hotfix anchor missing')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
           python -m py_compile /tmp/r8_transform.py
           python /tmp/r8_transform.py
 
