@@ -1,9 +1,11 @@
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.upgrade import run_upgrade
 from scripts.upgrade.run_airgapped_upgrade import (
+    AirGappedUpgradeOrchestrator,
     PAUSE_LOG,
     _external_origin,
     _operator_page_url,
@@ -35,6 +37,63 @@ class AirgappedUpgradeConductorTest(unittest.TestCase):
             _external_origin(
                 'http://10.190.162.33:19529/coverage/a/b/report.gcov.html'
             )
+
+    def test_flat_cutover_rechecks_deterministic_source_binding(self):
+        orchestrator = AirGappedUpgradeOrchestrator(repo_root=os.getcwd())
+        orchestrator._deployment_layout = run_upgrade.FLAT
+        orchestrator._current_adoption_plan = {"status": "PASSED"}
+        flat_binding = {
+            "previous_release_commit_sha": "a" * 40,
+            "legacy_source_root_realpath": "/srv/legacy-flat",
+            "legacy_source_tree_sha256": "3" * 64,
+            "legacy_source_file_count": 7,
+            "legacy_source_total_size": 1234,
+            "legacy_release_identity_sha256": "4" * 64,
+        }
+        orchestrator.candidate_preflight = {
+            "source_provenance": dict(flat_binding)
+        }
+        orchestrator.publisher = mock.Mock()
+        orchestrator.publisher.validate_current.return_value = {
+            "status": "PASSED"
+        }
+        orchestrator.publisher.current_session_id.return_value = \
+            "baseline-session"
+        orchestrator.manifest = mock.Mock()
+        previous = {"commit_sha": "a" * 40}
+        upgrade = {
+            "flat_current_adoption_on_cutover": True,
+            "flat_release_identity_path": "/srv/identity.json",
+            "flat_served_root": "/srv/legacy-flat",
+            "flat_baseline_session_id": "baseline-session",
+        }
+        current_binding = {
+            "previous_release_commit_sha": "a" * 40,
+            "served_root_tree_sha256": "9" * 64,
+            "served_root_identity_sha256": "8" * 64,
+        }
+        with mock.patch(
+                "scripts.upgrade.run_airgapped_upgrade.core.bootstrap_flat_current",
+                return_value={"status": "PASSED"}), mock.patch(
+                "scripts.upgrade.run_airgapped_upgrade.core.current_served_root_binding",
+                return_value=current_binding), mock.patch(
+                "scripts.upgrade.run_airgapped_upgrade.current_flat_source_binding",
+                return_value=flat_binding) as flat_probe:
+            result = orchestrator._ensure_flat_current_baseline(
+                upgrade, previous
+            )
+        self.assertEqual(result["status"], "PASSED")
+        self.assertEqual(
+            orchestrator._deployment_layout, run_upgrade.IMMUTABLE_CURRENT
+        )
+        flat_probe.assert_called_once_with(
+            "/srv/legacy-flat", "/srv/identity.json", "a" * 40
+        )
+        self.assertEqual(
+            orchestrator.candidate_preflight["current_served_root_binding"],
+            current_binding,
+        )
+        orchestrator.manifest.record.assert_called_once()
 
     def test_revision_source_is_exact_placeholder_and_must_exist(self):
         revision = 'a' * 40
