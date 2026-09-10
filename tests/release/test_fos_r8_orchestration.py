@@ -251,9 +251,12 @@ class OneClickAndBoundaryRegressionTest(unittest.TestCase):
             self.assertEqual(result["status"], "PASSED")
             subprocess.check_call(["bash", "-n", output])
             state = os.path.join(root, "state")
+            non_git_cwd = os.path.join(root, "non-git-cwd")
+            os.makedirs(non_git_cwd)
             env = dict(os.environ, FOS_R8_STATE_ROOT=state)
             verify = subprocess.check_output(
                 ["bash", output, "--verify-only"], env=env,
+                cwd=non_git_cwd,
                 stderr=subprocess.STDOUT,
             ).decode()
             self.assertIn("EXACT_SOURCE_BUNDLE=PASS", verify)
@@ -264,6 +267,29 @@ class OneClickAndBoundaryRegressionTest(unittest.TestCase):
             ).decode()
             self.assertIn("EXACT_PERFORMANCE_INPUTS=PASS", repeat)
             self.assertTrue(os.path.isfile(os.path.join(state, "input", "source.bundle")))
+
+            _write_json(os.path.join(state, "state.json"), {
+                "phase": "C",
+                "status": "CANDIDATE_VALIDATING",
+            })
+            _write_json(os.path.join(state, "upgrade-state.json"), {
+                "state": "PRE_CUTOVER_READY",
+            })
+            status_before_apply = subprocess.check_output(
+                ["bash", output, "--status"], env=env, cwd=non_git_cwd,
+                stderr=subprocess.STDOUT,
+            ).decode()
+            self.assertNotIn("CUTOVER_IN_PROGRESS", status_before_apply)
+            self.assertNotIn('"phase": "D"', status_before_apply)
+
+            _write_json(os.path.join(state, "upgrade-state.json"), {
+                "state": "CUTTING_OVER",
+            })
+            status_after_apply = subprocess.check_output(
+                ["bash", output, "--status"], env=env, cwd=non_git_cwd,
+                stderr=subprocess.STDOUT,
+            ).decode()
+            self.assertIn("CUTTING_OVER", status_after_apply)
 
     def test_source_gate_strings_keep_apply_after_pre_cutover(self):
         path = os.path.join(ROOT, "scripts", "upgrade", "run_upgrade.py")

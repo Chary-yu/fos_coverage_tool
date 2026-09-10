@@ -126,6 +126,25 @@ def _command(argv, cwd=None, check=False):
     return result.returncode, output, error
 
 
+def _interactive_command(argv, cwd=None):
+    """Run an operator-facing child with the caller's terminal attached.
+
+    The release upgrade deliberately owns its prompts.  Pipes would defer the
+    Candidate URL and confirmation prompts until the child exits, and would
+    make the one-click handoff unusable for a human operator.  Leaving all
+    three streams as ``None`` makes ``Popen`` inherit the current tty while
+    ``wait`` still gives the conductor an authoritative exit code.
+    """
+    try:
+        result = subprocess.Popen(
+            list(argv), cwd=cwd, stdin=None, stdout=None, stderr=None
+        )
+        return_code = result.wait()
+    except (OSError, ValueError) as exc:
+        return 127, "", str(exc)
+    return return_code, "", ""
+
+
 def _git(repo_root, *args, check=True):
     return _command(("git",) + tuple(args), cwd=repo_root, check=check)
 
@@ -174,6 +193,55 @@ def _phase_state(state_root, phase, status, **extra):
     current.update(extra)
     _atomic_json(path, current)
     return current
+
+
+def _optional_json(path):
+    """Read an optional evidence/state object without manufacturing status."""
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(os.path.abspath(str(path)), "r", encoding="utf-8") as stream:
+            value = json.load(stream)
+    except (OSError, ValueError, TypeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _authoritative_phase_d_state(state_root, evidence_root):
+    """Classify whether canonical APPLY R8 evidence crossed Phase D.
+
+    Captured child stdout is intentionally not consulted.  The upgrade state
+    and the canonical production evidence manifest are written by the actual
+    upgrade lifecycle and are therefore the only sources allowed to classify
+    a cutover failure.
+    """
+    upgrade_state = _optional_json(os.path.join(state_root, "upgrade-state.json"))
+    manifest = _optional_json(os.path.join(
+        evidence_root, MANIFEST_FILENAME
+    ))
+    boundary = manifest.get("production_mutation_boundary") or {}
+    apply_authorized = (
+        boundary.get("status") == "PASSED" and
+        boundary.get("production_mutation") == "AUTHORIZED" and
+        boundary.get("confirmation") == "APPLY R8"
+    )
+    upgrade_token = str(upgrade_state.get("state") or "")
+    state_indicates_cutover = upgrade_token in ("CUTTING_OVER", "READY")
+    file_cutover = manifest.get("file_cutover") or {}
+    cutover_evidence = file_cutover.get("status") == "PASSED"
+    phase_d_authorized = bool(
+        apply_authorized or state_indicates_cutover or cutover_evidence
+    )
+    return {
+        "phase_d_authorized": phase_d_authorized,
+        "apply_authorized": bool(apply_authorized),
+        "upgrade_state": upgrade_token,
+        "canonical_manifest_path": os.path.join(
+            os.path.abspath(evidence_root), MANIFEST_FILENAME
+        ),
+        "production_mutation_boundary": boundary,
+        "file_cutover_status": file_cutover.get("status", ""),
+    }
 
 
 def _resolve(value, base):
@@ -242,9 +310,18 @@ def verify_inputs(metadata, repo_root, source_bundle, baseline_perf,
         observed_bundle = _sha256(source_bundle)
         if observed_bundle != str(metadata.get("source_bundle_sha256") or "").lower():
             violations.append("embedded Git bundle SHA256 mismatch")
-        code, _, error = _command(("git", "bundle", "verify", source_bundle))
-        if code != 0:
-            violations.append("git bundle verify failed: {}".format(error))
+        bundle_path = os.path.realpath(os.path.abspath(source_bundle))
+        try:
+            with tempfile.TemporaryDirectory(prefix="fos-r8-bundle-verify-") as verify_root:
+                verify_repo = os.path.join(verify_root, "verify-repo")
+                os.makedirs(verify_repo)
+                _command(("git", "init", "-q"), cwd=verify_repo, check=True)
+                _command(
+                    ("git", "bundle", "verify", bundle_path),
+                    cwd=verify_repo, check=True,
+                )
+        except (OSError, RuntimeError, ValueError) as exc:
+            violations.append("git bundle verify failed: {}".format(exc))
         try:
             head = _git(repo_root, "rev-parse", "HEAD")[1].lower()
             tree = _git(repo_root, "rev-parse", "HEAD^{tree}")[1].lower()
@@ -729,6 +806,7 @@ def run(args):
         "production_host": str(metadata.get("production_host") or "vfoswind"),
         "production_baseline_sha": baseline_sha,
         "release_validation_session_id": session_id,
+        "upgrade_state_path": os.path.join(state_root, "upgrade-state.json"),
         "validation_session_manifest": os.path.join(
             state_root, "validation-session-{attempt_id}.json"
         ),
@@ -785,14 +863,41 @@ def run(args):
         "--target-release", os.path.join(state_root, "target-release-identity.json"),
         "--config", attempt_config_path,
     ]
-    _phase_state(state_root, "D", "RUNNING", release_validation_session_id=session_id)
-    code, output, error = _command(command, cwd=args.repo_root)
+    # Keep the outer conductor state in Candidate validation until the child
+    # has written canonical APPLY R8 evidence.  The nested upgrade-state.json
+    # is the live operator-facing state while the interactive child runs.
+    _phase_state(
+        state_root, "C", "CANDIDATE_VALIDATING",
+        release_validation_session_id=session_id,
+        authoritative_upgrade_state_path=os.path.join(
+            state_root, "upgrade-state.json"
+        ),
+    )
+    code, _output, _error = _interactive_command(command, cwd=args.repo_root)
+    authoritative_phase = _authoritative_phase_d_state(state_root, evidence_root)
+    if authoritative_phase.get("phase_d_authorized"):
+        _phase_state(
+            state_root, "D", "CUTOVER_IN_PROGRESS",
+            release_validation_session_id=session_id,
+            authoritative_upgrade_state=authoritative_phase,
+        )
+    else:
+        _phase_state(
+            state_root, "C", "CANDIDATE_VALIDATION_COMPLETE" if code == 0 else
+            "CANDIDATE_VALIDATION_FAILED",
+            release_validation_session_id=session_id,
+            authoritative_upgrade_state=authoritative_phase,
+        )
     _atomic_json(os.path.join(state_root, "run-upgrade-result.json"), {
         "status": "PASSED" if code == 0 else "FAILED",
         "exit_code": code,
-        "stdout_tail": output[-12000:],
-        "stderr_tail": error[-12000:],
-        "command": "python3.6 scripts/upgrade/run_upgrade.py --mode production",
+        "interactive": True,
+        "stdout_capture": "inherited",
+        "stderr_capture": "inherited",
+        "authoritative_upgrade_state": authoritative_phase,
+        "command": "{} scripts/upgrade/run_upgrade.py --mode production".format(
+            sys.executable
+        ),
     })
     # ProductionEvidenceManifest writes the canonical filename exposed by the
     # shared module.  Projecting any other name would leave the required
@@ -802,13 +907,17 @@ def run(args):
     if code != 0:
         _phase_state(
             state_root, "E",
-            "ROLLBACK_REQUIRED" if "Phase D" in output else "NOT_REQUIRED",
+            "ROLLBACK_REQUIRED" if authoritative_phase.get(
+                "phase_d_authorized"
+            ) else "NOT_REQUIRED",
             release_validation_session_id=session_id,
+            authoritative_upgrade_state=authoritative_phase,
         )
     else:
         _phase_state(
             state_root, "E", "NOT_REQUIRED",
             release_validation_session_id=session_id,
+            authoritative_upgrade_state=authoritative_phase,
         )
     _phase_state(
         state_root, "F", "PASSED" if code == 0 else "FAILED",
@@ -821,7 +930,13 @@ def status(state_root):
     path = os.path.join(os.path.abspath(state_root), "state.json")
     if not os.path.isfile(path):
         return {"status": "NOT_STARTED", "state_root": os.path.abspath(state_root)}
-    return _load_json(path, "R8 state")
+    result = _load_json(path, "R8 state")
+    upgrade_path = os.path.join(os.path.abspath(state_root), "upgrade-state.json")
+    if os.path.isfile(upgrade_path):
+        result["authoritative_upgrade_state"] = _load_json(
+            upgrade_path, "authoritative upgrade state"
+        )
+    return result
 
 
 def main(argv=None):

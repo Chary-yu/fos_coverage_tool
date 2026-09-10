@@ -2051,7 +2051,7 @@ class UpgradeOrchestrator:
         )
 
     def log(self, msg: str):
-        print(f"[{time.strftime('%H:%M:%S')}] {msg}")
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
         self.logs.append(msg)
         self.manifest.add_log(msg)
 
@@ -2073,10 +2073,11 @@ class UpgradeOrchestrator:
             return True
         url = str(upgrade_config.get("candidate_browser_url") or "").strip()
         self.log("PRODUCTION_MUTATION=NONE until APPLY R8")
-        print("Candidate browser URL: {}".format(url))
+        print("Candidate browser URL: {}".format(url), flush=True)
         print(
             "Open this URL in ordinary Chrome/Edge, confirm the exact Candidate "
-            "identity and report, then type: BROWSER READY"
+            "identity and report, then type: BROWSER READY",
+            flush=True,
         )
         try:
             answer = input("Browser observation confirmation: ").strip()
@@ -2101,10 +2102,14 @@ class UpgradeOrchestrator:
                 "require_apply_confirmation", True):
             return True
         print(
-            "PRE_CUTOVER_READY is complete. No production mutation has occurred."
+            "PRE_CUTOVER_READY is complete. No production mutation has occurred.",
+            flush=True,
         )
         self.log("PRODUCTION_MUTATION=NONE; awaiting APPLY R8")
-        print("Type exactly 'APPLY R8' to enter the production mutation boundary.")
+        print(
+            "Type exactly 'APPLY R8' to enter the production mutation boundary.",
+            flush=True,
+        )
         try:
             answer = input("Production mutation confirmation: ").strip()
         except (EOFError, KeyboardInterrupt):

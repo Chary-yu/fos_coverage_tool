@@ -119,7 +119,8 @@ def validate(repo_root, tool_path="", bundle_path=""):
     phase_ok = all(
         token in conductor for token in (
             '"A", "RUNNING"', '"B", "RUNNING"', '"C", "RUNNING"',
-            '"D", "RUNNING"', '"F", "PASSED"', '"FAILED"',
+            '"D", "CUTOVER_IN_PROGRESS"', '"F", "PASSED"', '"FAILED"',
+            '"phase_d_authorized"',
         )
     ) and "Phase D" in run_upgrade and "post_open_serving" in run_upgrade
     if not _check(checks, "phase_a_to_f_fail_closed", phase_ok,
