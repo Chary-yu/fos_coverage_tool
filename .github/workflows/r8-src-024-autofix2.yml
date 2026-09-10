@@ -1,0 +1,85 @@
+name: R8 SRC 024 Autofix 2
+on:
+  push:
+    branches: [r8-src-024-two-phase]
+    paths: [.github/workflows/r8-src-024-autofix2.yml]
+permissions:
+  contents: write
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          ref: r8-src-024-two-phase
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Reconstruct exact transform
+        run: |
+          python - <<'PY'
+          import hashlib
+          from pathlib import Path
+          data=bytearray(b''.join(Path('.github/r8-src-024-transform.seg%02d'%i).read_bytes() for i in range(8)))
+          block=b'S8T/BP1AbwXxvlllc5DbmzKdzLd1gcKIOgA+mwQApKuHaInGjiY+mfg7zq7cAH1dDJXn0dOgUV6+dOyntPlejbDAvFW8KYs5LCQm7CZbmEQ8F6+7v4V9GckWrbK7NHrz4jvYOWAA2WqlbaEMCwHD7n79AI+wFev2OiXr8sHcNeDFQBEQsENEQT1KP8xTWIHDtw8bsZuMtZ1lZG08AtXvk1WV2uRC8KhkWSIEfsa9DKh/eTUi+9LaUWJoEacfQFOoCDFqQ0BiGiQ+FxgfgL4ilUufxaeUmWSxcIkO/4NJmr0q8hSsQXhdmqcl/SlUqcjSj/xmCj8EO4Vsp/syg/2MjCeBg2tCgSl3tyyq+wyGlSySTQ1zvCmzO6FnoNktlLQuS45h4MAW2zkti1W2TOcP81X6ZEYduyD+Dnz8Luc/bpMK3RNEo/YG/Pc17DDffC3ayxGL39jF0Y6DsTT1nQp1h/vkIa6TEliLNs7GxHNaJxuUSSz8ikK2Fz3+D5I8m4vZ'
+          data[1536:2048]=block
+          got=hashlib.sha256(data).hexdigest()
+          want='2a2b6a43ddc5e24c204edeb2268366f07af34cde4c29d5d95cad336dcf72f8f1'
+          if got != want: raise SystemExit('transform transport sha mismatch '+got)
+          Path('/tmp/t.b64').write_bytes(data)
+          PY
+          base64 -d /tmp/t.b64 | gzip -dc > /tmp/t.py
+          python -m py_compile /tmp/t.py
+      - name: Tighten exact signature transform
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/t.py'); lines=p.read_text().splitlines(); hits=[i for i,x in enumerate(lines) if "'execute upgrade phase signature'," in x]
+          if len(hits)!=1: raise SystemExit('signature label count=%d'%len(hits))
+          end=hits[0]+1; start=hits[0]
+          while start>=0 and lines[start] != 'text = replace_once(': start-=1
+          if start<0: raise SystemExit('signature transform start missing')
+          repl='''text = replace_once(
+    text,
+    '                        target_connection_factory=None) -> Tuple[bool, str]:\\n',
+    '                        target_connection_factory=None,\\n'
+    '                        phase: str = "full") -> Tuple[bool, str]:\\n',
+    'execute upgrade phase signature',
+)'''.splitlines()
+          lines[start:end]=repl
+          p.write_text('\n'.join(lines)+'\n')
+          PY
+          python -m py_compile /tmp/t.py
+      - name: Apply repair
+        run: |
+          python /tmp/t.py
+          rm -f .github/r8-src-024-transform.b64 .github/r8-src-024-transform.part1 .github/r8-src-024-transform.part2 .github/r8-src-024-transform.seg0{0,1,2,3,4,5,6,7} .github/workflows/r8-src-024-autofix.yml .github/workflows/r8-src-024-autofix2.yml
+      - name: Install focused dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-py36.txt
+          pip install pymysql
+      - name: Syntax and Python 3.6 grammar
+        run: |
+          python -m py_compile scripts/upgrade/run_upgrade.py scripts/upgrade/validation_session.py scripts/upgrade/vfoswind_production_lifecycle.py scripts/diagnostics/browser_handoff_commands.py tests/release/test_upgrade_two_phase.py
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          for p in ('scripts/upgrade/run_upgrade.py','scripts/upgrade/validation_session.py','scripts/upgrade/vfoswind_production_lifecycle.py','scripts/diagnostics/browser_handoff_commands.py'):
+              ast.parse(Path(p).read_text(), filename=p, feature_version=(3,6))
+          PY
+      - name: Targeted tests only
+        run: |
+          python -m unittest tests.release.test_validation_session tests.release.test_vfoswind_production_lifecycle tests.release.test_upgrade_two_phase tests.release.test_upgrade_manifest tests.release.test_release_governance_tools -v
+      - name: Diff safety and commit
+        run: |
+          set -eu
+          git diff --check
+          test -z "$(find .github -maxdepth 1 -name 'r8-src-024-transform*' -print -quit)"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'fix(r8): add resumable real-browser release validation'
+          git push origin HEAD:r8-src-024-two-phase
