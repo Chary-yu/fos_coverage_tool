@@ -1,0 +1,207 @@
+name: R8 Offline Source Transfer Tooling V2
+
+on:
+  push:
+    branches:
+      - r8-offline-transfer-tooling
+    paths:
+      - '.github/workflows/r8-offline-source-transfer-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TARGET_SHA: cd8bc9e8f2982c54f3f9c172b5f281895ba5671f
+  TARGET_TREE: 50dc0f9414ecb27777e3e56235e0970294a19d36
+  BASELINE_SHA: e9fcc837a1ac9847f3966fc8ddb2aed92ca473fc
+  E36_SHA: e36f823d484251ef57054fbbab6b080c95a1b611
+
+jobs:
+  build:
+    name: Build and smoke exact self-extracting source TXT
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact locked source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+          path: source
+
+      - name: Build verified complete bundle
+        run: |
+          set -euo pipefail
+          cd source
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test "$(git rev-parse 'HEAD^{tree}')" = "$TARGET_TREE"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git cat-file -e "${BASELINE_SHA}^{commit}"
+          git cat-file -e "${E36_SHA}^{commit}"
+          test "$(git merge-base "$E36_SHA" "$TARGET_SHA")" = "$E36_SHA"
+          git branch -f offline-final "$TARGET_SHA"
+          git branch -f offline-baseline "$BASELINE_SHA"
+          git branch -f offline-e36 "$E36_SHA"
+          mkdir -p "$RUNNER_TEMP/r8-transfer"
+          BUNDLE="$RUNNER_TEMP/r8-transfer/repository-${TARGET_SHA}.bundle"
+          git bundle create "$BUNDLE" refs/heads/offline-final refs/heads/offline-baseline refs/heads/offline-e36
+          git bundle verify "$BUNDLE"
+          VERIFY="$RUNNER_TEMP/r8-transfer/verify"
+          git clone -q -b offline-final "$BUNDLE" "$VERIFY"
+          test "$(cd "$VERIFY" && git rev-parse HEAD)" = "$TARGET_SHA"
+          test "$(cd "$VERIFY" && git rev-parse 'HEAD^{tree}')" = "$TARGET_TREE"
+          (cd "$VERIFY" && git cat-file -e "${BASELINE_SHA}^{commit}" && git cat-file -e "${E36_SHA}^{commit}" && git fsck --full --strict)
+          sha256sum "$BUNDLE" > "$RUNNER_TEMP/r8-transfer/bundle.sha256"
+
+      - name: Build self-extracting TXT
+        env:
+          BUNDLE: ${{ runner.temp }}/r8-transfer/repository-${{ env.TARGET_SHA }}.bundle
+          BUNDLE_SHA: ${{ runner.temp }}/r8-transfer/bundle.sha256
+          OUT: .artifacts/fos_r8_offline_source_bundle_cd8bc9e8_20260910.txt
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts
+          python3 - <<'PY'
+          import base64, os, textwrap
+          from pathlib import Path
+          bundle=Path(os.environ['BUNDLE'])
+          expected=Path(os.environ['BUNDLE_SHA']).read_text().split()[0]
+          out=Path(os.environ['OUT'])
+          payload='\n'.join(textwrap.wrap(base64.b64encode(bundle.read_bytes()).decode('ascii'),76))
+          script=r'''#!/bin/bash
+          set -euo pipefail
+          umask 077
+          SELF="${BASH_SOURCE[0]}"
+          DEST_ROOT="${1:-/home/zcyu/coverage_candidate/r8_offline_cd8bc9e8/source_transfer}"
+          TARGET_SHA="__TARGET__"
+          TARGET_TREE="__TREE__"
+          BASELINE_SHA="__BASE__"
+          E36_SHA="__E36__"
+          EXPECTED_BUNDLE_SHA256="__BUNDLE_SHA__"
+          BUNDLE="$DEST_ROOT/repository-${TARGET_SHA}.bundle"
+          SOURCE_CHECKOUT="$DEST_ROOT/source_checkout"
+          IDENTITY="$DEST_ROOT/source_transfer_identity.txt"
+
+          fail(){ echo "ERROR: $*" >&2; echo "OFFLINE_SOURCE_TRANSFER=FAIL" >&2; exit 1; }
+          command -v python3 >/dev/null 2>&1 || fail "python3 is required"
+          command -v git >/dev/null 2>&1 || fail "git is required"
+          mkdir -p "$DEST_ROOT"
+          [ ! -L "$DEST_ROOT" ] || fail "destination root must not be a symlink"
+          TMP="$BUNDLE.part.$$"
+          trap 'rm -f "$TMP"' EXIT
+
+          python3 - "$SELF" "$TMP" "$EXPECTED_BUNDLE_SHA256" <<'PY_DECODE'
+          from __future__ import print_function
+          import base64, hashlib, os, sys
+          src,out,expected=sys.argv[1:4]
+          marker=b'__FOS_R8_GIT_BUNDLE_BASE64__\n'
+          raw=open(src,'rb').read()
+          if marker not in raw: raise SystemExit('embedded bundle marker missing')
+          data=base64.b64decode(raw.split(marker,1)[1])
+          got=hashlib.sha256(data).hexdigest()
+          if got != expected: raise SystemExit('embedded bundle SHA256 mismatch')
+          with open(out,'wb') as f:
+              f.write(data); f.flush()
+              try: os.fsync(f.fileno())
+              except OSError: pass
+          print('EMBEDDED_BUNDLE_SHA256='+got)
+          PY_DECODE
+
+          if [ -e "$BUNDLE" ] || [ -L "$BUNDLE" ]; then
+            [ -f "$BUNDLE" ] && [ ! -L "$BUNDLE" ] || fail "existing bundle is not a regular file"
+            GOT="$(python3 - "$BUNDLE" <<'PY_HASH'
+          import hashlib,sys
+          h=hashlib.sha256()
+          with open(sys.argv[1],'rb') as f:
+              for c in iter(lambda:f.read(1048576),b''): h.update(c)
+          print(h.hexdigest())
+          PY_HASH
+          )"
+            [ "$GOT" = "$EXPECTED_BUNDLE_SHA256" ] || fail "existing bundle SHA256 mismatch"
+            rm -f "$TMP"
+          else
+            mv "$TMP" "$BUNDLE"
+          fi
+          chmod 0600 "$BUNDLE"
+
+          VERIFY="$DEST_ROOT/.verify.$$"
+          rm -rf "$VERIFY"; mkdir -p "$VERIFY"
+          (cd "$VERIFY" && git init -q && git bundle verify "$BUNDLE") || fail "git bundle verify failed"
+          rm -rf "$VERIFY"
+
+          verify_checkout(){
+            [ -d "$SOURCE_CHECKOUT" ] && [ ! -L "$SOURCE_CHECKOUT" ] || return 1
+            [ "$(cd "$SOURCE_CHECKOUT" && git rev-parse HEAD 2>/dev/null || true)" = "$TARGET_SHA" ] || return 1
+            [ "$(cd "$SOURCE_CHECKOUT" && git rev-parse 'HEAD^{tree}' 2>/dev/null || true)" = "$TARGET_TREE" ] || return 1
+            [ -z "$(cd "$SOURCE_CHECKOUT" && git status --porcelain --untracked-files=all 2>/dev/null)" ] || return 1
+            (cd "$SOURCE_CHECKOUT" && git cat-file -e "${BASELINE_SHA}^{commit}" && git cat-file -e "${E36_SHA}^{commit}") >/dev/null 2>&1 || return 1
+          }
+          if [ -e "$SOURCE_CHECKOUT" ] || [ -L "$SOURCE_CHECKOUT" ]; then
+            verify_checkout || fail "existing source checkout does not match locked R8 source"
+            REUSED=YES
+          else
+            git clone -q -b offline-final "$BUNDLE" "$SOURCE_CHECKOUT" || fail "bundle clone failed"
+            verify_checkout || fail "cloned source identity mismatch"
+            REUSED=NO
+          fi
+          (cd "$SOURCE_CHECKOUT" && git fsck --full --strict) || fail "source Git fsck failed"
+          ACTUAL_SHA="$(cd "$SOURCE_CHECKOUT" && git rev-parse HEAD)"
+          ACTUAL_TREE="$(cd "$SOURCE_CHECKOUT" && git rev-parse 'HEAD^{tree}')"
+          cat > "$IDENTITY" <<EOF
+          FORMAT=FOS_R8_OFFLINE_SOURCE_TRANSFER_V2
+          PRODUCTION_MUTATION=NO
+          REPOSITORY=Chary-yu/fos_coverage_tool
+          TARGET_SHA=$TARGET_SHA
+          TARGET_TREE=$TARGET_TREE
+          BASELINE_SHA=$BASELINE_SHA
+          E36_SHA=$E36_SHA
+          BUNDLE_SHA256=$EXPECTED_BUNDLE_SHA256
+          BUNDLE_PATH=$BUNDLE
+          SOURCE_CHECKOUT=$SOURCE_CHECKOUT
+          ACTUAL_SHA=$ACTUAL_SHA
+          ACTUAL_TREE=$ACTUAL_TREE
+          EOF
+          chmod 0600 "$IDENTITY"
+          echo "SOURCE_CHECKOUT_REUSED=$REUSED"
+          echo "TARGET_SHA=$TARGET_SHA"
+          echo "TARGET_TREE=$TARGET_TREE"
+          echo "BASELINE_SHA=$BASELINE_SHA"
+          echo "BUNDLE_SHA256=$EXPECTED_BUNDLE_SHA256"
+          echo "BUNDLE=$BUNDLE"
+          echo "SOURCE_CHECKOUT=$SOURCE_CHECKOUT"
+          echo "IDENTITY=$IDENTITY"
+          echo "PRODUCTION_MUTATION=NONE"
+          echo "OFFLINE_SOURCE_TRANSFER=PASS"
+          exit 0
+          __FOS_R8_GIT_BUNDLE_BASE64__
+          '''
+          script=textwrap.dedent(script).replace('__TARGET__',os.environ['TARGET_SHA']).replace('__TREE__',os.environ['TARGET_TREE']).replace('__BASE__',os.environ['BASELINE_SHA']).replace('__E36__',os.environ['E36_SHA']).replace('__BUNDLE_SHA__',expected)
+          out.write_text(script+payload+'\n',encoding='utf-8')
+          os.chmod(str(out),0o700)
+          PY
+          bash -n "$OUT"
+          sha256sum "$OUT"
+
+      - name: Smoke twice
+        env:
+          INPUT: .artifacts/fos_r8_offline_source_bundle_cd8bc9e8_20260910.txt
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/r8-transfer/smoke"
+          FIRST="$(bash "$INPUT" "$ROOT")"
+          printf '%s\n' "$FIRST"
+          printf '%s\n' "$FIRST" | grep -Fqx 'OFFLINE_SOURCE_TRANSFER=PASS'
+          test "$(cd "$ROOT/source_checkout" && git rev-parse HEAD)" = "$TARGET_SHA"
+          test "$(cd "$ROOT/source_checkout" && git rev-parse 'HEAD^{tree}')" = "$TARGET_TREE"
+          SECOND="$(bash "$INPUT" "$ROOT")"
+          printf '%s\n' "$SECOND" | grep -Fqx 'SOURCE_CHECKOUT_REUSED=YES'
+          printf '%s\n' "$SECOND" | grep -Fqx 'OFFLINE_SOURCE_TRANSFER=PASS'
+
+      - name: Upload exact TXT
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: fos-r8-offline-source-transfer-cd8bc9e8-v2
+          path: .artifacts/fos_r8_offline_source_bundle_cd8bc9e8_20260910.txt
+          if-no-files-found: error
+          retention-days: 30
