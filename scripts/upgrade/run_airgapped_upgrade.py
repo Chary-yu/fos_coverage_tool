@@ -6,7 +6,8 @@ the first log boundary after CANDIDATE_READY, waits for the authenticated
 operator browser observation written by the isolated Candidate API, binds two
 pre-staged exact-revision performance source artifacts to the current
 publication attempt, joins the evidence, and then returns control to the
-canonical runner. No public network or browser runtime is used on vfoswind.
+canonical runner. No public network, browser runtime, or Node.js runtime is
+required on vfoswind.
 """
 
 from __future__ import print_function
@@ -14,13 +15,13 @@ from __future__ import print_function
 import argparse
 import json
 import os
-import subprocess
 import sys
 import time
 from urllib.parse import urlparse
 
 from scripts.upgrade import run_upgrade as core
 from scripts.upgrade.airgapped_evidence_join import build_join
+from scripts.diagnostics.release_performance_ab import build_release_performance_ab
 
 
 PAUSE_LOG = "[Step 5/10] Executing Targeted Unit Test Suites (Phases 0-6)..."
@@ -51,13 +52,34 @@ def _resolve_revision_source(repo_root, raw, revision, label):
     return path
 
 
-def _operator_page_url(candidate_url):
-    parsed = urlparse(str(candidate_url or "").strip())
+def _external_origin(value):
+    parsed = urlparse(str(value or "").strip())
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise RuntimeError("candidate_browser_url has no external gateway origin")
-    return "{}://{}/api/coverage/release-validation/page.html".format(
-        parsed.scheme, parsed.netloc
-    )
+        raise RuntimeError("Candidate Gateway origin is not an absolute HTTP(S) URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise RuntimeError("Candidate Gateway origin may not contain credentials/query/fragment")
+    hostname = str(parsed.hostname or "").strip().lower()
+    if not hostname or hostname in ("localhost", "127.0.0.1", "::1"):
+        raise RuntimeError("Candidate Gateway origin must be externally reachable")
+    path = str(parsed.path or "").rstrip("/")
+    if path:
+        raise RuntimeError("Candidate Gateway origin must not include a path")
+    return "{}://{}".format(parsed.scheme, parsed.netloc)
+
+
+def _operator_page_url(candidate_gateway_origin):
+    return _external_origin(candidate_gateway_origin) + \
+        "/api/coverage/release-validation/page.html"
+
+
+def _same_origin(url, expected_origin):
+    try:
+        return _external_origin("{}://{}".format(
+            urlparse(str(url or "")).scheme,
+            urlparse(str(url or "")).netloc,
+        )) == _external_origin(expected_origin)
+    except Exception:
+        return False
 
 
 class AirGappedUpgradeOrchestrator(core.UpgradeOrchestrator):
@@ -126,8 +148,11 @@ class AirGappedUpgradeOrchestrator(core.UpgradeOrchestrator):
                     candidate_payload.get("revision") != candidate_revision:
                 raise RuntimeError("air-gapped performance source revisions do not match release")
 
-            candidate_url = str(upgrade.get("candidate_browser_url") or "").strip()
-            operator_url = _operator_page_url(candidate_url)
+            gateway_origin = _external_origin(
+                profile.get("candidate_gateway_origin") or
+                upgrade.get("candidate_gateway_origin") or ""
+            )
+            operator_url = _operator_page_url(gateway_origin)
             timeout_sec = int(profile.get("operator_timeout_sec") or 1800)
             poll_sec = float(profile.get("poll_interval_sec") or 2.0)
             if timeout_sec < 60 or timeout_sec > 7200:
@@ -164,39 +189,28 @@ class AirGappedUpgradeOrchestrator(core.UpgradeOrchestrator):
                         payload.get("candidate_artifact_sha256") != self._candidate_artifact_sha256 or \
                         payload.get("served_root_sha256") != self._served_root_sha256:
                     raise RuntimeError("{} air-gapped evidence identity mismatch".format(label))
-            if observation.get("candidate_url") != candidate_url or auth.get("candidate_url") != candidate_url:
+            observed_candidate_url = str(observation.get("candidate_url") or "").strip()
+            if not observed_candidate_url or auth.get("candidate_url") != observed_candidate_url:
                 raise RuntimeError("air-gapped browser/auth Candidate URL mismatch")
+            if not _same_origin(observed_candidate_url, gateway_origin):
+                raise RuntimeError("manifest-derived Candidate report URL is outside configured gateway origin")
 
-            node = str(profile.get("node_command") or "node").strip()
-            combiner = os.path.join(
-                self.repo_root, "scripts", "diagnostics", "release_performance_ab.js"
+            performance = build_release_performance_ab(
+                baseline_source,
+                candidate_source,
+                baseline_revision,
+                candidate_revision,
+                workload_hash,
+                self.performance_evidence_path,
+                release_validation_session_id=self.release_validation_session_id,
+                candidate_artifact_sha256=self._candidate_artifact_sha256,
+                served_root_sha256=self._served_root_sha256,
+                max_regression_percent=profile.get("max_regression_percent", 20.0),
             )
-            if not os.path.isfile(combiner):
-                raise RuntimeError("release performance A/B combiner is missing")
-            command = [
-                node, combiner,
-                "--baseline-artifact", baseline_source,
-                "--candidate-artifact", candidate_source,
-                "--baseline-commit", baseline_revision,
-                "--candidate-commit", candidate_revision,
-                "--workload-hash", workload_hash,
-                "--output", self.performance_evidence_path,
-                "--release-validation-session-id", self.release_validation_session_id,
-                "--candidate-artifact-sha256", self._candidate_artifact_sha256,
-                "--served-root-sha256", self._served_root_sha256,
-            ]
-            if profile.get("max_regression_percent") is not None:
-                command.extend([
-                    "--max-regression-percent", str(profile.get("max_regression_percent")),
-                ])
-            result = subprocess.run(
-                command, cwd=self.repo_root,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
-            if result.returncode != 0:
+            if performance.get("status") != "PASSED":
                 raise RuntimeError(
                     "release performance A/B bind failed: {}".format(
-                        result.stderr.decode("utf-8", errors="replace")[-2000:]
+                        "; ".join(performance.get("violations") or [])
                     )
                 )
 
@@ -209,7 +223,7 @@ class AirGappedUpgradeOrchestrator(core.UpgradeOrchestrator):
                     "session_id": self.release_validation_session_id,
                     "candidate_artifact_sha256": self._candidate_artifact_sha256,
                     "served_root_sha256": self._served_root_sha256,
-                    "candidate_url": candidate_url,
+                    "candidate_url": observed_candidate_url,
                 },
             )
             if joined.get("status") != "PASSED":
@@ -241,6 +255,14 @@ def main():
         profile = upgrade_config.get("airgapped_operator_browser") or {}
         if not isinstance(profile, dict) or profile.get("enabled") is not True:
             print("Production air-gapped conductor requires upgrade.airgapped_operator_browser.enabled=true", file=sys.stderr)
+            return 1
+        try:
+            _external_origin(
+                profile.get("candidate_gateway_origin") or
+                upgrade_config.get("candidate_gateway_origin") or ""
+            )
+        except Exception as exc:
+            print("Production air-gapped conductor requires a valid Candidate Gateway origin: {}".format(exc), file=sys.stderr)
             return 1
 
     orchestrator = AirGappedUpgradeOrchestrator(
