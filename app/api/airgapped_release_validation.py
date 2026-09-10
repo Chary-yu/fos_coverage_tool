@@ -59,13 +59,32 @@ def _inside(root, path):
         return False
 
 
-def _atomic_json(path, payload):
+def _ensure_private_directory(root, directory):
+    root = _real(root)
+    directory = os.path.abspath(str(directory))
+    if not _inside(root, directory):
+        raise RuntimeError("validation evidence directory escapes its trusted root")
+    relative = os.path.relpath(directory, root)
+    cursor = root
+    for part in (() if relative == "." else relative.split(os.sep)):
+        cursor = os.path.join(cursor, part)
+        if os.path.lexists(cursor):
+            if os.path.islink(cursor) or not os.path.isdir(cursor):
+                raise RuntimeError("validation evidence parent is not a real directory")
+        else:
+            os.mkdir(cursor, 0o700)
+    return directory
+
+
+def _atomic_json(path, payload, trusted_root=None):
     path = os.path.abspath(str(path))
     directory = os.path.dirname(path)
-    if not os.path.isdir(directory):
-        os.makedirs(directory, 0o700)
-    if os.path.islink(directory):
-        raise RuntimeError("validation evidence directory may not be a symlink")
+    if trusted_root:
+        _ensure_private_directory(trusted_root, directory)
+    elif not os.path.isdir(directory) or os.path.islink(directory):
+        raise RuntimeError("validation evidence directory is unavailable")
+    if os.path.lexists(path) and os.path.islink(path):
+        raise RuntimeError("validation evidence target may not be a symlink")
     temporary = "{}.part-{}-{}".format(path, os.getpid(), secrets.token_hex(4))
     try:
         with open(temporary, "w", encoding="utf-8") as stream:
@@ -239,7 +258,7 @@ def _state(paths, session_id, timeout_sec):
         "expires_at": now + timeout_sec,
         "submitted": False,
     }
-    _atomic_json(path, value)
+    _atomic_json(path, value, trusted_root=paths["publish_root"])
     return value
 
 
@@ -347,14 +366,22 @@ def _require_operator(application, headers, remote_address, mutation=False):
         })
 
 
-def _negative_mutation_probe(candidate_url):
-    parsed = urlparse(candidate_url)
-    request = urllib.request.Request(
-        "{}://{}{}".format(parsed.scheme, parsed.netloc, AUTH_MUTATION_PROBE_PATH),
-        data=b"{}", method="POST", headers={"Content-Type": "application/json"},
-    )
+def _negative_mutation_probe(application):
+    server = (application.config or {}).get("server") or {}
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
+        port = int(server.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if port <= 0 or port > 65535:
+        return 0
+    url = "http://127.0.0.1:{}{}".format(port, AUTH_MUTATION_PROBE_PATH)
+    request = urllib.request.Request(
+        url, data=b"{}", method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=10) as response:
             return int(getattr(response, "status", 200))
     except urllib.error.HTTPError as exc:
         return int(exc.code)
@@ -418,7 +445,9 @@ def _write_evidence(context, body, operator, negative_status):
         "report_sha256": context["report_sha256"],
         "recorded_at": time.time(),
     })
-    _atomic_json(paths["workload"], workload)
+    _atomic_json(
+        paths["workload"], workload, trusted_root=paths["publish_root"]
+    )
     workload_sha = _sha256_file(paths["workload"])
     observation = {
         "schema_version": 2,
@@ -490,8 +519,10 @@ def _write_evidence(context, body, operator, negative_status):
         "exit_code": 0,
         "recorded_at": time.time(),
     }
-    _atomic_json(paths["operator"], observation)
-    _atomic_json(paths["auth"], auth)
+    _atomic_json(
+        paths["operator"], observation, trusted_root=paths["publish_root"]
+    )
+    _atomic_json(paths["auth"], auth, trusted_root=paths["publish_root"])
     return observation, auth
 
 
@@ -521,7 +552,7 @@ def _submit(application, body, headers, remote_address):
     errors = _validate_submission(context, body, operator)
     if errors:
         return 400, {"error": "invalid_browser_observation", "violations": errors}
-    negative_status = _negative_mutation_probe(context["candidate_url"])
+    negative_status = _negative_mutation_probe(application)
     if negative_status not in (401, 403):
         return 409, {
             "error": "auth_negative_control_failed",
@@ -534,7 +565,10 @@ def _submit(application, body, headers, remote_address):
         "operator_evidence_sha256": _sha256_file(context["_paths"]["operator"]),
         "auth_evidence_sha256": _sha256_file(context["_paths"]["auth"]),
     })
-    _atomic_json(context["_paths"]["state"], state)
+    _atomic_json(
+        context["_paths"]["state"], state,
+        trusted_root=context["_paths"]["publish_root"],
+    )
     return 200, {
         "status": "PASSED",
         "release_validation_session_id": context["release_validation_session_id"],
