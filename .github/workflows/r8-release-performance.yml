@@ -5,13 +5,6 @@ on:
   push:
     branches:
       - r8-airgapped-release-consolidation
-    paths:
-      - 'web/assets/js/coverage_enhance.js'
-      - 'web/assets/css/coverage_enhance.css'
-      - 'scripts/diagnostics/release_performance_revision.js'
-      - 'scripts/diagnostics/release_performance_ab.py'
-      - 'scripts/diagnostics/release_performance_ab.js'
-      - '.github/workflows/r8-release-performance.yml'
 
 permissions:
   contents: read
