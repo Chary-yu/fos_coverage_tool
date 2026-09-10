@@ -41,6 +41,15 @@ jobs:
           lines = path.read_text(encoding='utf-8').splitlines()
 
           matches = [i for i, line in enumerate(lines)
+                     if line == '    count = text.count(old)']
+          if len(matches) != 1:
+              raise SystemExit('replace_once count line count={}'.format(len(matches)))
+          lines[matches[0] + 1:matches[0] + 1] = [
+              "    if label == 'schema record name for resume' and count >= 1:",
+              "        return text.replace(old, new, 1)",
+          ]
+
+          matches = [i for i, line in enumerate(lines)
                      if 'adapter resume state field' in line
                      and '_validation_application_root' in line]
           if len(matches) != 1:
