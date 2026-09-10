@@ -5,6 +5,7 @@ import unittest
 from scripts.upgrade import run_upgrade
 from scripts.upgrade.run_airgapped_upgrade import (
     PAUSE_LOG,
+    _external_origin,
     _operator_page_url,
     _resolve_revision_source,
 )
@@ -22,12 +23,18 @@ class AirgappedUpgradeConductorTest(unittest.TestCase):
         self.assertLess(pause, phase_d)
 
     def test_operator_page_reuses_candidate_gateway_origin(self):
+        origin = 'http://10.190.162.33:19529'
         self.assertEqual(
-            'http://10.190.162.33:19529/api/coverage/release-validation/page.html',
-            _operator_page_url(
-                'http://10.190.162.33:19529/coverage/a/b/report.gcov.html'
-            ),
+            origin + '/api/coverage/release-validation/page.html',
+            _operator_page_url(origin),
         )
+
+    def test_gateway_origin_rejects_report_path(self):
+        with self.assertRaisesRegex(
+                RuntimeError, 'Candidate Gateway origin must not include a path'):
+            _external_origin(
+                'http://10.190.162.33:19529/coverage/a/b/report.gcov.html'
+            )
 
     def test_revision_source_is_exact_placeholder_and_must_exist(self):
         revision = 'a' * 40
