@@ -1,0 +1,108 @@
+name: R8 Release Performance Evidence
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - r8-airgapped-release-consolidation
+    paths:
+      - 'web/assets/js/coverage_enhance.js'
+      - 'web/assets/css/coverage_enhance.css'
+      - 'scripts/diagnostics/release_performance_revision.js'
+      - 'scripts/diagnostics/release_performance_ab.py'
+      - 'scripts/diagnostics/release_performance_ab.js'
+      - '.github/workflows/r8-release-performance.yml'
+
+permissions:
+  contents: read
+
+env:
+  BASELINE_SHA: e9fcc837a1ac9847f3966fc8ddb2aed92ca473fc
+
+jobs:
+  exact-revision-performance:
+    name: Exact revision Chromium performance
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Candidate tooling and source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '20'
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pinned repository browser dependencies
+        run: |
+          set -euo pipefail
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Materialize exact baseline worktree
+        run: |
+          set -euo pipefail
+          mkdir -p .artifacts/r8-release-performance .worktrees
+          git cat-file -e "${BASELINE_SHA}^{commit}"
+          git worktree add --detach .worktrees/baseline "${BASELINE_SHA}"
+          printf '%s\n' "$(git rev-parse HEAD)" > .artifacts/r8-release-performance/candidate.sha
+          (cd .worktrees/baseline && git rev-parse HEAD) > .artifacts/r8-release-performance/baseline.sha
+          test "$(cat .artifacts/r8-release-performance/baseline.sha)" = "${BASELINE_SHA}"
+          test "$(cat .artifacts/r8-release-performance/candidate.sha)" = "${GITHUB_SHA}"
+
+      - name: Produce independent baseline and Candidate revision evidence
+        run: |
+          set -euo pipefail
+          BASE_TREE="$(cd .worktrees/baseline && git rev-parse 'HEAD^{tree}')"
+          CAND_TREE="$(git rev-parse 'HEAD^{tree}')"
+          node scripts/diagnostics/release_performance_revision.js \
+            --source-root .worktrees/baseline \
+            --expected-revision "${BASELINE_SHA}" \
+            --expected-tree "${BASE_TREE}" \
+            --output .artifacts/r8-release-performance/release-performance-revision-${BASELINE_SHA}.json
+          node scripts/diagnostics/release_performance_revision.js \
+            --source-root . \
+            --expected-revision "${GITHUB_SHA}" \
+            --expected-tree "${CAND_TREE}" \
+            --output .artifacts/r8-release-performance/release-performance-revision-${GITHUB_SHA}.json
+
+      - name: Verify pair compatibility with production-host Python combiner
+        run: |
+          set -euo pipefail
+          BASE=.artifacts/r8-release-performance/release-performance-revision-${BASELINE_SHA}.json
+          CAND=.artifacts/r8-release-performance/release-performance-revision-${GITHUB_SHA}.json
+          WORKLOAD_HASH="$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["workload_hash"])' "$BASE")"
+          python scripts/diagnostics/release_performance_ab.py \
+            --baseline-artifact "$BASE" \
+            --candidate-artifact "$CAND" \
+            --baseline-commit "${BASELINE_SHA}" \
+            --candidate-commit "${GITHUB_SHA}" \
+            --workload-hash "$WORKLOAD_HASH" \
+            --output .artifacts/r8-release-performance/release-performance-ab-ci-${GITHUB_SHA}.json
+
+      - name: Write transfer integrity hashes
+        run: |
+          set -euo pipefail
+          cd .artifacts/r8-release-performance
+          sha256sum release-performance-revision-${BASELINE_SHA}.json > release-performance-revision-${BASELINE_SHA}.json.sha256
+          sha256sum release-performance-revision-${GITHUB_SHA}.json > release-performance-revision-${GITHUB_SHA}.json.sha256
+          sha256sum release-performance-ab-ci-${GITHUB_SHA}.json > release-performance-ab-ci-${GITHUB_SHA}.json.sha256
+
+      - name: Upload air-gapped transfer evidence
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
+        with:
+          name: r8-release-performance-${{ github.sha }}
+          path: |
+            .artifacts/r8-release-performance/release-performance-revision-*.json
+            .artifacts/r8-release-performance/release-performance-revision-*.json.sha256
+            .artifacts/r8-release-performance/release-performance-ab-ci-*.json
+            .artifacts/r8-release-performance/release-performance-ab-ci-*.json.sha256
+          if-no-files-found: error
+          retention-days: 30
