@@ -1,8 +1,12 @@
+import json
+import os
+import tempfile
 import unittest
 from unittest import mock
 
 from scripts.upgrade import run_upgrade as core
 from scripts.upgrade import airgapped_gateway_contract as contract
+from scripts.upgrade.run_airgapped_manifest_upgrade import _normalized_private_config
 
 
 class AirgappedGatewayContractTest(unittest.TestCase):
@@ -82,6 +86,44 @@ class AirgappedGatewayContractTest(unittest.TestCase):
         contract.restore_canonical_gateway_contract()
         self.assertIs(core._validate_external_candidate_browser_url, original_browser)
         self.assertIs(core.VfoswindProductionLifecycle, original_lifecycle)
+
+    def test_private_config_replaces_placeholder_report_with_gateway_origin(self):
+        origin = 'http://10.190.162.33:19529'
+        source = {
+            'mysql': {'database': 'coverage', 'user': 'coverage_user'},
+            'upgrade': {
+                'candidate_browser_url': origin + '/coverage/guessed.html',
+                'candidate_gateway_origin': origin,
+                'airgapped_operator_browser': {
+                    'enabled': True,
+                    'candidate_gateway_origin': origin,
+                },
+                'production_integration': {
+                    'candidate_gateway': {
+                        'browser_url': origin + '/coverage/guessed.html',
+                    },
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as root:
+            source_path = os.path.join(root, 'source.json')
+            with open(source_path, 'w', encoding='utf-8') as stream:
+                json.dump(source, stream)
+            normalized_path = _normalized_private_config(source_path)
+            self.addCleanup(lambda: os.path.exists(normalized_path) and os.remove(normalized_path))
+            with open(normalized_path, 'r', encoding='utf-8') as stream:
+                normalized = json.load(stream)
+            upgrade = normalized['upgrade']
+            self.assertEqual(origin, upgrade['candidate_browser_url'])
+            self.assertEqual(
+                origin,
+                upgrade['production_integration']['candidate_gateway']['browser_url'],
+            )
+            self.assertEqual(
+                origin,
+                upgrade['production_integration']['candidate_gateway']['origin'],
+            )
+            self.assertEqual(0o600, os.stat(normalized_path).st_mode & 0o777)
 
 
 if __name__ == '__main__':
