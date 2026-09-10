@@ -279,6 +279,23 @@ class OneClickAndBoundaryRegressionTest(unittest.TestCase):
         )
         self.assertIn("PRODUCTION_MUTATION", source)
 
+    def test_conductor_projects_canonical_production_manifest(self):
+        path = os.path.join(ROOT, "scripts", "release", "fos_r8_conductor.py")
+        with open(path, "r", encoding="utf-8") as stream:
+            source = stream.read()
+        self.assertIn(
+            "from scripts.upgrade.evidence_manifest import MANIFEST_FILENAME",
+            source,
+        )
+        self.assertIn(
+            "manifest_path = os.path.join(evidence_root, MANIFEST_FILENAME)",
+            source,
+        )
+        self.assertNotIn(
+            'manifest_path = os.path.join(evidence_root, "evidence_manifest.json")',
+            source,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

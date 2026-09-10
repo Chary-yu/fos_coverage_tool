@@ -794,7 +794,10 @@ def run(args):
         "stderr_tail": error[-12000:],
         "command": "python3.6 scripts/upgrade/run_upgrade.py --mode production",
     })
-    manifest_path = os.path.join(evidence_root, "evidence_manifest.json")
+    # ProductionEvidenceManifest writes the canonical filename exposed by the
+    # shared module.  Projecting any other name would leave the required
+    # phase evidence as placeholders after run_upgrade completes.
+    manifest_path = os.path.join(evidence_root, MANIFEST_FILENAME)
     _project_manifest(evidence_root, manifest_path, revision, session_id)
     if code != 0:
         _phase_state(
