@@ -22,6 +22,7 @@ from urllib.parse import urlparse
 from scripts.upgrade import run_upgrade as core
 from scripts.upgrade.airgapped_evidence_join import build_join
 from scripts.diagnostics.release_performance_ab import build_release_performance_ab
+from scripts.release.current_adoption import current_flat_source_binding
 
 
 PAUSE_LOG = "[Step 5/10] Executing Targeted Unit Test Suites (Phases 0-6)..."
@@ -82,6 +83,63 @@ def _same_origin(url, expected_origin):
         return False
 
 
+_FLAT_SOURCE_BINDING_FIELDS = (
+    "previous_release_commit_sha",
+    "legacy_source_root_realpath",
+    "legacy_source_tree_sha256",
+    "legacy_source_file_count",
+    "legacy_source_total_size",
+    "legacy_release_identity_sha256",
+)
+
+
+def verify_production_candidate_flat_source_binding(candidate_provenance,
+                                                    flat_binding):
+    """Bind a production Candidate to deterministic legacy Flat bytes.
+
+    The immutable bootstrap release manifest contains a generated timestamp,
+    so its complete tree hash differs across independent safe bootstraps.  The
+    Air-Gapped Flat transition instead verifies the stable source tree and
+    baseline identity fields carried by the Candidate.  Once CURRENT already
+    exists, the canonical full Served Root binding remains unchanged.
+    """
+    if not isinstance(candidate_provenance, dict) or not isinstance(
+            flat_binding, dict):
+        raise RuntimeError(
+            "production Candidate Flat source binding is unavailable"
+        )
+    normalized = {}
+    errors = []
+    for field in _FLAT_SOURCE_BINDING_FIELDS:
+        candidate_value = candidate_provenance.get(field)
+        actual_value = flat_binding.get(field)
+        if field in ("legacy_source_file_count", "legacy_source_total_size"):
+            try:
+                candidate_value = int(candidate_value)
+                actual_value = int(actual_value)
+            except (TypeError, ValueError):
+                errors.append(field)
+                continue
+        else:
+            candidate_value = str(candidate_value or "").strip()
+            actual_value = str(actual_value or "").strip()
+            if field != "legacy_source_root_realpath":
+                candidate_value = candidate_value.lower()
+                actual_value = actual_value.lower()
+        if candidate_value in (None, "") or candidate_value != actual_value:
+            errors.append(field)
+        else:
+            normalized[field] = candidate_value
+    if errors:
+        raise RuntimeError(
+            "production Candidate Flat source binding {} does not match the "
+            "authoritative Flat deployment selected for this upgrade".format(
+                ", ".join(errors)
+            )
+        )
+    return normalized
+
+
 class AirGappedUpgradeOrchestrator(core.UpgradeOrchestrator):
     def __init__(self, *args, **kwargs):
         super(AirGappedUpgradeOrchestrator, self).__init__(*args, **kwargs)
@@ -94,6 +152,93 @@ class AirGappedUpgradeOrchestrator(core.UpgradeOrchestrator):
         self._airgapped_runtime_config = kwargs.get("runtime_config") or {}
         self._airgapped_mode = str(kwargs.get("mode") or "")
         return super(AirGappedUpgradeOrchestrator, self).execute_upgrade(*args, **kwargs)
+
+    def _configure_release_controls(self, upgrade_config, identity,
+                                    previous_release, runtime_config):
+        result = super(AirGappedUpgradeOrchestrator, self)._configure_release_controls(
+            upgrade_config, identity, previous_release, runtime_config
+        )
+        if self._deployment_layout == core.FLAT:
+            deployment = self._current_adoption_plan or {}
+            flat_binding = deployment.get("flat_source_binding") or {}
+            candidate_binding = verify_production_candidate_flat_source_binding(
+                self.candidate_preflight.get("source_provenance") or {},
+                flat_binding,
+            )
+            self.candidate_preflight["candidate_flat_source_binding"] = \
+                candidate_binding
+            self.candidate_preflight["current_flat_source_binding"] = \
+                flat_binding
+        return result
+
+    def _ensure_flat_current_baseline(self, upgrade_config, previous_release):
+        """Adopt Flat CURRENT without comparing volatile bootstrap metadata."""
+        if self._deployment_layout != core.FLAT or not self._current_adoption_plan:
+            return None
+        if not upgrade_config.get("flat_current_adoption_on_cutover"):
+            raise RuntimeError(
+                "Flat deployment requires explicit flat_current_adoption_on_cutover"
+            )
+        identity_path = upgrade_config.get("flat_release_identity_path") or \
+            upgrade_config.get("legacy_flat_release_identity_path", "")
+        flat_root = upgrade_config.get("flat_served_root") or \
+            upgrade_config.get("legacy_flat_served_root", "")
+        if identity_path and not os.path.isabs(str(identity_path)):
+            identity_path = os.path.join(self.repo_root, str(identity_path))
+        if flat_root and not os.path.isabs(str(flat_root)):
+            flat_root = os.path.join(self.repo_root, str(flat_root))
+        baseline_session = str(
+            upgrade_config.get("flat_baseline_session_id") or ""
+        ).strip()
+        if not baseline_session:
+            raise RuntimeError(
+                "flat_baseline_session_id is required for explicit adoption"
+            )
+        application_root = ""
+        if self._production_lifecycle_adapter is not None:
+            application_root = str(
+                self._production_lifecycle_adapter.config.get(
+                    "legacy_application_root"
+                ) or ""
+            ).strip()
+            if not application_root:
+                raise RuntimeError(
+                    "vfoswind Flat adoption requires legacy_application_root"
+                )
+        result = core.bootstrap_flat_current(
+            self.publish_root, flat_root, identity_path,
+            previous_release.get("commit_sha", ""), baseline_session,
+            switch=True,
+            api_contract_version=upgrade_config.get("api_contract_version", ""),
+            application_root=application_root,
+        )
+        if result.get("status") != "PASSED":
+            raise RuntimeError("Flat baseline adoption did not pass")
+        current = self.publisher.validate_current()
+        if current.get("status") != "PASSED":
+            raise RuntimeError("adopted baseline CURRENT failed validation")
+        current_binding = core.current_served_root_binding(self.publish_root)
+        if current_binding.get("previous_release_commit_sha") != \
+                previous_release.get("commit_sha"):
+            raise RuntimeError(
+                "adopted baseline CURRENT commit does not match rollback identity"
+            )
+        flat_binding = current_flat_source_binding(
+            flat_root, identity_path, previous_release.get("commit_sha", "")
+        )
+        candidate_binding = verify_production_candidate_flat_source_binding(
+            self.candidate_preflight.get("source_provenance") or {},
+            flat_binding,
+        )
+        self.candidate_preflight["candidate_flat_source_binding"] = \
+            candidate_binding
+        self.candidate_preflight["current_flat_source_binding"] = flat_binding
+        self.candidate_preflight["current_served_root_binding"] = current_binding
+        self.previous_published_session_id = self.publisher.current_session_id()
+        self._deployment_layout = core.IMMUTABLE_CURRENT
+        result["deployment_layout_after_adoption"] = core.IMMUTABLE_CURRENT
+        self.manifest.record("flat_current_adoption", result)
+        return result
 
     def log(self, message):
         if message == PAUSE_LOG and not self._airgapped_join_done:
