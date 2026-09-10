@@ -84,6 +84,72 @@ jobs:
               raise SystemExit('phase initialization body count={}'.format(len(matches)))
           lines.insert(matches[0], '        mode = str(mode or "staging").strip().lower()')
 
+          # Exact CLI layout on e36f823d uses required=True and loads config
+          # directly with json.load. Keep required mode and bind resume session
+          # into config before upgrade_config is selected.
+          matches = [i for i, line in enumerate(lines)
+                     if 'CLI phase arguments' in line and 'replace_once' in line]
+          if len(matches) != 1:
+              raise SystemExit('CLI phase transform block start count={}'.format(len(matches)))
+          start = matches[0]
+          # Replace the multi-line replace_once call containing default=staging.
+          call_start = start
+          while call_start >= 0 and not lines[call_start].startswith('text = replace_once('):
+              call_start -= 1
+          call_end = start
+          while call_end < len(lines) and lines[call_end].strip() != ')':
+              call_end += 1
+          if call_start < 0 or call_end >= len(lines):
+              raise SystemExit('CLI phase transform block bounds unavailable')
+          cli_block = '''text = replace_once(
+    text,
+    '    parser.add_argument("--mode", choices=("staging", "production"), required=True)\\n',
+    '    parser.add_argument("--mode", choices=("staging", "production"), required=True)\\n'
+    '    parser.add_argument("--phase", choices=UPGRADE_PHASES, default="full")\\n'
+    '    parser.add_argument(\\n'
+    '        "--session-id", default="",\\n'
+    '        help="Existing release-validation session for finalize/abort",\\n'
+    '    )\\n',
+    'CLI phase arguments',
+)'''.splitlines()
+          lines[call_start:call_end + 1] = cli_block
+
+          matches = [i for i, line in enumerate(lines)
+                     if line.startswith('config_anchor = ')]
+          if len(matches) != 1:
+              raise SystemExit('config anchor declaration count={}'.format(len(matches)))
+          lines[matches[0]] = '''config_anchor = '    upgrade_config = config.get("upgrade") or {}\\n' '''.rstrip()
+          matches = [i for i, line in enumerate(lines)
+                     if line.startswith("config_block = ")]
+          if len(matches) != 1:
+              raise SystemExit('config block declaration count={}'.format(len(matches)))
+          block_start = matches[0]
+          block_end = block_start + 1
+          while block_end < len(lines) and not lines[block_end].endswith("'''\n"):
+              if lines[block_end].endswith("'''"):
+                  break
+              block_end += 1
+          # Original block is four physical lines ending with triple quote.
+          while block_end < len(lines) and "'''" not in lines[block_end]:
+              block_end += 1
+          new_block = '''config_block = ''' + "'''" + '''    if args.session_id:
+        config.setdefault("upgrade", {})[
+            "resume_validation_session_id"
+        ] = args.session_id
+''' + "'''"
+          lines[block_start:block_end + 1] = new_block.splitlines()
+
+          matches = [i for i, line in enumerate(lines)
+                     if line.startswith('factory_start_anchor = ')]
+          if len(matches) != 1:
+              raise SystemExit('factory anchor declaration count={}'.format(len(matches)))
+          lines[matches[0]] = '''factory_start_anchor = '        if target_preparation_mode in (\\n' '''.rstrip()
+          matches = [i for i, line in enumerate(lines)
+                     if 'factory_pos = text.index' in line]
+          if len(matches) != 1:
+              raise SystemExit('factory position line count={}'.format(len(matches)))
+          lines[matches[0]] = 'factory_pos = text.index(factory_start_anchor, text.index(\'if __name__ == "__main__":\'))'
+
           path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
           PY
           python -m py_compile /tmp/r8_transform.py
