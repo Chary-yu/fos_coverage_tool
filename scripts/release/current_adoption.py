@@ -22,7 +22,9 @@ from app.release_publication import current_served_root_binding
 from scripts.release.prepare_legacy_flat_adoption import (
     _bind_release_assets, _source_total_size, _source_tree_sha256,
     _validate_flat_root, _validate_release_identity,
+    flat_source_binding,
     prepare_legacy_flat_adoption,
+    verify_flat_source_binding,
 )
 from scripts.release.bootstrap_previous_release import bootstrap as bootstrap_baseline
 
@@ -103,23 +105,13 @@ def current_flat_source_binding(flat_served_root, release_identity_path,
     release identity.  The same binding is recomputed immediately before the
     real bootstrap/cutover.
     """
-    flat_root, entries, _html_entries = _validate_flat_root(flat_served_root)
-    identity_path = _real(release_identity_path)
-    identity = _validate_identity(identity_path, expected_commit_sha)
-    # Enforce the complete target release-asset contract while computing the
-    # source identity; a plausible directory with unrelated files must fail.
-    _bind_release_assets(entries, identity)
-    return {
-        "previous_release_commit_sha": str(expected_commit_sha).lower(),
-        "legacy_source_root_realpath": flat_root,
-        "legacy_source_tree_sha256": _source_tree_sha256(entries),
-        "legacy_source_file_count": len(entries),
-        "legacy_source_total_size": _source_total_size(entries),
-        "legacy_release_identity_sha256": hashlib.sha256(json.dumps(
-            identity, ensure_ascii=False, sort_keys=True,
-            separators=(",", ":")
-        ).encode("utf-8")).hexdigest(),
-    }
+    # Retain the strict compatibility API used by existing diagnostics, while
+    # returning the complete binding used by Candidate provenance and the
+    # cutover recheck.  The HTML/static-asset contract is still enforced here.
+    _validate_flat_root(flat_served_root)
+    return flat_source_binding(
+        flat_served_root, release_identity_path, expected_commit_sha
+    )
 
 
 def plan_flat_current_adoption(publish_root, flat_served_root,
@@ -134,21 +126,36 @@ def plan_flat_current_adoption(publish_root, flat_served_root,
         return dict(classification, adoption_action="NOOP_CURRENT_ALREADY_EXISTS")
     if classification.get("deployment_layout") != FLAT:
         raise ValueError("Flat adoption requires a real Flat Served Root")
-    flat_binding = current_flat_source_binding(
+    identity = _validate_identity(release_identity_path, expected_commit_sha)
+    source_binding = flat_source_binding(
         classification["flat_served_root"], release_identity_path,
-        expected_commit_sha,
+        expected_commit_sha, allow_incomplete=True,
     )
+    # Keep preflight read-only, but report malformed/partial legacy roots as
+    # INCOMPLETE instead of allowing a later staging step to become the first
+    # place that discovers the missing HTML/static-asset contract.
+    try:
+        _validate_flat_root(classification["flat_served_root"])
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        source_binding = dict(source_binding)
+        source_binding["binding_status"] = "INCOMPLETE"
+        violations = list(source_binding.get("binding_violations") or [])
+        if str(exc) not in violations:
+            violations.append(str(exc))
+        source_binding["binding_violations"] = violations
     return {
-        "status": "PASSED", "deployment_layout": FLAT,
+        "status": "PASSED" if source_binding.get("binding_status") == "PASSED"
+        else "INCOMPLETE", "deployment_layout": FLAT,
         "adoption_action": "BOOTSTRAP_IMMUTABLE_BASELINE",
         "publish_root": classification["publish_root"],
         "flat_served_root": classification["flat_served_root"],
         "release_identity_path": _real(release_identity_path),
         "expected_commit_sha": str(expected_commit_sha).lower(),
-        "release_identity_sha256": flat_binding[
-            "legacy_release_identity_sha256"
-        ],
-        "flat_source_binding": flat_binding,
+        "release_identity_sha256": hashlib.sha256(json.dumps(
+            identity, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")
+        ).encode("utf-8")).hexdigest(),
+        "flat_source_binding": source_binding,
         "current_path": classification["current_path"],
         "switch_performed": False,
     }
@@ -157,13 +164,36 @@ def plan_flat_current_adoption(publish_root, flat_served_root,
 def bootstrap_flat_current(publish_root, flat_served_root,
                            release_identity_path, expected_commit_sha,
                            session_id, switch=False, api_contract_version="",
-                           application_root=""):
+                           application_root="", expected_source_binding=None):
     """Adopt a Flat root only when the caller explicitly authorizes switching."""
-    plan = plan_flat_current_adoption(
-        publish_root, flat_served_root, release_identity_path, expected_commit_sha
-    )
+    try:
+        plan = plan_flat_current_adoption(
+            publish_root, flat_served_root, release_identity_path,
+            expected_commit_sha
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        if expected_source_binding is None:
+            raise
+        raise ValueError(
+            "legacy Flat Root source binding changed: {}".format(exc)
+        )
     if plan.get("adoption_action") == "NOOP_CURRENT_ALREADY_EXISTS":
         return dict(plan, switch_performed=False)
+    if expected_source_binding is not None:
+        verify_flat_source_binding(
+            plan["flat_served_root"], plan["release_identity_path"],
+            plan["expected_commit_sha"], expected_source_binding,
+        )
+    if plan.get("status") != "PASSED":
+        if not switch:
+            return plan
+        raise ValueError(
+            "Flat adoption preflight is incomplete: {}".format(
+                "; ".join(plan.get("flat_source_binding", {}).get(
+                    "binding_violations", []
+                ))
+            )
+        )
     if not switch:
         return plan
 
@@ -174,10 +204,16 @@ def bootstrap_flat_current(publish_root, flat_served_root,
     )
     staging_root = os.path.join(temporary_parent, "staging")
     try:
-        prepare_legacy_flat_adoption(
+        adoption = prepare_legacy_flat_adoption(
             plan["flat_served_root"], staging_root,
             plan["release_identity_path"], plan["expected_commit_sha"],
         )
+        if expected_source_binding is not None:
+            observed = adoption.get("flat_source_binding") or {}
+            if observed != expected_source_binding:
+                raise ValueError(
+                    "legacy Flat Root source binding changed while staging"
+                )
         result = bootstrap_baseline(
             staging_root, publish_root,
             os.path.join(staging_root, "release_identity.json"),
@@ -187,6 +223,7 @@ def bootstrap_flat_current(publish_root, flat_served_root,
         result["adoption_plan"] = plan
         result["deployment_layout"] = FLAT
         result["switch_performed"] = True
+        result["flat_source_binding"] = adoption.get("flat_source_binding")
         return result
     finally:
         shutil.rmtree(temporary_parent, ignore_errors=True)

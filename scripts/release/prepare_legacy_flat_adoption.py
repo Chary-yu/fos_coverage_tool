@@ -305,6 +305,104 @@ def _source_total_size(entries):
     return sum(int(entry["size"]) for entry in entries)
 
 
+def _flat_source_binding_from_entries(flat_root, entries, identity,
+                                      identity_path, expected_commit_sha):
+    source_files = _source_manifest_entries(entries)
+    return {
+        "source_kind": "legacy_flat_root",
+        "previous_release_commit_sha": str(expected_commit_sha).lower(),
+        "legacy_source_root_realpath": _real(flat_root),
+        "legacy_source_tree_sha256": _source_tree_sha256(entries),
+        "legacy_source_file_count": len(source_files),
+        "legacy_source_total_size": _source_total_size(entries),
+        "legacy_release_identity_sha256": _canonical_hash(identity),
+        "legacy_release_identity_file_sha256": _sha256(identity_path),
+        "source_files": source_files,
+        "release_asset_bindings": _bind_release_assets(entries, identity),
+        "binding_status": "PASSED",
+    }
+
+
+def flat_source_binding(flat_root, identity_path, expected_commit_sha,
+                        allow_incomplete=False):
+    """Return the deterministic identity of a legacy Flat Root.
+
+    The binding deliberately contains only the source files observed in the
+    Flat Root and the separately supplied release identity.  It does not hash
+    adoption manifests, generated timestamps, temporary directories, or any
+    other control metadata.  This is the identity that Candidate preparation
+    records and the Phase-D bootstrap must recompute before it may create
+    ``CURRENT``.
+    """
+    # The layout classifier is a read-only preflight and must be able to
+    # describe a partially provisioned legacy root without creating CURRENT.
+    # Strict report HTML/content validation remains in the actual adoption
+    # preparation path.  The binding itself only needs the stable regular-file
+    # inventory and the separately validated release identity.
+    flat_root = _real(flat_root)
+    entries = _scan_source_tree(flat_root)
+    if not entries and not allow_incomplete:
+        raise ValueError("legacy Flat Root contains no source files")
+    identity_path = os.path.abspath(str(identity_path))
+    identity = _validate_release_identity(identity_path, expected_commit_sha)
+    try:
+        asset_bindings = _bind_release_assets(entries, identity)
+        binding_error = ""
+    except ValueError as exc:
+        if not allow_incomplete:
+            raise
+        asset_bindings = []
+        binding_error = str(exc)
+    binding = {
+        "source_kind": "legacy_flat_root",
+        "previous_release_commit_sha": str(expected_commit_sha).lower(),
+        "legacy_source_root_realpath": _real(flat_root),
+        "legacy_source_tree_sha256": _source_tree_sha256(entries),
+        "legacy_source_file_count": len(entries),
+        "legacy_source_total_size": _source_total_size(entries),
+        "legacy_release_identity_sha256": _canonical_hash(identity),
+        "legacy_release_identity_file_sha256": _sha256(identity_path),
+        "source_files": _source_manifest_entries(entries),
+        "release_asset_bindings": asset_bindings,
+    }
+    if binding_error:
+        binding.update({
+            "binding_status": "INCOMPLETE",
+            "binding_violations": [binding_error],
+        })
+    else:
+        binding["binding_status"] = "PASSED"
+    return binding
+
+
+def verify_flat_source_binding(flat_root, identity_path, expected_commit_sha,
+                               expected_binding):
+    """Recompute and compare a previously captured Flat Root binding."""
+    try:
+        observed = flat_source_binding(
+            flat_root, identity_path, expected_commit_sha
+        )
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            "legacy Flat Root source binding changed: {}".format(exc)
+        )
+    expected = dict(expected_binding or {})
+    # Compare every stable field, including the file list and asset aliases.
+    # A summary-only comparison would allow a same-sized replacement file to
+    # pass the cutover boundary.
+    if observed != expected:
+        mismatches = []
+        for key in sorted(set(observed) | set(expected)):
+            if observed.get(key) != expected.get(key):
+                mismatches.append(key)
+        raise ValueError(
+            "legacy Flat Root source binding changed: {}".format(
+                ", ".join(mismatches)
+            )
+        )
+    return observed
+
+
 def _validate_flat_root(flat_root):
     """Validate and describe a recursive legacy Flat Root."""
     requested_root = os.path.abspath(str(flat_root))
@@ -578,6 +676,9 @@ def prepare_legacy_flat_adoption(flat_root, output_root, release_identity_path,
         "source_file_count": len(entries),
         "source_total_size": _source_total_size(entries),
         "release_identity_sha256": _canonical_hash(identity),
+        "flat_source_binding": _flat_source_binding_from_entries(
+            flat_root, entries, identity, identity_path, identity["commit_sha"]
+        ),
         "release_asset_bindings": asset_bindings,
         "modified_html": sorted(
             modified_html, key=lambda item: item["source_path"]
