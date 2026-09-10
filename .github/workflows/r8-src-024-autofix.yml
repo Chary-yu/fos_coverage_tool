@@ -62,6 +62,19 @@ jobs:
               raise SystemExit('handoff path insertion line count={}'.format(len(matches)))
           lines[matches[0]] = "text = insert_before(text, path_anchor, path_block, 'attempt-scoped handoff paths')"
 
+          matches = [i for i, line in enumerate(lines)
+                     if line.startswith('execute_start = ')
+                     and 'mode = str(mode or' in line]
+          if len(matches) != 1:
+              raise SystemExit('execute entry anchor declaration count={}'.format(len(matches)))
+          lines[matches[0]] = '''execute_start = '        self._runtime_config = dict(runtime_config or {})\\n' '''.rstrip()
+
+          matches = [i for i, line in enumerate(lines)
+                     if line == '        self._execution_phase = phase']
+          if len(matches) != 1:
+              raise SystemExit('phase initialization body count={}'.format(len(matches)))
+          lines.insert(matches[0], '        mode = str(mode or "staging").strip().lower()')
+
           path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
           PY
           python -m py_compile /tmp/r8_transform.py
