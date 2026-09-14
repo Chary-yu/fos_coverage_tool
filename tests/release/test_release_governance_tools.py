@@ -177,13 +177,28 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         production_sha = config["upgrade"][
             "production_candidate_builder_workflow_sha"
         ]
+        approved_builder_sha = (
+            "0f4009c9f8c253f42e60394841795522bbaaa24d"
+        )
         self.assertRegex(validation_sha, r"^[0-9a-f]{40}$")
         self.assertRegex(production_sha, r"^[0-9a-f]{40}$")
+        self.assertEqual(validation_sha, approved_builder_sha)
+        self.assertEqual(production_sha, approved_builder_sha)
+        self.assertNotIn(
+            "d73753b4cf6d5d900e77035883adaf157b870903", caller
+        )
         self.assertIn(
             "trusted-candidate-builder.yml@{}".format(validation_sha), caller
         )
         self.assertIn(
             "builder_workflow_sha: {}".format(validation_sha), caller
+        )
+        self.assertIn(
+            "trusted-production-candidate-builder.yml@{}".format(production_sha),
+            caller,
+        )
+        self.assertIn(
+            "builder_workflow_sha: {}".format(production_sha), caller
         )
         self.assertIn("environment: trusted-candidate-build", builder)
         self.assertIn("actions/attest@", builder)

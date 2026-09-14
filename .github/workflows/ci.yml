@@ -730,10 +730,10 @@ jobs:
       id-token: write
       attestations: write
       artifact-metadata: write
-    uses: Chary-yu/fos_coverage_tool/.github/workflows/trusted-candidate-builder.yml@d73753b4cf6d5d900e77035883adaf157b870903
+    uses: Chary-yu/fos_coverage_tool/.github/workflows/trusted-candidate-builder.yml@0f4009c9f8c253f42e60394841795522bbaaa24d
     with:
       source_sha: ${{ github.sha }}
-      builder_workflow_sha: d73753b4cf6d5d900e77035883adaf157b870903
+      builder_workflow_sha: 0f4009c9f8c253f42e60394841795522bbaaa24d
     secrets: inherit
 
   production-candidate-build:
@@ -744,10 +744,10 @@ jobs:
       id-token: write
       attestations: write
       artifact-metadata: write
-    uses: Chary-yu/fos_coverage_tool/.github/workflows/trusted-production-candidate-builder.yml@d73753b4cf6d5d900e77035883adaf157b870903
+    uses: Chary-yu/fos_coverage_tool/.github/workflows/trusted-production-candidate-builder.yml@0f4009c9f8c253f42e60394841795522bbaaa24d
     with:
       source_sha: ${{ github.sha }}
-      builder_workflow_sha: d73753b4cf6d5d900e77035883adaf157b870903
+      builder_workflow_sha: 0f4009c9f8c253f42e60394841795522bbaaa24d
       attestation_repository: Chary-yu/fos_coverage_tool
     secrets: inherit
 
