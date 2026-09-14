@@ -11,6 +11,13 @@ import argparse
 import os
 import sys
 
+# This file is executed directly by the offline one-click handoff.  In that
+# mode Python only adds scripts/release to sys.path, so bind the repository
+# root before importing project packages such as ``scripts.release``.
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 from scripts.release import fos_r8_conductor_base as _base
 from scripts.release.vfoswind_attempt_config import (
     normalize_vfoswind_attempt_config,
