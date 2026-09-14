@@ -1,0 +1,25 @@
+name: R8 Targeted vfoswind Readiness 778c7a8d
+
+on:
+  push:
+    branches:
+      - r8-targeted-test-778c7a8d-20260914
+
+permissions:
+  contents: read
+
+jobs:
+  targeted:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Run focused vfoswind attempt-config regression
+        run: python -m unittest tests.release.test_vfoswind_attempt_config -v
+      - name: Verify changed files only
+        run: |
+          git diff --name-only ddfa2a1190f9d43aeab290bc9d58338d4850fa99 778c7a8da3ef365c9d2424cf7006120c8c419253
