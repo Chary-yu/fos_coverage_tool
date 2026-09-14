@@ -10,6 +10,7 @@ from scripts.release.production_candidate_evidence import (
     compare_application_inventory,
     sha256_file,
     select_unique_production_candidate_job,
+    verify_candidate_only_workflow_jobs,
     verify_protected_receipt_evidence,
 )
 
@@ -29,6 +30,12 @@ class ProductionCandidateCollectorTest(unittest.TestCase):
         self.assertNotIn(
             'actions/workflows/ci.yml/runs/$RUN_ID', collector
         )
+        self.assertNotIn(
+            'run.get("conclusion") != "success"', collector
+        )
+        self.assertIn("verify_candidate_only_workflow_jobs", collector)
+        self.assertIn("Require all Production READY evidence lanes to pass", collector)
+        self.assertIn("Build fail-closed Gate A-F evidence matrix", collector)
         self.assertNotIn("COVERAGE_BUILD_PROVENANCE_HMAC_KEY", collector)
         self.assertIn("protected_receipt_verification.json", collector)
         self.assertIn("protected_receipt_verification_attestation.bundle.json", collector)
@@ -63,6 +70,137 @@ class ProductionCandidateCollectorTest(unittest.TestCase):
                 "status": "completed",
                 "conclusion": "failure",
             }])
+
+    @staticmethod
+    def _job(name, conclusion="success", steps=None):
+        job = {
+            "id": abs(hash(name)) % 100000 + 1,
+            "name": name,
+            "status": "completed",
+            "conclusion": conclusion,
+        }
+        if steps is not None:
+            job["steps"] = steps
+        return job
+
+    @staticmethod
+    def _step(name, conclusion="success"):
+        return {
+            "name": name,
+            "status": "completed",
+            "conclusion": conclusion,
+        }
+
+    def _candidate_only_jobs(self):
+        ready_steps = [
+            self._step("Checkout Code"),
+            self._step(
+                "Require all Production READY evidence lanes to pass",
+                "failure",
+            ),
+            self._step("Upload Production READY identity join"),
+        ]
+        jobs = [
+            self._job("Candidate source identity gate"),
+            self._job("Candidate source gate (required source lanes)"),
+            self._job(PRODUCTION_CANDIDATE_CALLER_JOB_NAME),
+            self._job(
+                "Trusted Validation Candidate Build (manual protected lane)",
+                "skipped",
+            ),
+            self._job(
+                "Verified production backup rehearsal (MariaDB 5.5)",
+                "skipped",
+            ),
+            self._job("Real Candidate browser evidence", "skipped"),
+            self._job(
+                "Cross-layer performance release evidence (browser artifact)",
+                "skipped",
+            ),
+            self._job(
+                "Production READY gate (manual external evidence)",
+                "failure",
+                ready_steps,
+            ),
+        ]
+        for version in ("3.10", "3.12"):
+            jobs.append(self._job(
+                "Test Suite (Python {})".format(version),
+                "success",
+                [self._step("Run ordinary regression steps")],
+            ))
+        return jobs
+
+    def test_candidate_only_allows_expected_external_evidence_failure(self):
+        result = verify_candidate_only_workflow_jobs(
+            self._candidate_only_jobs(), "failure"
+        )
+        self.assertEqual(result["status"], "PASSED")
+        self.assertEqual(result["mode"], "candidate_only")
+        self.assertTrue(result["production_ready_failure_allowed"])
+        self.assertEqual(
+            result["external_evidence_job_conclusions"][
+                "Real Candidate browser evidence"
+            ],
+            "skipped",
+        )
+
+    def test_candidate_only_blocks_production_candidate_failure(self):
+        jobs = self._candidate_only_jobs()
+        for job in jobs:
+            if job["name"] == PRODUCTION_CANDIDATE_CALLER_JOB_NAME:
+                job["conclusion"] = "failure"
+        with self.assertRaisesRegex(ValueError, "Production Candidate job did not pass"):
+            verify_candidate_only_workflow_jobs(jobs, "failure")
+
+    def test_candidate_only_blocks_source_gate_failure(self):
+        jobs = self._candidate_only_jobs()
+        for job in jobs:
+            if job["name"] == "Candidate source gate (required source lanes)":
+                job["conclusion"] = "failure"
+        with self.assertRaisesRegex(ValueError, "expected success conclusion"):
+            verify_candidate_only_workflow_jobs(jobs, "failure")
+
+    def test_candidate_only_blocks_unrelated_regression_failure(self):
+        jobs = self._candidate_only_jobs()
+        jobs.append(self._job("R8 release orchestration regression", "failure"))
+        with self.assertRaisesRegex(ValueError, "unexpected Candidate-only workflow job failure"):
+            verify_candidate_only_workflow_jobs(jobs, "failure")
+
+    def test_candidate_only_allows_exact_gate_a_f_fail_closed_step(self):
+        jobs = self._candidate_only_jobs()
+        for job in jobs:
+            if job["name"] in ("Test Suite (Python 3.10)", "Test Suite (Python 3.12)"):
+                job["conclusion"] = "failure"
+                job["steps"] = [
+                    self._step("Run ordinary regression steps"),
+                    self._step(
+                        "Build fail-closed Gate A-F evidence matrix", "failure"
+                    ),
+                    self._step("Build per-task Gate A-F status", "skipped"),
+                ]
+        result = verify_candidate_only_workflow_jobs(jobs, "failure")
+        self.assertTrue(result["candidate_only_failure_allowed"])
+        self.assertTrue(
+            result["test_suite_results"]["Test Suite (Python 3.10)"][
+                "gate_a_f_failure_allowed"
+            ]
+        )
+
+    def test_candidate_only_blocks_failure_before_gate_a_f_step(self):
+        jobs = self._candidate_only_jobs()
+        job = next(
+            item for item in jobs if item["name"] == "Test Suite (Python 3.10)"
+        )
+        job["conclusion"] = "failure"
+        job["steps"] = [
+            self._step("Run ordinary regression steps", "failure"),
+            self._step(
+                "Build fail-closed Gate A-F evidence matrix", "failure"
+            ),
+        ]
+        with self.assertRaisesRegex(ValueError, "failed outside the expected fail-closed step"):
+            verify_candidate_only_workflow_jobs(jobs, "failure")
 
     def test_application_inventory_uses_app_manifest_namespace(self):
         source = [
