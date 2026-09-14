@@ -15,6 +15,7 @@ from scripts.release import fos_r8_conductor_base as _base
 from scripts.release.vfoswind_attempt_config import (
     normalize_vfoswind_attempt_config,
 )
+from scripts.upgrade.evidence_manifest import MANIFEST_FILENAME
 
 
 # Keep the release orchestration contract visible at the public entrypoint.
@@ -47,6 +48,12 @@ _DELEGATED_PHASE_CONTRACT = (
     "FAILED",
     "phase_d_authorized",
 )
+
+
+def _canonical_manifest_path(evidence_root):
+    """Expose the canonical manifest binding at the public entrypoint."""
+    manifest_path = os.path.join(evidence_root, MANIFEST_FILENAME)
+    return manifest_path
 
 
 def _normalized_args(args):
