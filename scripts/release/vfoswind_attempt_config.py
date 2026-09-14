@@ -17,6 +17,8 @@ except ImportError:  # pragma: no cover - Python 2 compatibility is not required
 VFOSWIND_ADAPTER = "vfoswind"
 
 _INTEGRATION_DEFAULTS = {
+    "systemd_unit": "onesensor-api.service",
+    "systemd_unit_file": "/etc/systemd/system/onesensor-api.service",
     "runtime_environment_file": "/etc/onesensor/coverage-runtime.env",
     "validation_systemd_unit": "onesensor-coverage-validation.service",
     "validation_systemd_unit_file": (
@@ -24,6 +26,23 @@ _INTEGRATION_DEFAULTS = {
     ),
     "validation_runtime_environment_file": "/etc/onesensor/coverage-validation.env",
     "validation_config_path": "/etc/onesensor/coverage-validation.json",
+    "legacy_application_root": "/home/zcyu/coverage/onesensor_code-coverage-tool",
+    "legacy_served_root": "/home/zcyu/coverage/export0810/onesensor",
+    "nginx_config_path": "/etc/nginx/conf.d/coverage.conf",
+    "nginx_proxy_pass": "http://127.0.0.1:9528",
+    "api_location": "/api/coverage",
+}
+
+_UPGRADE_TOPOLOGY_DEFAULTS = {
+    "publish_root": "/home/zcyu/coverage_published",
+    "served_root_path": "/home/zcyu/coverage_published/CURRENT/reports",
+    "flat_served_root": "/home/zcyu/coverage/export0810/onesensor",
+    "flat_release_identity_path": (
+        "/home/zcyu/coverage/export0810/onesensor/release_identity.json"
+    ),
+    "health_endpoint": "http://127.0.0.1:9528/api/coverage/health",
+    "release_endpoint": "http://127.0.0.1:9528/api/coverage/release",
+    "previous_release_endpoint": "http://127.0.0.1:9528/api/coverage/release",
 }
 
 _SERVING_DEFAULTS = {
@@ -65,6 +84,10 @@ def normalize_vfoswind_attempt_config(config, candidate_application_root=""):
     trusted the local gateway.  The R8 production contract makes that trust
     explicit as ``reverse_proxy`` and restricts it to loopback proxies.
     Unknown non-empty auth modes fail closed.
+
+    Stable vfoswind production topology is also materialized when a legacy
+    production config predates the R8 release contract.  Explicit operator
+    values always win; this adapter only fills missing fields.
     """
     result = copy.deepcopy(config or {})
     upgrade = dict(result.get("upgrade") or {})
@@ -90,6 +113,9 @@ def normalize_vfoswind_attempt_config(config, candidate_application_root=""):
             os.path.abspath(candidate_application_root)
         )
 
+    for key, value in _UPGRADE_TOPOLOGY_DEFAULTS.items():
+        if _missing(upgrade.get(key)):
+            upgrade[key] = value
     for key, value in _SERVING_DEFAULTS.items():
         if _missing(upgrade.get(key)):
             upgrade[key] = value
