@@ -42,6 +42,31 @@ class VfoswindAttemptConfigRegressionTest(unittest.TestCase):
         self.assertEqual(result["auth"]["allowed_origins"], [])
 
         upgrade = result["upgrade"]
+        self.assertEqual(upgrade["publish_root"], "/home/zcyu/coverage_published")
+        self.assertEqual(
+            upgrade["served_root_path"],
+            "/home/zcyu/coverage_published/CURRENT/reports",
+        )
+        self.assertEqual(
+            upgrade["flat_served_root"],
+            "/home/zcyu/coverage/export0810/onesensor",
+        )
+        self.assertEqual(
+            upgrade["flat_release_identity_path"],
+            "/home/zcyu/coverage/export0810/onesensor/release_identity.json",
+        )
+        self.assertEqual(
+            upgrade["health_endpoint"],
+            "http://127.0.0.1:9528/api/coverage/health",
+        )
+        self.assertEqual(
+            upgrade["release_endpoint"],
+            "http://127.0.0.1:9528/api/coverage/release",
+        )
+        self.assertEqual(
+            upgrade["previous_release_endpoint"],
+            "http://127.0.0.1:9528/api/coverage/release",
+        )
         self.assertEqual(upgrade["serving_session_id"], "current-serving")
         self.assertEqual(
             upgrade["serving_session_manifest"],
@@ -61,6 +86,11 @@ class VfoswindAttemptConfigRegressionTest(unittest.TestCase):
         )
 
         integration = upgrade["production_integration"]
+        self.assertEqual(integration["systemd_unit"], "onesensor-api.service")
+        self.assertEqual(
+            integration["systemd_unit_file"],
+            "/etc/systemd/system/onesensor-api.service",
+        )
         self.assertEqual(
             integration["runtime_environment_file"],
             "/etc/onesensor/coverage-runtime.env",
@@ -81,6 +111,22 @@ class VfoswindAttemptConfigRegressionTest(unittest.TestCase):
             integration["validation_config_path"],
             "/etc/onesensor/coverage-validation.json",
         )
+        self.assertEqual(
+            integration["legacy_application_root"],
+            "/home/zcyu/coverage/onesensor_code-coverage-tool",
+        )
+        self.assertEqual(
+            integration["legacy_served_root"],
+            "/home/zcyu/coverage/export0810/onesensor",
+        )
+        self.assertEqual(
+            integration["nginx_config_path"],
+            "/etc/nginx/conf.d/coverage.conf",
+        )
+        self.assertEqual(
+            integration["nginx_proxy_pass"], "http://127.0.0.1:9528"
+        )
+        self.assertEqual(integration["api_location"], "/api/coverage")
         self.assertTrue(
             integration["validation_application_root"].endswith(
                 "/production-candidate/app"
@@ -101,6 +147,13 @@ class VfoswindAttemptConfigRegressionTest(unittest.TestCase):
         }
         upgrade = source["upgrade"]
         upgrade.update({
+            "publish_root": "/custom/published",
+            "served_root_path": "/custom/published/CURRENT/reports",
+            "flat_served_root": "/custom/flat",
+            "flat_release_identity_path": "/custom/flat/release_identity.json",
+            "health_endpoint": "http://127.0.0.1:19000/custom-health",
+            "release_endpoint": "http://127.0.0.1:19000/custom-release",
+            "previous_release_endpoint": "http://127.0.0.1:19000/previous-release",
             "candidate_browser_url": (
                 "http://10.190.162.33:19529/coverage/custom.html"
             ),
@@ -111,18 +164,51 @@ class VfoswindAttemptConfigRegressionTest(unittest.TestCase):
         })
         integration = upgrade["production_integration"]
         integration["runtime_environment_file"] = "/custom/runtime.env"
+        integration["legacy_application_root"] = "/custom/app"
+        integration["legacy_served_root"] = "/custom/served"
+        integration["nginx_config_path"] = "/custom/nginx.conf"
         integration["candidate_gateway"]["browser_url"] = upgrade[
             "candidate_browser_url"
         ]
 
         result = normalize_vfoswind_attempt_config(source, "")
         self.assertEqual(result["auth"], source["auth"])
+        self.assertEqual(result["upgrade"]["publish_root"], "/custom/published")
+        self.assertEqual(
+            result["upgrade"]["served_root_path"],
+            "/custom/published/CURRENT/reports",
+        )
+        self.assertEqual(result["upgrade"]["flat_served_root"], "/custom/flat")
+        self.assertEqual(
+            result["upgrade"]["flat_release_identity_path"],
+            "/custom/flat/release_identity.json",
+        )
+        self.assertEqual(
+            result["upgrade"]["health_endpoint"],
+            "http://127.0.0.1:19000/custom-health",
+        )
+        self.assertEqual(
+            result["upgrade"]["release_endpoint"],
+            "http://127.0.0.1:19000/custom-release",
+        )
         self.assertEqual(result["upgrade"]["serving_session_id"], "stable-owner")
         self.assertEqual(
             result["upgrade"]["production_integration"][
                 "runtime_environment_file"
             ],
             "/custom/runtime.env",
+        )
+        self.assertEqual(
+            result["upgrade"]["production_integration"]["legacy_application_root"],
+            "/custom/app",
+        )
+        self.assertEqual(
+            result["upgrade"]["production_integration"]["legacy_served_root"],
+            "/custom/served",
+        )
+        self.assertEqual(
+            result["upgrade"]["production_integration"]["nginx_config_path"],
+            "/custom/nginx.conf",
         )
         self.assertEqual(
             result["upgrade"]["candidate_browser_url"],
