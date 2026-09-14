@@ -28,9 +28,15 @@ from scripts.upgrade.evidence_manifest import MANIFEST_FILENAME
 
 # Preserve the public compatibility surface used by the one-click regression
 # suite while keeping the canonical implementation in fos_r8_conductor_base.
-# These are aliases, not duplicate lifecycle implementations.
-_interactive_command = _base._interactive_command
-_authoritative_phase_d_state = _base._authoritative_phase_d_state
+# Resolve these delegates only when called so the public --help entrypoint can
+# still load against the deliberately minimal base-module fixture used by the
+# direct-execution regression.
+def _interactive_command(*args, **kwargs):
+    return _base._interactive_command(*args, **kwargs)
+
+
+def _authoritative_phase_d_state(*args, **kwargs):
+    return _base._authoritative_phase_d_state(*args, **kwargs)
 
 
 # Keep the release orchestration contract visible at the public entrypoint.
