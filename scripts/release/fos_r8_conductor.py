@@ -26,6 +26,13 @@ from scripts.release.vfoswind_attempt_config import (
 from scripts.upgrade.evidence_manifest import MANIFEST_FILENAME
 
 
+# Preserve the public compatibility surface used by the one-click regression
+# suite while keeping the canonical implementation in fos_r8_conductor_base.
+# These are aliases, not duplicate lifecycle implementations.
+_interactive_command = _base._interactive_command
+_authoritative_phase_d_state = _base._authoritative_phase_d_state
+
+
 # Keep the release orchestration contract visible at the public entrypoint.
 # scripts/validate_release_orchestration.py intentionally validates this file
 # without importing or executing production code.
