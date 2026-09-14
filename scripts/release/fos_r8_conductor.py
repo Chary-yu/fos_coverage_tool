@@ -8,6 +8,7 @@ vfoswind -> R8 attempt-config compatibility contract before delegation.
 from __future__ import print_function
 
 import argparse
+import copy
 import os
 import sys
 
@@ -63,8 +64,39 @@ def _canonical_manifest_path(evidence_root):
     return manifest_path
 
 
+def _bind_legacy_vfoswind_adapter(source_config, metadata):
+    """Bind adapterless legacy config only when exact release metadata says vfoswind.
+
+    Old production configs predate the lifecycle adapter fields.  The one-click
+    release metadata is already exact-input evidence for the production host,
+    so it may supply the missing adapter identity.  Explicit conflicting
+    adapter values remain fail-closed.
+    """
+    result = copy.deepcopy(source_config or {})
+    if str((metadata or {}).get("production_host") or "").strip() != "vfoswind":
+        return result
+
+    upgrade = dict(result.get("upgrade") or {})
+    integration = dict(upgrade.get("production_integration") or {})
+    lifecycle_adapter = str(upgrade.get("lifecycle_adapter") or "").strip()
+    integration_adapter = str(integration.get("adapter") or "").strip()
+    if lifecycle_adapter and lifecycle_adapter != "vfoswind":
+        raise RuntimeError("release metadata vfoswind conflicts with lifecycle adapter")
+    if integration_adapter and integration_adapter != "vfoswind":
+        raise RuntimeError("release metadata vfoswind conflicts with integration adapter")
+    if not lifecycle_adapter:
+        upgrade["lifecycle_adapter"] = "vfoswind"
+    if not integration_adapter:
+        integration["adapter"] = "vfoswind"
+    upgrade["production_integration"] = integration
+    result["upgrade"] = upgrade
+    return result
+
+
 def _normalized_args(args):
     source_config = _base._load_json(args.config, "production config")
+    metadata = _base._load_json(args.metadata, "release metadata")
+    source_config = _bind_legacy_vfoswind_adapter(source_config, metadata)
     candidate_application_root = os.path.join(
         os.path.realpath(os.path.abspath(args.state_root)),
         "production-candidate",
