@@ -52,6 +52,9 @@ on:
       served_root_identity_sha256:
         description: Canonical SHA256 of the pre-build CURRENT release identity
         value: ${{ jobs.build.outputs.served_root_identity_sha256 }}
+      protected_receipt_verification_sha256:
+        description: SHA256 of the protected HMAC receipt verification evidence
+        value: ${{ jobs.build.outputs.protected_receipt_verification_sha256 }}
   workflow_dispatch:
     inputs:
       source_sha:
@@ -93,6 +96,7 @@ jobs:
       served_root_previous_release_sha: ${{ steps.metadata.outputs.served_root_previous_release_sha }}
       served_root_tree_sha256: ${{ steps.metadata.outputs.served_root_tree_sha256 }}
       served_root_identity_sha256: ${{ steps.metadata.outputs.served_root_identity_sha256 }}
+      protected_receipt_verification_sha256: ${{ steps.metadata.outputs.protected_receipt_verification_sha256 }}
     env:
       BUILD_WORKFLOW_IDENTITY: github-actions/trusted-production-candidate-builder
       BUILD_WORKFLOW_RUN_ID: ${{ github.run_id }}
@@ -253,40 +257,41 @@ jobs:
             --receipt-output "$GITHUB_WORKSPACE/.artifacts/production-candidate/candidate/candidate_build_receipt.json" \
             | tee "$GITHUB_WORKSPACE/.artifacts/production-candidate/receipt.json"
 
-      - name: Verify attestation, receipt, and exact source binding
+      - name: Protected verification lane — verify HMAC receipt and emit evidence
         run: |
           set -eu
-          PYTHONPATH="$GITHUB_WORKSPACE/builder" python - <<'PY'
-          import json
-          import os
+          test -n "$COVERAGE_BUILD_PROVENANCE_HMAC_KEY"
+          PYTHONPATH="$GITHUB_WORKSPACE/builder" python \
+            "$GITHUB_WORKSPACE/builder/scripts/release/verify_protected_candidate_receipt.py" \
+            --candidate-root "$GITHUB_WORKSPACE/.artifacts/production-candidate/candidate" \
+            --release-identity "$GITHUB_WORKSPACE/.artifacts/production-candidate/release_identity.json" \
+            --source-repo-root "$GITHUB_WORKSPACE/source" \
+            --candidate-manifest "$GITHUB_WORKSPACE/.artifacts/production-candidate/candidate/candidate_artifact_manifest.json" \
+            --candidate-receipt "$GITHUB_WORKSPACE/.artifacts/production-candidate/candidate/candidate_build_receipt.json" \
+            --candidate-attestation-bundle "$GITHUB_WORKSPACE/.artifacts/production-candidate/candidate_build_attestation.bundle.json" \
+            --attestation-repository "$ATTESTATION_REPOSITORY" \
+            --attestation-workflow "$ATTESTATION_REPOSITORY/.github/workflows/trusted-production-candidate-builder.yml" \
+            --source-sha "$SOURCE_SHA" \
+            --source-tree-sha "$(git -C "$GITHUB_WORKSPACE/source" rev-parse 'HEAD^{tree}')" \
+            --builder-workflow-identity "$BUILD_WORKFLOW_IDENTITY" \
+            --builder-workflow-sha "$BUILD_WORKFLOW_SHA" \
+            --workflow-run-id "$BUILD_WORKFLOW_RUN_ID" \
+            --workflow-run-attempt "$BUILD_WORKFLOW_RUN_ATTEMPT" \
+            --output "$GITHUB_WORKSPACE/.artifacts/production-candidate/protected_receipt_verification.json"
 
-          from app.candidate_artifact import CandidateArtifactManifest
-          from app.candidate_build_receipt import (
-              ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
-              verify_candidate_build_receipt,
-          )
+      - name: Attest protected HMAC receipt verification evidence
+        id: protected_receipt_verification_attestation
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: .artifacts/production-candidate/protected_receipt_verification.json
 
-          root = '.artifacts/production-candidate/candidate'
-          with open('.artifacts/production-candidate/release_identity.json') as stream:
-              identity = json.load(stream)
-          manifest = CandidateArtifactManifest.verify(
-              root, identity, candidate_sha=identity['commit_sha'],
-              require_trusted_provenance=True,
-          )
-          result = verify_candidate_build_receipt(
-              root, identity, manifest,
-              '.artifacts/production-candidate/candidate_build_attestation.bundle.json',
-              attestation_repository=os.environ['ATTESTATION_REPOSITORY'],
-              attestation_workflow=(
-                  os.environ['ATTESTATION_REPOSITORY']
-                  + '/.github/workflows/trusted-production-candidate-builder.yml'
-              ),
-              attestation_runner_policy=ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
-          )
-          payload = result['payload']
-          assert payload['build_workflow_run_id'] == manifest['build_workflow_run_id']
-          assert payload['build_workflow_run_attempt'] == manifest['build_workflow_run_attempt']
-          PY
+      - name: Persist protected verification attestation bundle
+        run: |
+          set -eu
+          test -n "${{ steps.protected_receipt_verification_attestation.outputs.bundle-path }}"
+          test -s "${{ steps.protected_receipt_verification_attestation.outputs.bundle-path }}"
+          cp "${{ steps.protected_receipt_verification_attestation.outputs.bundle-path }}" \
+            "$GITHUB_WORKSPACE/.artifacts/production-candidate/protected_receipt_verification_attestation.bundle.json"
 
       - name: Expose exact production Candidate identity
         id: metadata
@@ -312,6 +317,10 @@ jobs:
               provenance['served_root_tree_sha256']))
           print('served_root_identity_sha256={}'.format(
               provenance['served_root_identity_sha256']))
+          import hashlib
+          with open('.artifacts/production-candidate/protected_receipt_verification.json', 'rb') as stream:
+              digest = hashlib.sha256(stream.read()).hexdigest()
+          print('protected_receipt_verification_sha256={}'.format(digest))
           PY
 
       - name: Upload immutable production Candidate build evidence
