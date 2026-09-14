@@ -26,7 +26,7 @@ _INTEGRATION_DEFAULTS = {
     ),
     "validation_runtime_environment_file": "/etc/onesensor/coverage-validation.env",
     "validation_config_path": "/etc/onesensor/coverage-validation.json",
-    "legacy_application_root": "/home/zcyu/coverage/onesensor_code-coverage-tool",
+    "legacy_application_root": "/home/zcyu/coverage/onesensor_code-coverage_tool",
     "legacy_served_root": "/home/zcyu/coverage/export0810/onesensor",
     "nginx_config_path": "/etc/nginx/conf.d/coverage.conf",
     "nginx_proxy_pass": "http://127.0.0.1:9528",
@@ -38,7 +38,7 @@ _UPGRADE_TOPOLOGY_DEFAULTS = {
     "served_root_path": "/home/zcyu/coverage_published/CURRENT/reports",
     "flat_served_root": "/home/zcyu/coverage/export0810/onesensor",
     "flat_release_identity_path": (
-        "/home/zcyu/coverage/export0810/onesensor/release_identity.json"
+        "/home/zcyu/coverage/onesensor_code-coverage_tool/release_manifest.json"
     ),
     "health_endpoint": "http://127.0.0.1:9528/api/coverage/health",
     "release_endpoint": "http://127.0.0.1:9528/api/coverage/release",
