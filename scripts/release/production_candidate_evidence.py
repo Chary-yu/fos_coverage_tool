@@ -25,6 +25,27 @@ PRODUCTION_CANDIDATE_JOB_NAMES = (
     PRODUCTION_CANDIDATE_CALLER_JOB_NAME,
     PRODUCTION_CANDIDATE_CALLED_JOB_NAME,
 )
+CANDIDATE_SOURCE_IDENTITY_JOB_NAME = "Candidate source identity gate"
+CANDIDATE_SOURCE_GATE_JOB_NAME = "Candidate source gate (required source lanes)"
+VALIDATION_CANDIDATE_JOB_NAME = (
+    "Trusted Validation Candidate Build (manual protected lane)"
+)
+PRODUCTION_READY_JOB_NAME = "Production READY gate (manual external evidence)"
+PRODUCTION_READY_FAILURE_STEP_NAME = (
+    "Require all Production READY evidence lanes to pass"
+)
+CANDIDATE_ONLY_EXTERNAL_EVIDENCE_JOB_NAMES = (
+    "Verified production backup rehearsal (MariaDB 5.5)",
+    "Real Candidate browser evidence",
+    "Cross-layer performance release evidence (browser artifact)",
+)
+CANDIDATE_ONLY_TEST_SUITE_JOB_NAMES = (
+    "Test Suite (Python 3.10)",
+    "Test Suite (Python 3.12)",
+)
+CANDIDATE_ONLY_GATE_FAILURE_STEP_NAME = (
+    "Build fail-closed Gate A-F evidence matrix"
+)
 PROTECTED_RECEIPT_EVIDENCE_SCHEMA_VERSION = 1
 PROTECTED_RECEIPT_EVIDENCE_TYPE = "protected_candidate_receipt_verification"
 PROTECTED_RECEIPT_EVIDENCE_NAME = "protected_receipt_verification.json"
@@ -189,6 +210,204 @@ def select_unique_production_candidate_job(job_items):
     if job.get("status") != "completed" or job.get("conclusion") != "success":
         raise ValueError("protected Production Candidate job did not pass")
     return job
+
+
+def _select_unique_job_by_name(job_items, name):
+    matches = [
+        job for job in job_items
+        if isinstance(job, dict) and job.get("name") == name
+    ]
+    if len(matches) != 1:
+        raise ValueError("workflow job is missing or ambiguous: {}".format(name))
+    return matches[0]
+
+
+def _require_completed_job(job, name, conclusion):
+    if job.get("status") != "completed" or job.get("conclusion") != conclusion:
+        raise ValueError(
+            "workflow job did not have expected {} conclusion: {}".format(
+                conclusion, name
+            )
+        )
+
+
+def _verify_expected_failure_step(job, job_name, expected_step_name):
+    steps = job.get("steps")
+    if not isinstance(steps, list) or not steps:
+        raise ValueError("{} has no verifiable step list".format(job_name))
+    for step in steps:
+        if not isinstance(step, dict) or step.get("status") != "completed":
+            raise ValueError("{} has an incomplete workflow step".format(job_name))
+    failures = [
+        (index, step) for index, step in enumerate(steps)
+        if step.get("conclusion") == "failure"
+    ]
+    if len(failures) != 1 or failures[0][1].get("name") != expected_step_name:
+        raise ValueError(
+            "{} failed outside the expected fail-closed step: {}".format(
+                job_name, expected_step_name
+            )
+        )
+    failure_index = failures[0][0]
+    for step in steps[:failure_index]:
+        if step.get("conclusion") != "success":
+            raise ValueError(
+                "{} has a non-success step before {}".format(
+                    job_name, expected_step_name
+                )
+            )
+    for step in steps[failure_index + 1:]:
+        if step.get("conclusion") not in ("success", "skipped"):
+            raise ValueError(
+                "{} has an unexpected step after {}".format(
+                    job_name, expected_step_name
+                )
+            )
+
+
+def verify_candidate_only_workflow_jobs(job_items, overall_conclusion):
+    """Verify a completed Candidate-only CI run without requiring green CI.
+
+    A Candidate-only dispatch deliberately omits production backup, real
+    browser, and cross-layer performance evidence.  The resulting
+    Production READY gate (and, on some runners, the exact Gate A-F matrix
+    step) may therefore fail closed.  Every other failure remains fatal.
+    """
+    if not isinstance(job_items, list):
+        raise ValueError("workflow jobs response is invalid")
+    if overall_conclusion not in ("success", "failure"):
+        raise ValueError(
+            "Candidate-only workflow conclusion is not success/failure: {}".format(
+                overall_conclusion
+            )
+        )
+
+    source_identity = _select_unique_job_by_name(
+        job_items, CANDIDATE_SOURCE_IDENTITY_JOB_NAME
+    )
+    _require_completed_job(
+        source_identity, CANDIDATE_SOURCE_IDENTITY_JOB_NAME, "success"
+    )
+    source_gate = _select_unique_job_by_name(
+        job_items, CANDIDATE_SOURCE_GATE_JOB_NAME
+    )
+    _require_completed_job(source_gate, CANDIDATE_SOURCE_GATE_JOB_NAME, "success")
+
+    production_candidate = select_unique_production_candidate_job(job_items)
+    validation_candidate = _select_unique_job_by_name(
+        job_items, VALIDATION_CANDIDATE_JOB_NAME
+    )
+    _require_completed_job(
+        validation_candidate, VALIDATION_CANDIDATE_JOB_NAME, "skipped"
+    )
+
+    external_evidence = {}
+    for name in CANDIDATE_ONLY_EXTERNAL_EVIDENCE_JOB_NAMES:
+        job = _select_unique_job_by_name(job_items, name)
+        _require_completed_job(job, name, "skipped")
+        external_evidence[name] = job
+
+    production_ready = _select_unique_job_by_name(
+        job_items, PRODUCTION_READY_JOB_NAME
+    )
+    if production_ready.get("status") != "completed":
+        raise ValueError("Production READY gate is not completed")
+    ready_failure_allowed = False
+    if production_ready.get("conclusion") == "failure":
+        _verify_expected_failure_step(
+            production_ready, PRODUCTION_READY_JOB_NAME,
+            PRODUCTION_READY_FAILURE_STEP_NAME,
+        )
+        ready_failure_allowed = True
+    elif production_ready.get("conclusion") != "success":
+        raise ValueError("Production READY gate has an unexpected conclusion")
+    else:
+        raise ValueError(
+            "Candidate-only Production READY gate unexpectedly passed with external evidence skipped"
+        )
+
+    test_suite_results = {}
+    gate_failure_allowed = False
+    for name in CANDIDATE_ONLY_TEST_SUITE_JOB_NAMES:
+        job = _select_unique_job_by_name(job_items, name)
+        if job.get("status") != "completed":
+            raise ValueError("{} is not completed".format(name))
+        conclusion = job.get("conclusion")
+        if conclusion == "success":
+            test_suite_results[name] = {
+                "conclusion": conclusion,
+                "gate_a_f_failure_allowed": False,
+            }
+        elif conclusion == "failure":
+            _verify_expected_failure_step(
+                job, name, CANDIDATE_ONLY_GATE_FAILURE_STEP_NAME
+            )
+            gate_failure_allowed = True
+            test_suite_results[name] = {
+                "conclusion": conclusion,
+                "gate_a_f_failure_allowed": True,
+            }
+        else:
+            raise ValueError(
+                "{} has an unexpected conclusion: {}".format(name, conclusion)
+            )
+
+    known_names = {
+        CANDIDATE_SOURCE_IDENTITY_JOB_NAME,
+        CANDIDATE_SOURCE_GATE_JOB_NAME,
+        VALIDATION_CANDIDATE_JOB_NAME,
+        PRODUCTION_READY_JOB_NAME,
+    }
+    known_names.update(PRODUCTION_CANDIDATE_JOB_NAMES)
+    known_names.update(CANDIDATE_ONLY_EXTERNAL_EVIDENCE_JOB_NAMES)
+    known_names.update(CANDIDATE_ONLY_TEST_SUITE_JOB_NAMES)
+    unexpected = []
+    for job in job_items:
+        if not isinstance(job, dict):
+            raise ValueError("workflow jobs response contains a non-object job")
+        name = job.get("name")
+        if name in known_names:
+            continue
+        if job.get("status") != "completed":
+            raise ValueError("unrelated workflow job is not completed: {}".format(name))
+        if job.get("conclusion") != "success":
+            unexpected.append((name, job.get("conclusion")))
+    if unexpected:
+        raise ValueError(
+            "unexpected Candidate-only workflow job failure: {}".format(
+                unexpected
+            )
+        )
+
+    allowed_failure = ready_failure_allowed or gate_failure_allowed
+    if overall_conclusion == "failure" and not allowed_failure:
+        raise ValueError(
+            "overall workflow failed without an expected Candidate-only fail-closed failure"
+        )
+    if overall_conclusion == "success" and allowed_failure:
+        raise ValueError(
+            "overall workflow is green despite an expected failed Candidate-only gate"
+        )
+
+    return {
+        "status": "PASSED",
+        "mode": "candidate_only",
+        "overall_conclusion": overall_conclusion,
+        "candidate_only_failure_allowed": allowed_failure,
+        "source_identity_job": source_identity.get("name"),
+        "source_gate_job": source_gate.get("name"),
+        "production_candidate_job": production_candidate.get("name"),
+        "validation_candidate_job_conclusion": validation_candidate.get(
+            "conclusion"
+        ),
+        "external_evidence_job_conclusions": {
+            name: job.get("conclusion")
+            for name, job in external_evidence.items()
+        },
+        "production_ready_gate_conclusion": production_ready.get("conclusion"),
+        "production_ready_failure_allowed": ready_failure_allowed,
+        "test_suite_results": test_suite_results,
+    }
 
 
 def verify_protected_receipt_evidence(
