@@ -183,7 +183,10 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertRegex(validation_sha, r"^[0-9a-f]{40}$")
         self.assertRegex(production_sha, r"^[0-9a-f]{40}$")
         self.assertEqual(validation_sha, approved_builder_sha)
-        self.assertEqual(production_sha, approved_builder_sha)
+        self.assertNotEqual(production_sha, validation_sha)
+        self.assertNotEqual(
+            production_sha, "d73753b4cf6d5d900e77035883adaf157b870903"
+        )
         self.assertNotIn(
             "d73753b4cf6d5d900e77035883adaf157b870903", caller
         )
@@ -239,8 +242,26 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("build_production_candidate_artifact.py", production_workflow)
         self.assertIn("PRODUCTION_PROJECT_NAME", production_workflow)
         self.assertIn("import os", production_workflow)
-        self.assertIn("payload['build_workflow_run_id']", production_workflow)
         self.assertNotIn("result['status']", production_workflow)
+        self.assertIn(
+            "Protected verification lane — verify HMAC receipt and emit evidence",
+            production_workflow,
+        )
+        self.assertIn("verify_protected_candidate_receipt.py", production_workflow)
+        self.assertIn("protected_receipt_verification.json", production_workflow)
+        self.assertIn(
+            "protected_receipt_verification_attestation.bundle.json",
+            production_workflow,
+        )
+        self.assertIn("protected_receipt_verification_sha256", production_workflow)
+        with open(
+                os.path.join(os.getcwd(), "scripts", "release",
+                             "verify_protected_candidate_receipt.py"),
+                encoding="utf-8") as stream:
+            protected_verifier = stream.read()
+        self.assertIn("verify_candidate_build_receipt", protected_verifier)
+        self.assertIn("COVERAGE_BUILD_PROVENANCE_HMAC_KEY", protected_verifier)
+        self.assertIn("candidate_attestation_bundle_sha256", protected_verifier)
         self.assertIn("production-candidate-build:", caller)
         self.assertIn("production_candidate_build:", caller)
         self.assertNotIn("production_publish_root:", caller)
