@@ -190,6 +190,7 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn(
             "trusted-candidate-builder.yml@{}".format(validation_sha), caller
         )
+        self.assertIn("source_sha: ${{ inputs.source_sha }}", caller)
         self.assertIn(
             "builder_workflow_sha: {}".format(validation_sha), caller
         )
@@ -197,9 +198,14 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
             "trusted-production-candidate-builder.yml@{}".format(production_sha),
             caller,
         )
+        self.assertIn("source_sha: ${{ inputs.source_sha }}", caller)
         self.assertIn(
             "builder_workflow_sha: {}".format(production_sha), caller
         )
+        self.assertIn("source_sha:", caller)
+        self.assertIn("Candidate source identity gate", caller)
+        self.assertIn("REQUESTED_SOURCE_SHA", caller)
+        self.assertIn("needs.candidate_source_identity.result == 'success'", caller)
         self.assertIn("environment: trusted-candidate-build", builder)
         self.assertIn("actions/attest@", builder)
         self.assertIn("BUILD_WORKFLOW_RUN_ATTEMPT", builder)

@@ -3,6 +3,10 @@ name: CI
 on:
   workflow_dispatch:
     inputs:
+      source_sha:
+        description: 'Exact 40-character application Source SHA for this manual Candidate run'
+        required: true
+        type: string
       real_browser_url:
         description: 'Exact Candidate HTML URL for real HTTP + Chromium Gate E evidence'
         required: false
@@ -722,9 +726,25 @@ jobs:
             .artifacts/py36-runtime-evidence.json
           if-no-files-found: error
 
+  candidate_source_identity:
+    name: Candidate source identity gate
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the requested Source SHA to equal the workflow ref
+        env:
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          WORKFLOW_REF_SHA: ${{ github.sha }}
+        run: |
+          set -eu
+          printf '%s\n' "$REQUESTED_SOURCE_SHA" | grep -Eq '^[0-9a-f]{40}$'
+          test "$REQUESTED_SOURCE_SHA" = "$WORKFLOW_REF_SHA"
+          echo "Candidate Source identity: $REQUESTED_SOURCE_SHA"
+
   candidate-build:
     name: Trusted Validation Candidate Build (manual protected lane)
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_build == true }}
+    needs: candidate_source_identity
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.candidate_build == true && needs.candidate_source_identity.result == 'success' }}
     permissions:
       contents: read
       id-token: write
@@ -732,13 +752,14 @@ jobs:
       artifact-metadata: write
     uses: Chary-yu/fos_coverage_tool/.github/workflows/trusted-candidate-builder.yml@0f4009c9f8c253f42e60394841795522bbaaa24d
     with:
-      source_sha: ${{ github.sha }}
+      source_sha: ${{ inputs.source_sha }}
       builder_workflow_sha: 0f4009c9f8c253f42e60394841795522bbaaa24d
     secrets: inherit
 
   production-candidate-build:
     name: Trusted Production Candidate Build (manual protected lane)
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.production_candidate_build == true }}
+    needs: candidate_source_identity
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.production_candidate_build == true && needs.candidate_source_identity.result == 'success' }}
     permissions:
       contents: read
       id-token: write
@@ -746,7 +767,7 @@ jobs:
       artifact-metadata: write
     uses: Chary-yu/fos_coverage_tool/.github/workflows/trusted-production-candidate-builder.yml@0f4009c9f8c253f42e60394841795522bbaaa24d
     with:
-      source_sha: ${{ github.sha }}
+      source_sha: ${{ inputs.source_sha }}
       builder_workflow_sha: 0f4009c9f8c253f42e60394841795522bbaaa24d
       attestation_repository: Chary-yu/fos_coverage_tool
     secrets: inherit
