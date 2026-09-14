@@ -53,7 +53,7 @@ class VfoswindAttemptConfigRegressionTest(unittest.TestCase):
         )
         self.assertEqual(
             upgrade["flat_release_identity_path"],
-            "/home/zcyu/coverage/export0810/onesensor/release_identity.json",
+            "/home/zcyu/coverage/onesensor_code-coverage_tool/release_manifest.json",
         )
         self.assertEqual(
             upgrade["health_endpoint"],
@@ -113,7 +113,7 @@ class VfoswindAttemptConfigRegressionTest(unittest.TestCase):
         )
         self.assertEqual(
             integration["legacy_application_root"],
-            "/home/zcyu/coverage/onesensor_code-coverage-tool",
+            "/home/zcyu/coverage/onesensor_code-coverage_tool",
         )
         self.assertEqual(
             integration["legacy_served_root"],
