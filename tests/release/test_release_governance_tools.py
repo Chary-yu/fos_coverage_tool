@@ -283,6 +283,8 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("PRODUCTION_RELEASE_ARTIFACT_ROLE", production_builder)
         self.assertIn("validate_production_candidate_content", production_builder)
         self.assertIn("_is_report_html", production_builder)
+        self.assertIn("manifest['artifact_role'] == 'production_candidate'", production_workflow)
+        self.assertNotIn("manifest['artifact_role'] == 'production_release'", production_workflow)
         with open(
                 os.path.join(os.getcwd(), "scripts", "release",
                              "prepare_legacy_flat_adoption.py"),

@@ -42,11 +42,17 @@ RELEASE_TRUST_MODES = (
     RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
 )
 VALIDATION_FIXTURE_ARTIFACT_ROLE = "validation_fixture"
-PRODUCTION_RELEASE_ARTIFACT_ROLE = "production_release"
+# The signed artifact contract distinguishes a publishable Production
+# Candidate from the later publication/adoption operation.  Keep the old
+# Python symbol as a compatibility alias for callers that still import it;
+# the serialized role is intentionally the canonical production_candidate
+# value.
+PRODUCTION_CANDIDATE_ARTIFACT_ROLE = "production_candidate"
+PRODUCTION_RELEASE_ARTIFACT_ROLE = PRODUCTION_CANDIDATE_ARTIFACT_ROLE
 PRODUCTION_PROJECT_NAME = "FOS_V6R2"
 VALIDATION_FIXTURE_PROJECT_NAME = "Coverage Candidate"
 ARTIFACT_ROLES = (
-    VALIDATION_FIXTURE_ARTIFACT_ROLE, PRODUCTION_RELEASE_ARTIFACT_ROLE,
+    VALIDATION_FIXTURE_ARTIFACT_ROLE, PRODUCTION_CANDIDATE_ARTIFACT_ROLE,
 )
 ARTIFACT_DIRECTORIES = ("reports", "assets", "registry")
 SERVED_ROOT_PROVENANCE_FIELDS = (
@@ -176,7 +182,7 @@ def _artifact_descriptor(artifact_role, production_publishable, project_name):
         )
     if not isinstance(production_publishable, bool):
         raise ValueError("candidate artifact production_publishable must be boolean")
-    expected_publishable = role == PRODUCTION_RELEASE_ARTIFACT_ROLE
+    expected_publishable = role == PRODUCTION_CANDIDATE_ARTIFACT_ROLE
     if production_publishable != expected_publishable:
         raise ValueError(
             "candidate artifact production_publishable does not match artifact_role"
@@ -769,7 +775,7 @@ def _build_payload(candidate_root, identity, manifest_path, source_provenance,
     descriptor = _artifact_descriptor(
         artifact_role, production_publishable, project_name
     )
-    if descriptor["artifact_role"] == PRODUCTION_RELEASE_ARTIFACT_ROLE and \
+    if descriptor["artifact_role"] == PRODUCTION_CANDIDATE_ARTIFACT_ROLE and \
             provenance.get("provenance_class") != SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS:
         _verify_release_assets(candidate_root, identity_snapshot)
     return {

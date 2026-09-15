@@ -223,7 +223,7 @@ jobs:
           validate_production_candidate_content(root, PRODUCTION_PROJECT_NAME)
           application = validate_production_application_bundle(root)
           assert application['status'] == 'PASSED'
-          assert manifest['artifact_role'] == 'production_release'
+          assert manifest['artifact_role'] == 'production_candidate'
           assert manifest['production_publishable'] is True
           assert manifest['project_name'] == 'FOS_V6R2'
           PY

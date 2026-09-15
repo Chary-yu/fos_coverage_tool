@@ -246,7 +246,7 @@ class ProductionCandidateCollectorTest(unittest.TestCase):
         run_attempt = "2"
         builder_identity = "github-actions/trusted-production-candidate-builder"
         project_name = "FOS_V6R2"
-        artifact_role = "production_release"
+        artifact_role = "production_candidate"
         with tempfile.TemporaryDirectory(prefix="candidate-collector-") as root:
             candidate_root = os.path.join(root, "candidate")
             os.makedirs(candidate_root)

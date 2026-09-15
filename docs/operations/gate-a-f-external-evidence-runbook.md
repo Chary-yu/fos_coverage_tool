@@ -416,7 +416,7 @@ python3 scripts/release/build_production_candidate_artifact.py \
 冻结三个 expected binding 值；它们在构建开始时和复制完成后都会重检。CURRENT
 必须有完整且通过 `validate_release_manifest()` 的 `release_manifest.json`，不会再
 降级读取 `release_identity.json`。命令输出的 manifest 必须明确为
-`artifact_role=production_release`、`production_publishable=true`、
+`artifact_role=production_candidate`、`production_publishable=true`、
 `project_name=FOS_V6R2`。之后在受保护 Build job 中为这个 production manifest
 生成 GitHub Actions attestation 和 detached receipt：
 
