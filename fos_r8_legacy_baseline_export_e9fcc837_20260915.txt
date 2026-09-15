@@ -431,6 +431,143 @@ def check_space(path, inventory_path):
     return result
 
 
+def detect_identity_mode(identity_path):
+    """Select strict existing identity or explicit legacy pre-adoption mode."""
+    requested = os.path.abspath(str(identity_path))
+    if os.path.lexists(requested):
+        if os.path.islink(requested) or not os.path.isfile(requested):
+            raise ValueError(
+                "release_identity.json is present but is not a regular file"
+            )
+        return "EXISTING_VERIFIED_IDENTITY"
+    return "LEGACY_PRE_ADOPTION"
+
+
+def _identity_manifest_from_inventory(value, description):
+    files = value.get("files")
+    if not isinstance(files, list) or not files:
+        raise ValueError("{} has no regular files".format(description))
+    declared = []
+    seen = set()
+    for item in files:
+        if not isinstance(item, dict):
+            raise ValueError("{} inventory record is invalid".format(description))
+        path = str(item.get("path") or "").replace("\\", "/")
+        if not safe_relative(path):
+            raise ValueError("{} path is invalid: {}".format(description, path))
+        if path in seen:
+            raise ValueError("{} has duplicate path: {}".format(
+                description, path
+            ))
+        seen.add(path)
+        try:
+            size = int(item.get("size"))
+        except (TypeError, ValueError):
+            raise ValueError("{} size is invalid: {}".format(description, path))
+        digest = str(item.get("sha256") or "").lower()
+        if size < 0 or not SHA256_RE.fullmatch(digest):
+            raise ValueError("{} fingerprint is invalid: {}".format(
+                description, path
+            ))
+        declared.append({"path": path, "size": size, "sha256": digest})
+    declared.sort(key=lambda item: item["path"])
+    try:
+        file_count = int(value.get("file_count"))
+        total_size = int(value.get("total_size"))
+    except (TypeError, ValueError):
+        raise ValueError("{} summary is invalid".format(description))
+    if file_count != len(declared) or total_size != sum(
+            item["size"] for item in declared):
+        raise ValueError("{} summary does not match files".format(description))
+    tree_sha = str(value.get("tree_sha256") or "").lower()
+    if not SHA256_RE.fullmatch(tree_sha) or canonical(declared) != tree_sha:
+        raise ValueError("{} tree identity is invalid".format(description))
+    return declared
+
+
+def build_legacy_adoption_identity(
+        adoption_inventory_path, adoption_root, snapshot_inventory_path,
+        expected_commit, app_git_sha, app_git_tree, attempt_id, timestamp,
+        output_path, result_path, normalized_path):
+    """Create identity only for the already-copied legacy adoption payload."""
+    snapshot = load_json(snapshot_inventory_path)
+    adoption = load_json(adoption_inventory_path)
+    expected_commit = str(expected_commit or "").lower()
+    app_git_sha = str(app_git_sha or "").lower()
+    app_git_tree = str(app_git_tree or "").lower()
+    if not COMMIT_RE.fullmatch(expected_commit):
+        raise ValueError("expected legacy baseline SHA is not exact")
+    if app_git_sha != expected_commit or not COMMIT_RE.fullmatch(app_git_sha):
+        raise ValueError("application Git baseline does not match expected baseline")
+    if not COMMIT_RE.fullmatch(app_git_tree):
+        raise ValueError("application Git tree SHA is not exact")
+    _identity_manifest_from_inventory(snapshot, "legacy snapshot inventory")
+    declared = _identity_manifest_from_inventory(
+        adoption, "legacy adoption inventory"
+    )
+    snapshot_tree = str(snapshot.get("tree_sha256") or "").lower()
+    adoption_tree = str(adoption.get("tree_sha256") or "").lower()
+    asset_hash = canonical(declared)
+    identity = {
+        "version": "legacy-pre-adoption",
+        "commit_sha": expected_commit,
+        "build_id": "legacy-adoption-{}-{}".format(
+            expected_commit[:8], str(attempt_id)
+        ),
+        "asset_hash": asset_hash,
+        "asset_manifest_version": 1,
+        "asset_count": len(declared),
+        "asset_manifest_hash": asset_hash,
+        "asset_manifest": declared,
+        "schema_version": 2,
+        "build_provenance": "legacy-adoption-observed-snapshot",
+        "built_at": str(timestamp),
+        "identity_mode": "LEGACY_PRE_ADOPTION",
+        "identity_origin": "legacy_adoption",
+        "original_release_identity": "ABSENT",
+        "historical_build_attestation": "NOT_AVAILABLE",
+        "provenance_claim": (
+            "observed/adopted legacy snapshot; not an original historical "
+            "build attestation"
+        ),
+        "expected_baseline_sha": expected_commit,
+        "application_git_sha": app_git_sha,
+        "application_git_tree_sha": app_git_tree,
+        "snapshot_tree_sha256": snapshot_tree,
+        "adoption_source_tree_sha256": adoption_tree,
+        "source_snapshot_file_count": snapshot.get("file_count"),
+        "source_snapshot_total_size": snapshot.get("total_size"),
+        "adoption_source_file_count": adoption.get("file_count"),
+        "adoption_source_total_size": adoption.get("total_size"),
+        "attempt_id": str(attempt_id),
+        "collection_timestamp_utc": str(timestamp),
+        "artifact_role": "validation_input_baseline_only",
+        "production_publishable": False,
+        "project_name": "FOS_V6R2",
+    }
+    write_json(output_path, identity)
+    result = validate_identity(
+        output_path, adoption_root, expected_commit, normalized_path
+    )
+    result.update({
+        "identity_mode": "LEGACY_PRE_ADOPTION",
+        "identity_origin": "legacy_adoption",
+        "original_release_identity": "ABSENT",
+        "historical_build_attestation": "NOT_AVAILABLE",
+        "provenance_claim": identity["provenance_claim"],
+        "expected_baseline_sha": expected_commit,
+        "application_git_sha": app_git_sha,
+        "application_git_tree_sha": app_git_tree,
+        "snapshot_tree_sha256": snapshot_tree,
+        "adoption_source_tree_sha256": adoption_tree,
+        "artifact_role": identity["artifact_role"],
+        "production_publishable": False,
+        "project_name": identity["project_name"],
+    })
+    write_json(result_path, result)
+    return identity, result
+
+
 def validate_identity(identity_path, source_root, expected_commit, normalized_path):
     identity = load_json(identity_path)
     if "release_identity" in identity:
@@ -1057,6 +1194,22 @@ def main():
     item.add_argument("normalized")
     item.add_argument("output")
 
+    item = sub.add_parser("identity-mode")
+    item.add_argument("identity")
+
+    item = sub.add_parser("adoption-identity")
+    item.add_argument("adoption_inventory")
+    item.add_argument("adoption_root")
+    item.add_argument("snapshot_inventory")
+    item.add_argument("expected_commit")
+    item.add_argument("app_git_sha")
+    item.add_argument("app_git_tree")
+    item.add_argument("attempt_id")
+    item.add_argument("timestamp")
+    item.add_argument("output_identity")
+    item.add_argument("result")
+    item.add_argument("normalized")
+
     item = sub.add_parser("nginx")
     item.add_argument("config")
     item.add_argument("expected_root")
@@ -1123,12 +1276,38 @@ def main():
             result = validate_identity(
                 args.identity, args.source, args.expected_commit, args.normalized
             )
+            result.update({
+                "identity_mode": "EXISTING_VERIFIED_IDENTITY",
+                "identity_origin": "existing_verified_identity",
+                "original_release_identity": "PRESENT",
+            })
             write_json(args.output, result)
             print("IDENTITY_STATUS=PASS")
+            print("IDENTITY_MODE=EXISTING_VERIFIED_IDENTITY")
             print("IDENTITY_COMMIT_SHA={}".format(result["commit_sha"]))
             print("IDENTITY_ASSET_COUNT={}".format(result["asset_count"]))
             print("IDENTITY_CANONICAL_SHA256={}".format(result["identity_sha256"]))
             print("IDENTITY_FILE_SHA256={}".format(result["identity_file_sha256"]))
+            return 0
+        if args.command == "identity-mode":
+            print("IDENTITY_MODE={}".format(detect_identity_mode(args.identity)))
+            return 0
+        if args.command == "adoption-identity":
+            identity, result = build_legacy_adoption_identity(
+                args.adoption_inventory, args.adoption_root,
+                args.snapshot_inventory, args.expected_commit,
+                args.app_git_sha, args.app_git_tree, args.attempt_id,
+                args.timestamp, args.output_identity, args.result,
+                args.normalized,
+            )
+            print("IDENTITY_STATUS=PASS")
+            print("IDENTITY_MODE={}".format(identity["identity_mode"]))
+            print("IDENTITY_ORIGIN={}".format(identity["identity_origin"]))
+            print("IDENTITY_ASSET_COUNT={}".format(identity["asset_count"]))
+            print("IDENTITY_SNAPSHOT_TREE_SHA256={}".format(
+                identity["snapshot_tree_sha256"]
+            ))
+            print("IDENTITY_PRODUCTION_PUBLISHABLE=false")
             return 0
         if args.command == "nginx":
             result = nginx_summary(
@@ -1234,6 +1413,87 @@ NGINX
         "$TMP_DIR/evidence/source-before.json" \
         "$TMP_DIR/evidence/destination.json" >/dev/null ||
         die "synthetic byte inventory comparison failed"
+    SELFTEST_GIT_TREE="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    "$PYTHON_BIN" "$HELPER" identity-mode \
+        "$TMP_DIR/source/release_identity.json" \
+        >"$TMP_DIR/evidence/pre-adoption-mode.stdout" ||
+        die "pre-adoption identity mode detection failed"
+    if ! grep -F -q 'IDENTITY_MODE=LEGACY_PRE_ADOPTION' \
+        "$TMP_DIR/evidence/pre-adoption-mode.stdout"; then
+        die "missing release identity was not classified as pre-adoption"
+    fi
+    mkdir -p "$TMP_DIR/pre-adoption"
+    "$PYTHON_BIN" "$HELPER" adoption-identity \
+        "$TMP_DIR/evidence/destination.json" "$TMP_DIR/destination" \
+        "$TMP_DIR/evidence/source-before.json" "$EXPECTED_BASELINE_SHA" \
+        "$EXPECTED_BASELINE_SHA" "$SELFTEST_GIT_TREE" \
+        "selftest-pre-adoption" "2026-09-15T00:00:00Z" \
+        "$TMP_DIR/pre-adoption/release_identity.json" \
+        "$TMP_DIR/evidence/pre-adoption-identity.json" \
+        "$TMP_DIR/evidence/pre-adoption-normalized.json" \
+        >"$TMP_DIR/evidence/pre-adoption.stdout" ||
+        die "pre-adoption identity generation failed"
+    for required in \
+        '"identity_mode": "LEGACY_PRE_ADOPTION"' \
+        '"identity_origin": "legacy_adoption"' \
+        '"original_release_identity": "ABSENT"' \
+        '"historical_build_attestation": "NOT_AVAILABLE"' \
+        '"artifact_role": "validation_input_baseline_only"' \
+        '"production_publishable": false'; do
+        if ! grep -F -q "$required" \
+            "$TMP_DIR/pre-adoption/release_identity.json"; then
+            die "pre-adoption identity contract is incomplete"
+        fi
+    done
+    "$PYTHON_BIN" "$HELPER" copy "$TMP_DIR/source" \
+        "$TMP_DIR/existing" >/dev/null ||
+        die "existing-identity fixture copy failed"
+    cp "$TMP_DIR/pre-adoption/release_identity.json" \
+        "$TMP_DIR/existing/release_identity.json" ||
+        die "existing-identity fixture setup failed"
+    "$PYTHON_BIN" "$HELPER" identity-mode \
+        "$TMP_DIR/existing/release_identity.json" \
+        >"$TMP_DIR/evidence/existing-mode.stdout" ||
+        die "existing identity mode detection failed"
+    if ! grep -F -q 'IDENTITY_MODE=EXISTING_VERIFIED_IDENTITY' \
+        "$TMP_DIR/evidence/existing-mode.stdout"; then
+        die "existing release identity was not classified strictly"
+    fi
+    "$PYTHON_BIN" "$HELPER" identity \
+        "$TMP_DIR/existing/release_identity.json" "$TMP_DIR/existing" \
+        "$EXPECTED_BASELINE_SHA" "$TMP_DIR/evidence/existing-normalized.json" \
+        "$TMP_DIR/evidence/existing-identity.json" >/dev/null ||
+        die "valid existing release identity did not pass strict validation"
+    mkdir -p "$TMP_DIR/malformed"
+    "$PYTHON_BIN" "$HELPER" copy "$TMP_DIR/source" \
+        "$TMP_DIR/malformed" >/dev/null ||
+        die "malformed-identity fixture copy failed"
+    printf '{not-json\n' >"$TMP_DIR/malformed/release_identity.json"
+    if "$PYTHON_BIN" "$HELPER" identity \
+        "$TMP_DIR/malformed/release_identity.json" "$TMP_DIR/malformed" \
+        "$EXPECTED_BASELINE_SHA" "$TMP_DIR/evidence/malformed-normalized.json" \
+        "$TMP_DIR/evidence/malformed-identity.json" \
+        >"$TMP_DIR/evidence/malformed.stdout" 2>&1; then
+        die "malformed release identity did not fail closed"
+    fi
+    if "$PYTHON_BIN" "$HELPER" adoption-identity \
+        "$TMP_DIR/evidence/destination.json" "$TMP_DIR/destination" \
+        "$TMP_DIR/evidence/source-before.json" "$EXPECTED_BASELINE_SHA" \
+        "dddddddddddddddddddddddddddddddddddddddd" "$SELFTEST_GIT_TREE" \
+        "selftest-git-mismatch" "2026-09-15T00:00:00Z" \
+        "$TMP_DIR/pre-adoption/mismatch.json" \
+        "$TMP_DIR/evidence/mismatch.json" \
+        "$TMP_DIR/evidence/mismatch-normalized.json" \
+        >"$TMP_DIR/evidence/mismatch.stdout" 2>&1; then
+        die "pre-adoption application Git mismatch did not fail closed"
+    fi
+    "$PYTHON_BIN" "$HELPER" inventory "$TMP_DIR/source" \
+        "$TMP_DIR/evidence/source-after.json" >/dev/null ||
+        die "source immutability inventory failed"
+    "$PYTHON_BIN" "$HELPER" compare \
+        "$TMP_DIR/evidence/source-before.json" \
+        "$TMP_DIR/evidence/source-after.json" >/dev/null ||
+        die "legacy source changed during synthetic adoption"
     "$PYTHON_BIN" "$HELPER" nginx "$TMP_DIR/nginx.dump" \
         "/fixture/legacy/onesensor" "$EXPECTED_PROXY" \
         "$TMP_DIR/evidence/nginx.txt" >"$TMP_DIR/evidence/nginx.stdout" ||
@@ -1264,6 +1524,11 @@ NGINX
     printf 'NGINX_PROXY_PASS_REGRESSION=127.0.0.1:9528 -> MATCH\n'
     printf 'SIDECAR_META_JSON_REGRESSION=reports/.source_cache/**/meta.json -> PASS\n'
     printf 'SENSITIVE_PATH_REGRESSION=coverage source artifacts allowed, secret material blocked\n'
+    printf 'LEGACY_PRE_ADOPTION_NO_RELEASE_IDENTITY=PASS\n'
+    printf 'EXISTING_RELEASE_IDENTITY=PASS\n'
+    printf 'MALFORMED_RELEASE_IDENTITY=BLOCK\n'
+    printf 'BASELINE_GIT_MISMATCH=BLOCK\n'
+    printf 'LEGACY_SOURCE_IMMUTABLE=PASS\n'
     printf 'BYTE_INVENTORY_REGRESSION=PASS\n'
     exit 0
 fi
@@ -1347,14 +1612,66 @@ IDENTITY_RESULT="$TMP_DIR/identity-result.json"
 "$PYTHON_BIN" "$HELPER" space "$EXPECTED_EXPORT_PARENT" \
     "$SOURCE_BEFORE" >>"$REPORT" ||
     die "insufficient free space for immutable baseline export"
-"$PYTHON_BIN" "$HELPER" identity "$EXPECTED_LEGACY_ROOT/release_identity.json" \
-    "$EXPECTED_LEGACY_ROOT" "$EXPECTED_BASELINE_SHA" \
-    "$STAGING_DIR/adoption/release_identity.json" \
-    "$IDENTITY_RESULT" >>"$REPORT" ||
-    die "legacy release identity is not an exact verified baseline"
-cp "$EXPECTED_LEGACY_ROOT/release_identity.json" \
-    "$STAGING_DIR/adoption/release_identity.json" ||
-    die "exact release identity copy failed"
+
+IDENTITY_PATH="$EXPECTED_LEGACY_ROOT/release_identity.json"
+"$PYTHON_BIN" "$HELPER" identity-mode "$IDENTITY_PATH" \
+    >"$TMP_DIR/identity-mode.stdout" ||
+    die "legacy release identity mode cannot be determined"
+IDENTITY_MODE="$(sed -n 's/^IDENTITY_MODE=//p' \
+    "$TMP_DIR/identity-mode.stdout")"
+case "$IDENTITY_MODE" in
+    EXISTING_VERIFIED_IDENTITY|LEGACY_PRE_ADOPTION)
+        printf 'IDENTITY_MODE=%s\n' "$IDENTITY_MODE" >>"$REPORT"
+        ;;
+    *)
+        die "legacy release identity mode is invalid"
+        ;;
+esac
+
+APP_GIT_SHA=""
+APP_GIT_TREE=""
+if command -v git >/dev/null 2>&1 && [ -e "$EXPECTED_APP_ROOT/.git" ]; then
+    APP_GIT_SHA="$(cd "$EXPECTED_APP_ROOT" &&
+        git rev-parse HEAD 2>/dev/null || true)"
+    APP_GIT_TREE="$(cd "$EXPECTED_APP_ROOT" &&
+        git rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
+    (cd "$EXPECTED_APP_ROOT" &&
+        git status --porcelain) >"$TMP_DIR/git.status" 2>/dev/null || true
+else
+    : >"$TMP_DIR/git.status"
+fi
+{
+    printf 'APP_GIT_SHA='
+    if [ -n "$APP_GIT_SHA" ]; then printf '%s\n' "$APP_GIT_SHA"; else printf 'NOT_VERIFIED\n'; fi
+    printf 'APP_GIT_TREE_SHA='
+    if [ -n "$APP_GIT_TREE" ]; then printf '%s\n' "$APP_GIT_TREE"; else printf 'NOT_VERIFIED\n'; fi
+} >"$STAGING_DIR/evidence/application-git-summary.txt"
+"$PYTHON_BIN" "$HELPER" sanitize "$TMP_DIR/git.status" \
+    "$STAGING_DIR/evidence/application-git-status.txt" ||
+    die "application Git status sanitization failed"
+if [ "$IDENTITY_MODE" = "LEGACY_PRE_ADOPTION" ]; then
+    [ "$APP_GIT_SHA" = "$EXPECTED_BASELINE_SHA" ] ||
+        die "pre-adoption application Git HEAD does not match expected baseline"
+    [ -n "$APP_GIT_TREE" ] ||
+        die "pre-adoption application Git tree cannot be verified"
+    printf 'APPLICATION_GIT_BASELINE=PASS\n' >>"$REPORT"
+else
+    if [ "$APP_GIT_SHA" = "$EXPECTED_BASELINE_SHA" ]; then
+        printf 'APPLICATION_GIT_BASELINE=PASS\n' >>"$REPORT"
+    else
+        printf 'APPLICATION_GIT_BASELINE=NOT_VERIFIED\n' >>"$REPORT"
+    fi
+fi
+
+if [ "$IDENTITY_MODE" = "EXISTING_VERIFIED_IDENTITY" ]; then
+    "$PYTHON_BIN" "$HELPER" identity "$IDENTITY_PATH" \
+        "$EXPECTED_LEGACY_ROOT" "$EXPECTED_BASELINE_SHA" \
+        "$STAGING_DIR/adoption/release_identity.json" \
+        "$IDENTITY_RESULT" >>"$REPORT" ||
+        die "legacy release identity is not an exact verified baseline"
+    cp "$IDENTITY_PATH" "$STAGING_DIR/adoption/release_identity.json" ||
+        die "exact release identity copy failed"
+fi
 "$PYTHON_BIN" "$HELPER" copy "$EXPECTED_LEGACY_ROOT" \
     "$STAGING_DIR/legacy-flat-root" >/dev/null ||
     die "complete legacy Served Root copy failed"
@@ -1374,6 +1691,17 @@ cp "$EXPECTED_LEGACY_ROOT/release_identity.json" \
     >>"$REPORT" || die "legacy Served Root changed during export"
 "$PYTHON_BIN" "$HELPER" compare "$SOURCE_BEFORE" "$RAW_COPY" \
     >>"$REPORT" || die "exported legacy bytes do not match source bytes"
+
+if [ "$IDENTITY_MODE" = "LEGACY_PRE_ADOPTION" ]; then
+    "$PYTHON_BIN" "$HELPER" adoption-identity \
+        "$ADOPTION_COPY" "$STAGING_DIR/adoption-source" \
+        "$SOURCE_BEFORE" "$EXPECTED_BASELINE_SHA" "$APP_GIT_SHA" \
+        "$APP_GIT_TREE" "$ATTEMPT_ID" "$STAMP" \
+        "$STAGING_DIR/adoption/release_identity.json" \
+        "$IDENTITY_RESULT" "$TMP_DIR/normalized-adoption-identity.json" \
+        >>"$REPORT" ||
+        die "legacy pre-adoption identity generation or validation failed"
+fi
 
 cp "$SOURCE_BEFORE" "$STAGING_DIR/evidence/inventory-source-before.json"
 cp "$SOURCE_AFTER" "$STAGING_DIR/evidence/inventory-source-after.json"
@@ -1417,31 +1745,6 @@ printf 'SYSTEMD=PASS\n' >>"$REPORT"
     "$STAGING_DIR/evidence/database-readonly-summary.txt" >>"$REPORT" ||
     die "database read-only evidence collector failed"
 printf 'DATABASE_QUERY_SCOPE=SELECT_AND_INFORMATION_SCHEMA_ONLY\n' >>"$REPORT"
-
-if command -v git >/dev/null 2>&1 && [ -d "$EXPECTED_APP_ROOT/.git" ]; then
-    APP_GIT_SHA="$(cd "$EXPECTED_APP_ROOT" &&
-        git rev-parse HEAD 2>/dev/null || true)"
-    APP_GIT_TREE="$(cd "$EXPECTED_APP_ROOT" &&
-        git rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
-    (cd "$EXPECTED_APP_ROOT" &&
-        git status --porcelain) >"$TMP_DIR/git.status" 2>/dev/null || true
-    {
-        printf 'APP_GIT_SHA='
-        if [ -n "$APP_GIT_SHA" ]; then printf '%s\n' "$APP_GIT_SHA"; else printf 'NOT_VERIFIED\n'; fi
-        printf 'APP_GIT_TREE_SHA='
-        if [ -n "$APP_GIT_TREE" ]; then printf '%s\n' "$APP_GIT_TREE"; else printf 'NOT_VERIFIED\n'; fi
-    } >"$STAGING_DIR/evidence/application-git-summary.txt"
-    "$PYTHON_BIN" "$HELPER" sanitize "$TMP_DIR/git.status" \
-        "$STAGING_DIR/evidence/application-git-status.txt" ||
-        die "application Git status sanitization failed"
-    if [ "$APP_GIT_SHA" = "$EXPECTED_BASELINE_SHA" ]; then
-        printf 'APPLICATION_GIT_BASELINE=PASS\n' >>"$REPORT"
-    else
-        printf 'APPLICATION_GIT_BASELINE=NOT_VERIFIED\n' >>"$REPORT"
-    fi
-else
-    printf 'APPLICATION_GIT_BASELINE=NOT_VERIFIED\n' >>"$REPORT"
-fi
 
 if command -v ss >/dev/null 2>&1; then
     ss -ltn >"$TMP_DIR/listeners" 2>/dev/null || true
@@ -1506,7 +1809,8 @@ META="$TMP_DIR/metadata.json"
     "$SOURCE_BEFORE" "$SOURCE_AFTER" "$RAW_COPY" "$ADOPTION_COPY" \
     "$IDENTITY_RESULT" "$STAGING_DIR/evidence/nginx-summary.txt" \
     "$STAGING_DIR/evidence/systemd-summary.txt" \
-    "$STAGING_DIR/evidence/database-readonly-summary.txt" <<'PYMETA'
+    "$STAGING_DIR/evidence/database-readonly-summary.txt" "$IDENTITY_MODE" \
+    "$APP_GIT_SHA" "$APP_GIT_TREE" <<'PYMETA'
 from __future__ import print_function
 import hashlib
 import json
@@ -1528,6 +1832,7 @@ def key_values(path):
     return result
 
 
+identity_evidence = load(sys.argv[10])
 output = {
     "attempt_id": sys.argv[2],
     "collection_timestamp_utc": sys.argv[3],
@@ -1545,7 +1850,19 @@ output = {
     "source_after_tree_sha256": load(sys.argv[7])["tree_sha256"],
     "legacy_flat_export_tree_sha256": load(sys.argv[8])["tree_sha256"],
     "adoption_source_tree_sha256": load(sys.argv[9])["tree_sha256"],
-    "identity_evidence": load(sys.argv[10]),
+    "identity_evidence": identity_evidence,
+    "identity_mode": sys.argv[14],
+    "identity_origin": identity_evidence.get(
+        "identity_origin", "NOT_VERIFIED"
+    ),
+    "original_release_identity": identity_evidence.get(
+        "original_release_identity", "NOT_VERIFIED"
+    ),
+    "historical_build_attestation": identity_evidence.get(
+        "historical_build_attestation", "NOT_VERIFIED"
+    ),
+    "application_git_sha": sys.argv[15] or "NOT_VERIFIED",
+    "application_git_tree_sha": sys.argv[16] or "NOT_VERIFIED",
     "resolved_nginx_config_paths": key_values(sys.argv[11]).get(
         "NGINX_CONFIG_PATHS", "NOT_VERIFIED"
     ),
@@ -1558,7 +1875,8 @@ output = {
         open(sys.argv[12], "rb").read()).hexdigest(),
     "database_summary_sha256": __import__("hashlib").sha256(
         open(sys.argv[13], "rb").read()).hexdigest(),
-    "legacy_git_tree_sha": "NOT_CLAIMED",
+    "legacy_git_sha": sys.argv[15] or "NOT_VERIFIED",
+    "legacy_git_tree_sha": sys.argv[16] or "NOT_VERIFIED",
     "artifact_role": "validation_input_baseline_only",
     "production_publishable": False,
     "project_name": "FOS_V6R2",

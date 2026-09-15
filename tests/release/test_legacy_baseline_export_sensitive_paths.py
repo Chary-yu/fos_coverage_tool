@@ -1,3 +1,4 @@
+import json
 import importlib.util
 import os
 import shutil
@@ -194,6 +195,155 @@ class LegacyBaselineExportSensitivePathTest(unittest.TestCase):
                 "legacy-flat-root/ssh/" + artifact,
                 [item["path"] for item in manifest["files"]],
             )
+
+    def _pre_adoption_fixture(self, root):
+        source = os.path.join(root, "legacy")
+        adoption = os.path.join(root, "adoption-source")
+        os.mkdir(source)
+        self._write(source, "auth-passwd.c.func-sort-c.html")
+        self._write(source, "ssh/auth.c.html")
+        self._write(source, "coverage/report.html")
+        before = self.helper.inventory(source)
+        before_path = os.path.join(root, "source-before.json")
+        adoption_path = os.path.join(root, "adoption.json")
+        self.helper.write_json(before_path, before)
+        self.helper.copy_files(source, adoption)
+        adoption_inventory = self.helper.inventory(adoption)
+        self.helper.write_json(adoption_path, adoption_inventory)
+        identity_path = os.path.join(root, "staging", "release_identity.json")
+        result_path = os.path.join(root, "staging", "identity-result.json")
+        normalized_path = os.path.join(root, "normalized.json")
+        if not os.path.isdir(os.path.dirname(identity_path)):
+            os.makedirs(os.path.dirname(identity_path))
+        identity, result = self.helper.build_legacy_adoption_identity(
+            adoption_path, adoption, before_path,
+            self.helper.CONTRACT["baseline_sha"],
+            self.helper.CONTRACT["baseline_sha"],
+            "b" * 40, "fixture-pre-adoption", "2026-09-15T00:00:00Z",
+            identity_path, result_path, normalized_path,
+        )
+        self.assertEqual(result["identity_mode"], "LEGACY_PRE_ADOPTION")
+        self.assertFalse(os.path.exists(os.path.join(
+            source, "release_identity.json"
+        )))
+        return source, adoption, before_path, identity_path, identity
+
+    def test_legacy_pre_adoption_generates_verified_observed_identity(self):
+        with tempfile.TemporaryDirectory(prefix="r8-pre-adoption-valid-") as root:
+            source, adoption, before_path, identity_path, identity = \
+                self._pre_adoption_fixture(root)
+            self.assertEqual(identity["identity_mode"], "LEGACY_PRE_ADOPTION")
+            self.assertEqual(identity["identity_origin"], "legacy_adoption")
+            self.assertEqual(identity["original_release_identity"], "ABSENT")
+            self.assertEqual(
+                identity["historical_build_attestation"], "NOT_AVAILABLE"
+            )
+            self.assertIn("not an original historical build attestation",
+                          identity["provenance_claim"])
+            self.assertEqual(
+                identity["artifact_role"], "validation_input_baseline_only"
+            )
+            self.assertIs(identity["production_publishable"], False)
+            with open(before_path, "r") as stream:
+                before = json.load(stream)
+            self.assertEqual(before, self.helper.inventory(source))
+            self.assertFalse(os.path.exists(os.path.join(
+                source, "release_identity.json"
+            )))
+            self.assertEqual(identity["snapshot_tree_sha256"], before["tree_sha256"])
+            self.assertEqual(
+                identity["adoption_source_tree_sha256"],
+                self.helper.inventory(adoption)["tree_sha256"],
+            )
+
+    def test_existing_valid_identity_remains_strict(self):
+        with tempfile.TemporaryDirectory(prefix="r8-existing-identity-") as root:
+            source, _adoption, _before, identity_path, _identity = \
+                self._pre_adoption_fixture(root)
+            existing_path = os.path.join(source, "release_identity.json")
+            shutil.copyfile(identity_path, existing_path)
+            self.assertEqual(
+                self.helper.detect_identity_mode(existing_path),
+                "EXISTING_VERIFIED_IDENTITY",
+            )
+            result = self.helper.validate_identity(
+                existing_path, source, self.helper.CONTRACT["baseline_sha"],
+                os.path.join(root, "existing-normalized.json"),
+            )
+            self.assertEqual(result["commit_sha"],
+                             self.helper.CONTRACT["baseline_sha"])
+
+    def test_malformed_and_mismatched_existing_identity_block(self):
+        with tempfile.TemporaryDirectory(prefix="r8-existing-invalid-") as root:
+            source, _adoption, _before, identity_path, identity = \
+                self._pre_adoption_fixture(root)
+            existing_path = os.path.join(source, "release_identity.json")
+            with open(existing_path, "w") as stream:
+                stream.write("{not-json\n")
+            with self.assertRaises(ValueError):
+                self.helper.validate_identity(
+                    existing_path, source,
+                    self.helper.CONTRACT["baseline_sha"],
+                    os.path.join(root, "malformed-normalized.json"),
+                )
+            self.helper.write_json(existing_path, identity)
+            invalid = dict(identity)
+            invalid["commit_sha"] = "f" * 40
+            self.helper.write_json(existing_path, invalid)
+            with self.assertRaises(ValueError):
+                self.helper.validate_identity(
+                    existing_path, source,
+                    self.helper.CONTRACT["baseline_sha"],
+                    os.path.join(root, "mismatch-normalized.json"),
+                )
+
+    def test_adoption_identity_byte_and_git_anchor_mismatches_block(self):
+        with tempfile.TemporaryDirectory(prefix="r8-pre-adoption-mismatch-") as root:
+            source, adoption, before_path, _identity_path, identity = \
+                self._pre_adoption_fixture(root)
+            invalid = dict(identity)
+            invalid["asset_manifest"] = list(identity["asset_manifest"])
+            invalid["asset_manifest"][0] = dict(invalid["asset_manifest"][0])
+            invalid["asset_manifest"][0]["size"] += 1
+            invalid["asset_hash"] = self.helper.canonical(
+                invalid["asset_manifest"]
+            )
+            invalid["asset_manifest_hash"] = invalid["asset_hash"]
+            invalid_path = os.path.join(root, "invalid-identity.json")
+            self.helper.write_json(invalid_path, invalid)
+            with self.assertRaises(ValueError):
+                self.helper.validate_identity(
+                    invalid_path, adoption,
+                    self.helper.CONTRACT["baseline_sha"],
+                    os.path.join(root, "invalid-normalized.json"),
+                )
+            with self.assertRaises(ValueError):
+                self.helper.build_legacy_adoption_identity(
+                    os.path.join(root, "adoption.json"), adoption, before_path,
+                    self.helper.CONTRACT["baseline_sha"], "f" * 40, "b" * 40,
+                    "git-mismatch", "2026-09-15T00:00:00Z",
+                    os.path.join(root, "git-mismatch.json"),
+                    os.path.join(root, "git-mismatch-result.json"),
+                    os.path.join(root, "git-mismatch-normalized.json"),
+                )
+
+    def test_source_change_and_sidecar_absence_fail_or_classify_explicitly(self):
+        with tempfile.TemporaryDirectory(prefix="r8-pre-adoption-state-") as root:
+            source = os.path.join(root, "legacy")
+            os.mkdir(source)
+            self._write(source, "coverage.c.html", b"AAAA\n")
+            before = self.helper.inventory(source)
+            before_path = os.path.join(root, "before.json")
+            after_path = os.path.join(root, "after.json")
+            self.helper.write_json(before_path, before)
+            with open(os.path.join(source, "coverage.c.html"), "wb") as stream:
+                stream.write(b"BBBB\n")
+            self.helper.write_json(after_path, self.helper.inventory(source))
+            with self.assertRaises(ValueError):
+                self.helper.compare(before_path, after_path)
+            sidecar_path = os.path.join(root, "sidecar.txt")
+            summary = self.helper.sidecar_summary(source, sidecar_path)
+            self.assertEqual(summary["SIDECAR_STATUS"], "NOT_APPLICABLE")
 
 
 if __name__ == "__main__":
