@@ -1,0 +1,1610 @@
+#!/usr/bin/env bash
+#
+# FOS R8 legacy baseline export.  This is a read-only production-side
+# collector.  It is deliberately a standalone .txt file so an operator can
+# transfer exactly one file to vfoswind and execute it once.
+#
+# It never starts/stops/reloads services, changes permissions, changes
+# CURRENT, writes a database, contacts GitHub/Internet, or stages a Candidate.
+# Its only writes are a private temporary helper and one new export directory
+# under EXPECTED_EXPORT_PARENT.
+
+if [ "$(printenv FOS_R8_BASELINE_EXPORT_CHILD 2>/dev/null || true)" != "1" ]; then
+    export FOS_R8_BASELINE_EXPORT_CHILD=1
+    exec /usr/bin/env bash "$0" "$@"
+fi
+
+set -u
+set -o pipefail
+umask 077
+
+readonly EXPECTED_HOST="vfoswind"
+readonly EXPECTED_LEGACY_ROOT="/home/zcyu/coverage/export0810/onesensor"
+readonly EXPECTED_APP_ROOT="/home/zcyu/coverage/onesensor_code-coverage_tool"
+readonly EXPECTED_BASELINE_SHA="e9fcc837a1ac9847f3966fc8ddb2aed92ca473fc"
+readonly EXPECTED_PUBLISH_ROOT="/home/zcyu/coverage_published"
+readonly EXPECTED_EXPORT_PARENT="/home/zcyu/fos_r8_baseline_exports"
+readonly EXPECTED_NGINX_PREFIX="/coverage/"
+readonly EXPECTED_PROXY="http://127.0.0.1:9528"
+readonly EXPORT_TOOL_ID="fos-r8-legacy-baseline-export-v1"
+readonly COMPLETION_MARKER_NAME="COMPLETION_MARKER"
+
+TMP_DIR=""
+STAGING_DIR=""
+
+cleanup() {
+    if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
+        rm -rf -- "$TMP_DIR"
+    fi
+    if [ -n "$STAGING_DIR" ] && [ -d "$STAGING_DIR" ]; then
+        rm -rf -- "$STAGING_DIR"
+    fi
+}
+trap cleanup EXIT HUP INT TERM
+
+die() {
+    printf 'BASELINE_EXPORT=BLOCKED\nBLOCKER=%s\n' "$1" >&2
+    exit 1
+}
+
+PYTHON_BIN="$(command -v python3 2>/dev/null || true)"
+[ -n "$PYTHON_BIN" ] || die "python3 is unavailable"
+
+TMP_PARENT="$(printenv TMPDIR 2>/dev/null || true)"
+[ -n "$TMP_PARENT" ] || TMP_PARENT="/tmp"
+TMP_DIR="$(mktemp -d "$TMP_PARENT/fos-r8-baseline-export.XXXXXX")" ||
+    die "cannot create private temporary directory"
+HELPER="$TMP_DIR/helper.py"
+
+cat >"$HELPER" <<'PY'
+from __future__ import print_function
+
+import argparse
+import hashlib
+import json
+import os
+import posixpath
+import re
+import shutil
+import stat
+import subprocess
+import sys
+
+
+EXPECTED_IDENTITY_KEYS = (
+    "version", "commit_sha", "build_id", "asset_hash", "schema_version",
+    "asset_manifest_version", "asset_count", "asset_manifest_hash",
+    "asset_manifest",
+)
+CONTROL_NAMES = frozenset((
+    "CURRENT", "candidate_artifact_manifest.json",
+    "candidate_build_attestation.json", "candidate_build_receipt.json",
+    "release_identity.json", "release_manifest.json", "report_manifest.json",
+    "validated_publication_identity.json", "legacy_adoption_manifest.json",
+))
+CONTROL_DIRECTORIES = frozenset((
+    "CURRENT", "reports", "assets", "registry", ".source_cache",
+))
+SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+SENSITIVE_METADATA_KEY_RE = re.compile(
+    r"(?i)(password|passwd|secret|token|hmac|private[._-]?key|"
+    r"authorization|cookie|credential|api[._-]?key)"
+)
+SENSITIVE_PATH_KEYWORD_RE = re.compile(
+    r"(?i)(password|passwd|secret|token|hmac|private[._-]?key|"
+    r"authorization|auth|cookie|credential|api[._-]?key|ssh|"
+    r"(?:^|[._-])key(?:$|[._-]))"
+)
+SOURCE_COVERAGE_BASENAME_RE = re.compile(
+    r"(?i)\.(?:c|h|cc|cpp|cxx|hh|hpp|hxx|java|py|js|ts|go|rs|"
+    r"swift|m|mm|cs|rb|php|pl|sh)(?:\.[a-z0-9_-]+)*$"
+)
+SENSITIVE_EXTENSION_RE = re.compile(
+    r"(?i)\.(?:pem|key|p12|pfx|secret|token|credential|credentials)$"
+)
+PRIVATE_KEY_FILENAME_RE = re.compile(
+    r"(?i)(?:^|[._-])private[._-]?key(?:$|[._-])"
+)
+ENV_SECRET_FILENAME_RE = re.compile(r"(?i)^\.env(?:$|[._-])")
+PROTECTED_DIRECTORY_COMPONENTS = frozenset((
+    ".ssh", "private_keys", "private-keys", "credentials", "credential",
+    "secrets", "secret-files",
+))
+SENSITIVE_EXACT_BASENAMES = frozenset((
+    "passwd", "shadow", "gshadow", "password", "secret", "token",
+    "hmac", "credential", "credentials", "id_rsa", "id_dsa",
+    "id_ecdsa", "id_ed25519", "authorized_keys", "private_key",
+    "private-key", ".env", ".env-secret", "secret.env",
+    "credentials.json", "credential.json", "token.json", "secret.json",
+    "password.html", "passwd.html", "secret.html", "token.html",
+    "credentials.html", "credential.html",
+))
+COVERAGE_HTML_BASENAMES = frozenset((
+    "index.html", "report.html", "coverage.html", "lcov.html",
+    "summary.html",
+))
+COVERAGE_DIRECTORY_COMPONENTS = frozenset((
+    "coverage", "coverage-results", "reports", "report", "source", "src",
+    "html", "lcov", "gcov", "export",
+))
+URI_RE = re.compile(
+    r"(?i)([a-z][a-z0-9+.-]*://)([^/@\s]+@)"
+)
+CONTRACT = {
+    "host": "vfoswind",
+    "legacy_root": "/home/zcyu/coverage/export0810/onesensor",
+    "application_root": "/home/zcyu/coverage/onesensor_code-coverage_tool",
+    "baseline_sha": "e9fcc837a1ac9847f3966fc8ddb2aed92ca473fc",
+    "publish_root": "/home/zcyu/coverage_published",
+    "export_parent": "/home/zcyu/fos_r8_baseline_exports",
+    "nginx_prefix": "/coverage/",
+    "proxy": "http://127.0.0.1:9528",
+    "tool_id": "fos-r8-legacy-baseline-export-v1",
+}
+COMPLETION_MARKER_NAME = "COMPLETION_MARKER"
+COMPLETION_MARKER_BYTES = b"FOS_R8_BASELINE_EXPORT_COMPLETE\n"
+MANIFEST_DIGEST_NAME = "baseline-export-manifest.sha256"
+
+
+def fail(message):
+    print("HELPER_ERROR={}".format(message), file=sys.stderr)
+    return 2
+
+
+def canonical(value):
+    raw = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def file_info(path):
+    requested = os.path.abspath(str(path))
+    if os.path.islink(requested) or not os.path.isfile(requested):
+        raise ValueError("regular file required: {}".format(path))
+    file_stat = os.stat(requested, follow_symlinks=False)
+    return {
+        "filename": os.path.basename(requested),
+        "path": requested,
+        "size": int(file_stat.st_size),
+        "sha256": sha256_file(requested),
+    }
+
+
+def resolved_path(path):
+    return os.path.realpath(os.path.abspath(str(path)))
+
+
+def check_constants(values):
+    observed = {
+        "host": values[0],
+        "legacy_root": values[1],
+        "application_root": values[2],
+        "baseline_sha": values[3],
+        "publish_root": values[4],
+        "export_parent": values[5],
+        "nginx_prefix": values[6],
+        "proxy": values[7],
+        "tool_id": values[8],
+    }
+    if observed != CONTRACT:
+        raise ValueError("embedded contract constants are inconsistent")
+    if not COMMIT_RE.fullmatch(CONTRACT["baseline_sha"]):
+        raise ValueError("embedded baseline SHA is malformed")
+    if CONTRACT["proxy"] != "http://127.0.0.1:9528":
+        raise ValueError("embedded loopback proxy is malformed")
+    return observed
+
+
+def safe_relative(value):
+    value = str(value).replace("\\", "/")
+    parts = value.split("/")
+    return bool(value) and not value.startswith("/") and \
+        all(part not in ("", ".", "..") for part in parts)
+
+
+def _path_within(path, root):
+    return path == root or path.startswith(root + os.sep)
+
+
+def _normalise_export_path(relative, actual_path=None, export_root=None):
+    value = str(relative).replace("\\", "/")
+    if value.startswith("/"):
+        if export_root is None:
+            raise ValueError("absolute path is not export-relative")
+        root_abs = os.path.abspath(str(export_root))
+        value = os.path.relpath(os.path.abspath(value), root_abs).replace(
+            os.sep, "/"
+        )
+    if not safe_relative(value):
+        raise ValueError("path is not safely contained: {}".format(relative))
+    normalised = posixpath.normpath(value)
+    if normalised != value or not safe_relative(normalised):
+        raise ValueError("path is not canonical or safely contained: {}".format(
+            relative
+        ))
+    parts = normalised.split("/")
+    if actual_path is not None:
+        requested = os.path.abspath(str(actual_path))
+        if os.path.islink(requested):
+            raise ValueError("symlink is not exportable: {}".format(relative))
+        if export_root is not None:
+            root_real = resolved_path(export_root)
+            actual_real = resolved_path(requested)
+            if not _path_within(actual_real, root_real):
+                raise ValueError("path escapes Served Root: {}".format(relative))
+    return normalised, parts
+
+
+def _is_coverage_source_artifact(parts):
+    basename = parts[-1].lower()
+    if basename in COVERAGE_HTML_BASENAMES:
+        return True
+    if SOURCE_COVERAGE_BASENAME_RE.search(basename):
+        return True
+    if basename.endswith((".html", ".htm")) and any(
+            component.lower() in COVERAGE_DIRECTORY_COMPONENTS
+            for component in parts[:-1]
+    ):
+        return True
+    return False
+
+
+def _sensitive_path_reason(parts, is_directory=False):
+    lower_parts = [part.lower() for part in parts]
+    basename = lower_parts[-1]
+    if any(part in PROTECTED_DIRECTORY_COMPONENTS for part in lower_parts):
+        return "protected directory component"
+    if is_directory:
+        return None
+    if basename in SENSITIVE_EXACT_BASENAMES:
+        return "known sensitive filename"
+    if SENSITIVE_EXTENSION_RE.search(basename):
+        return "known sensitive file type"
+    if ENV_SECRET_FILENAME_RE.match(basename):
+        return "environment secret filename"
+    if _is_coverage_source_artifact(parts):
+        return None
+    if PRIVATE_KEY_FILENAME_RE.search(basename):
+        return "private-key filename"
+    for part in lower_parts:
+        if SENSITIVE_PATH_KEYWORD_RE.search(part):
+            return "sensitive-looking non-artifact path component"
+    return None
+
+
+def reject_sensitive_path(relative, actual_path=None, export_root=None):
+    normalised, parts = _normalise_export_path(
+        relative, actual_path=actual_path, export_root=export_root
+    )
+    is_directory = actual_path is not None and os.path.isdir(actual_path)
+    reason = _sensitive_path_reason(parts, is_directory=is_directory)
+    if reason:
+        raise ValueError(
+            "sensitive-looking path is not exported: {} ({})".format(
+                normalised, reason
+            )
+        )
+
+
+def inventory(root):
+    requested = os.path.abspath(str(root))
+    if os.path.islink(requested) or not os.path.isdir(requested):
+        raise ValueError("root is not a real directory: {}".format(root))
+    root = os.path.realpath(requested)
+    files = []
+    directories = []
+
+    def visit(directory, relative_directory=""):
+        try:
+            names = sorted(os.listdir(directory))
+        except OSError as exc:
+            raise ValueError("cannot scan {}: {}".format(directory, exc))
+        for name in names:
+            path = os.path.join(directory, name)
+            relative = name if not relative_directory else \
+                relative_directory + "/" + name
+            if os.path.islink(path):
+                raise ValueError("symlink is not allowed: {}".format(relative))
+            try:
+                file_stat = os.stat(path, follow_symlinks=False)
+            except OSError as exc:
+                raise ValueError("cannot stat {}: {}".format(relative, exc))
+            if stat.S_ISDIR(file_stat.st_mode):
+                reject_sensitive_path(relative, path, root)
+                directories.append(relative)
+                visit(path, relative)
+            elif stat.S_ISREG(file_stat.st_mode):
+                reject_sensitive_path(relative, path, root)
+                files.append({
+                    "path": relative,
+                    "size": int(file_stat.st_size),
+                    "sha256": sha256_file(path),
+                })
+            else:
+                raise ValueError("special file is not allowed: {}".format(relative))
+
+    visit(root)
+    files.sort(key=lambda item: item["path"])
+    directories.sort()
+    return {
+        "files": files,
+        "directories": directories,
+        "file_count": len(files),
+        "total_size": sum(int(item["size"]) for item in files),
+        "tree_sha256": canonical(files),
+    }
+
+
+def write_json(path, value):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent)
+    with open(path, "w", encoding="utf-8") as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n")
+
+
+def load_json(path):
+    with open(path, "r", encoding="utf-8") as stream:
+        value = json.load(stream)
+    if not isinstance(value, dict):
+        raise ValueError("JSON object required: {}".format(path))
+    return value
+
+
+def copy_files(source, destination, skip_controls=False):
+    source_inventory = inventory(source)
+    source_root = os.path.realpath(os.path.abspath(str(source)))
+    destination = os.path.abspath(str(destination))
+    if os.path.lexists(destination):
+        if os.path.islink(destination) or not os.path.isdir(destination):
+            raise ValueError("destination is not a real directory: {}".format(destination))
+    else:
+        os.makedirs(destination)
+    skipped_directories = set()
+    for relative in source_inventory["directories"]:
+        top_level = relative.split("/", 1)[0]
+        if skip_controls and top_level in CONTROL_DIRECTORIES:
+            skipped_directories.add(relative)
+            continue
+        if any(relative == parent or relative.startswith(parent + "/")
+               for parent in skipped_directories):
+            skipped_directories.add(relative)
+            continue
+        target_directory = os.path.join(destination, *relative.split("/"))
+        if not os.path.lexists(target_directory):
+            os.makedirs(target_directory)
+        elif os.path.islink(target_directory) or not os.path.isdir(target_directory):
+            raise ValueError("destination directory is unsafe: {}".format(relative))
+    copied = 0
+    skipped = []
+    for item in source_inventory["files"]:
+        relative = item["path"]
+        basename = relative.rsplit("/", 1)[-1]
+        top_level = relative.split("/", 1)[0]
+        if skip_controls and (top_level in CONTROL_DIRECTORIES or
+                              basename in CONTROL_NAMES):
+            skipped.append(relative)
+            continue
+        target = os.path.join(destination, *relative.split("/"))
+        target_parent = os.path.dirname(target)
+        if not os.path.isdir(target_parent):
+            os.makedirs(target_parent)
+        if os.path.lexists(target) and os.path.islink(target):
+            raise ValueError("destination file is a symlink: {}".format(relative))
+        shutil.copy2(os.path.join(source_root, *relative.split("/")), target)
+        copied += 1
+    return source_inventory, copied, skipped
+
+
+def compare(left_path, right_path):
+    left = load_json(left_path)
+    right = load_json(right_path)
+    if left.get("files") != right.get("files") or \
+            left.get("directories") != right.get("directories"):
+        raise ValueError("inventory changed")
+    return left
+
+
+def check_space(path, inventory_path):
+    value = load_json(inventory_path)
+    stats = os.statvfs(os.path.abspath(str(path)))
+    free_bytes = int(stats.f_bavail) * int(stats.f_frsize)
+    required_bytes = int(value.get("total_size") or 0) * 2 + 1024 * 1024
+    result = {
+        "free_bytes": free_bytes,
+        "required_bytes": required_bytes,
+        "status": "PASS" if free_bytes >= required_bytes else "FAIL",
+    }
+    if result["status"] != "PASS":
+        raise ValueError("insufficient free space for immutable export")
+    return result
+
+
+def validate_identity(identity_path, source_root, expected_commit, normalized_path):
+    identity = load_json(identity_path)
+    if "release_identity" in identity:
+        raise ValueError("identity must be a direct object")
+    for key in identity:
+        if SENSITIVE_METADATA_KEY_RE.search(str(key)):
+            raise ValueError("identity contains a sensitive-looking key")
+    missing = [key for key in EXPECTED_IDENTITY_KEYS
+               if identity.get(key) in (None, "")]
+    if missing:
+        raise ValueError("identity is incomplete: {}".format(",".join(missing)))
+    commit_sha = str(identity.get("commit_sha") or "").lower()
+    if not COMMIT_RE.fullmatch(commit_sha):
+        raise ValueError("identity commit_sha is not exact")
+    if commit_sha != str(expected_commit).lower():
+        raise ValueError("identity commit_sha does not match fixed baseline")
+    declared = identity.get("asset_manifest")
+    if not isinstance(declared, list) or not declared:
+        raise ValueError("identity asset_manifest is invalid")
+    if int(identity.get("asset_count") or 0) != len(declared):
+        raise ValueError("identity asset_count is invalid")
+    if int(identity.get("asset_manifest_version") or 0) <= 0:
+        raise ValueError("identity asset_manifest_version is invalid")
+    if canonical(declared) != str(identity.get("asset_hash") or "").lower():
+        raise ValueError("identity asset_hash is invalid")
+    if canonical(declared) != str(identity.get("asset_manifest_hash") or "").lower():
+        raise ValueError("identity asset_manifest_hash is invalid")
+    source = inventory(source_root)
+    by_path = dict((item["path"], item) for item in source["files"])
+    by_basename = {}
+    for item in source["files"]:
+        if "/" not in item["path"]:
+            by_basename.setdefault(item["path"], []).append(item)
+    bindings = []
+    for item in sorted(declared, key=lambda value: str(value.get("path", ""))):
+        path = str(item.get("path") or "").replace("\\", "/")
+        if not safe_relative(path):
+            raise ValueError("identity asset path is invalid: {}".format(path))
+        try:
+            expected_size = int(item.get("size"))
+        except (TypeError, ValueError):
+            raise ValueError("identity asset size is invalid: {}".format(path))
+        expected_hash = str(item.get("sha256") or "").lower()
+        if expected_size < 0 or not SHA256_RE.fullmatch(expected_hash):
+            raise ValueError("identity asset fingerprint is invalid: {}".format(path))
+        observed = by_path.get(path)
+        if observed is None:
+            candidates = by_basename.get(os.path.basename(path), [])
+            if len(candidates) != 1:
+                raise ValueError("identity asset is missing or ambiguous: {}".format(path))
+            observed = candidates[0]
+        observed_path = os.path.join(
+            os.path.realpath(os.path.abspath(str(source_root))),
+            *observed["path"].split("/")
+        )
+        try:
+            reject_sensitive_path(path, observed_path, source_root)
+        except ValueError:
+            raise ValueError("identity asset path is sensitive-looking: {}".format(
+                path
+            ))
+        if int(observed["size"]) != expected_size or \
+                observed["sha256"].lower() != expected_hash:
+            raise ValueError("identity asset bytes do not match: {}".format(path))
+        bindings.append({
+            "identity_path": path,
+            "source_path": observed["path"],
+            "size": expected_size,
+            "sha256": expected_hash,
+        })
+    allowed = set(EXPECTED_IDENTITY_KEYS)
+    allowed.update(("project_name", "report_mode", "release_mode"))
+    normalized = dict((key, identity[key]) for key in identity if key in allowed)
+    write_json(normalized_path, normalized)
+    return {
+        "identity_sha256": canonical(identity),
+        "identity_file_sha256": sha256_file(identity_path),
+        "commit_sha": commit_sha,
+        "asset_count": len(declared),
+        "asset_bindings": bindings,
+        "normalized_path": os.path.abspath(normalized_path),
+    }
+
+
+def redact_line(line):
+    def redact_uri(match):
+        scheme = match.group(1)
+        userinfo = match.group(2)
+        value = userinfo[:-1]
+        username = value.split(":", 1)[0]
+        return scheme + username + ":REDACTED@"
+
+    line = URI_RE.sub(redact_uri, line)
+    line = re.sub(
+        r"(?i)(\b(?:password|passwd|secret|token|hmac|private[._-]?key|"
+        r"authorization|cookie|credential|api[._-]?key)\b\s*[=:]\s*)"
+        r"([^\s,;]+)",
+        r"\1REDACTED",
+        line,
+    )
+    line = re.sub(
+        r"(?i)(--password(?:=|\s+)|--secret(?:=|\s+))([^\s]+)",
+        r"\1REDACTED",
+        line,
+    )
+    return line.rstrip()
+
+
+def sanitize_file(input_path, output_path):
+    with open(input_path, "r", encoding="utf-8", errors="replace") as source:
+        lines = [redact_line(line) for line in source]
+    with open(output_path, "w", encoding="utf-8") as target:
+        for line in lines:
+            target.write(line + "\n")
+
+
+def sidecar_summary(root, output_path):
+    root = os.path.realpath(os.path.abspath(str(root)))
+    cache_root = os.path.join(root, "reports", ".source_cache")
+    records = []
+    invalid = []
+    if os.path.isdir(cache_root):
+        for directory, dirnames, filenames in os.walk(
+                cache_root, topdown=True, followlinks=False):
+            dirnames[:] = sorted(dirnames)
+            filenames = sorted(filenames)
+            for name in filenames:
+                if name != "meta.json":
+                    continue
+                path = os.path.join(directory, name)
+                relative = os.path.relpath(path, root).replace(os.sep, "/")
+                if os.path.islink(path) or not os.path.isfile(path):
+                    invalid.append(relative + ":not-a-regular-file")
+                    continue
+                try:
+                    value = load_json(path)
+                except (IOError, OSError, ValueError, TypeError) as exc:
+                    invalid.append(relative + ":invalid-json:" + str(exc))
+                    continue
+                schema = value.get("schema_version")
+                if isinstance(schema, bool):
+                    schema = None
+                try:
+                    schema = int(schema)
+                except (TypeError, ValueError):
+                    schema = None
+                mode = str(value.get("report_mode") or "").upper()
+                mode = re.sub(r"[^A-Z0-9_.-]", "_", mode) or "ABSENT"
+                total_lines = value.get("total_lines")
+                has_total_lines = (
+                    isinstance(total_lines, int) and
+                    not isinstance(total_lines, bool) and total_lines >= 0
+                )
+                ranges = value.get("function_ranges")
+                has_function_ranges = isinstance(ranges, list)
+                if schema is None:
+                    invalid.append(relative + ":schema_version-missing")
+                if schema is not None and schema >= 2 and \
+                        (not has_total_lines or not has_function_ranges):
+                    invalid.append(relative + ":schema-v2-fields-missing")
+                records.append({
+                    "path": relative,
+                    "schema_version": schema if schema is not None else "NOT_VERIFIED",
+                    "report_mode": mode,
+                    "total_lines": "PRESENT" if has_total_lines else "ABSENT",
+                    "function_ranges": (
+                        "PRESENT" if has_function_ranges else "ABSENT"
+                    ),
+                    "sha256": sha256_file(path),
+                })
+    records.sort(key=lambda item: item["path"])
+    schema_v2 = [item for item in records if item["schema_version"] == 2]
+    schema_v1 = [item for item in records if item["schema_version"] == 1]
+    modes = sorted(set(item["report_mode"] for item in records))
+    if invalid:
+        status = "FAIL"
+    elif records:
+        status = "PASS"
+    else:
+        status = "NOT_APPLICABLE"
+    result = {
+        "SIDECAR_LAYOUT": "reports/.source_cache/**/meta.json",
+        "SIDECAR_STATUS": status,
+        "SIDECAR_META_JSON_COUNT": len(records),
+        "SIDECAR_SCHEMA_V2_COUNT": len(schema_v2),
+        "SIDECAR_SCHEMA_V1_COUNT": len(schema_v1),
+        "SIDECAR_V2_TOTAL_LINES_COUNT": sum(
+            1 for item in schema_v2 if item["total_lines"] == "PRESENT"
+        ),
+        "SIDECAR_V2_FUNCTION_RANGES_COUNT": sum(
+            1 for item in schema_v2 if item["function_ranges"] == "PRESENT"
+        ),
+        "SIDECAR_REPORT_MODES": ",".join(modes) if modes else "ABSENT",
+        "SIDECAR_INVALID": "|".join(invalid) if invalid else "NONE",
+        "SIDECAR_RECORDS": json.dumps(
+            records, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":")
+        ) if records else "[]",
+    }
+    with open(output_path, "w", encoding="utf-8") as stream:
+        for key in sorted(result):
+            stream.write("{}={}\n".format(key, result[key]))
+    if invalid:
+        raise ValueError("canonical Sidecar metadata is invalid")
+    return result
+
+
+def nginx_summary(config_path, expected_root, expected_proxy, output_path):
+    with open(config_path, "r", encoding="utf-8", errors="replace") as stream:
+        raw = stream.read()
+    config_paths = []
+    config_path_pattern = re.compile(
+        r"^\s*#\s*configuration file\s+(.+?):\s*$", re.IGNORECASE
+    )
+    for raw_line in raw.splitlines():
+        config_match = config_path_pattern.match(raw_line)
+        if config_match:
+            config_paths.append(config_match.group(1).strip())
+    clean_lines = []
+    for line in raw.splitlines():
+        clean_lines.append(line.split("#", 1)[0])
+    clean = "\n".join(clean_lines)
+    proxy_pattern = re.compile(
+        r"(?mi)^\s*proxy_pass\s+http://127\.0\.0\.1:9528\s*;"
+    )
+    proxy_match = proxy_pattern.search(clean)
+    location_pattern = re.compile(
+        r"(?mi)^\s*location\s+(?:(?:=|\^~|~\*?|~)\s+)?"
+        r"(/coverage/)\s*\{"
+    )
+    locations = []
+    for match in location_pattern.finditer(clean):
+        depth = 0
+        end = None
+        for index in range(match.end() - 1, len(clean)):
+            if clean[index] == "{":
+                depth += 1
+            elif clean[index] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = index
+                    break
+        if end is None:
+            raise ValueError("coverage location has unbalanced braces")
+        block = clean[match.end():end]
+        alias = re.search(r"(?mi)^\s*alias\s+([^;]+);", block)
+        root = re.search(r"(?mi)^\s*root\s+([^;]+);", block)
+        selected = None
+        source = "UNRESOLVED"
+        if alias:
+            selected = alias.group(1).strip().strip("\"'")
+            source = "alias"
+        elif root:
+            selected = root.group(1).strip().strip("\"'")
+            source = "root"
+        if selected:
+            selected = os.path.normpath(selected)
+        locations.append({
+            "prefix": match.group(1),
+            "static_root": selected,
+            "directive": source,
+        })
+    expected = os.path.normpath(str(expected_root))
+    matching = [item for item in locations
+                if item.get("static_root") == expected]
+    if not proxy_match:
+        raise ValueError("exact loopback proxy_pass was not found")
+    if len(locations) != 1 or len(matching) != 1:
+        raise ValueError(
+            "effective /coverage/ static root is ambiguous or unresolved"
+        )
+    result = {
+        "nginx_dump_sha256": sha256_file(config_path),
+        "proxy_pass": str(expected_proxy),
+        "proxy_pass_match": "MATCH",
+        "coverage_location_count": len(locations),
+        "coverage_prefix": locations[0]["prefix"],
+        "coverage_static_root": locations[0]["static_root"],
+        "coverage_static_root_match": "MATCH",
+        "coverage_static_root_directive": locations[0]["directive"],
+        "nginx_config_paths": "|".join(sorted(set(config_paths))) or "NOT_VERIFIED",
+    }
+    with open(output_path, "w", encoding="utf-8") as stream:
+        for key in sorted(result):
+            stream.write("{}={}\n".format(key.upper(), result[key]))
+    return result
+
+
+def systemd_summary(input_path, output_path):
+    properties = {}
+    with open(input_path, "r", encoding="utf-8", errors="replace") as stream:
+        for raw_line in stream:
+            line = raw_line.rstrip("\n")
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            properties[key] = value
+    selected = (
+        "Id", "LoadState", "ActiveState", "SubState", "UnitFileState",
+        "FragmentPath", "User", "Group", "WorkingDirectory", "ExecStart",
+        "MainPID",
+    )
+    with open(output_path, "w", encoding="utf-8") as stream:
+        for key in selected:
+            if key in properties:
+                stream.write("{}={}\n".format(key, redact_line(properties[key])))
+            else:
+                stream.write("{}=ABSENT\n".format(key))
+        raw_environment_files = properties.get("EnvironmentFiles", "")
+        paths = []
+        for token in raw_environment_files.split():
+            if token.startswith("-/"):
+                token = token[1:]
+            if token.startswith("/"):
+                paths.append(token.split("(", 1)[0])
+        if paths:
+            stream.write("EnvironmentFiles={}\n".format(",".join(sorted(set(paths)))))
+        else:
+            stream.write("EnvironmentFiles=ABSENT\n")
+        if "Environment" in properties:
+            names = []
+            for token in properties["Environment"].split():
+                if "=" in token:
+                    names.append(token.split("=", 1)[0])
+            stream.write("EnvironmentNames={}\n".format(",".join(sorted(set(names)))))
+        else:
+            stream.write("EnvironmentNames=ABSENT\n")
+
+
+def parse_env_file(path, values):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as stream:
+            for raw_line in stream:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip("\"'")
+                if key:
+                    values[key] = value
+    except (IOError, OSError):
+        return False
+    return True
+
+
+def systemd_environment_paths(path):
+    properties = {}
+    with open(path, "r", encoding="utf-8", errors="replace") as stream:
+        for raw_line in stream:
+            if "=" in raw_line:
+                key, value = raw_line.rstrip("\n").split("=", 1)
+                properties[key] = value
+    paths = []
+    for token in properties.get("EnvironmentFiles", "").split():
+        if token.startswith("-/"):
+            token = token[1:]
+        if token.startswith("/"):
+            paths.append(token.split("(", 1)[0])
+    return sorted(set(paths))
+
+
+def first_value(values, names):
+    for name in names:
+        if values.get(name) not in (None, ""):
+            return values[name]
+    return ""
+
+
+def db_probe(systemd_path, output_path):
+    values = {}
+    paths = systemd_environment_paths(systemd_path)
+    readable = []
+    for path in paths:
+        if parse_env_file(path, values):
+            readable.append(path)
+    systemd_properties = {}
+    with open(systemd_path, "r", encoding="utf-8", errors="replace") as stream:
+        for raw_line in stream:
+            if "=" in raw_line:
+                key, value = raw_line.rstrip("\n").split("=", 1)
+                systemd_properties[key] = value
+    for token in systemd_properties.get("Environment", "").split():
+        if "=" in token:
+            key, value = token.split("=", 1)
+            if key:
+                values[key] = value
+    host = first_value(values, ("COVERAGE_MYSQL_HOST", "MYSQL_HOST", "DB_HOST"))
+    port = first_value(values, ("COVERAGE_MYSQL_PORT", "MYSQL_PORT", "DB_PORT"))
+    user = first_value(values, ("COVERAGE_MYSQL_USER", "MYSQL_USER", "DB_USER"))
+    database = first_value(
+        values, ("COVERAGE_MYSQL_DATABASE", "MYSQL_DATABASE", "DB_NAME", "DATABASE")
+    )
+    password = first_value(
+        values, ("COVERAGE_MYSQL_PASSWORD", "MYSQL_PASSWORD", "MYSQL_PWD",
+                 "DB_PASSWORD", "DATABASE_PASSWORD")
+    )
+    if not host:
+        host = "127.0.0.1"
+    if not port:
+        port = "3306"
+    client = shutil.which("mariadb") or shutil.which("mysql")
+    result = {
+        "DB_ENVIRONMENT_FILES": ",".join(readable) if readable else "ABSENT",
+        "DB_CLIENT": client or "ABSENT",
+        "DB_CONFIG_HOST": redact_line(host),
+        "DB_CONFIG_PORT": redact_line(port),
+        "DB_CONFIG_USER": redact_line(user) if user else "ABSENT",
+        "DB_CONFIG_DATABASE": redact_line(database) if database else "ABSENT",
+        "DB_PASSWORD": "PRESENT" if password else "ABSENT",
+    }
+    if not client or not user or not database:
+        result["DB_STATUS"] = "NOT_VERIFIED"
+    else:
+        command = [
+            client, "--protocol=tcp", "--host", host, "--port", str(port),
+            "--user", user, "--database", database, "--batch", "--raw",
+            "--skip-column-names",
+        ]
+        environment = {"PATH": os.environ.get("PATH", ""), "LANG": "C"}
+        if password:
+            environment["MYSQL_PWD"] = password
+        queries = (
+            "SELECT VERSION(), CURRENT_USER(), DATABASE();",
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE();",
+            "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE();",
+            "SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema=DATABASE();",
+            "SELECT COUNT(*) FROM information_schema.referential_constraints WHERE constraint_schema=DATABASE();",
+            "SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema=DATABASE();",
+        )
+        outputs = []
+        failed = False
+        for query in queries:
+            try:
+                value = subprocess.check_output(
+                    command + ["-e", query], stderr=subprocess.DEVNULL,
+                    env=environment, timeout=15,
+                ).decode("utf-8", "replace").strip()
+                outputs.append(redact_line(value))
+            except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                failed = True
+                outputs.append("NOT_VERIFIED")
+        result["DB_STATUS"] = "NOT_VERIFIED" if failed else "PASS"
+        result["DB_READ_ONLY_RESULTS"] = "|".join(outputs)
+    with open(output_path, "w", encoding="utf-8") as stream:
+        for key in sorted(result):
+            stream.write("{}={}\n".format(key, result[key]))
+    return result
+
+
+def manifest(export_root, output_path, metadata_path):
+    export_root = os.path.realpath(os.path.abspath(str(export_root)))
+    metadata = load_json(metadata_path)
+    files = []
+    directories = []
+    excluded = os.path.basename(os.path.abspath(output_path))
+    before_path = os.path.join(
+        export_root, "evidence", "inventory-source-before.json"
+    )
+    after_path = os.path.join(
+        export_root, "evidence", "inventory-source-after.json"
+    )
+    copied_path = os.path.join(
+        export_root, "evidence", "inventory-legacy-flat-root.json"
+    )
+    for path in (before_path, after_path, copied_path):
+        if not os.path.isfile(path):
+            raise ValueError("required inventory evidence is missing: {}".format(path))
+    source_before = load_json(before_path)
+    source_after = load_json(after_path)
+    copied_snapshot = load_json(copied_path)
+    sidecar_path = os.path.join(
+        export_root, "evidence", "sidecar-summary.txt"
+    )
+    if not os.path.isfile(sidecar_path):
+        raise ValueError("required Sidecar summary is missing: {}".format(
+            sidecar_path
+        ))
+    sidecar = {}
+    with open(sidecar_path, "r", encoding="utf-8", errors="replace") as stream:
+        for raw_line in stream:
+            if "=" in raw_line:
+                key, value = raw_line.rstrip("\n").split("=", 1)
+                sidecar[key] = value
+    if sidecar.get("SIDECAR_LAYOUT") != "reports/.source_cache/**/meta.json":
+        raise ValueError("Sidecar layout summary is not canonical")
+    if sidecar.get("SIDECAR_STATUS") not in (
+            "PASS", "NOT_APPLICABLE", "DEFERRED"):
+        raise ValueError("Sidecar status is invalid")
+    for key in (
+            "SIDECAR_META_JSON_COUNT", "SIDECAR_SCHEMA_V2_COUNT",
+            "SIDECAR_SCHEMA_V1_COUNT", "SIDECAR_V2_TOTAL_LINES_COUNT",
+            "SIDECAR_V2_FUNCTION_RANGES_COUNT"):
+        try:
+            if int(sidecar.get(key, "")) < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError("Sidecar count is invalid: {}".format(key))
+    if sidecar.get("SIDECAR_STATUS") == "PASS":
+        if sidecar.get("SIDECAR_INVALID") not in ("NONE", ""):
+            raise ValueError("passing Sidecar summary contains invalid records")
+    if source_before.get("files") != source_after.get("files") or \
+            source_before.get("directories") != source_after.get("directories"):
+        raise ValueError("source-before/source-after inventory mismatch")
+    if source_before.get("files") != copied_snapshot.get("files") or \
+            source_before.get("directories") != copied_snapshot.get("directories"):
+        raise ValueError("copied snapshot inventory mismatch")
+    if source_before.get("tree_sha256") != source_after.get("tree_sha256") or \
+            source_before.get("tree_sha256") != copied_snapshot.get("tree_sha256"):
+        raise ValueError("inventory tree identity mismatch")
+    control_file_hashes = {}
+    for item in source_before.get("files", []):
+        name = str(item.get("path", "")).rsplit("/", 1)[-1]
+        if name in CONTROL_NAMES:
+            control_file_hashes[item["path"]] = item["sha256"]
+
+    def visit(directory, relative_directory=""):
+        names = sorted(os.listdir(directory))
+        for name in names:
+            path = os.path.join(directory, name)
+            relative = name if not relative_directory else \
+                relative_directory + "/" + name
+            if relative in (excluded, MANIFEST_DIGEST_NAME,
+                            COMPLETION_MARKER_NAME):
+                continue
+            if os.path.islink(path):
+                raise ValueError("export contains symlink: {}".format(relative))
+            file_stat = os.stat(path, follow_symlinks=False)
+            if stat.S_ISDIR(file_stat.st_mode):
+                reject_sensitive_path(relative, path, export_root)
+                directories.append(relative)
+                visit(path, relative)
+            elif stat.S_ISREG(file_stat.st_mode):
+                reject_sensitive_path(relative, path, export_root)
+                files.append({
+                    "path": relative,
+                    "size": int(file_stat.st_size),
+                    "sha256": sha256_file(path),
+                })
+            else:
+                raise ValueError("export contains special file: {}".format(relative))
+
+    visit(export_root)
+    files.sort(key=lambda item: item["path"])
+    directories.sort()
+    payload = {
+        "export_schema_version": 1,
+        "status": "PASS",
+        "schema_version": 1,
+        "manifest_scope": (
+            "all_export_bytes_except_manifest_and_completion_marker"
+        ),
+        "completion_marker": {
+            "path": COMPLETION_MARKER_NAME,
+            "sha256": hashlib.sha256(COMPLETION_MARKER_BYTES).hexdigest(),
+            "written_last": True,
+            "required": True,
+        },
+        "manifest_digest": {
+            "path": MANIFEST_DIGEST_NAME,
+            "written_after_manifest": True,
+        },
+        "attempt_id": metadata.get("attempt_id"),
+        "tool_filename": metadata.get("tool_filename"),
+        "tool_sha256": metadata.get("tool_sha256"),
+        "tool_size": metadata.get("tool_size"),
+        "hostname": metadata.get("hostname"),
+        "collection_timestamp_utc": metadata.get("collection_timestamp_utc"),
+        "expected_baseline_sha": metadata.get("expected_baseline_sha"),
+        "resolved_nginx_config_paths": metadata.get(
+            "resolved_nginx_config_paths"
+        ),
+        "resolved_nginx_config_sha256": metadata.get(
+            "resolved_nginx_config_sha256"
+        ),
+        "resolved_served_root": metadata.get("resolved_served_root"),
+        "source_before_inventory": source_before,
+        "source_after_inventory": source_after,
+        "copied_snapshot_inventory": copied_snapshot,
+        "sidecar_summary": sidecar,
+        "copied_snapshot_root_relative_path": "legacy-flat-root",
+        "source_file_count": source_before.get("file_count"),
+        "source_total_size": source_before.get("total_size"),
+        "source_canonical_tree_sha256": source_before.get("tree_sha256"),
+        "control_file_hashes": control_file_hashes,
+        "sanitization": metadata.get("sanitization"),
+        "identity_evidence": metadata.get("identity_evidence"),
+        "metadata": metadata,
+        "directories": directories,
+        "files": files,
+        "file_count": len(files),
+        "total_size": sum(int(item["size"]) for item in files),
+        "export_tree_sha256": canonical(files),
+    }
+    write_json(output_path, payload)
+    return payload
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="command")
+
+    item = sub.add_parser("inventory")
+    item.add_argument("root")
+    item.add_argument("output")
+
+    item = sub.add_parser("copy")
+    item.add_argument("source")
+    item.add_argument("destination")
+    item.add_argument("--skip-controls", action="store_true")
+
+    item = sub.add_parser("compare")
+    item.add_argument("left")
+    item.add_argument("right")
+
+    item = sub.add_parser("space")
+    item.add_argument("path")
+    item.add_argument("inventory")
+
+    item = sub.add_parser("identity")
+    item.add_argument("identity")
+    item.add_argument("source")
+    item.add_argument("expected_commit")
+    item.add_argument("normalized")
+    item.add_argument("output")
+
+    item = sub.add_parser("nginx")
+    item.add_argument("config")
+    item.add_argument("expected_root")
+    item.add_argument("expected_proxy")
+    item.add_argument("output")
+
+    item = sub.add_parser("sanitize")
+    item.add_argument("input")
+    item.add_argument("output")
+
+    item = sub.add_parser("sidecar")
+    item.add_argument("root")
+    item.add_argument("output")
+
+    item = sub.add_parser("systemd")
+    item.add_argument("input")
+    item.add_argument("output")
+
+    item = sub.add_parser("db")
+    item.add_argument("systemd")
+    item.add_argument("output")
+
+    item = sub.add_parser("manifest")
+    item.add_argument("root")
+    item.add_argument("output")
+    item.add_argument("metadata")
+
+    item = sub.add_parser("info")
+    item.add_argument("path")
+    item.add_argument("output")
+
+    item = sub.add_parser("path")
+    item.add_argument("path")
+
+    item = sub.add_parser("constants")
+    item.add_argument("values", nargs=9)
+
+    args = parser.parse_args()
+    try:
+        if args.command == "inventory":
+            write_json(args.output, inventory(args.root))
+            print("INVENTORY_TREE_SHA256={}".format(load_json(args.output)["tree_sha256"]))
+            return 0
+        if args.command == "copy":
+            source, copied, skipped = copy_files(
+                args.source, args.destination, args.skip_controls
+            )
+            print("COPY_SOURCE_TREE_SHA256={}".format(source["tree_sha256"]))
+            print("COPY_FILE_COUNT={}".format(copied))
+            print("COPY_SKIPPED_CONTROL_COUNT={}".format(len(skipped)))
+            return 0
+        if args.command == "compare":
+            value = compare(args.left, args.right)
+            print("INVENTORY_MATCH=PASS")
+            print("INVENTORY_TREE_SHA256={}".format(value["tree_sha256"]))
+            return 0
+        if args.command == "space":
+            result = check_space(args.path, args.inventory)
+            print("SPACE_STATUS={}".format(result["status"]))
+            print("SPACE_FREE_BYTES={}".format(result["free_bytes"]))
+            print("SPACE_REQUIRED_BYTES={}".format(result["required_bytes"]))
+            return 0
+        if args.command == "identity":
+            result = validate_identity(
+                args.identity, args.source, args.expected_commit, args.normalized
+            )
+            write_json(args.output, result)
+            print("IDENTITY_STATUS=PASS")
+            print("IDENTITY_COMMIT_SHA={}".format(result["commit_sha"]))
+            print("IDENTITY_ASSET_COUNT={}".format(result["asset_count"]))
+            print("IDENTITY_CANONICAL_SHA256={}".format(result["identity_sha256"]))
+            print("IDENTITY_FILE_SHA256={}".format(result["identity_file_sha256"]))
+            return 0
+        if args.command == "nginx":
+            result = nginx_summary(
+                args.config, args.expected_root, args.expected_proxy, args.output
+            )
+            for key in sorted(result):
+                print("{}={}".format(key.upper(), result[key]))
+            return 0
+        if args.command == "sanitize":
+            sanitize_file(args.input, args.output)
+            return 0
+        if args.command == "sidecar":
+            result = sidecar_summary(args.root, args.output)
+            print("SIDECAR_STATUS={}".format(result["SIDECAR_STATUS"]))
+            print("SIDECAR_META_JSON_COUNT={}".format(
+                result["SIDECAR_META_JSON_COUNT"]
+            ))
+            return 0
+        if args.command == "systemd":
+            systemd_summary(args.input, args.output)
+            return 0
+        if args.command == "db":
+            result = db_probe(args.systemd, args.output)
+            print("DB_STATUS={}".format(result["DB_STATUS"]))
+            return 0
+        if args.command == "manifest":
+            result = manifest(args.root, args.output, args.metadata)
+            print("EXPORT_TREE_SHA256={}".format(result["export_tree_sha256"]))
+            print("EXPORT_FILE_COUNT={}".format(result["file_count"]))
+            return 0
+        if args.command == "info":
+            result = file_info(args.path)
+            write_json(args.output, result)
+            print("FILE_SHA256={}".format(result["sha256"]))
+            print("FILE_SIZE={}".format(result["size"]))
+            return 0
+        if args.command == "path":
+            print(resolved_path(args.path))
+            return 0
+        if args.command == "constants":
+            check_constants(args.values)
+            print("CONTRACT_CONSTANTS=PASS")
+            return 0
+        return fail("unknown helper command")
+    except (IOError, OSError, ValueError, TypeError, KeyError) as exc:
+        return fail(str(exc))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PY
+
+"$PYTHON_BIN" "$HELPER" constants \
+    "$EXPECTED_HOST" "$EXPECTED_LEGACY_ROOT" "$EXPECTED_APP_ROOT" \
+    "$EXPECTED_BASELINE_SHA" "$EXPECTED_PUBLISH_ROOT" \
+    "$EXPECTED_EXPORT_PARENT" "$EXPECTED_NGINX_PREFIX" \
+    "$EXPECTED_PROXY" "$EXPORT_TOOL_ID" >/dev/null ||
+    die "embedded export contract constants are inconsistent"
+TOOL_INFO="$TMP_DIR/tool-info.json"
+"$PYTHON_BIN" "$HELPER" info "$0" "$TOOL_INFO" >/dev/null ||
+    die "operator tool identity cannot be captured"
+
+if [ "$#" -gt 0 ] && [ "$1" = "--self-test" ]; then
+    mkdir -p "$TMP_DIR/source" "$TMP_DIR/destination" \
+        "$TMP_DIR/evidence" "$TMP_DIR/source/reports/.source_cache/report-v2" \
+        "$TMP_DIR/source/home/git_for_coverage/git_fosip/fosip/fosip/nbm/source/comp/ssh/ssh/openssh/src" \
+        "$TMP_DIR/source/ssh" "$TMP_DIR/source/coverage" \
+        "$TMP_DIR/sensitive/etc" "$TMP_DIR/sensitive/root/.ssh"
+    printf '<html><head><title>fixture</title></head><body>fixture</body></html>\n' \
+        >"$TMP_DIR/source/report.html"
+    printf 'fixture-static\n' >"$TMP_DIR/source/report.css"
+    printf 'coverage-source\n' \
+        >"$TMP_DIR/source/home/git_for_coverage/git_fosip/fosip/fosip/nbm/source/comp/ssh/ssh/openssh/src/auth-passwd.c.func-sort-c.html"
+    printf 'coverage-source\n' >"$TMP_DIR/source/password.c.html"
+    printf 'coverage-source\n' >"$TMP_DIR/source/ssh/auth.c.html"
+    printf 'coverage-source\n' >"$TMP_DIR/source/secret.c.html"
+    printf 'coverage-source\n' >"$TMP_DIR/source/private_key_parser.cpp.html"
+    printf 'coverage-index\n' >"$TMP_DIR/source/coverage/index.html"
+    cat >"$TMP_DIR/source/reports/.source_cache/report-v2/meta.json" <<'SIDECAR'
+{"schema_version":2,"report_mode":"VNEXT_ARTIFACT_READY","total_lines":2,"function_ranges":[]}
+SIDECAR
+    printf 'not-exportable\n' >"$TMP_DIR/sensitive/etc/passwd"
+    printf 'not-exportable\n' >"$TMP_DIR/sensitive/root/.ssh/id_rsa"
+    printf 'not-exportable\n' >"$TMP_DIR/sensitive/server.key"
+    cat >"$TMP_DIR/nginx.dump" <<'NGINX'
+server {
+    listen 80;
+    location /coverage/ {
+        alias /fixture/legacy/onesensor/;
+        proxy_pass http://127.0.0.1:9528;
+    }
+}
+NGINX
+    "$PYTHON_BIN" "$HELPER" inventory "$TMP_DIR/source" \
+        "$TMP_DIR/evidence/source-before.json" >/dev/null ||
+        die "synthetic inventory failed"
+    "$PYTHON_BIN" "$HELPER" copy "$TMP_DIR/source" "$TMP_DIR/destination" >/dev/null ||
+        die "synthetic copy failed"
+    "$PYTHON_BIN" "$HELPER" inventory "$TMP_DIR/destination" \
+        "$TMP_DIR/evidence/destination.json" >/dev/null ||
+        die "synthetic destination inventory failed"
+    "$PYTHON_BIN" "$HELPER" compare \
+        "$TMP_DIR/evidence/source-before.json" \
+        "$TMP_DIR/evidence/destination.json" >/dev/null ||
+        die "synthetic byte inventory comparison failed"
+    "$PYTHON_BIN" "$HELPER" nginx "$TMP_DIR/nginx.dump" \
+        "/fixture/legacy/onesensor" "$EXPECTED_PROXY" \
+        "$TMP_DIR/evidence/nginx.txt" >"$TMP_DIR/evidence/nginx.stdout" ||
+        die "synthetic nginx parsing failed"
+    if ! grep -F -q 'PROXY_PASS_MATCH=MATCH' "$TMP_DIR/evidence/nginx.stdout"; then
+        die "synthetic proxy_pass regression did not match"
+    fi
+    if ! grep -F -q 'COVERAGE_STATIC_ROOT_MATCH=MATCH' \
+        "$TMP_DIR/evidence/nginx.stdout"; then
+        die "synthetic served-root regression did not match"
+    fi
+    "$PYTHON_BIN" "$HELPER" sidecar "$TMP_DIR/source" \
+        "$TMP_DIR/evidence/sidecar.txt" >"$TMP_DIR/evidence/sidecar.stdout" ||
+        die "synthetic .source_cache/meta.json scan failed"
+    if ! grep -F -q 'SIDECAR_SCHEMA_V2_COUNT=1' \
+        "$TMP_DIR/evidence/sidecar.txt"; then
+        die "synthetic schema v2 Sidecar regression did not match"
+    fi
+    if ! grep -F -q 'SIDECAR_V2_TOTAL_LINES_COUNT=1' \
+        "$TMP_DIR/evidence/sidecar.txt"; then
+        die "synthetic total_lines Sidecar regression did not match"
+    fi
+    if "$PYTHON_BIN" "$HELPER" inventory "$TMP_DIR/sensitive" \
+        "$TMP_DIR/evidence/sensitive.json" >/dev/null 2>&1; then
+        die "synthetic sensitive-path guard did not fail closed"
+    fi
+    printf 'BASELINE_EXPORT_SELF_TEST=PASS\n'
+    printf 'NGINX_PROXY_PASS_REGRESSION=127.0.0.1:9528 -> MATCH\n'
+    printf 'SIDECAR_META_JSON_REGRESSION=reports/.source_cache/**/meta.json -> PASS\n'
+    printf 'SENSITIVE_PATH_REGRESSION=coverage source artifacts allowed, secret material blocked\n'
+    printf 'BYTE_INVENTORY_REGRESSION=PASS\n'
+    exit 0
+fi
+
+HOST_SHORT="$(hostname -s 2>/dev/null || true)"
+[ "$HOST_SHORT" = "$EXPECTED_HOST" ] ||
+    die "host identity is not vfoswind"
+
+[ -d "$EXPECTED_LEGACY_ROOT" ] && [ ! -L "$EXPECTED_LEGACY_ROOT" ] ||
+    die "legacy Served Root is missing or linked"
+[ -d "$EXPECTED_APP_ROOT" ] && [ ! -L "$EXPECTED_APP_ROOT" ] ||
+    die "canonical application root is missing or linked"
+
+LEGACY_REAL="$("$PYTHON_BIN" "$HELPER" path "$EXPECTED_LEGACY_ROOT" 2>/dev/null || true)"
+APP_REAL="$("$PYTHON_BIN" "$HELPER" path "$EXPECTED_APP_ROOT" 2>/dev/null || true)"
+[ "$LEGACY_REAL" = "$EXPECTED_LEGACY_ROOT" ] ||
+    die "legacy Served Root realpath does not match canonical topology"
+[ "$APP_REAL" = "$EXPECTED_APP_ROOT" ] ||
+    die "application root realpath does not match canonical topology"
+[ -r "$EXPECTED_LEGACY_ROOT" ] && [ -x "$EXPECTED_LEGACY_ROOT" ] ||
+    die "operator cannot read/traverse legacy Served Root"
+[ -r "$EXPECTED_APP_ROOT" ] && [ -x "$EXPECTED_APP_ROOT" ] ||
+    die "operator cannot read/traverse canonical application root"
+
+mkdir -p "$EXPECTED_EXPORT_PARENT" ||
+    die "cannot create the isolated baseline export parent"
+[ -d "$EXPECTED_EXPORT_PARENT" ] && [ ! -L "$EXPECTED_EXPORT_PARENT" ] ||
+    die "baseline export parent is unsafe"
+
+STAMP="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || true)"
+[ -n "$STAMP" ] || die "cannot obtain UTC collection timestamp"
+ATTEMPT_ID="r8-legacy-baseline-e9fcc837-$STAMP-$$"
+STAGING_DIR="$EXPECTED_EXPORT_PARENT/.r8-baseline-export.$ATTEMPT_ID"
+FINAL_DIR="$EXPECTED_EXPORT_PARENT/$ATTEMPT_ID"
+[ ! -e "$FINAL_DIR" ] || die "attempt output directory already exists"
+mkdir "$STAGING_DIR" ||
+    die "cannot create private export staging directory"
+mkdir "$STAGING_DIR/legacy-flat-root" "$STAGING_DIR/adoption" \
+    "$STAGING_DIR/adoption-source" "$STAGING_DIR/evidence" ||
+    die "cannot create export staging layout"
+
+REPORT="$STAGING_DIR/baseline-export.txt"
+{
+    printf 'FOS R8 LEGACY BASELINE EXPORT\n'
+    printf 'EXPORT_TOOL_ID=%s\n' "$EXPORT_TOOL_ID"
+    printf 'COLLECTION_TIMESTAMP_UTC=%s\n' "$STAMP"
+    printf 'HOST_IDENTITY=%s\n' "$HOST_SHORT"
+    printf 'TARGET_BASELINE_SOURCE_SHA=%s\n' "$EXPECTED_BASELINE_SHA"
+    printf 'CANONICAL_APPLICATION_ROOT=%s\n' "$EXPECTED_APP_ROOT"
+    printf 'CANONICAL_LEGACY_SERVED_ROOT=%s\n' "$EXPECTED_LEGACY_ROOT"
+    printf 'EXPECTED_PUBLISH_ROOT=%s\n' "$EXPECTED_PUBLISH_ROOT"
+    printf 'READ_ONLY_PRODUCTION_MUTATION=NONE\n'
+    printf 'CURRENT_ADOPTION_STATE=EXPECTED_PRE_ADOPTION\n'
+} >"$REPORT"
+
+printf 'PRODUCTION_TOPOLOGY=PASS\n' >>"$REPORT"
+printf 'APPLICATION_ROOT=PASS %s\n' "$EXPECTED_APP_ROOT" >>"$REPORT"
+printf 'LEGACY_SERVED_ROOT=PASS %s\n' "$EXPECTED_LEGACY_ROOT" >>"$REPORT"
+{
+    printf 'OPERATOR_UID='
+    id -u 2>/dev/null || printf 'NOT_VERIFIED'
+    printf '\nOPERATOR_GID='
+    id -g 2>/dev/null || printf 'NOT_VERIFIED'
+    printf '\nOPERATOR_IDENTITY='
+    id -un 2>/dev/null || printf 'NOT_VERIFIED'
+    printf '\nEFFECTIVE_IDENTITY='
+    id 2>/dev/null || printf 'NOT_VERIFIED'
+    printf '\n'
+} >"$STAGING_DIR/evidence/operator-identity.txt"
+printf 'OPERATOR_PRIVILEGE_EVIDENCE=COLLECTED\n' >>"$REPORT"
+
+SOURCE_BEFORE="$TMP_DIR/source-before.json"
+SOURCE_AFTER="$TMP_DIR/source-after.json"
+RAW_COPY="$TMP_DIR/raw-copy.json"
+ADOPTION_COPY="$TMP_DIR/adoption-copy.json"
+IDENTITY_RESULT="$TMP_DIR/identity-result.json"
+
+"$PYTHON_BIN" "$HELPER" inventory "$EXPECTED_LEGACY_ROOT" \
+    "$SOURCE_BEFORE" >/dev/null ||
+    die "legacy Served Root inventory before copy failed"
+"$PYTHON_BIN" "$HELPER" space "$EXPECTED_EXPORT_PARENT" \
+    "$SOURCE_BEFORE" >>"$REPORT" ||
+    die "insufficient free space for immutable baseline export"
+"$PYTHON_BIN" "$HELPER" identity "$EXPECTED_LEGACY_ROOT/release_identity.json" \
+    "$EXPECTED_LEGACY_ROOT" "$EXPECTED_BASELINE_SHA" \
+    "$STAGING_DIR/adoption/release_identity.json" \
+    "$IDENTITY_RESULT" >>"$REPORT" ||
+    die "legacy release identity is not an exact verified baseline"
+cp "$EXPECTED_LEGACY_ROOT/release_identity.json" \
+    "$STAGING_DIR/adoption/release_identity.json" ||
+    die "exact release identity copy failed"
+"$PYTHON_BIN" "$HELPER" copy "$EXPECTED_LEGACY_ROOT" \
+    "$STAGING_DIR/legacy-flat-root" >/dev/null ||
+    die "complete legacy Served Root copy failed"
+"$PYTHON_BIN" "$HELPER" copy "$EXPECTED_LEGACY_ROOT" \
+    "$STAGING_DIR/adoption-source" --skip-controls >/dev/null ||
+    die "canonical adoption-source copy failed"
+"$PYTHON_BIN" "$HELPER" inventory "$EXPECTED_LEGACY_ROOT" \
+    "$SOURCE_AFTER" >/dev/null ||
+    die "legacy Served Root inventory after copy failed"
+"$PYTHON_BIN" "$HELPER" inventory "$STAGING_DIR/legacy-flat-root" \
+    "$RAW_COPY" >/dev/null ||
+    die "exported legacy Served Root inventory failed"
+"$PYTHON_BIN" "$HELPER" inventory "$STAGING_DIR/adoption-source" \
+    "$ADOPTION_COPY" >/dev/null ||
+    die "exported adoption-source inventory failed"
+"$PYTHON_BIN" "$HELPER" compare "$SOURCE_BEFORE" "$SOURCE_AFTER" \
+    >>"$REPORT" || die "legacy Served Root changed during export"
+"$PYTHON_BIN" "$HELPER" compare "$SOURCE_BEFORE" "$RAW_COPY" \
+    >>"$REPORT" || die "exported legacy bytes do not match source bytes"
+
+cp "$SOURCE_BEFORE" "$STAGING_DIR/evidence/inventory-source-before.json"
+cp "$SOURCE_AFTER" "$STAGING_DIR/evidence/inventory-source-after.json"
+cp "$RAW_COPY" "$STAGING_DIR/evidence/inventory-legacy-flat-root.json"
+cp "$ADOPTION_COPY" "$STAGING_DIR/evidence/inventory-adoption-source.json"
+cp "$IDENTITY_RESULT" "$STAGING_DIR/evidence/identity-verification.json"
+"$PYTHON_BIN" "$HELPER" sidecar "$EXPECTED_LEGACY_ROOT" \
+    "$STAGING_DIR/evidence/sidecar-summary.txt" >>"$REPORT" ||
+    die "canonical reports/.source_cache/**/meta.json scan failed"
+printf 'REPORT_BYTES=PASS\n' >>"$REPORT"
+
+NGINX_BIN="$(command -v nginx 2>/dev/null || true)"
+[ -n "$NGINX_BIN" ] || die "nginx executable is unavailable"
+"$NGINX_BIN" -T >"$TMP_DIR/nginx.dump" 2>"$TMP_DIR/nginx.stderr"
+NGINX_RC=$?
+[ "$NGINX_RC" -eq 0 ] ||
+    die "nginx -T failed; effective Served Root is not verified"
+"$PYTHON_BIN" "$HELPER" nginx "$TMP_DIR/nginx.dump" \
+    "$EXPECTED_LEGACY_ROOT" "$EXPECTED_PROXY" \
+    "$STAGING_DIR/evidence/nginx-summary.txt" >>"$REPORT" ||
+    die "effective /coverage/ Nginx root or proxy_pass is not verified"
+printf 'NGINX_CONFIG=PASS\n' >>"$REPORT"
+
+SYSTEMCTL_BIN="$(command -v systemctl 2>/dev/null || true)"
+if [ -n "$SYSTEMCTL_BIN" ]; then
+    "$SYSTEMCTL_BIN" show onesensor-api.service \
+        --property=Id,LoadState,ActiveState,SubState,UnitFileState,FragmentPath,User,Group,WorkingDirectory,ExecStart,EnvironmentFiles,Environment,MainPID \
+        >"$TMP_DIR/systemd.show" 2>"$TMP_DIR/systemd.stderr"
+    SYSTEMD_RC=$?
+else
+    SYSTEMD_RC=127
+fi
+[ "$SYSTEMD_RC" -eq 0 ] ||
+    die "onesensor-api.service read-only systemd metadata is unavailable"
+"$PYTHON_BIN" "$HELPER" systemd "$TMP_DIR/systemd.show" \
+    "$STAGING_DIR/evidence/systemd-summary.txt" >>"$REPORT" ||
+    die "systemd metadata sanitization failed"
+printf 'SYSTEMD=PASS\n' >>"$REPORT"
+
+"$PYTHON_BIN" "$HELPER" db "$TMP_DIR/systemd.show" \
+    "$STAGING_DIR/evidence/database-readonly-summary.txt" >>"$REPORT" ||
+    die "database read-only evidence collector failed"
+printf 'DATABASE_QUERY_SCOPE=SELECT_AND_INFORMATION_SCHEMA_ONLY\n' >>"$REPORT"
+
+if command -v git >/dev/null 2>&1 && [ -d "$EXPECTED_APP_ROOT/.git" ]; then
+    APP_GIT_SHA="$(cd "$EXPECTED_APP_ROOT" &&
+        git rev-parse HEAD 2>/dev/null || true)"
+    APP_GIT_TREE="$(cd "$EXPECTED_APP_ROOT" &&
+        git rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
+    (cd "$EXPECTED_APP_ROOT" &&
+        git status --porcelain) >"$TMP_DIR/git.status" 2>/dev/null || true
+    {
+        printf 'APP_GIT_SHA='
+        if [ -n "$APP_GIT_SHA" ]; then printf '%s\n' "$APP_GIT_SHA"; else printf 'NOT_VERIFIED\n'; fi
+        printf 'APP_GIT_TREE_SHA='
+        if [ -n "$APP_GIT_TREE" ]; then printf '%s\n' "$APP_GIT_TREE"; else printf 'NOT_VERIFIED\n'; fi
+    } >"$STAGING_DIR/evidence/application-git-summary.txt"
+    "$PYTHON_BIN" "$HELPER" sanitize "$TMP_DIR/git.status" \
+        "$STAGING_DIR/evidence/application-git-status.txt" ||
+        die "application Git status sanitization failed"
+    if [ "$APP_GIT_SHA" = "$EXPECTED_BASELINE_SHA" ]; then
+        printf 'APPLICATION_GIT_BASELINE=PASS\n' >>"$REPORT"
+    else
+        printf 'APPLICATION_GIT_BASELINE=NOT_VERIFIED\n' >>"$REPORT"
+    fi
+else
+    printf 'APPLICATION_GIT_BASELINE=NOT_VERIFIED\n' >>"$REPORT"
+fi
+
+if command -v ss >/dev/null 2>&1; then
+    ss -ltn >"$TMP_DIR/listeners" 2>/dev/null || true
+    "$PYTHON_BIN" "$HELPER" sanitize "$TMP_DIR/listeners" \
+        "$STAGING_DIR/evidence/listener-summary.txt" || true
+else
+    printf 'ss=NOT_VERIFIED\n' >"$STAGING_DIR/evidence/listener-summary.txt"
+fi
+printf 'LOOPBACK_API_LISTENER_EVIDENCE=COLLECTED\n' >>"$REPORT"
+
+if command -v ps >/dev/null 2>&1; then
+    ps -eo pid,user,comm,args >"$TMP_DIR/processes" 2>/dev/null || true
+    "$PYTHON_BIN" "$HELPER" sanitize "$TMP_DIR/processes" \
+        "$STAGING_DIR/evidence/process-summary.txt" || true
+else
+    printf 'ps=NOT_VERIFIED\n' >"$STAGING_DIR/evidence/process-summary.txt"
+fi
+printf 'API_PROCESS_EVIDENCE=COLLECTED\n' >>"$REPORT"
+
+if [ -L "$EXPECTED_PUBLISH_ROOT/CURRENT" ]; then
+    [ -e "$EXPECTED_PUBLISH_ROOT/CURRENT" ] ||
+        die "CURRENT is a dangling symlink; immutable identity is unknown"
+    CURRENT_REAL="$("$PYTHON_BIN" "$HELPER" path \
+        "$EXPECTED_PUBLISH_ROOT/CURRENT" 2>/dev/null || true)"
+    [ -n "$CURRENT_REAL" ] && [ -d "$CURRENT_REAL" ] ||
+        die "CURRENT target is not a real release directory"
+    if [ -f "$EXPECTED_PUBLISH_ROOT/CURRENT/release_identity.json" ]; then
+        "$PYTHON_BIN" "$HELPER" info \
+            "$EXPECTED_PUBLISH_ROOT/CURRENT/release_identity.json" \
+            "$TMP_DIR/current-identity-info.json" >"$TMP_DIR/current-identity-info.stdout" ||
+            die "current identity evidence failed"
+    fi
+    {
+        printf 'PUBLISH_CURRENT=PREPARATION_REQUIRED\n'
+        printf 'CURRENT_REALPATH='
+        if [ -n "$CURRENT_REAL" ]; then printf '%s\n' "$CURRENT_REAL"; else printf 'NOT_VERIFIED\n'; fi
+        if [ -f "$EXPECTED_PUBLISH_ROOT/CURRENT/release_identity.json" ]; then
+            cat "$TMP_DIR/current-identity-info.stdout"
+        else
+            printf 'CURRENT_IDENTITY_SHA256=NOT_VERIFIED\n'
+        fi
+    } >"$STAGING_DIR/evidence/current-summary.txt"
+    printf 'PUBLISH_CURRENT=PREPARATION_REQUIRED\n' >>"$REPORT"
+elif [ -e "$EXPECTED_PUBLISH_ROOT/CURRENT" ]; then
+    {
+        printf 'PUBLISH_CURRENT=PREPARATION_REQUIRED\n'
+        printf 'CURRENT_REALPATH='
+        CURRENT_REAL="$("$PYTHON_BIN" "$HELPER" path \
+            "$EXPECTED_PUBLISH_ROOT/CURRENT" 2>/dev/null || true)"
+        if [ -n "$CURRENT_REAL" ]; then printf '%s\n' "$CURRENT_REAL"; else printf 'NOT_VERIFIED\n'; fi
+        printf 'CURRENT_IDENTITY_SHA256=NOT_VERIFIED\n'
+    } >"$STAGING_DIR/evidence/current-summary.txt"
+    printf 'PUBLISH_CURRENT=PREPARATION_REQUIRED\n' >>"$REPORT"
+else
+    printf 'PUBLISH_CURRENT=EXPECTED_PRE_ADOPTION\n' \
+        >"$STAGING_DIR/evidence/current-summary.txt"
+    printf 'PUBLISH_CURRENT=EXPECTED_PRE_ADOPTION\n' >>"$REPORT"
+fi
+
+META="$TMP_DIR/metadata.json"
+"$PYTHON_BIN" - "$META" "$ATTEMPT_ID" "$STAMP" "$HOST_SHORT" "$TOOL_INFO" \
+    "$SOURCE_BEFORE" "$SOURCE_AFTER" "$RAW_COPY" "$ADOPTION_COPY" \
+    "$IDENTITY_RESULT" "$STAGING_DIR/evidence/nginx-summary.txt" \
+    "$STAGING_DIR/evidence/systemd-summary.txt" \
+    "$STAGING_DIR/evidence/database-readonly-summary.txt" <<'PYMETA'
+from __future__ import print_function
+import hashlib
+import json
+import sys
+
+
+def load(path):
+    with open(path, "r", encoding="utf-8") as stream:
+        return json.load(stream)
+
+
+def key_values(path):
+    result = {}
+    with open(path, "r", encoding="utf-8", errors="replace") as stream:
+        for line in stream:
+            if "=" in line:
+                key, value = line.rstrip("\n").split("=", 1)
+                result[key] = value
+    return result
+
+
+output = {
+    "attempt_id": sys.argv[2],
+    "collection_timestamp_utc": sys.argv[3],
+    "hostname": sys.argv[4],
+    "export_tool_id": "fos-r8-legacy-baseline-export-v1",
+    "tool_filename": load(sys.argv[5])["filename"],
+    "tool_sha256": load(sys.argv[5])["sha256"],
+    "tool_size": load(sys.argv[5])["size"],
+    "expected_baseline_sha": "e9fcc837a1ac9847f3966fc8ddb2aed92ca473fc",
+    "legacy_root": "/home/zcyu/coverage/export0810/onesensor",
+    "resolved_served_root": "/home/zcyu/coverage/export0810/onesensor",
+    "application_root": "/home/zcyu/coverage/onesensor_code-coverage_tool",
+    "publish_root": "/home/zcyu/coverage_published",
+    "source_before_tree_sha256": load(sys.argv[6])["tree_sha256"],
+    "source_after_tree_sha256": load(sys.argv[7])["tree_sha256"],
+    "legacy_flat_export_tree_sha256": load(sys.argv[8])["tree_sha256"],
+    "adoption_source_tree_sha256": load(sys.argv[9])["tree_sha256"],
+    "identity_evidence": load(sys.argv[10]),
+    "resolved_nginx_config_paths": key_values(sys.argv[11]).get(
+        "NGINX_CONFIG_PATHS", "NOT_VERIFIED"
+    ),
+    "resolved_nginx_config_sha256": key_values(sys.argv[11]).get(
+        "NGINX_DUMP_SHA256", "NOT_VERIFIED"
+    ),
+    "nginx_summary_sha256": __import__("hashlib").sha256(
+        open(sys.argv[11], "rb").read()).hexdigest(),
+    "systemd_summary_sha256": __import__("hashlib").sha256(
+        open(sys.argv[12], "rb").read()).hexdigest(),
+    "database_summary_sha256": __import__("hashlib").sha256(
+        open(sys.argv[13], "rb").read()).hexdigest(),
+    "legacy_git_tree_sha": "NOT_CLAIMED",
+    "artifact_role": "validation_input_baseline_only",
+    "production_publishable": False,
+    "project_name": "FOS_V6R2",
+    "sanitization": {
+        "status": "PASS",
+        "secret_values_copied": "NONE",
+        "configuration_secrets_exported": "NONE",
+        "sensitive_values_in_evidence": "REDACTED",
+        "legacy_payload_policy": "path-rejected-and-byte-bound",
+    },
+    "status": "PASS",
+}
+with open(sys.argv[1], "w", encoding="utf-8") as stream:
+    json.dump(output, stream, ensure_ascii=False, indent=2, sort_keys=True)
+    stream.write("\n")
+PYMETA
+[ -s "$META" ] || die "export metadata generation failed"
+cp "$META" "$STAGING_DIR/evidence/export-metadata.json"
+
+printf 'STATUS=PASS\n' >>"$REPORT"
+printf 'COMPLETION_MARKER=%s\n' "$COMPLETION_MARKER_NAME" >>"$REPORT"
+"$PYTHON_BIN" "$HELPER" manifest "$STAGING_DIR" \
+    "$STAGING_DIR/baseline-export-manifest.json" "$META" \
+    >"$TMP_DIR/manifest.stdout" || die "deterministic export manifest generation failed"
+EXPORT_TREE_SHA="$(sed -n 's/^EXPORT_TREE_SHA256=//p' "$TMP_DIR/manifest.stdout")"
+"$PYTHON_BIN" "$HELPER" info "$STAGING_DIR/baseline-export-manifest.json" \
+    "$TMP_DIR/manifest-info.json" >"$TMP_DIR/manifest-info.stdout" ||
+    die "manifest identity generation failed"
+MANIFEST_SHA="$(sed -n 's/^FILE_SHA256=//p' "$TMP_DIR/manifest-info.stdout")"
+[ -n "$EXPORT_TREE_SHA" ] && [ -n "$MANIFEST_SHA" ] ||
+    die "manifest identity fields are incomplete"
+printf '%s  baseline-export-manifest.json\n' "$MANIFEST_SHA" \
+    >"$STAGING_DIR/baseline-export-manifest.sha256" ||
+    die "manifest digest sidecar write failed"
+printf 'FOS_R8_BASELINE_EXPORT_COMPLETE\n' >"$STAGING_DIR/$COMPLETION_MARKER_NAME" ||
+    die "completion marker write failed"
+
+mv "$STAGING_DIR" "$FINAL_DIR" ||
+    die "cannot atomically publish the completed isolated export"
+STAGING_DIR=""
+
+printf 'BASELINE_EXPORT=PASS\n'
+printf 'EXPORT_DIR=%s\n' "$FINAL_DIR"
+printf 'EXPORT_MANIFEST=%s\n' "$FINAL_DIR/baseline-export-manifest.json"
+printf 'EXPORT_MANIFEST_SHA256=%s\n' "$MANIFEST_SHA"
+printf 'EXPORT_TREE_SHA256=%s\n' "$EXPORT_TREE_SHA"
+printf 'BASELINE_SOURCE_SHA=%s\n' "$EXPECTED_BASELINE_SHA"
+printf 'PRODUCTION_MUTATION=NONE\n'
+printf 'NEXT_ACTION=RETURN_COMPLETE_EXPORT_DIRECTORY\n'
