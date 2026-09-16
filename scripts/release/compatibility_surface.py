@@ -61,6 +61,13 @@ _DB_SENSITIVE_CONTENT = re.compile(
     r"\b(?:select|insert|update|delete)\s+.+\bfrom\b|"
     r"\bcursor\s*\(|\bconnect\s*\()"
 )
+_DB_SENSITIVE_CONTENT_EXCLUDED_PATHS = (
+    # These files describe or execute disposable compatibility checks.  SQL
+    # tokens in them are test inputs, not production database operations.
+    "scripts/release/compatibility_surface.py",
+    "scripts/release/local_compatibility_gate.py",
+    "scripts/release/local_release_gate.py",
+)
 
 
 def _exact_sha(value, label):
@@ -120,6 +127,12 @@ def _is_db_sensitive_path(path):
         basename in _DB_SENSITIVE_FILENAMES
 
 
+def _is_db_sensitive_content_path(path):
+    path = str(path or "").replace(os.sep, "/")
+    return _is_production_python(path) and \
+        path not in _DB_SENSITIVE_CONTENT_EXCLUDED_PATHS
+
+
 def _path_diff(repo_root, baseline_sha, source_sha, path):
     return _git(
         repo_root, "diff", "--unified=0", baseline_sha, source_sha,
@@ -143,9 +156,11 @@ def classify_compatibility_surface(repo_root, source_sha, baseline_sha):
     python_paths = [path for path in changed_paths if _is_production_python(path)]
     db_paths = []
     for path in changed_paths:
-        if _is_db_sensitive_path(path) or _DB_SENSITIVE_CONTENT.search(
+        if _is_db_sensitive_path(path) or (
+                _is_db_sensitive_content_path(path) and
+                _DB_SENSITIVE_CONTENT.search(
                 _path_diff(repo_root, baseline_sha, source_sha, path)
-        ):
+                )):
             db_paths.append(path)
 
     return {
@@ -166,4 +181,3 @@ def classify_compatibility_surface(repo_root, source_sha, baseline_sha):
             "production_database_execution": bool(db_paths),
         },
     }
-

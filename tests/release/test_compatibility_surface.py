@@ -116,6 +116,41 @@ class CompatibilitySurfaceTest(unittest.TestCase):
         self.assertEqual(result["python"]["status"], "PRODUCTION_PYTHON_CHANGED")
         self.assertEqual(result["mariadb"]["status"], "DB_SENSITIVE_CHANGED")
 
+    def test_compatibility_tool_sql_is_not_production_db_surface(self):
+        from scripts.release.compatibility_surface import (
+            classify_compatibility_surface,
+        )
+
+        root, baseline, source = self._repo(
+            {"scripts/release/local_compatibility_gate.py":
+             "def check():\n    return True\n"},
+            {"scripts/release/local_compatibility_gate.py":
+             "def check():\n    return 'GRANT SELECT'\n"},
+        )
+        try:
+            result = classify_compatibility_surface(root, source, baseline)
+        finally:
+            import shutil
+            shutil.rmtree(root)
+        self.assertEqual(result["python"]["status"], "PRODUCTION_PYTHON_CHANGED")
+        self.assertEqual(result["mariadb"]["status"], "NOT_DB_SENSITIVE")
+
+    def test_documentation_about_mariadb_is_not_db_surface(self):
+        from scripts.release.compatibility_surface import (
+            classify_compatibility_surface,
+        )
+
+        root, baseline, source = self._repo(
+            {"docs/release.md": "baseline\n"},
+            {"docs/release.md": "MariaDB GRANT/REVOKE compatibility notes\n"},
+        )
+        try:
+            result = classify_compatibility_surface(root, source, baseline)
+        finally:
+            import shutil
+            shutil.rmtree(root)
+        self.assertEqual(result["mariadb"]["status"], "NOT_DB_SENSITIVE")
+
 
 if __name__ == "__main__":
     unittest.main()
