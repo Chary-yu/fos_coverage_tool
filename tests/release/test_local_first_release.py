@@ -103,6 +103,22 @@ class LocalFirstReleaseTest(unittest.TestCase):
         identity["worktree_clean"] = True
         self.assertFalse(_source_identity_ready(identity, "c" * 40))
 
+    def test_deferred_compatibility_is_staging_only(self):
+        from scripts.release.local_release_gate import compatibility_scope
+
+        result = compatibility_scope({
+            "status": "DEFERRED_TO_TARGET_RUNTIME",
+            "PYTHON36_COMPAT": "DEFERRED_TO_TARGET_RUNTIME",
+            "MARIADB55_COMPAT": "NOT_APPLICABLE",
+        })
+        self.assertTrue(result["isolated_candidate_staging_allowed"])
+        self.assertFalse(result["publication_allowed"])
+        self.assertFalse(result["cutover_allowed"])
+        self.assertEqual(
+            result["required_next_step"],
+            "READY_FOR_MANUAL_VFOS_COMPATIBILITY_PREFLIGHT",
+        )
+
     def test_local_release_gate_removes_hosted_credentials_from_child_processes(self):
         from scripts.release.local_release_gate import _clean_env
 

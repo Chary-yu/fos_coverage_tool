@@ -214,8 +214,9 @@ def validate(repo_root, tool_path="", bundle_path=""):
         "local_release_gate", "evidence_manifest.json", "SHA256SUMS",
         "production_mutation", "targeted_tests", "compatibility",
     )) and all(token in compatibility_gate for token in (
-        "PYTHON36_IMAGE", "MARIADB55_IMAGE", "--network", "NOT_VERIFIED",
-        "PYTHON36_COMPAT", "MARIADB55_COMPAT",
+        "PYTHON36_IMAGE", "MARIADB55_IMAGE", "--network",
+        "PYTHON36_COMPAT", "MARIADB55_COMPAT", "COMPATIBILITY_STATUSES",
+        "NOT_APPLICABLE", "DEFERRED_TO_TARGET_RUNTIME",
     )) and all(token in authority for token in (
         "PRODUCTION_RELEASE_AUTHORITY", "GITHUB_ACTIONS_REQUIRED",
         "GITHUB_API_REQUIRED_FOR_READINESS", "PROTECTED_BUILDER_NEW_PUBLICATION_ALLOWED",

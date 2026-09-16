@@ -42,6 +42,9 @@ TEST_MODULES = (
 SHA40 = re.compile(r"^[0-9a-fA-F]{40}$")
 SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 SAFE_SESSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+COMPATIBILITY_ALLOWED_STATUSES = (
+    "PASS", "NOT_APPLICABLE", "DEFERRED_TO_TARGET_RUNTIME",
+)
 FORBIDDEN_RUNTIME_PATTERNS = (
     (r"\bssh(?:\s|$)", "ssh"),
     (r"\bscp(?:\s|$)", "scp"),
@@ -219,6 +222,37 @@ def _source_identity_ready(identity, requested_sha):
         SHA40.fullmatch(tree_sha) and identity.get("worktree_clean") is True and
         identity.get("clean_checkout") is True
     )
+
+
+def compatibility_scope(payload):
+    """Return the release scope allowed by compatibility evidence.
+
+    A deferred target-runtime check is explicitly sufficient for isolated
+    Candidate staging only.  It never silently becomes a publication or
+    cutover decision.
+    """
+    payload = dict(payload or {})
+    statuses = (
+        str(payload.get("PYTHON36_COMPAT") or ""),
+        str(payload.get("MARIADB55_COMPAT") or ""),
+    )
+    invalid = [status for status in statuses
+               if status not in COMPATIBILITY_ALLOWED_STATUSES + ("FAIL",)]
+    failed = "FAIL" in statuses or invalid
+    deferred = "DEFERRED_TO_TARGET_RUNTIME" in statuses
+    staging_allowed = not bool(failed)
+    publication_allowed = staging_allowed and not deferred
+    return {
+        "isolated_candidate_staging_allowed": staging_allowed,
+        "publication_allowed": publication_allowed,
+        "cutover_allowed": publication_allowed,
+        "deferred": deferred,
+        "invalid_statuses": invalid,
+        "required_next_step": (
+            "READY_FOR_MANUAL_VFOS_COMPATIBILITY_PREFLIGHT"
+            if deferred else ""
+        ),
+    }
 
 
 def _environment_identity(repo_root):
@@ -430,7 +464,7 @@ def verify_evidence_manifest(root, manifest_path=None):
         return False
 
 
-def _make_release_input_manifest(source, output, session_id):
+def _make_release_input_manifest(source, output, session_id, baseline_sha):
     from scripts.release.release_input_manifest import (
         build_release_input_manifest, write_release_input_manifest,
     )
@@ -445,7 +479,7 @@ def _make_release_input_manifest(source, output, session_id):
         "tooling_tree_sha": source["tree_sha"],
         "tooling_bundle_sha256": source["tooling_bundle_sha256"],
         "production_host": "local-validation",
-        "baseline_commit_sha": source["head_sha"],
+        "baseline_commit_sha": baseline_sha or source["head_sha"],
         "baseline_attempt_id": "local-validation-baseline",
         "baseline_tree_sha256": digest_literal("local-validation-tree"),
         "baseline_manifest_sha256": digest_literal("local-validation-manifest"),
@@ -465,7 +499,8 @@ def _make_release_input_manifest(source, output, session_id):
     return path, digest
 
 
-def run_gate(repo_root, source_sha, output, session_id="", test_modules=None):
+def run_gate(repo_root, source_sha, output, session_id="", test_modules=None,
+             baseline_sha=""):
     """Run all local release checks and return the machine-readable decision."""
     repo_root = os.path.abspath(repo_root)
     source_sha = str(source_sha or "").strip().lower()
@@ -474,12 +509,15 @@ def run_gate(repo_root, source_sha, output, session_id="", test_modules=None):
     session_id = session_id or "local-{}".format(source_sha[:12])
     if not SAFE_SESSION.fullmatch(session_id):
         raise ValueError("session_id contains unsafe characters")
+    baseline_sha = str(baseline_sha or source_sha).strip().lower()
+    if not SHA40.fullmatch(baseline_sha) or baseline_sha == "0" * 40:
+        raise ValueError("baseline_sha must be an exact non-zero commit SHA")
     output = _safe_output(repo_root, output)
     source = _source_identity(repo_root, source_sha, output)
     _atomic_json(os.path.join(output, "environment_identity.json"),
                  _environment_identity(repo_root))
     manifest_path, manifest_sha = _make_release_input_manifest(
-        source, output, session_id
+        source, output, session_id, baseline_sha
     )
     from scripts.release.generate_flat_production_candidate_operator import generate
     operator_path = os.path.join(output, "offline_operator.txt")
@@ -528,7 +566,9 @@ def run_gate(repo_root, source_sha, output, session_id="", test_modules=None):
         repo_root,
         (sys.executable, "scripts/release/local_compatibility_gate.py",
          "--repo-root", repo_root, "--output",
-         os.path.join(output, "compatibility_tests.json")),
+         os.path.join(output, "compatibility_tests.json"),
+         "--source-sha", source_sha,
+         "--baseline-sha", baseline_sha),
         os.path.join(output, "compatibility_gate_command.json"),
         "local Python 3.6/MariaDB 5.5 compatibility",
     )
@@ -538,6 +578,11 @@ def run_gate(repo_root, source_sha, output, session_id="", test_modules=None):
             compatibility_payload = json.load(stream)
     except (OSError, ValueError, TypeError):
         compatibility_payload = {"status": "FAIL"}
+    if isinstance(compatibility_payload.get("compatibility_surface"), dict):
+        _atomic_json(
+            os.path.join(output, "compatibility_surface.json"),
+            compatibility_payload["compatibility_surface"],
+        )
     regressions = _script_record(
         repo_root,
         (sys.executable, "scripts/validate_release_orchestration.py",
@@ -565,9 +610,9 @@ def run_gate(repo_root, source_sha, output, session_id="", test_modules=None):
             not security.get("status") == "PASS" or not regressions["passed"] or \
             not regression_suite["passed"]:
         local_status = "FAIL"
-    if compatibility_payload.get("status") != "PASS":
-        local_status = "NOT_VERIFIED" if compatibility_payload.get("status") == \
-            "NOT_VERIFIED" else "FAIL"
+    compatibility_scope_result = compatibility_scope(compatibility_payload)
+    if not compatibility_scope_result["isolated_candidate_staging_allowed"]:
+        local_status = "FAIL"
     gate = {
         "schema_version": 1,
         "local_release_gate": local_status,
@@ -579,6 +624,7 @@ def run_gate(repo_root, source_sha, output, session_id="", test_modules=None):
         "authority": authority,
         "targeted_tests": tests,
         "compatibility": compatibility_payload,
+        "compatibility_scope": compatibility_scope_result,
         "release_regressions": regressions,
         "release_orchestration_regressions": regression_suite,
         "security": security,
@@ -598,6 +644,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="local_release_gate.py")
     parser.add_argument("--repo-root", default=ROOT)
     parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--baseline-sha", default="")
     parser.add_argument("--output", required=True)
     parser.add_argument("--session-id", default="")
     parser.add_argument("--test-module", action="append", dest="test_modules")
@@ -606,6 +653,7 @@ def main(argv=None):
         result = run_gate(
             args.repo_root, args.source_sha, args.output,
             session_id=args.session_id, test_modules=args.test_modules,
+            baseline_sha=args.baseline_sha,
         )
     except (OSError, RuntimeError, ValueError, TypeError) as exc:
         print("LOCAL_RELEASE_GATE=FAIL", file=sys.stderr)
