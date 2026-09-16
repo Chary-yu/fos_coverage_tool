@@ -152,6 +152,8 @@ def build_flat_production_candidate(
                 "production_host": production_host,
                 "production_baseline_sha": production_baseline_sha,
                 "validation_session_id": validation_session_id,
+                "release_input_manifest": release_input_manifest_path,
+                "release_input_manifest_sha256": release_input_manifest_sha256,
             }
             missing = sorted(key for key, value in required.items()
                              if not str(value or "").strip())

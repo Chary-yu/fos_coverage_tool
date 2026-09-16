@@ -348,7 +348,9 @@ def _assert_preparation_only(manifest):
 
 
 def _builder_command(manifest, source_root, candidate_root, identity_output,
-                    evidence_output, source_bundle, session_id, tooling_root):
+                    evidence_output, source_bundle, session_id, tooling_root,
+                    release_input_manifest_path,
+                    release_input_manifest_sha256):
     mode = manifest["candidate_build_mode"]
     builder = os.path.join(
         tooling_root, "scripts", "release",
@@ -368,6 +370,8 @@ def _builder_command(manifest, source_root, candidate_root, identity_output,
         "--production-host", manifest["production_host"],
         "--production-baseline-sha", manifest["baseline_commit_sha"],
         "--validation-session-id", session_id,
+        "--release-input-manifest", release_input_manifest_path,
+        "--release-input-manifest-sha256", release_input_manifest_sha256,
     ]
     if mode == "flat_production":
         required = ("flat_served_root", "flat_release_identity_path")
@@ -488,7 +492,8 @@ def build(args):
         command = _builder_command(
             manifest, source_root, os.path.join(state_root, "candidate"),
             identity_output, evidence_output, source_bundle, args.session_id,
-            tooling_root,
+            tooling_root, args.release_input_manifest,
+            args.release_input_manifest_sha256,
         )
         _run(command, cwd=tooling_root, label="offline Candidate builder")
         output_manifest = os.path.join(state_root, "release_input_manifest.json")

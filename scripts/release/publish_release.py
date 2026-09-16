@@ -78,6 +78,8 @@ def main(argv=None):
     parser.add_argument("--production-host", default="")
     parser.add_argument("--production-baseline-sha", default="")
     parser.add_argument("--validation-session-id", default="")
+    parser.add_argument("--release-input-manifest", default="")
+    parser.add_argument("--release-input-manifest-sha256", default="")
     parser.add_argument("--switch", action="store_true")
     parser.add_argument("--rollback-session")
     parser.add_argument("--validate-current", action="store_true")
@@ -107,12 +109,15 @@ def main(argv=None):
                 not args.offline_operator_repository or \
                 not args.production_host or \
                 not args.production_baseline_sha or \
-                not args.validation_session_id:
+                not args.validation_session_id or \
+                not args.release_input_manifest or \
+                not args.release_input_manifest_sha256:
             parser.error(
                 "offline publication requires --offline-operator-evidence, "
                 "--offline-operator-source-bundle, "
                 "--offline-operator-repository, --production-host, "
-                "--production-baseline-sha and --validation-session-id"
+                "--production-baseline-sha, --validation-session-id, "
+                "--release-input-manifest and --release-input-manifest-sha256"
             )
         identity = _load(args.release_identity)
         manifest = publisher.prepare(
@@ -133,6 +138,8 @@ def main(argv=None):
             production_host=args.production_host,
             production_baseline_sha=args.production_baseline_sha,
             validation_session_id=args.validation_session_id,
+            release_input_manifest=args.release_input_manifest,
+            release_input_manifest_sha256=args.release_input_manifest_sha256,
         )
         result = {
             "status": "PASSED",

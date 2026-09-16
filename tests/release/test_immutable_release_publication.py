@@ -12,6 +12,7 @@ from app.candidate_artifact import (
     CandidateArtifactManifest, build_git_source_provenance,
     PRODUCTION_PROJECT_NAME, PRODUCTION_RELEASE_ARTIFACT_ROLE,
     VALIDATION_FIXTURE_ARTIFACT_ROLE,
+    RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
     RELEASE_TRUST_MODE_PROTECTED_BUILDER,
     identity_manifest_sha256,
 )
@@ -395,6 +396,38 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                     release_trust_mode=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
                 )
 
+    def test_offline_publication_requires_release_input_manifest(self):
+        with tempfile.TemporaryDirectory(prefix="release-input-required-") as root:
+            source = os.path.join(root, "source")
+            os.makedirs(source)
+            self._source(source)
+            publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
+            offline_manifest = {
+                "source_provenance": {
+                    "provenance_class": "offline-operator",
+                },
+            }
+            with mock.patch.object(
+                    release_publication.CandidateArtifactManifest, "verify",
+                    return_value=offline_manifest), \
+                    mock.patch.object(
+                        release_publication, "validate_production_candidate_content"), \
+                    mock.patch.object(
+                        release_publication, "validate_production_application_bundle"):
+                with self.assertRaisesRegex(ValueError, "release_input_manifest"):
+                    publisher.prepare(
+                        source, {"commit_sha": "a" * 40},
+                        "offline-manifest-required",
+                        source_repo_root=root,
+                        release_trust_mode=RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+                        offline_operator_evidence="evidence.json",
+                        offline_operator_source_bundle="source.bundle",
+                        offline_operator_repository="Chary-yu/fos_coverage_tool",
+                        production_host="vfoswind",
+                        production_baseline_sha="b" * 40,
+                        validation_session_id="offline-session",
+                    )
+
     def test_bootstrap_provenance_cannot_use_generic_publisher(self):
         with tempfile.TemporaryDirectory(prefix="release-bootstrap-boundary-") as root:
             source = os.path.join(root, "source")
@@ -441,6 +474,24 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                     "--candidate-build-attestation-workflow",
                     "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
                     "--release-trust-mode", RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+                ])
+
+    def test_offline_publish_cli_requires_release_input_manifest(self):
+        with tempfile.TemporaryDirectory(prefix="release-cli-input-required-") as root:
+            with self.assertRaises(SystemExit):
+                publish_release_main([
+                    "--publish-root", os.path.join(root, "publish"),
+                    "--source-root", os.path.join(root, "source"),
+                    "--release-identity", os.path.join(root, "identity.json"),
+                    "--session-id", "offline-cli-session",
+                    "--source-repo-root", root,
+                    "--release-trust-mode", RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+                    "--offline-operator-evidence", "evidence.json",
+                    "--offline-operator-source-bundle", "source.bundle",
+                    "--offline-operator-repository", "Chary-yu/fos_coverage_tool",
+                    "--production-host", "vfoswind",
+                    "--production-baseline-sha", "a" * 40,
+                    "--validation-session-id", "offline-session",
                 ])
 
     def test_git_provenance_uses_source_tree_manifest_and_attestation(self):

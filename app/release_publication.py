@@ -1363,8 +1363,9 @@ class ImmutableReleasePublisher(object):
                 offline_operator_evidence="", offline_operator_source_bundle="",
                 offline_operator_repository="",
                 production_host="", production_baseline_sha="",
-                validation_session_id=""):
-        """Prepare a Candidate produced by a verified trusted CI checkout.
+                validation_session_id="", release_input_manifest="",
+                release_input_manifest_sha256=""):
+        """Prepare a Candidate produced by the verified offline operator.
 
         ``source_repo_root`` is deliberately mandatory for this generic
         publisher.  A Candidate manifest can describe bytes and provenance,
@@ -1391,6 +1392,8 @@ class ImmutableReleasePublisher(object):
             production_host=production_host,
             production_baseline_sha=production_baseline_sha,
             validation_session_id=validation_session_id,
+            release_input_manifest=release_input_manifest,
+            release_input_manifest_sha256=release_input_manifest_sha256,
             allow_bootstrap=False,
         )
 
@@ -1426,6 +1429,8 @@ class ImmutableReleasePublisher(object):
                  offline_operator_repository="",
                  production_host="", production_baseline_sha="",
                  validation_session_id="",
+                 release_input_manifest="",
+                 release_input_manifest_sha256="",
                  allow_bootstrap=False):
         session_id = _validate_session_id(session_id)
         final_root = self.release_path(session_id)
@@ -1465,6 +1470,14 @@ class ImmutableReleasePublisher(object):
                 raise ValueError(
                     "offline operator publication requires offline-operator provenance"
                 )
+            if not release_input_manifest:
+                raise ValueError(
+                    "offline operator publication requires release_input_manifest"
+                )
+            if not release_input_manifest_sha256:
+                raise ValueError(
+                    "offline operator publication requires release_input_manifest_sha256"
+                )
             if not source_repo_root:
                 raise ValueError(
                     "source_repo_root is required for offline operator publication"
@@ -1481,6 +1494,8 @@ class ImmutableReleasePublisher(object):
                 expected_production_host=production_host,
                 expected_production_baseline_sha=production_baseline_sha,
                 expected_validation_session_id=validation_session_id,
+                release_input_manifest=release_input_manifest or None,
+                release_input_manifest_sha256=release_input_manifest_sha256,
             )
             served_root_provenance_binding(provenance)
         self._ensure_releases_root()
@@ -1529,6 +1544,8 @@ class ImmutableReleasePublisher(object):
                     expected_production_host=production_host,
                     expected_production_baseline_sha=production_baseline_sha,
                     expected_validation_session_id=validation_session_id,
+                    release_input_manifest=release_input_manifest or None,
+                    release_input_manifest_sha256=release_input_manifest_sha256,
                 )
                 if copied_trust.get("candidate_tree_sha256") != \
                         trust_evidence.get("candidate_tree_sha256"):

@@ -19,6 +19,17 @@ from app.release_publication import (
 from scripts.release.build_production_candidate_artifact import (
     build_production_candidate,
 )
+from scripts.release.release_input_manifest import (
+    build_release_input_manifest, write_release_input_manifest,
+)
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class ProductionCandidateBuildTest(unittest.TestCase):
@@ -119,10 +130,39 @@ class ProductionCandidateBuildTest(unittest.TestCase):
         return ("", "", "", "")
 
     @staticmethod
-    def _offline_kwargs(root, baseline_sha, session="offline-build-session"):
+    def _offline_kwargs(root, baseline_sha, source,
+                        session="offline-build-session"):
         bundle = os.path.join(root, "offline-source.bundle")
         with open(bundle, "wb") as stream:
             stream.write(b"offline source bundle")
+        source_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=source
+        ).decode("ascii").strip()
+        source_tree = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"], cwd=source
+        ).decode("ascii").strip()
+        manifest_path = os.path.join(root, "release_input_manifest.json")
+        manifest = build_release_input_manifest({
+            "schema_version": 1,
+            "repository": "Chary-yu/fos_coverage_tool",
+            "source_commit_sha": source_sha,
+            "source_tree_sha": source_tree,
+            "source_bundle_sha256": _sha256(bundle),
+            "tooling_commit_sha": source_sha,
+            "tooling_tree_sha": source_tree,
+            "tooling_bundle_sha256": _sha256(bundle),
+            "production_host": "coverage-prod-01",
+            "baseline_commit_sha": baseline_sha,
+            "baseline_attempt_id": "offline-baseline-1",
+            "baseline_tree_sha256": "2" * 64,
+            "baseline_manifest_sha256": "3" * 64,
+            "baseline_adoption_identity_sha256": "4" * 64,
+            "project_name": PRODUCTION_PROJECT_NAME,
+            "candidate_parent": os.path.join(root, "candidate-parent"),
+            "release_trust_mode": RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+            "validation_session_id": session,
+        })
+        manifest_sha = write_release_input_manifest(manifest_path, manifest)
         return {
             "release_trust_mode": RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
             "offline_operator_evidence_output": os.path.join(
@@ -133,6 +173,8 @@ class ProductionCandidateBuildTest(unittest.TestCase):
             "production_host": "coverage-prod-01",
             "production_baseline_sha": baseline_sha,
             "validation_session_id": session,
+            "release_input_manifest_path": manifest_path,
+            "release_input_manifest_sha256": manifest_sha,
         }
 
     @staticmethod
@@ -161,7 +203,7 @@ class ProductionCandidateBuildTest(unittest.TestCase):
             result = build_production_candidate(
                 served, source, candidate, identity_output, *self._provenance_args(),
                 **self._expected_binding_kwargs(served),
-                **self._offline_kwargs(root, previous_sha)
+                **self._offline_kwargs(root, previous_sha, source)
             )
             self.assertEqual(result["artifact_role"], PRODUCTION_RELEASE_ARTIFACT_ROLE)
             self.assertTrue(result["production_publishable"])
@@ -242,7 +284,7 @@ class ProductionCandidateBuildTest(unittest.TestCase):
                 served, source, candidate, os.path.join(root, "identity.json"),
                 *self._provenance_args(),
                 **self._expected_binding_kwargs(served),
-                **self._offline_kwargs(root, "1" * 40)
+                **self._offline_kwargs(root, "1" * 40, source)
             )
             self.assertEqual(result["status"], "PASSED")
             self.assertFalse(os.path.exists(os.path.join(
@@ -262,25 +304,16 @@ class ProductionCandidateBuildTest(unittest.TestCase):
             os.makedirs(source)
             self._source_repo(source)
             served, previous_sha = self._current_served_root(root)
-            bundle = os.path.join(root, "source.bundle")
-            with open(bundle, "wb") as stream:
-                stream.write(b"offline source bundle")
-            evidence_path = os.path.join(root, "operator-evidence.json")
+            offline = self._offline_kwargs(root, previous_sha, source)
             result = build_production_candidate(
                 served, source, candidate, os.path.join(root, "identity.json"),
                 "", "", "", "",
                 **self._expected_binding_kwargs(served),
-                release_trust_mode=RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
-                offline_operator_evidence_output=evidence_path,
-                offline_operator_source_bundle=bundle,
-                offline_operator_repository="Chary-yu/fos_coverage_tool",
-                production_host="coverage-prod-01",
-                production_baseline_sha=previous_sha,
-                validation_session_id="offline-build-session",
+                **offline,
             )
             self.assertEqual(result["release_trust_mode"], "offline_operator")
             self.assertFalse(result["receipt_required"])
-            with open(evidence_path, encoding="utf-8") as stream:
+            with open(offline["offline_operator_evidence_output"], encoding="utf-8") as stream:
                 evidence = json.load(stream)
             self.assertEqual(evidence["protected_builder"], "SKIPPED_BY_OPERATOR")
             self.assertEqual(evidence["trust_class"], "OFFLINE_OPERATOR")
@@ -291,6 +324,23 @@ class ProductionCandidateBuildTest(unittest.TestCase):
                 "offline-operator",
             )
             self.assertEqual(manifest["source_provenance"]["build_workflow_run_id"], "")
+
+    def test_offline_builder_requires_release_input_manifest(self):
+        with tempfile.TemporaryDirectory(prefix="production-candidate-manifest-required-") as root:
+            source = os.path.join(root, "source")
+            os.makedirs(source)
+            self._source_repo(source)
+            served, previous_sha = self._current_served_root(root)
+            offline = self._offline_kwargs(root, previous_sha, source)
+            offline.pop("release_input_manifest_path")
+            offline.pop("release_input_manifest_sha256")
+            with self.assertRaisesRegex(ValueError, "release_input_manifest"):
+                build_production_candidate(
+                    served, source, os.path.join(root, "candidate"),
+                    os.path.join(root, "identity.json"), *self._provenance_args(),
+                    **self._expected_binding_kwargs(served),
+                    **offline,
+                )
 
     def test_protected_builder_mode_is_rejected_by_current_builder(self):
         with tempfile.TemporaryDirectory(prefix="production-candidate-protected-") as root:
@@ -395,7 +445,9 @@ class ProductionCandidateBuildTest(unittest.TestCase):
                 expected_served_root_tree_sha256=binding["served_root_tree_sha256"],
                 expected_current_identity_sha256=binding["served_root_identity_sha256"],
                 publish_root=publish_root,
-                **self._offline_kwargs(root, binding["previous_release_commit_sha"]),
+                **self._offline_kwargs(
+                    root, binding["previous_release_commit_sha"], source
+                ),
             )
             self.assertEqual(
                 result["served_root_binding"]["realpath"],

@@ -30,6 +30,9 @@ from scripts.release.build_production_candidate_artifact import (
 from scripts.release.prepare_legacy_flat_adoption import (
     LEGACY_STATIC, prepare_legacy_flat_adoption,
 )
+from scripts.release.release_input_manifest import (
+    build_release_input_manifest, write_release_input_manifest,
+)
 
 
 adoption_module = importlib.import_module(
@@ -428,6 +431,42 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
             )
             offline_evidence = os.path.join(root, "offline-operator-evidence.json")
             current_binding = current_served_root_binding(publish_root)
+            source_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=target_source
+            ).decode("ascii").strip()
+            source_tree = subprocess.check_output(
+                ["git", "rev-parse", "HEAD^{tree}"], cwd=target_source
+            ).decode("ascii").strip()
+            with open(source_bundle, "rb") as stream:
+                source_bundle_sha = hashlib.sha256(stream.read()).hexdigest()
+            input_manifest_path = os.path.join(
+                root, "release_input_manifest.json"
+            )
+            input_manifest = build_release_input_manifest({
+                "schema_version": 1,
+                "repository": "Chary-yu/fos_coverage_tool",
+                "source_commit_sha": source_commit,
+                "source_tree_sha": source_tree,
+                "source_bundle_sha256": source_bundle_sha,
+                "tooling_commit_sha": source_commit,
+                "tooling_tree_sha": source_tree,
+                "tooling_bundle_sha256": source_bundle_sha,
+                "production_host": "vfoswind",
+                "baseline_commit_sha": LEGACY_COMMIT_SHA,
+                "baseline_attempt_id": "previous-e9fcc837",
+                "baseline_tree_sha256": "1" * 64,
+                "baseline_manifest_sha256": "2" * 64,
+                "baseline_adoption_identity_sha256": "3" * 64,
+                "project_name": PRODUCTION_PROJECT_NAME,
+                "candidate_parent": os.path.join(root, "candidate-parent"),
+                "release_trust_mode": RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+                "validation_session_id": current_binding[
+                    "release_validation_session_id"
+                ],
+            })
+            input_manifest_sha = write_release_input_manifest(
+                input_manifest_path, input_manifest
+            )
             result = build_production_candidate(
                 "", target_source, candidate_root, target_identity_path,
                 *self._provenance_args(),
@@ -439,6 +478,8 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
                 production_host="vfoswind",
                 production_baseline_sha=LEGACY_COMMIT_SHA,
                 validation_session_id=current_binding["release_validation_session_id"],
+                release_input_manifest_path=input_manifest_path,
+                release_input_manifest_sha256=input_manifest_sha,
                 **self._expected_binding_kwargs(publish_root)
             )
             self.assertEqual(result["status"], "PASSED")

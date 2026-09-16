@@ -1,3 +1,4 @@
+import hashlib
 import importlib
 import json
 import os
@@ -23,6 +24,9 @@ from scripts.release.build_flat_production_candidate_artifact import (
     build_flat_production_candidate,
 )
 from scripts.release.prepare_legacy_flat_adoption import flat_source_binding
+from scripts.release.release_input_manifest import (
+    build_release_input_manifest, write_release_input_manifest,
+)
 
 
 flat_builder_module = importlib.import_module(
@@ -34,6 +38,14 @@ LEGACY_SHA = "e" * 40
 REPOSITORY = "Chary-yu/fos_coverage_tool"
 HOST = "vfoswind"
 LEGACY_ASSETS = tuple(DEFAULT_RELEASE_ASSET_RELATIVE_PATHS[:6])
+
+
+def _sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 class FlatProductionCandidateOperatorTest(unittest.TestCase):
@@ -124,6 +136,30 @@ class FlatProductionCandidateOperatorTest(unittest.TestCase):
         candidate = os.path.join(root.name, "candidate")
         identity_output = os.path.join(root.name, "candidate-release-identity.json")
         evidence = os.path.join(root.name, "offline-operator-evidence.json")
+        manifest_path = os.path.join(root.name, "release_input_manifest.json")
+        manifest = build_release_input_manifest({
+            "schema_version": 1,
+            "repository": REPOSITORY,
+            "source_commit_sha": source_sha,
+            "source_tree_sha": source_tree,
+            "source_bundle_sha256": _sha256(bundle),
+            "tooling_commit_sha": source_sha,
+            "tooling_tree_sha": source_tree,
+            "tooling_bundle_sha256": _sha256(bundle),
+            "production_host": HOST,
+            "baseline_commit_sha": LEGACY_SHA,
+            "baseline_attempt_id": "legacy-flat-baseline-1",
+            "baseline_tree_sha256": "1" * 64,
+            "baseline_manifest_sha256": "2" * 64,
+            "baseline_adoption_identity_sha256": "3" * 64,
+            "project_name": PRODUCTION_PROJECT_NAME,
+            "candidate_parent": os.path.join(root.name, "candidate-parent"),
+            "release_trust_mode": RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+            "candidate_build_mode": "flat_production",
+            "production_publishable": False,
+            "validation_session_id": "flat-focused-session-1",
+        })
+        manifest_sha = write_release_input_manifest(manifest_path, manifest)
         return {
             "root": root,
             "flat": flat,
@@ -137,6 +173,8 @@ class FlatProductionCandidateOperatorTest(unittest.TestCase):
             "candidate": candidate,
             "identity_output": identity_output,
             "evidence": evidence,
+            "manifest_path": manifest_path,
+            "manifest_sha": manifest_sha,
             "session": "flat-focused-session-1",
         }
 
@@ -157,6 +195,8 @@ class FlatProductionCandidateOperatorTest(unittest.TestCase):
             production_baseline_sha=LEGACY_SHA,
             validation_session_id=fixture["session"],
             flat_baseline_session_id="legacy-flat-baseline-1",
+            release_input_manifest_path=fixture["manifest_path"],
+            release_input_manifest_sha256=fixture["manifest_sha"],
         )
 
     def test_flat_builder_is_first_migration_path_and_final_publication_accepts_offline_trust(self):
@@ -200,6 +240,8 @@ class FlatProductionCandidateOperatorTest(unittest.TestCase):
             production_host=HOST,
             production_baseline_sha=LEGACY_SHA,
             validation_session_id=fixture["session"],
+            release_input_manifest=fixture["manifest_path"],
+            release_input_manifest_sha256=fixture["manifest_sha"],
         )
         self.assertEqual(
             validate_release_manifest(

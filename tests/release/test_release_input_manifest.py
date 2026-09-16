@@ -175,6 +175,45 @@ class ReleaseInputManifestTest(unittest.TestCase):
             self.assertIn("OPERATOR_SELF_TEST=PASS", completed.stdout)
             self.assertIn("PRODUCTION_MUTATION=NONE", completed.stdout)
 
+            tampered_operator = os.path.join(root, "tampered_operator.txt")
+            with open(operator, encoding="utf-8") as stream:
+                tampered_text = stream.read().replace(digest, "0" * 64, 1)
+            with open(tampered_operator, "w", encoding="utf-8") as stream:
+                stream.write(tampered_text)
+            tampered = subprocess.run(
+                ["bash", tampered_operator, "--self-test"],
+                cwd=root,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+            )
+            self.assertNotEqual(tampered.returncode, 0, tampered.stdout)
+            self.assertNotIn("OPERATOR_SELF_TEST=PASS", tampered.stdout)
+
+    def test_runtime_builder_command_carries_manifest_and_digest(self):
+        from scripts.release.flat_candidate_operator_runtime import _builder_command
+
+        manifest = dict(self._manifest(),
+                        candidate_build_mode="production",
+                        served_root="/srv/publish/CURRENT",
+                        served_root_tree_sha256="5" * 64,
+                        served_root_identity_sha256="6" * 64)
+        manifest_sha = release_input_manifest_sha256(manifest)
+        command = _builder_command(
+            manifest, "/source", "/candidate", "/identity.json",
+            "/evidence.json", "/source.bundle", "session-1", "/tooling",
+            "/state/input/release_input_manifest.json", manifest_sha,
+        )
+        self.assertEqual(
+            command[command.index("--release-input-manifest") + 1],
+            "/state/input/release_input_manifest.json",
+        )
+        self.assertEqual(
+            command[command.index("--release-input-manifest-sha256") + 1],
+            manifest_sha,
+        )
+
 
 def _sha256(path):
     digest = hashlib.sha256()
