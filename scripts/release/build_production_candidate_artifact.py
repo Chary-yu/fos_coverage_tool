@@ -46,6 +46,11 @@ from app.release_publication import (
     copy_production_application_bundle, validate_production_application_bundle,
     validate_production_candidate_content, current_served_root_binding,
 )
+from app.release_trust_policy import (
+    CURRENT_PRODUCTION_RELEASE_TRUST_MODE,
+    assert_current_production_trust_mode,
+    verify_current_production_candidate_trust,
+)
 from app.time_utils import utc_iso
 
 
@@ -534,20 +539,19 @@ def _offline_operator_evidence(
 
 def build_production_candidate(
         served_root, source_repo_root, production_candidate_root,
-        release_identity_output, build_workflow_identity,
-        build_workflow_run_id, build_workflow_run_attempt, build_workflow_sha,
+        release_identity_output, build_workflow_identity="",
+        build_workflow_run_id="", build_workflow_run_attempt="",
+        build_workflow_sha="",
         expected_previous_release_sha="", expected_served_root_tree_sha256="",
         expected_current_identity_sha256="", publish_root="",
-        release_trust_mode=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+        release_trust_mode=CURRENT_PRODUCTION_RELEASE_TRUST_MODE,
         offline_operator_evidence_output="", offline_operator_source_bundle="",
         offline_operator_repository="", production_host="",
         production_baseline_sha="", validation_session_id=""):
     """Create and validate one production-role Candidate artifact."""
-    release_trust_mode = str(
-        release_trust_mode or RELEASE_TRUST_MODE_PROTECTED_BUILDER
-    ).strip()
-    if release_trust_mode not in RELEASE_TRUST_MODES:
-        raise ValueError("unsupported release_trust_mode")
+    release_trust_mode = assert_current_production_trust_mode(
+        release_trust_mode, operation="production Candidate build"
+    )
     if publish_root:
         publish_root = os.path.abspath(str(publish_root))
         derived_served_root = os.path.join(publish_root, "CURRENT")
@@ -658,9 +662,9 @@ def build_production_candidate(
             offline_operator_source_bundle, offline_operator_repository,
             production_host, production_baseline_sha, validation_session_id,
         )
-        verify_offline_operator_trust(
-            candidate_root, identity, manifest, source_repo_root,
-            evidence=offline_evidence,
+        verify_current_production_candidate_trust(
+            release_trust_mode, candidate_root, identity, manifest,
+            source_repo_root, evidence=offline_evidence,
             source_bundle_path=offline_operator_source_bundle,
             expected_repository=offline_operator_repository,
             expected_production_host=production_host,
@@ -739,7 +743,7 @@ def main(argv=None):
     parser.add_argument("--expected-current-identity-sha256", required=True)
     parser.add_argument(
         "--release-trust-mode", choices=RELEASE_TRUST_MODES,
-        default=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+        default=CURRENT_PRODUCTION_RELEASE_TRUST_MODE,
     )
     parser.add_argument("--offline-operator-evidence-output", default="")
     parser.add_argument("--offline-operator-source-bundle", default="")

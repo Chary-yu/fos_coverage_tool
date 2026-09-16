@@ -33,6 +33,11 @@ from app.release_publication import (
     validate_production_candidate_content,
 )
 from app.time_utils import utc_iso
+from app.release_trust_policy import (
+    CURRENT_PRODUCTION_RELEASE_TRUST_MODE,
+    assert_current_production_trust_mode,
+    verify_current_production_candidate_trust,
+)
 from scripts.release.build_production_candidate_artifact import (
     _copy_served_root, _prepare_empty_root, _refresh_release_assets,
     _release_asset_contract, _reject_validation_fixture, _real, _write_json,
@@ -49,18 +54,14 @@ def build_flat_production_candidate(
         build_workflow_identity="", build_workflow_run_id="",
         build_workflow_run_attempt="", build_workflow_sha="",
         expected_previous_release_sha="", expected_source_binding=None,
-        release_trust_mode=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+        release_trust_mode=CURRENT_PRODUCTION_RELEASE_TRUST_MODE,
         offline_operator_evidence_output="", offline_operator_source_bundle="",
         offline_operator_repository="", production_host="",
         production_baseline_sha="", validation_session_id="",
         flat_baseline_session_id=""):
-    release_trust_mode = str(
-        release_trust_mode or RELEASE_TRUST_MODE_PROTECTED_BUILDER
-    ).strip()
-    if release_trust_mode not in (
-            RELEASE_TRUST_MODE_PROTECTED_BUILDER,
-            RELEASE_TRUST_MODE_OFFLINE_OPERATOR):
-        raise ValueError("unsupported release_trust_mode")
+    release_trust_mode = assert_current_production_trust_mode(
+        release_trust_mode, operation="flat production Candidate build"
+    )
     flat_served_root = _real(flat_served_root)
     flat_release_identity_path = _real(flat_release_identity_path)
     source_repo_root = _real(source_repo_root)
@@ -181,9 +182,10 @@ def build_flat_production_candidate(
             }
             offline_path = os.path.abspath(str(offline_operator_evidence_output))
             _write_json(offline_path, offline_payload)
-            verify_offline_operator_trust(
-                candidate_root, identity, manifest, source_repo_root,
-                evidence=offline_payload, source_bundle_path=bundle,
+            verify_current_production_candidate_trust(
+                release_trust_mode, candidate_root, identity, manifest,
+                source_repo_root, evidence=offline_payload,
+                source_bundle_path=bundle,
                 expected_repository=offline_operator_repository,
                 expected_production_host=production_host,
                 expected_production_baseline_sha=production_baseline_sha,
@@ -254,7 +256,7 @@ def main(argv=None):
     parser.add_argument("--build-workflow-run-id", default="")
     parser.add_argument("--build-workflow-run-attempt", default="")
     parser.add_argument("--build-workflow-sha", default="")
-    parser.add_argument("--release-trust-mode", default=RELEASE_TRUST_MODE_PROTECTED_BUILDER)
+    parser.add_argument("--release-trust-mode", default=CURRENT_PRODUCTION_RELEASE_TRUST_MODE)
     parser.add_argument("--offline-operator-evidence-output", default="")
     parser.add_argument("--offline-operator-source-bundle", default="")
     parser.add_argument("--offline-operator-repository", default="")

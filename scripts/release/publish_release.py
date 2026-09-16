@@ -17,6 +17,10 @@ from app.candidate_artifact import (
     RELEASE_TRUST_MODE_PROTECTED_BUILDER,
     RELEASE_TRUST_MODES,
 )
+from app.release_trust_policy import (
+    CURRENT_PRODUCTION_RELEASE_TRUST_MODE,
+    assert_current_production_trust_mode,
+)
 from app.release_publication import ImmutableReleasePublisher
 
 
@@ -66,7 +70,7 @@ def main(argv=None):
     )
     parser.add_argument(
         "--release-trust-mode", choices=RELEASE_TRUST_MODES,
-        default=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+        default=CURRENT_PRODUCTION_RELEASE_TRUST_MODE,
     )
     parser.add_argument("--offline-operator-evidence", default="")
     parser.add_argument("--offline-operator-source-bundle", default="")
@@ -92,38 +96,24 @@ def main(argv=None):
             parser.error(
                 "--source-repo-root is required for Candidate source verification"
             )
-        if args.release_trust_mode == RELEASE_TRUST_MODE_PROTECTED_BUILDER:
-            if not args.trusted_build_workflow_identity or \
-                    not args.trusted_build_workflow_sha:
-                parser.error(
-                    "--trusted-build-workflow-identity and "
-                    "--trusted-build-workflow-sha are required for protected publication"
-                )
-            if not args.candidate_build_receipt or \
-                    not args.candidate_build_attestation_bundle:
-                parser.error(
-                    "--candidate-build-receipt and "
-                    "--candidate-build-attestation-bundle are required for protected publication"
-                )
-            if not args.candidate_build_attestation_repository or \
-                    not args.candidate_build_attestation_workflow:
-                parser.error(
-                    "--candidate-build-attestation-repository and "
-                    "--candidate-build-attestation-workflow are required for protected publication"
-                )
-        else:
-            if not args.offline_operator_evidence or \
-                    not args.offline_operator_source_bundle or \
-                    not args.offline_operator_repository or \
-                    not args.production_host or \
-                    not args.production_baseline_sha or \
-                    not args.validation_session_id:
-                parser.error(
-                    "offline publication requires --offline-operator-evidence, "
-                    "--offline-operator-source-bundle, "
-                    "--offline-operator-repository, --production-host, "
-                    "--production-baseline-sha and --validation-session-id"
-                )
+        try:
+            assert_current_production_trust_mode(
+                args.release_trust_mode, operation="current production publication"
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        if not args.offline_operator_evidence or \
+                not args.offline_operator_source_bundle or \
+                not args.offline_operator_repository or \
+                not args.production_host or \
+                not args.production_baseline_sha or \
+                not args.validation_session_id:
+            parser.error(
+                "offline publication requires --offline-operator-evidence, "
+                "--offline-operator-source-bundle, "
+                "--offline-operator-repository, --production-host, "
+                "--production-baseline-sha and --validation-session-id"
+            )
         identity = _load(args.release_identity)
         manifest = publisher.prepare(
             args.source_root, identity, args.session_id,

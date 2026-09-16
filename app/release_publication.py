@@ -45,6 +45,11 @@ from app.reports.identity import (
     validate_report_id, validate_report_mode,
 )
 from app.time_utils import utc_iso
+from app.release_trust_policy import (
+    CURRENT_PRODUCTION_RELEASE_TRUST_MODE,
+    assert_current_production_trust_mode,
+    verify_current_production_candidate_trust,
+)
 
 
 RELEASE_MANIFEST_SCHEMA_VERSION = 1
@@ -1354,7 +1359,7 @@ class ImmutableReleasePublisher(object):
                 candidate_build_attestation_bundle="",
                 candidate_build_attestation_repository="",
                 candidate_build_attestation_workflow="",
-                release_trust_mode=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+                release_trust_mode=CURRENT_PRODUCTION_RELEASE_TRUST_MODE,
                 offline_operator_evidence="", offline_operator_source_bundle="",
                 offline_operator_repository="",
                 production_host="", production_baseline_sha="",
@@ -1416,7 +1421,7 @@ class ImmutableReleasePublisher(object):
                  candidate_build_attestation_bundle="",
                  candidate_build_attestation_repository="",
                  candidate_build_attestation_workflow="",
-                 release_trust_mode=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+                 release_trust_mode=CURRENT_PRODUCTION_RELEASE_TRUST_MODE,
                  offline_operator_evidence="", offline_operator_source_bundle="",
                  offline_operator_repository="",
                  production_host="", production_baseline_sha="",
@@ -1453,71 +1458,31 @@ class ImmutableReleasePublisher(object):
                     "bootstrap publisher requires served-root-bootstrap provenance"
                 )
         else:
-            release_trust_mode = str(
-                release_trust_mode or RELEASE_TRUST_MODE_PROTECTED_BUILDER
-            ).strip()
-            if release_trust_mode not in RELEASE_TRUST_MODES:
-                raise ValueError("unsupported release trust mode")
-            if release_trust_mode == RELEASE_TRUST_MODE_OFFLINE_OPERATOR:
-                if provenance_class != OFFLINE_OPERATOR_PROVENANCE_CLASS:
-                    raise ValueError(
-                        "offline operator publication requires offline-operator provenance"
-                    )
-                if not source_repo_root:
-                    raise ValueError(
-                        "source_repo_root is required for offline operator publication"
-                    )
-                trust_evidence = verify_offline_operator_trust(
-                    source_root, release_identity, verified_candidate_manifest,
-                    source_repo_root, evidence_path=offline_operator_evidence,
-                    source_bundle_path=offline_operator_source_bundle,
-                    expected_repository=offline_operator_repository,
-                    expected_production_host=production_host,
-                    expected_production_baseline_sha=production_baseline_sha,
-                    expected_validation_session_id=validation_session_id,
+            release_trust_mode = assert_current_production_trust_mode(
+                release_trust_mode, operation="current production publication"
+            )
+            if provenance_class != OFFLINE_OPERATOR_PROVENANCE_CLASS:
+                raise ValueError(
+                    "offline operator publication requires offline-operator provenance"
                 )
-                served_root_provenance_binding(provenance)
-            else:
-                if provenance_class != TRUSTED_CI_PROVENANCE_CLASS:
-                    raise ValueError(
-                        "generic publisher accepts trusted-ci-build provenance only"
-                    )
-                if not source_repo_root:
-                    raise ValueError(
-                        "source_repo_root is required for trusted-ci-build publication"
-                    )
-                _verify_trusted_build_workflow(
-                    provenance, trusted_build_workflow_identity,
-                    trusted_build_workflow_sha,
+            if not source_repo_root:
+                raise ValueError(
+                    "source_repo_root is required for offline operator publication"
                 )
-                verify_git_source_provenance(
-                    source_repo_root, release_identity,
-                    provenance,
-                )
-                served_root_provenance_binding(provenance)
-                receipt_path = candidate_build_receipt or os.path.join(
-                    _real(source_root),
-                    str(verified_candidate_manifest.get("receipt_path") or
-                        "candidate_build_receipt.json").replace("/", os.sep),
-                )
-                if not candidate_build_attestation_bundle:
-                    raise ValueError(
-                        "candidate_build_attestation_bundle is required for trusted publication"
-                    )
-                verify_candidate_build_receipt(
-                    source_root, release_identity, verified_candidate_manifest,
-                    candidate_build_attestation_bundle,
-                    receipt_path=receipt_path,
-                    attestation_repository=candidate_build_attestation_repository,
-                    attestation_workflow=candidate_build_attestation_workflow,
-                    attestation_runner_policy=ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
-                )
-                trust_evidence = {
-                    "status": "PASSED",
-                    "release_trust_mode": RELEASE_TRUST_MODE_PROTECTED_BUILDER,
-                    "protected_builder": "PASSED",
-                    "trust_class": "PROTECTED_BUILDER",
-                }
+            trust_evidence = verify_current_production_candidate_trust(
+                release_trust_mode,
+                source_root,
+                release_identity,
+                verified_candidate_manifest,
+                source_repo_root,
+                evidence_path=offline_operator_evidence,
+                source_bundle_path=offline_operator_source_bundle,
+                expected_repository=offline_operator_repository,
+                expected_production_host=production_host,
+                expected_production_baseline_sha=production_baseline_sha,
+                expected_validation_session_id=validation_session_id,
+            )
+            served_root_provenance_binding(provenance)
         self._ensure_releases_root()
         staging = tempfile.mkdtemp(prefix=".release-{}-".format(session_id),
                                    dir=self.releases_root)
@@ -1552,42 +1517,22 @@ class ImmutableReleasePublisher(object):
                         "copied Candidate is not a served-root-bootstrap artifact"
                     )
             else:
-                if release_trust_mode == RELEASE_TRUST_MODE_OFFLINE_OPERATOR:
-                    copied_trust = verify_offline_operator_trust(
-                        staging, release_identity, copied_candidate_manifest,
-                        source_repo_root, evidence_path=offline_operator_evidence,
-                        source_bundle_path=offline_operator_source_bundle,
-                        expected_repository=offline_operator_repository,
-                        expected_production_host=production_host,
-                        expected_production_baseline_sha=production_baseline_sha,
-                        expected_validation_session_id=validation_session_id,
-                    )
-                    if copied_trust.get("candidate_tree_sha256") != \
-                            trust_evidence.get("candidate_tree_sha256"):
-                        raise ValueError("copied Candidate offline trust hash changed")
-                else:
-                    _verify_trusted_build_workflow(
-                        copied_provenance, trusted_build_workflow_identity,
-                        trusted_build_workflow_sha,
-                    )
-                    verify_git_source_provenance(
-                        source_repo_root, release_identity,
-                        copied_provenance,
-                    )
-                    served_root_provenance_binding(copied_provenance)
-                    copied_receipt_path = os.path.join(
-                        staging,
-                        str(copied_candidate_manifest.get("receipt_path") or
-                            "candidate_build_receipt.json").replace("/", os.sep),
-                    )
-                    verify_candidate_build_receipt(
-                        staging, release_identity, copied_candidate_manifest,
-                        candidate_build_attestation_bundle,
-                        receipt_path=copied_receipt_path,
-                        attestation_repository=candidate_build_attestation_repository,
-                        attestation_workflow=candidate_build_attestation_workflow,
-                        attestation_runner_policy=ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
-                    )
+                copied_trust = verify_current_production_candidate_trust(
+                    release_trust_mode,
+                    staging,
+                    release_identity,
+                    copied_candidate_manifest,
+                    source_repo_root,
+                    evidence_path=offline_operator_evidence,
+                    source_bundle_path=offline_operator_source_bundle,
+                    expected_repository=offline_operator_repository,
+                    expected_production_host=production_host,
+                    expected_production_baseline_sha=production_baseline_sha,
+                    expected_validation_session_id=validation_session_id,
+                )
+                if copied_trust.get("candidate_tree_sha256") != \
+                        trust_evidence.get("candidate_tree_sha256"):
+                    raise ValueError("copied Candidate offline trust hash changed")
             if copied_candidate_manifest.get("artifact_sha256") != \
                     verified_candidate_manifest.get("artifact_sha256"):
                 raise ValueError("copied Candidate artifact bytes do not match manifest")

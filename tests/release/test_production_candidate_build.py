@@ -9,6 +9,7 @@ import unittest
 from app.candidate_artifact import (
     CandidateArtifactManifest, PRODUCTION_PROJECT_NAME,
     PRODUCTION_RELEASE_ARTIFACT_ROLE, RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+    RELEASE_TRUST_MODE_PROTECTED_BUILDER,
 )
 from app.release_identity import DEFAULT_RELEASE_ASSET_RELATIVE_PATHS
 from app.release_publication import (
@@ -115,9 +116,24 @@ class ProductionCandidateBuildTest(unittest.TestCase):
         return current, previous_sha
 
     def _provenance_args(self):
-        return (
-            "github-actions/trusted-production-builder", "123", "1", "f" * 40
-        )
+        return ("", "", "", "")
+
+    @staticmethod
+    def _offline_kwargs(root, baseline_sha, session="offline-build-session"):
+        bundle = os.path.join(root, "offline-source.bundle")
+        with open(bundle, "wb") as stream:
+            stream.write(b"offline source bundle")
+        return {
+            "release_trust_mode": RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+            "offline_operator_evidence_output": os.path.join(
+                root, "operator-evidence.json"
+            ),
+            "offline_operator_source_bundle": bundle,
+            "offline_operator_repository": "Chary-yu/fos_coverage_tool",
+            "production_host": "coverage-prod-01",
+            "production_baseline_sha": baseline_sha,
+            "validation_session_id": session,
+        }
 
     @staticmethod
     def _expected_binding_kwargs(current):
@@ -144,7 +160,8 @@ class ProductionCandidateBuildTest(unittest.TestCase):
             identity_output = os.path.join(root, "release_identity.json")
             result = build_production_candidate(
                 served, source, candidate, identity_output, *self._provenance_args(),
-                **self._expected_binding_kwargs(served)
+                **self._expected_binding_kwargs(served),
+                **self._offline_kwargs(root, previous_sha)
             )
             self.assertEqual(result["artifact_role"], PRODUCTION_RELEASE_ARTIFACT_ROLE)
             self.assertTrue(result["production_publishable"])
@@ -224,7 +241,8 @@ class ProductionCandidateBuildTest(unittest.TestCase):
             result = build_production_candidate(
                 served, source, candidate, os.path.join(root, "identity.json"),
                 *self._provenance_args(),
-                **self._expected_binding_kwargs(served)
+                **self._expected_binding_kwargs(served),
+                **self._offline_kwargs(root, "1" * 40)
             )
             self.assertEqual(result["status"], "PASSED")
             self.assertFalse(os.path.exists(os.path.join(
@@ -273,6 +291,23 @@ class ProductionCandidateBuildTest(unittest.TestCase):
                 "offline-operator",
             )
             self.assertEqual(manifest["source_provenance"]["build_workflow_run_id"], "")
+
+    def test_protected_builder_mode_is_rejected_by_current_builder(self):
+        with tempfile.TemporaryDirectory(prefix="production-candidate-protected-") as root:
+            source = os.path.join(root, "source")
+            os.makedirs(source)
+            self._source_repo(source)
+            served, _ = self._current_served_root(root)
+            with self.assertRaisesRegex(
+                    ValueError,
+                    "PROTECTED_BUILDER_CURRENT_PUBLICATION_ALLOWED=NO"):
+                build_production_candidate(
+                    served, source, os.path.join(root, "candidate"),
+                    os.path.join(root, "identity.json"),
+                    *self._provenance_args(),
+                    **self._expected_binding_kwargs(served),
+                    release_trust_mode=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+                )
 
     def test_builder_rejects_non_production_project_and_validation_fixture_content(self):
         with tempfile.TemporaryDirectory(prefix="production-candidate-reject-") as root:
@@ -360,6 +395,7 @@ class ProductionCandidateBuildTest(unittest.TestCase):
                 expected_served_root_tree_sha256=binding["served_root_tree_sha256"],
                 expected_current_identity_sha256=binding["served_root_identity_sha256"],
                 publish_root=publish_root,
+                **self._offline_kwargs(root, binding["previous_release_commit_sha"]),
             )
             self.assertEqual(
                 result["served_root_binding"]["realpath"],

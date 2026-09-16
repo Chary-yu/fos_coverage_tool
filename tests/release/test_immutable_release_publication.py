@@ -12,6 +12,7 @@ from app.candidate_artifact import (
     CandidateArtifactManifest, build_git_source_provenance,
     PRODUCTION_PROJECT_NAME, PRODUCTION_RELEASE_ARTIFACT_ROLE,
     VALIDATION_FIXTURE_ARTIFACT_ROLE,
+    RELEASE_TRUST_MODE_PROTECTED_BUILDER,
     identity_manifest_sha256,
 )
 from app.candidate_build_receipt import (
@@ -386,8 +387,13 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 source, identity, self._trusted_fixture_provenance(identity)
             )
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
-            with self.assertRaisesRegex(ValueError, "source_repo_root is required"):
-                publisher.prepare(source, identity, "missing-source-root-session")
+            with self.assertRaisesRegex(
+                    ValueError,
+                    "PROTECTED_BUILDER_CURRENT_PUBLICATION_ALLOWED=NO"):
+                publisher.prepare(
+                    source, identity, "missing-source-root-session",
+                    release_trust_mode=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+                )
 
     def test_bootstrap_provenance_cannot_use_generic_publisher(self):
         with tempfile.TemporaryDirectory(prefix="release-bootstrap-boundary-") as root:
@@ -398,7 +404,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 source, identity, self._bootstrap_fixture_provenance(identity)
             )
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
-            with self.assertRaisesRegex(ValueError, "trusted-ci-build"):
+            with self.assertRaisesRegex(ValueError, "offline operator publication"):
                 publisher.prepare(
                     source, identity, "bootstrap-generic-session",
                     source_repo_root=root,
@@ -415,7 +421,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             identity_path = os.path.join(root, "identity.json")
             with open(identity_path, "w", encoding="utf-8") as stream:
                 json.dump(identity, stream)
-            with self.assertRaisesRegex(ValueError, "trusted-ci-build"):
+            with self.assertRaises(SystemExit):
                 publish_release_main([
                     "--publish-root", os.path.join(root, "publish"),
                     "--source-root", source,
@@ -434,6 +440,7 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                     "Chary-yu/fos_coverage_tool",
                     "--candidate-build-attestation-workflow",
                     "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml",
+                    "--release-trust-mode", RELEASE_TRUST_MODE_PROTECTED_BUILDER,
                 ])
 
     def test_git_provenance_uses_source_tree_manifest_and_attestation(self):
@@ -501,20 +508,24 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                 manifest["artifact_sha256"],
             )
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
-            with self.assertRaisesRegex(ValueError, "workflow SHA"):
+            with self.assertRaisesRegex(
+                    ValueError,
+                    "PROTECTED_BUILDER_CURRENT_PUBLICATION_ALLOWED=NO"):
                 publisher.prepare(
                     candidate, identity, "workflow-mismatch-session",
                     source_repo_root=source_repo,
                     trusted_build_workflow_identity="trusted-ci",
                     trusted_build_workflow_sha="e" * 40,
+                    release_trust_mode=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
                 )
             previous_key = os.environ.get("COVERAGE_BUILD_PROVENANCE_HMAC_KEY")
             os.environ["COVERAGE_BUILD_PROVENANCE_HMAC_KEY"] = \
                 "test-protected-build-key-1234567890"
             try:
-                with mock.patch(
-                        "app.candidate_build_receipt.verify_github_artifact_attestation"):
-                    prepared = publisher.prepare(
+                with self.assertRaisesRegex(
+                        ValueError,
+                        "PROTECTED_BUILDER_CURRENT_PUBLICATION_ALLOWED=NO"):
+                    publisher.prepare(
                         candidate, identity, "attested-session", source_repo_root=source_repo,
                         trusted_build_workflow_identity="trusted-ci",
                         trusted_build_workflow_sha="f" * 40,
@@ -524,15 +535,13 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
                         candidate_build_attestation_workflow=(
                             "Chary-yu/fos_coverage_tool/.github/workflows/ci.yml"
                         ),
+                        release_trust_mode=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
                     )
             finally:
                 if previous_key is None:
                     os.environ.pop("COVERAGE_BUILD_PROVENANCE_HMAC_KEY", None)
                 else:
                     os.environ["COVERAGE_BUILD_PROVENANCE_HMAC_KEY"] = previous_key
-            self.assertEqual(
-                prepared["release_validation_session_id"], "attested-session"
-            )
 
     def test_trusted_ci_publish_requires_protected_receipt_and_bundle(self):
         with tempfile.TemporaryDirectory(prefix="release-receipt-required-") as root:
@@ -571,12 +580,15 @@ class ImmutableReleasePublicationTest(unittest.TestCase):
             })
             self._build_production_manifest(candidate, identity, provenance)
             publisher = ImmutableReleasePublisher(os.path.join(root, "publish"))
-            with self.assertRaisesRegex(ValueError, "attestation_bundle"):
+            with self.assertRaisesRegex(
+                    ValueError,
+                    "PROTECTED_BUILDER_CURRENT_PUBLICATION_ALLOWED=NO"):
                 publisher.prepare(
                     candidate, identity, "receipt-missing",
                     source_repo_root=source_repo,
                     trusted_build_workflow_identity="trusted-ci",
                     trusted_build_workflow_sha="f" * 40,
+                    release_trust_mode=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
                 )
 
     def test_github_attestation_wrapper_enforces_subject_digest_and_policy(self):

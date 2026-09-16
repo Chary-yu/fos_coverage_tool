@@ -11,6 +11,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from scripts.upgrade.build_deployment_manifest import build
+from app.candidate_artifact import RELEASE_TRUST_MODE_PROTECTED_BUILDER
 from scripts.upgrade.cutover_controller import CutoverController
 from scripts.upgrade.run_upgrade import (
     _new_release_validation_session_id, _resolve_attempt_path,
@@ -743,12 +744,15 @@ class TestUpgradeManifest(unittest.TestCase):
             self.assertEqual(result["exit_code"], 127)
             self.assertIn("node", result["command"])
 
-    def test_candidate_preflight_rejects_workflow_sha_placeholder_before_maintenance(self):
-        with self.assertRaisesRegex(RuntimeError, "still a placeholder"):
+    def test_candidate_preflight_rejects_protected_builder_before_maintenance(self):
+        with self.assertRaisesRegex(
+                RuntimeError,
+                "PROTECTED_BUILDER_CURRENT_PUBLICATION_ALLOWED=NO"):
             validate_candidate_publication_preflight(
                 os.getcwd(), os.path.join(os.getcwd(), "missing-candidate"),
                 {"commit_sha": "a" * 40}, "", "github-actions/candidate-build",
                 "REPLACE_WITH_TRUSTED_BUILD_WORKFLOW_COMMIT_SHA",
+                release_trust_mode=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
             )
 
     def test_candidate_preflight_rejects_missing_manifest_before_maintenance(self):

@@ -57,6 +57,11 @@ from app.candidate_build_receipt import (
     ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
     verify_candidate_build_receipt,
 )
+from app.release_trust_policy import (
+    CURRENT_PRODUCTION_RELEASE_TRUST_MODE,
+    assert_current_production_trust_mode,
+    verify_current_production_candidate_trust,
+)
 from scripts.upgrade.evidence_manifest import ProductionEvidenceManifest
 from scripts.upgrade.schema_preflight import validate_ddl_file
 from scripts.diagnostics.path_mapping_audit import audit_path_mappings, audit_lcov_paths
@@ -245,7 +250,7 @@ def validate_candidate_publication_preflight(
         candidate_build_attestation_bundle: Optional[str] = "",
         candidate_build_attestation_repository: Optional[str] = "",
         candidate_build_attestation_workflow: Optional[str] = "",
-        release_trust_mode: str = RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+        release_trust_mode: str = CURRENT_PRODUCTION_RELEASE_TRUST_MODE,
         offline_operator_evidence: Optional[str] = "",
         offline_operator_source_bundle: Optional[str] = "",
         offline_operator_repository: Optional[str] = "",
@@ -253,31 +258,14 @@ def validate_candidate_publication_preflight(
         production_baseline_sha: Optional[str] = "",
         validation_session_id: Optional[str] = "") -> Dict[str, Any]:
     """Verify all candidate/source/trust inputs before maintenance begins."""
-    release_trust_mode = str(
-        release_trust_mode or RELEASE_TRUST_MODE_PROTECTED_BUILDER
-    ).strip()
-    if release_trust_mode not in RELEASE_TRUST_MODES:
-        raise RuntimeError("unsupported release_trust_mode")
+    try:
+        release_trust_mode = assert_current_production_trust_mode(
+            release_trust_mode, operation="current production Candidate preflight"
+        )
+    except ValueError as exc:
+        raise RuntimeError(str(exc))
     trusted_workflow_identity = str(trusted_workflow_identity or "").strip()
     trusted_workflow_sha = str(trusted_workflow_sha or "").strip()
-    if release_trust_mode == RELEASE_TRUST_MODE_PROTECTED_BUILDER:
-        if not trusted_workflow_identity or not trusted_workflow_sha:
-            raise RuntimeError(
-                "trusted build workflow identity and SHA are required"
-            )
-        if "REPLACE_WITH" in trusted_workflow_sha.upper():
-            raise RuntimeError(
-                "production_candidate_builder_workflow_sha is still a placeholder"
-            )
-        if not is_valid_commit_sha(trusted_workflow_sha):
-            raise RuntimeError(
-                "production_candidate_builder_workflow_sha must be an exact commit SHA"
-            )
-        if not str(candidate_build_attestation_repository or "").strip() or \
-                not str(candidate_build_attestation_workflow or "").strip():
-            raise RuntimeError(
-                "candidate build attestation repository and signer workflow are required"
-            )
     production_candidate_root = os.path.realpath(
         os.path.abspath(production_candidate_root)
     )
@@ -301,72 +289,36 @@ def validate_candidate_publication_preflight(
     validate_production_candidate_content(
         production_candidate_root, PRODUCTION_PROJECT_NAME
     )
-    if release_trust_mode == RELEASE_TRUST_MODE_PROTECTED_BUILDER:
-        provenance = verify_trusted_build_policy(
-            manifest.get("source_provenance") or {},
-            trusted_workflow_identity, trusted_workflow_sha,
+    provenance = manifest.get("source_provenance") or {}
+    offline_repository = str(offline_operator_repository or "").strip()
+    if not offline_repository:
+        raise RuntimeError(
+            "offline_operator_repository is required for offline trust"
         )
-        observed_source = verify_git_source_provenance(
-            repo_root, release_identity, provenance,
+    evidence_path = str(offline_operator_evidence or "")
+    if evidence_path and not os.path.isabs(evidence_path):
+        evidence_path = os.path.join(
+            os.path.realpath(os.path.abspath(repo_root)), evidence_path
         )
-        receipt_path = _resolve_candidate_manifest_path(
-            os.path.realpath(os.path.abspath(repo_root)), production_candidate_root,
-            candidate_build_receipt or manifest.get("receipt_path") or
-            "candidate_build_receipt.json",
+    source_bundle = str(offline_operator_source_bundle or "")
+    if source_bundle and not os.path.isabs(source_bundle):
+        source_bundle = os.path.join(
+            os.path.realpath(os.path.abspath(repo_root)), source_bundle
         )
-        if not candidate_build_attestation_bundle:
-            raise RuntimeError(
-                "candidate_build_attestation_bundle is required before maintenance"
-            )
-        bundle_path = str(candidate_build_attestation_bundle)
-        if not os.path.isabs(bundle_path):
-            bundle_path = os.path.join(
-                os.path.realpath(os.path.abspath(repo_root)), bundle_path
-            )
-        bundle_path = os.path.realpath(os.path.abspath(bundle_path))
-        verify_candidate_build_receipt(
-            production_candidate_root, release_identity, manifest, bundle_path,
-            receipt_path=receipt_path,
-            attestation_repository=candidate_build_attestation_repository,
-            attestation_workflow=candidate_build_attestation_workflow,
-            attestation_runner_policy=ATTESTATION_RUNNER_POLICY_PRODUCTION_BUILDER,
-        )
-        trust_evidence = {
-            "status": "PASSED",
-            "release_trust_mode": RELEASE_TRUST_MODE_PROTECTED_BUILDER,
-            "protected_builder": "PASSED",
-            "trust_class": "PROTECTED_BUILDER",
-        }
-    else:
-        provenance = manifest.get("source_provenance") or {}
-        offline_repository = str(offline_operator_repository or "").strip()
-        if not offline_repository:
-            raise RuntimeError(
-                "offline_operator_repository is required for offline trust"
-            )
-        evidence_path = str(offline_operator_evidence or "")
-        if evidence_path and not os.path.isabs(evidence_path):
-            evidence_path = os.path.join(
-                os.path.realpath(os.path.abspath(repo_root)), evidence_path
-            )
-        source_bundle = str(offline_operator_source_bundle or "")
-        if source_bundle and not os.path.isabs(source_bundle):
-            source_bundle = os.path.join(
-                os.path.realpath(os.path.abspath(repo_root)), source_bundle
-            )
-        observed_source = verify_offline_operator_trust(
-            production_candidate_root, release_identity, manifest, repo_root,
-            evidence_path=evidence_path,
-            source_bundle_path=source_bundle,
-            expected_repository=offline_repository,
-            expected_production_host=production_host,
-            expected_production_baseline_sha=production_baseline_sha,
-            expected_validation_session_id=validation_session_id,
-        )
-        served_root_binding = served_root_provenance_binding(provenance)
-        trust_evidence = dict(observed_source)
-        receipt_path = ""
-        bundle_path = ""
+    trust_evidence = verify_current_production_candidate_trust(
+        release_trust_mode, production_candidate_root, release_identity,
+        manifest, repo_root,
+        evidence_path=evidence_path,
+        source_bundle_path=source_bundle,
+        expected_repository=offline_repository,
+        expected_production_host=production_host,
+        expected_production_baseline_sha=production_baseline_sha,
+        expected_validation_session_id=validation_session_id,
+    )
+    served_root_binding = served_root_provenance_binding(provenance)
+    observed_source = trust_evidence
+    receipt_path = ""
+    bundle_path = ""
     served_root_binding = served_root_provenance_binding(
         manifest.get("source_provenance") or {}
     )
@@ -390,16 +342,12 @@ def validate_candidate_publication_preflight(
         "served_root_identity_sha256": served_root_binding[
             "served_root_identity_sha256"
         ],
-        "build_workflow_identity": trusted_workflow_identity,
-        "build_workflow_sha": trusted_workflow_sha,
+        "build_workflow_identity": "",
+        "build_workflow_sha": "",
         "candidate_build_receipt": receipt_path,
         "candidate_build_attestation_bundle": bundle_path,
-        "candidate_build_attestation_repository": str(
-            candidate_build_attestation_repository or ""
-        ).strip(),
-        "candidate_build_attestation_workflow": str(
-            candidate_build_attestation_workflow or ""
-        ).strip(),
+        "candidate_build_attestation_repository": "",
+        "candidate_build_attestation_workflow": "",
         "release_trust": trust_evidence,
         "release_trust_mode": release_trust_mode,
     }
@@ -1073,7 +1021,7 @@ class UpgradeOrchestrator:
         self._production_runtime_binding_attempted = False
         self._traffic_open_attempted = False
         self._previous_release_identity = {}
-        self._release_trust_mode = RELEASE_TRUST_MODE_PROTECTED_BUILDER
+        self._release_trust_mode = CURRENT_PRODUCTION_RELEASE_TRUST_MODE
         self._deployment_layout = ""
         self._current_adoption_plan = None
         self._database_generation = {}
@@ -1156,7 +1104,7 @@ class UpgradeOrchestrator:
         ).strip()
         self._release_trust_mode = str(
             upgrade_config.get("release_trust_mode") or
-            RELEASE_TRUST_MODE_PROTECTED_BUILDER
+            CURRENT_PRODUCTION_RELEASE_TRUST_MODE
         ).strip()
         self.candidate_preflight = validate_candidate_publication_preflight(
             self.repo_root, production_candidate_root, identity,
