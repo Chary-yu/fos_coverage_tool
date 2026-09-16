@@ -15,7 +15,12 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from scripts.release.compatibility_surface import (
     classify_compatibility_surface,

@@ -1,5 +1,7 @@
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -94,6 +96,29 @@ class LocalCompatibilityGateTest(unittest.TestCase):
             self.assertFalse(result["isolated_candidate_staging_allowed"])
             self.assertFalse(result["publication_allowed"])
             self.assertFalse(result["cutover_allowed"])
+
+    def test_cli_runs_from_repository_root_without_package_path_setup(self):
+        source = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=os.getcwd()
+        ).decode("ascii").strip()
+        with tempfile.TemporaryDirectory(prefix="compatibility-cli-") as root:
+            output = os.path.join(root, "compatibility.json")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "scripts/release/local_compatibility_gate.py",
+                    "--repo-root", os.getcwd(),
+                    "--source-sha", source,
+                    "--baseline-sha", source,
+                    "--output", output,
+                ],
+                cwd=os.getcwd(), stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, universal_newlines=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            with open(output, encoding="utf-8") as stream:
+                payload = json.load(stream)
+        self.assertEqual(payload["status"], "NOT_APPLICABLE")
 
 
 if __name__ == "__main__":
