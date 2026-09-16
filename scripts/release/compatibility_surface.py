@@ -33,6 +33,15 @@ _PRODUCTION_PYTHON_FILES = (
     "enhance_coverage.py",
     "source_reader.py",
 )
+_LOCAL_ONLY_PYTHON_PATHS = (
+    # These programs run only in the repository-local release gate.  They are
+    # deliberately not confused with Python carried into a VFOS Candidate.
+    "scripts/release/compatibility_surface.py",
+    "scripts/release/local_compatibility_gate.py",
+    "scripts/release/local_release_gate.py",
+    "scripts/release/generate_flat_production_candidate_operator.py",
+    "scripts/release/generate_r8_flat_production_candidate_operator.py",
+)
 
 # A path in these areas is DB-sensitive even if a particular change is only
 # a small implementation detail.  Content matching below catches SQL/driver
@@ -114,7 +123,7 @@ def _changed_paths(repo_root, baseline_sha, source_sha):
 
 def _is_production_python(path):
     path = str(path or "").replace(os.sep, "/")
-    return path.endswith(".py") and (
+    return path.endswith(".py") and path not in _LOCAL_ONLY_PYTHON_PATHS and (
         path in _PRODUCTION_PYTHON_FILES or
         path.startswith(_PRODUCTION_PYTHON_ROOTS)
     )

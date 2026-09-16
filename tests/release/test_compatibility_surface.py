@@ -132,7 +132,7 @@ class CompatibilitySurfaceTest(unittest.TestCase):
         finally:
             import shutil
             shutil.rmtree(root)
-        self.assertEqual(result["python"]["status"], "PRODUCTION_PYTHON_CHANGED")
+        self.assertEqual(result["python"]["status"], "NOT_PRODUCTION_PYTHON")
         self.assertEqual(result["mariadb"]["status"], "NOT_DB_SENSITIVE")
 
     def test_documentation_about_mariadb_is_not_db_surface(self):
