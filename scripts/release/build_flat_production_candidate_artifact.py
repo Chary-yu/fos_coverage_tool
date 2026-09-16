@@ -54,6 +54,13 @@ def build_flat_production_candidate(
         offline_operator_repository="", production_host="",
         production_baseline_sha="", validation_session_id="",
         flat_baseline_session_id=""):
+    release_trust_mode = str(
+        release_trust_mode or RELEASE_TRUST_MODE_PROTECTED_BUILDER
+    ).strip()
+    if release_trust_mode not in (
+            RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+            RELEASE_TRUST_MODE_OFFLINE_OPERATOR):
+        raise ValueError("unsupported release_trust_mode")
     flat_served_root = _real(flat_served_root)
     flat_release_identity_path = _real(flat_release_identity_path)
     source_repo_root = _real(source_repo_root)
@@ -182,6 +189,14 @@ def build_flat_production_candidate(
                 expected_production_baseline_sha=production_baseline_sha,
                 expected_validation_session_id=validation_session_id,
             )
+        # Adoption performs a before/after scan around its isolated copy.  A
+        # final scan here closes the whole Candidate construction window as
+        # well: the accepted Flat Root binding must still be byte-identical
+        # when the Candidate is ready for the operator's compact evidence.
+        verify_flat_source_binding(
+            flat_served_root, flat_release_identity_path,
+            expected_previous_release_sha, binding,
+        )
         release_identity_output = os.path.abspath(str(release_identity_output))
         save_release_manifest(release_identity_output, identity)
         return {
@@ -209,6 +224,7 @@ def build_flat_production_candidate(
             "application_sha256": application_evidence["application_sha256"],
             "application_file_count": application_evidence["file_count"],
             "source_binding_verified": True,
+            "source_binding_verified_after_build": True,
         }
     finally:
         shutil.rmtree(temporary_parent, ignore_errors=True)
