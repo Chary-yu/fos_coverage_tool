@@ -116,6 +116,7 @@ class InheritanceRejectionService(object):
             """, (int(rejection_id),))
 
     def _assert_current(self, connection, project_id, scan_id):
-        state = self.states.get(connection, int(project_id)) or {}
+        state = self.states.lock_for_update(connection, int(project_id)) or {}
         if int(state.get("current_scan_id") or 0) != int(scan_id):
             raise ValueError("MUTATION_REQUIRES_CURRENT_SCAN")
+        return state

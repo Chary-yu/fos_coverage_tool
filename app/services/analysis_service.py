@@ -52,7 +52,7 @@ class AnalysisService(object):
         with transaction(connection) as conn:
             # Analysis mutations never create or change the project CURRENT
             # pointer.  Publication owns that state transition exclusively.
-            state = self.states.ensure(conn, project["id"])
+            state = self.states.lock_for_update(conn, project["id"])
             if enforce_current and int(state.get("current_scan_id") or 0) != int(scan_id):
                 raise ValueError("MUTATION_REQUIRES_CURRENT_SCAN")
             if not records:

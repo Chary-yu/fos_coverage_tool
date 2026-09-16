@@ -12,7 +12,7 @@ completed skill execution.
 | FOS-001 | P1 | Change Review | CONFIRMED: `_resolve_records` shared `_operation_key` across ranges and the save planner created one same-file Block from the first range; repository links did not enforce line containment. | FIXED_VERIFIED | Legacy malformed historical ranges require separate evidence-bound repair. |
 | FOS-002 | P1 | Change Review | CONFIRMED: successful inheritance created a candidate LineLink without a candidate `AnalysisBlock`; confirm-only rolling inheritance lost the next-generation block identity. | FIXED_VERIFIED | Full external parser corpus remains pending. |
 | FOS-003 | P1 | Runtime Reliability | CONFIRMED: generic `JobRepository.upsert` updated by `job_id` only and runner heartbeat could race terminal persistence. | FIXED_VERIFIED | MariaDB driver-level concurrency evidence remains pending. |
-| FOS-004 | P1 | Runtime Reliability | CONFIRMED structural gap / NEEDS_EXTERNAL_EVIDENCE for real dual-connection MariaDB ordering: analysis/review/publication paths lack a shared project-state lock boundary. | PRODUCTION_ACCEPTANCE_PENDING | Disposable MariaDB/production-like concurrency run must be executed outside this task. |
+| FOS-004 | P1 | Runtime Reliability | CONFIRMED structural gap / NEEDS_EXTERNAL_EVIDENCE for real dual-connection MariaDB ordering: analysis/review/publication paths lacked a shared project-state lock boundary. | PRODUCTION_ACCEPTANCE_PENDING | Source lock boundary is fixed and tested; disposable MariaDB/production-like concurrency run remains external. |
 | FOS-005 | P2 | Change Review | CONFIRMED: affected-file path rebases every `coverage_file_state` row and validates a full authoritative fact aggregate inside the mutation transaction. | BLOCKED | Remediation in progress; fixed-hardware workload measurement remains pending. |
 | FOS-006 | P2 | Change Review | CONFIRMED: `execute` and `executemany` share one `db_query_count`, while returned and affected rows are not separately named from server-examined rows. | BLOCKED | Remediation in progress; real driver/session statement count remains pending. |
 | FOS-007 | P2 | Change Review | CONFIRMED: inheritance records all predecessor active relations even for unready repositories or missing candidate files, then publication replays the full predecessor set. | BLOCKED | Remediation in progress; large-scope checkpoint measurement remains pending. |
@@ -82,3 +82,19 @@ The following fields are updated after each root-cause commit:
 - Commit SHA: recorded after the focused commit below.
 - Status: FIXED_VERIFIED
 - Remaining Evidence: real MariaDB lock/driver interleaving and an external long-running process shutdown remain pending.
+
+### FOS-004
+
+- Original Severity: P1
+- Original Root Cause: CURRENT validation, analysis mutation, and publication read-set/CURRENT CAS did not share a project-state linearization boundary.
+- Current Revalidation Result: CONFIRMED structurally; before the fix the targeted contract could not find a `lock_for_update` API and the paths used ordinary state reads.
+- Root Owner: Runtime Reliability
+- Changed Files: `app/db/repositories/project_state_repository.py`, `app/services/analysis_service.py`, `app/services/inheritance_review_service.py`, `app/inheritance/rejections.py`, `app/scan_import/publication.py`, `tests/vnext/test_current_review_publication_race.py`
+- Changed Functions: `ProjectStateRepository.lock_for_update`, `advance`, `set_current_scan`, `invalidate`, `mark_ready`, and the analysis/review/reject/undo/publication entry boundaries.
+- Regression Test: `test_project_state_lock_uses_for_update_on_mysql_connections`, `test_analysis_and_publication_share_project_state_lock_boundary` — PASS.
+- Integration Test: Phase 1 gate command `python3 -m unittest -v tests.vnext.test_analysis_domain tests.vnext.test_inheritance_engine tests.vnext.test_scan_import_lifecycle tests.vnext.test_reliability_repairs` — PASS (74 tests), including CURRENT CAS and rejection/undo paths.
+- Browser Test: NOT_RUN; no UI code changed.
+- Compatibility Check: SQLite omits MySQL-only syntax while its writer transaction remains serialized; existing publication/import/review tests pass.
+- Commit SHA: recorded after the focused commit below.
+- Status: PRODUCTION_ACCEPTANCE_PENDING
+- Remaining Evidence: real disposable MariaDB dual-connection barriers for review/edit/reject/undo/read-set/publication, plus production deployment outer serialization, must be executed by an authorized operator.

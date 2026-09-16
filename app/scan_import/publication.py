@@ -33,7 +33,10 @@ class ScanPublicationService(object):
             raise KeyError("candidate scan is not bound to project")
         if str(scan.get("status") or "").upper() not in ("SEALED", "READY"):
             raise ValueError("candidate scan is not sealed")
-        state = self.states.ensure(connection, project_id)
+        # Publication and every current-scan analysis mutation serialize on
+        # the same project-state row. The expected-CURRENT UPDATE below stays
+        # as a second fail-closed CAS for diagnostics and API compatibility.
+        state = self.states.lock_for_update(connection, project_id)
         current = state.get("current_scan_id")
         if expected_current_scan_id is not _UNSET and (
                 (current is None and expected_current_scan_id is not None) or
