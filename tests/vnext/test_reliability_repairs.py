@@ -259,7 +259,7 @@ class ProgressReadyGateTest(unittest.TestCase):
         state = self.states.get(self.connection, self.project["id"])
         self.assertEqual(int(state["file_state_version"]), 0)
 
-    def test_partial_rebuild_rebases_unchanged_files_and_keeps_full_ready_gate(self):
+    def test_partial_rebuild_updates_only_affected_files_and_keeps_ready_gate(self):
         other_file = self.projects.ensure_file(
             self.connection, self.scan["id"], "repo", "g" * 32,
             "src/other-ready-gate.c", "other-ready-gate.c",
@@ -317,6 +317,11 @@ class ProgressReadyGateTest(unittest.TestCase):
         self.assertEqual(int(other_state["total_uncovered"]), 1)
         self.assertEqual(int(other_state["pending_total"]), 1)
         self.assertEqual(int(other_state["data_version"]), 1)
+        summary = self.progress.summary(
+            self.connection, "ready-gate", self.scan["id"]
+        )
+        self.assertEqual(summary["source"], "coverage_file_state")
+        self.assertEqual(summary["derived_state_status"], "READY")
 
 
 if __name__ == "__main__":

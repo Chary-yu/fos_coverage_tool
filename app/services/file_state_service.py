@@ -34,7 +34,8 @@ class FileStateService(object):
 
     def validate_rebuilt(self, connection, project_id, scan_id, data_version,
                          affected_file_ids=None, before_aggregate=None,
-                         before_affected_aggregate=None):
+                         before_affected_aggregate=None,
+                         require_exact_version=True):
         state = self.states.get(connection, int(project_id)) or {}
         expected_version = int(data_version)
         if int(state.get("data_version") or 0) != expected_version:
@@ -52,8 +53,11 @@ class FileStateService(object):
             before_affected_aggregate is not None
         )
         completeness = self.file_states.file_state_completeness(
-            connection, int(scan_id), expected_version,
+            connection,
+            int(scan_id),
+            expected_version,
             affected_file_ids=selected_file_ids if incremental else None,
+            allow_older_versions=bool(incremental or not require_exact_version),
         )
         conservation = self.file_states.pending_conservation(
             connection, int(scan_id),

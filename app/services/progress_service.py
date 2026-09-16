@@ -55,7 +55,8 @@ class ProgressService(object):
             return None
         try:
             return self.file_state_service.validate_rebuilt(
-                connection, project["id"], int(scan_id), data_version
+                connection, project["id"], int(scan_id), data_version,
+                require_exact_version=False,
             )
         except Exception:
             # Validation is an online read gate, not a reason to expose a

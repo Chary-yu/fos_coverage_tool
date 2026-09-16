@@ -285,7 +285,8 @@ class FileStateRepository(object):
         return self.scan_aggregate(connection, scan_id, file_ids=file_ids)
 
     def file_state_completeness(self, connection, scan_id: int,
-                                data_version=None, affected_file_ids=None):
+                                data_version=None, affected_file_ids=None,
+                                allow_older_versions=False):
         """Return the file-state coverage/version gate for one immutable Scan.
 
         ``coverage_file_state`` is a rebuildable projection.  A row count that
@@ -302,20 +303,34 @@ class FileStateRepository(object):
         ) if selected_file_ids is not None else "NULL"
         if data_version is not None:
             if selected_file_ids is None:
+                comparison = ">" if allow_older_versions else "<>"
                 stale_sql = """
                     COALESCE(SUM(CASE WHEN fs.file_id IS NOT NULL
-                                           AND fs.data_version <> ?
+                                           AND fs.data_version {comparison} ?
                                       THEN 1 ELSE 0 END), 0)
-                """
+                """.format(comparison=comparison)
                 version_params = [int(data_version)]
             else:
                 if selected_file_ids:
-                    stale_sql = """
-                        COALESCE(SUM(CASE WHEN fs.file_id IN ({})
-                                               AND fs.data_version <> ?
-                                          THEN 1 ELSE 0 END), 0)
-                    """.format(",".join("?" for _ in selected_file_ids))
-                    version_params = list(selected_file_ids) + [int(data_version)]
+                    placeholders = ",".join("?" for _ in selected_file_ids)
+                    if allow_older_versions:
+                        stale_sql = """
+                            COALESCE(SUM(CASE WHEN fs.data_version > ? OR
+                                                   (fs.file_id IN ({}) AND
+                                                    fs.data_version <> ?)
+                                              THEN 1 ELSE 0 END), 0)
+                        """.format(placeholders)
+                        version_params = (
+                            [int(data_version)] + list(selected_file_ids) +
+                            [int(data_version)]
+                        )
+                    else:
+                        stale_sql = """
+                            COALESCE(SUM(CASE WHEN fs.file_id IN ({})
+                                                   AND fs.data_version <> ?
+                                              THEN 1 ELSE 0 END), 0)
+                        """.format(placeholders)
+                        version_params = list(selected_file_ids) + [int(data_version)]
                 else:
                     stale_sql = "0"
                     version_params = []
@@ -371,6 +386,7 @@ class FileStateRepository(object):
         return {
             "scan_id": int(scan_id),
             "data_version": None if data_version is None else int(data_version),
+            "allow_older_versions": bool(allow_older_versions),
             "expected_file_count": expected,
             "state_file_count": states,
             "missing_file_count": missing,

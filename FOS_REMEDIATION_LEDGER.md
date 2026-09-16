@@ -107,7 +107,7 @@ The following fields are updated after each root-cause commit:
 - Root Owner: Change Review
 - Changed Files: `app/db/repositories/file_state_repository.py`, `app/services/file_state_service.py`, `app/services/analysis_service.py`, `app/services/inheritance_review_service.py`, `app/inheritance/rejections.py`, `tests/vnext/test_reliability_repairs.py`
 - Changed Functions: `FileStateRepository.scan_aggregate`, `file_state_completeness`, `pending_conservation`, `scan_summary_from_facts`, `FileStateService.validate_rebuilt`, `rebuild_validate_and_mark_ready_in_transaction`, and the analysis/review/reject/undo callers.
-- Regression Test: `test_partial_rebuild_rebases_unchanged_files_and_keeps_full_ready_gate` — PASS; the affected file is rebuilt, the unchanged row retains its previously verified version, the rebase UPDATE is not called, and the fact reconciliation is scoped to the affected file.
+- Regression Test: `test_partial_rebuild_updates_only_affected_files_and_keeps_ready_gate` — PASS; the affected file is rebuilt, the unchanged row retains its previously verified version, the rebase UPDATE is not called, the fact reconciliation is scoped to the affected file, and a ready consumer accepts the mixed (older-but-verified) row versions.
 - Integration Test: `python3 -m unittest -v tests.vnext.test_reliability_repairs tests.vnext.test_scan_import_lifecycle` — PASS (25 tests).
 - Browser Test: NOT_RUN; this is a persistence/transaction workload invariant and no UI code changed.
 - Compatibility Check: full rebuild/import paths remain authoritative and retain full reconciliation; stale/partial previous projections fail closed to the full rebuild path; SQLite and MariaDB SQL remain bounded by parameterized file-id sets.
