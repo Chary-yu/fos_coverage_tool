@@ -19,10 +19,12 @@ class LocalGateNoGithubTest(unittest.TestCase):
         output_parent = os.path.join(repo_root, ".artifacts")
         if not os.path.isdir(output_parent):
             os.makedirs(output_parent)
-        environment = {
-            "PATH": "/usr/bin:/bin",
-            "LANG": "C",
-        }
+        environment = dict(os.environ)
+        for name in (
+                "GITHUB_TOKEN", "GH_TOKEN", "ACTIONS_RUNTIME_TOKEN",
+                "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+                "ACTIONS_ID_TOKEN_REQUEST_URL"):
+            environment.pop(name, None)
         with tempfile.TemporaryDirectory(
                 prefix="local-gate-no-github-", dir=output_parent) as root:
             output = os.path.join(root, "evidence")
