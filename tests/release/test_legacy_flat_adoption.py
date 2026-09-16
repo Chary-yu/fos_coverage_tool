@@ -10,6 +10,7 @@ from unittest import mock
 
 from app.candidate_artifact import (
     PRODUCTION_PROJECT_NAME, build_directory_input_manifest_sha256,
+    RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
 )
 from app.release_identity import (
     DEFAULT_RELEASE_ASSET_RELATIVE_PATHS, generate_release_identity,
@@ -179,9 +180,7 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
 
     @staticmethod
     def _provenance_args():
-        return (
-            "github-actions/trusted-production-builder", "123", "1", "f" * 40
-        )
+        return ("", "", "", "")
 
     @staticmethod
     def _expected_binding_kwargs(publish_root):
@@ -422,10 +421,24 @@ class LegacyFlatAdoptionTest(unittest.TestCase):
             self._target_source(target_source)
             candidate_root = os.path.join(root, "production-candidate")
             target_identity_path = os.path.join(root, "target-identity.json")
+            source_bundle = os.path.join(root, "target-source.bundle")
+            subprocess.check_call(
+                ["git", "bundle", "create", source_bundle, "HEAD"],
+                cwd=target_source,
+            )
+            offline_evidence = os.path.join(root, "offline-operator-evidence.json")
+            current_binding = current_served_root_binding(publish_root)
             result = build_production_candidate(
                 "", target_source, candidate_root, target_identity_path,
                 *self._provenance_args(),
                 publish_root=publish_root,
+                release_trust_mode=RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+                offline_operator_evidence_output=offline_evidence,
+                offline_operator_source_bundle=source_bundle,
+                offline_operator_repository="Chary-yu/fos_coverage_tool",
+                production_host="vfoswind",
+                production_baseline_sha=LEGACY_COMMIT_SHA,
+                validation_session_id=current_binding["release_validation_session_id"],
                 **self._expected_binding_kwargs(publish_root)
             )
             self.assertEqual(result["status"], "PASSED")
