@@ -24,8 +24,18 @@ readonly EXPECTED_APP_ROOT="/home/zcyu/coverage/onesensor_code-coverage_tool"
 readonly EXPECTED_BASELINE_SHA="e9fcc837a1ac9847f3966fc8ddb2aed92ca473fc"
 readonly EXPECTED_PUBLISH_ROOT="/home/zcyu/coverage_published"
 readonly EXPECTED_EXPORT_PARENT="/home/zcyu/fos_r8_baseline_exports"
-readonly EXPECTED_NGINX_PREFIX="/coverage/"
-readonly EXPECTED_PROXY="http://127.0.0.1:9528"
+readonly EXPECTED_NGINX_CONFIG="/etc/nginx/conf.d/coverage.conf"
+readonly EXPECTED_PRODUCTION_LISTEN="80"
+readonly EXPECTED_PRODUCTION_SERVER_NAME="10.190.162.33"
+readonly EXPECTED_STATIC_LOCATION="/coverage/"
+readonly EXPECTED_STATIC_ALIAS="/home/zcyu/coverage/export0810/onesensor/"
+readonly EXPECTED_API_LOCATION="/api/coverage"
+readonly EXPECTED_API_PROXY_ORIGIN="http://127.0.0.1:9528"
+readonly EXPECTED_API_PROXY_PATH="/api/coverage"
+readonly EXPECTED_API_PROXY="http://127.0.0.1:9528/api/coverage"
+readonly KNOWN_RELEASE_MANIFEST_SHA256="07e2e79a85da37e11eeb9bd2fca4b477f992250d66849df59fee6f4c8156a85e"
+readonly KNOWN_RELEASE_ASSET_HASH="8a4acc312e15583e877f10911b7b6ed8d301b2931cf777b650329888f04f1833"
+readonly APPLICATION_GIT_UNAVAILABLE="NOT_AVAILABLE_PACKAGED_DEPLOYMENT"
 readonly EXPORT_TOOL_ID="fos-r8-legacy-baseline-export-v1"
 readonly COMPLETION_MARKER_NAME="COMPLETION_MARKER"
 
@@ -75,6 +85,16 @@ EXPECTED_IDENTITY_KEYS = (
     "version", "commit_sha", "build_id", "asset_hash", "schema_version",
     "asset_manifest_version", "asset_count", "asset_manifest_hash",
     "asset_manifest",
+)
+APPLICATION_IDENTITY_MODES = frozenset(("GIT_CHECKOUT", "PACKAGED_RELEASE_MANIFEST"))
+APPLICATION_GIT_UNAVAILABLE = "NOT_AVAILABLE_PACKAGED_DEPLOYMENT"
+EXPECTED_RELEASE_SCHEMA_VERSION = 2
+EXPECTED_ASSET_MANIFEST_VERSION = 1
+KNOWN_RELEASE_MANIFEST_SHA256 = (
+    "07e2e79a85da37e11eeb9bd2fca4b477f992250d66849df59fee6f4c8156a85e"
+)
+KNOWN_RELEASE_ASSET_HASH = (
+    "8a4acc312e15583e877f10911b7b6ed8d301b2931cf777b650329888f04f1833"
 )
 CONTROL_NAMES = frozenset((
     "CURRENT", "candidate_artifact_manifest.json",
@@ -138,8 +158,17 @@ CONTRACT = {
     "baseline_sha": "e9fcc837a1ac9847f3966fc8ddb2aed92ca473fc",
     "publish_root": "/home/zcyu/coverage_published",
     "export_parent": "/home/zcyu/fos_r8_baseline_exports",
-    "nginx_prefix": "/coverage/",
-    "proxy": "http://127.0.0.1:9528",
+    "nginx_config": "/etc/nginx/conf.d/coverage.conf",
+    "production_listen": "80",
+    "production_server_name": "10.190.162.33",
+    "static_location": "/coverage/",
+    "static_alias": "/home/zcyu/coverage/export0810/onesensor/",
+    "api_location": "/api/coverage",
+    "api_proxy_origin": "http://127.0.0.1:9528",
+    "api_proxy_path": "/api/coverage",
+    "api_proxy": "http://127.0.0.1:9528/api/coverage",
+    "known_release_manifest_sha256": KNOWN_RELEASE_MANIFEST_SHA256,
+    "known_release_asset_hash": KNOWN_RELEASE_ASSET_HASH,
     "tool_id": "fos-r8-legacy-baseline-export-v1",
 }
 COMPLETION_MARKER_NAME = "COMPLETION_MARKER"
@@ -185,23 +214,33 @@ def resolved_path(path):
 
 
 def check_constants(values):
-    observed = {
-        "host": values[0],
-        "legacy_root": values[1],
-        "application_root": values[2],
-        "baseline_sha": values[3],
-        "publish_root": values[4],
-        "export_parent": values[5],
-        "nginx_prefix": values[6],
-        "proxy": values[7],
-        "tool_id": values[8],
-    }
+    contract_keys = (
+        "host", "legacy_root", "application_root", "baseline_sha",
+        "publish_root", "export_parent", "nginx_config",
+        "production_listen", "production_server_name", "static_location",
+        "static_alias", "api_location", "api_proxy_origin",
+        "api_proxy_path", "api_proxy", "known_release_manifest_sha256",
+        "known_release_asset_hash", "tool_id",
+    )
+    if len(values) != len(contract_keys):
+        raise ValueError("embedded export contract argument count is invalid")
+    observed = dict(zip(contract_keys, values))
     if observed != CONTRACT:
         raise ValueError("embedded contract constants are inconsistent")
     if not COMMIT_RE.fullmatch(CONTRACT["baseline_sha"]):
         raise ValueError("embedded baseline SHA is malformed")
-    if CONTRACT["proxy"] != "http://127.0.0.1:9528":
-        raise ValueError("embedded loopback proxy is malformed")
+    if CONTRACT["production_listen"] != "80":
+        raise ValueError("embedded production listen is malformed")
+    if CONTRACT["api_proxy_origin"] != "http://127.0.0.1:9528":
+        raise ValueError("embedded loopback proxy origin is malformed")
+    if CONTRACT["api_proxy_path"] != "/api/coverage":
+        raise ValueError("embedded API proxy path is malformed")
+    if CONTRACT["api_proxy"] != (
+            CONTRACT["api_proxy_origin"] + CONTRACT["api_proxy_path"]):
+        raise ValueError("embedded API proxy directive is inconsistent")
+    for key in ("known_release_manifest_sha256", "known_release_asset_hash"):
+        if not SHA256_RE.fullmatch(CONTRACT[key]):
+            raise ValueError("embedded {} is malformed".format(key))
     return observed
 
 
@@ -443,6 +482,266 @@ def detect_identity_mode(identity_path):
     return "LEGACY_PRE_ADOPTION"
 
 
+def detect_application_identity_mode(application_root):
+    """Select checkout identity or the explicit packaged-release identity."""
+    root = os.path.abspath(str(application_root))
+    git_metadata = os.path.join(root, ".git")
+    if os.path.lexists(git_metadata):
+        return "GIT_CHECKOUT"
+    manifest_path = os.path.join(root, "release_manifest.json")
+    if os.path.islink(manifest_path) or not os.path.isfile(manifest_path):
+        raise ValueError(
+            "packaged application requires a regular release_manifest.json"
+        )
+    return "PACKAGED_RELEASE_MANIFEST"
+
+
+def _valid_git_object_sha(value):
+    value = str(value or "").strip().lower()
+    return bool(COMMIT_RE.fullmatch(value)) and set(value) != {"0"}
+
+
+def _git_value(application_root, arguments, label):
+    try:
+        value = subprocess.check_output(
+            ["git", "-C", os.path.abspath(str(application_root))] + list(arguments),
+            stderr=subprocess.DEVNULL,
+        ).decode("utf-8", "replace").strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ValueError("{} cannot be verified: {}".format(label, exc))
+    if not value or "\n" in value:
+        raise ValueError("{} is ambiguous".format(label))
+    return value
+
+
+def validate_git_checkout(application_root, expected_commit):
+    """Verify the exact checkout HEAD/tree without inventing package metadata."""
+    root = os.path.abspath(str(application_root))
+    if os.path.islink(root) or not os.path.isdir(root):
+        raise ValueError("application root is not a real directory")
+    if not os.path.lexists(os.path.join(root, ".git")):
+        raise ValueError("Git checkout metadata is absent")
+    top_level = _git_value(root, ["rev-parse", "--show-toplevel"],
+                           "Git checkout root")
+    if os.path.realpath(top_level) != os.path.realpath(root):
+        raise ValueError("Git checkout root does not match application root")
+    head = _git_value(root, ["rev-parse", "HEAD"], "Git HEAD").lower()
+    tree = _git_value(root, ["rev-parse", "HEAD^{tree}"], "Git tree").lower()
+    expected = str(expected_commit or "").strip().lower()
+    if not COMMIT_RE.fullmatch(expected):
+        raise ValueError("expected Git baseline SHA is not exact")
+    if not _valid_git_object_sha(head) or head != expected:
+        raise ValueError("Git HEAD does not match expected baseline")
+    if not _valid_git_object_sha(tree):
+        raise ValueError("Git tree SHA is not exact")
+    return {
+        "application_identity_mode": "GIT_CHECKOUT",
+        "application_git_sha": head,
+        "application_git_tree_sha": tree,
+        "packaged_release_anchor": None,
+    }
+
+
+def _packaged_asset_path(application_root, relative):
+    root = os.path.abspath(str(application_root))
+    root_real = os.path.realpath(root)
+    parts = relative.split("/")
+    candidate = os.path.join(root, *parts)
+    candidate_real = os.path.realpath(candidate)
+    if not _path_within(candidate_real, root_real):
+        raise ValueError("packaged asset escapes application root: {}".format(
+            relative
+        ))
+    current = root
+    for part in parts[:-1]:
+        current = os.path.join(current, part)
+        if os.path.islink(current) or not os.path.isdir(current):
+            raise ValueError("packaged asset parent is not a real directory: {}".format(
+                relative
+            ))
+    if os.path.islink(candidate) or not os.path.lexists(candidate):
+        raise ValueError("packaged asset is missing or linked: {}".format(relative))
+    file_stat = os.stat(candidate, follow_symlinks=False)
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise ValueError("packaged asset is not a regular file: {}".format(relative))
+    return candidate
+
+
+def _validate_packaged_asset_manifest(declared, application_root):
+    if not isinstance(declared, list) or not declared:
+        raise ValueError("release manifest asset_manifest is invalid")
+    normalized = []
+    seen = set()
+    root = os.path.abspath(str(application_root))
+    for item in declared:
+        if not isinstance(item, dict) or set(item) != set(("path", "size", "sha256")):
+            raise ValueError("release manifest asset record is invalid")
+        path = item.get("path")
+        if not isinstance(path, str) or path != path.replace("\\", "/") or \
+                not safe_relative(path) or posixpath.normpath(path) != path:
+            raise ValueError("release manifest asset path is invalid: {}".format(
+                path
+            ))
+        if path in seen:
+            raise ValueError("release manifest has duplicate asset path: {}".format(
+                path
+            ))
+        seen.add(path)
+        size = item.get("size")
+        if not isinstance(size, int) or isinstance(size, bool):
+            raise ValueError("release manifest asset size is invalid: {}".format(
+                path
+            ))
+        digest = item.get("sha256")
+        if not isinstance(digest, str) or digest != digest.lower() or \
+                size < 0 or not SHA256_RE.fullmatch(digest):
+            raise ValueError("release manifest asset fingerprint is invalid: {}".format(
+                path
+            ))
+        normalized.append({"path": path, "size": size, "sha256": digest})
+    if normalized != sorted(normalized, key=lambda value: value["path"]):
+        raise ValueError("release manifest asset_manifest is not canonical")
+    for item in normalized:
+        path = _packaged_asset_path(root, item["path"])
+        file_stat = os.stat(path, follow_symlinks=False)
+        observed_hash = sha256_file(path)
+        if int(file_stat.st_size) != item["size"] or \
+                observed_hash.lower() != item["sha256"]:
+            raise ValueError("packaged asset bytes do not match: {}".format(
+                item["path"]
+            ))
+    return normalized
+
+
+def validate_packaged_release_manifest(
+        manifest_path, application_root, expected_commit=None,
+        expected_manifest_sha256=None, expected_asset_hash=None):
+    """Verify a packaged release manifest and every declared package byte."""
+    root = os.path.abspath(str(application_root))
+    if os.path.islink(root) or not os.path.isdir(root):
+        raise ValueError("application root is not a real directory")
+    expected_manifest_path = os.path.join(root, "release_manifest.json")
+    requested_manifest = os.path.abspath(str(manifest_path))
+    if requested_manifest != expected_manifest_path:
+        raise ValueError("packaged release manifest path is not at application root")
+    manifest_info = file_info(requested_manifest)
+    expected_commit = str(
+        expected_commit if expected_commit is not None else CONTRACT["baseline_sha"]
+    ).strip().lower()
+    expected_manifest_sha256 = str(
+        expected_manifest_sha256
+        if expected_manifest_sha256 is not None
+        else CONTRACT["known_release_manifest_sha256"]
+    ).strip().lower()
+    expected_asset_hash = str(
+        expected_asset_hash
+        if expected_asset_hash is not None
+        else CONTRACT["known_release_asset_hash"]
+    ).strip().lower()
+    if not COMMIT_RE.fullmatch(expected_commit):
+        raise ValueError("expected packaged baseline SHA is not exact")
+    if not SHA256_RE.fullmatch(expected_manifest_sha256):
+        raise ValueError("expected release manifest SHA256 is malformed")
+    if not SHA256_RE.fullmatch(expected_asset_hash):
+        raise ValueError("expected release asset hash is malformed")
+    if manifest_info["sha256"].lower() != expected_manifest_sha256:
+        raise ValueError("release manifest file SHA256 does not match known release")
+    manifest = load_json(requested_manifest)
+    for key in EXPECTED_IDENTITY_KEYS:
+        if manifest.get(key) in (None, ""):
+            raise ValueError("release manifest is incomplete: {}".format(key))
+    version = manifest.get("version")
+    if not isinstance(version, str) or not version.strip():
+        raise ValueError("release manifest version is invalid")
+    commit_sha = manifest.get("commit_sha")
+    if not isinstance(commit_sha, str) or commit_sha != commit_sha.lower() or \
+            not COMMIT_RE.fullmatch(commit_sha) or commit_sha != expected_commit:
+        raise ValueError("release manifest commit_sha does not match baseline")
+    schema_version = manifest.get("schema_version")
+    asset_manifest_version = manifest.get("asset_manifest_version")
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool) or \
+            schema_version != EXPECTED_RELEASE_SCHEMA_VERSION:
+        raise ValueError("release manifest schema_version is invalid")
+    if not isinstance(asset_manifest_version, int) or \
+            isinstance(asset_manifest_version, bool) or \
+            asset_manifest_version != EXPECTED_ASSET_MANIFEST_VERSION:
+        raise ValueError("release manifest asset_manifest_version is invalid")
+    declared = _validate_packaged_asset_manifest(
+        manifest.get("asset_manifest"), root
+    )
+    asset_count = manifest.get("asset_count")
+    if not isinstance(asset_count, int) or isinstance(asset_count, bool):
+        raise ValueError("release manifest asset_count is invalid")
+    if asset_count != len(declared):
+        raise ValueError("release manifest asset_count does not match assets")
+    asset_manifest_hash = canonical(declared)
+    manifest_asset_manifest_hash = manifest.get("asset_manifest_hash")
+    if not isinstance(manifest_asset_manifest_hash, str) or \
+            manifest_asset_manifest_hash != asset_manifest_hash:
+        raise ValueError("release manifest asset_manifest_hash is invalid")
+    manifest_asset_hash = manifest.get("asset_hash")
+    if not isinstance(manifest_asset_hash, str) or \
+            manifest_asset_hash != asset_manifest_hash:
+        raise ValueError("release manifest asset_hash is invalid")
+    if asset_manifest_hash != expected_asset_hash:
+        raise ValueError("release manifest asset hash does not match known release")
+    build_id = str(manifest.get("build_id") or "")
+    expected_build_id = "{}-{}-{}".format(
+        version.split()[0], commit_sha[:8], asset_manifest_hash[:8]
+    )
+    if build_id != expected_build_id:
+        raise ValueError("release manifest build_id is invalid")
+    anchor = {
+        "anchor_type": "PACKAGED_RELEASE_MANIFEST",
+        "verified": True,
+        "release_manifest_path": requested_manifest,
+        "release_manifest_sha256": manifest_info["sha256"].lower(),
+        "commit_sha": commit_sha,
+        "asset_hash": asset_manifest_hash,
+        "asset_manifest_hash": asset_manifest_hash,
+        "asset_count": asset_count,
+        "schema_version": int(schema_version),
+        "asset_manifest_version": int(asset_manifest_version),
+        "version": version,
+        "build_id": build_id,
+    }
+    return {
+        "application_identity_mode": "PACKAGED_RELEASE_MANIFEST",
+        "application_git_sha": APPLICATION_GIT_UNAVAILABLE,
+        "application_git_tree_sha": APPLICATION_GIT_UNAVAILABLE,
+        "release_manifest_path": requested_manifest,
+        "release_manifest_sha256": manifest_info["sha256"].lower(),
+        "release_manifest_file_sha256": manifest_info["sha256"].lower(),
+        "release_manifest_asset_hash": asset_manifest_hash,
+        "release_manifest_asset_manifest_hash": asset_manifest_hash,
+        "release_manifest_asset_count": asset_count,
+        "release_manifest_schema_version": int(schema_version),
+        "release_manifest_asset_manifest_version": int(asset_manifest_version),
+        "release_manifest_version": version,
+        "release_manifest_build_id": build_id,
+        "packaged_release_anchor": anchor,
+        "packaged_asset_bindings": declared,
+    }
+
+
+def validate_application_identity(
+        application_root, expected_commit=None, expected_manifest_sha256=None,
+        expected_asset_hash=None):
+    mode = detect_application_identity_mode(application_root)
+    if mode == "GIT_CHECKOUT":
+        return validate_git_checkout(
+            application_root,
+            expected_commit if expected_commit is not None else CONTRACT["baseline_sha"],
+        )
+    return validate_packaged_release_manifest(
+        os.path.join(os.path.abspath(str(application_root)), "release_manifest.json"),
+        application_root,
+        expected_commit=expected_commit,
+        expected_manifest_sha256=expected_manifest_sha256,
+        expected_asset_hash=expected_asset_hash,
+    )
+
+
 def _identity_manifest_from_inventory(value, description):
     files = value.get("files")
     if not isinstance(files, list) or not files:
@@ -488,19 +787,72 @@ def _identity_manifest_from_inventory(value, description):
 def build_legacy_adoption_identity(
         adoption_inventory_path, adoption_root, snapshot_inventory_path,
         expected_commit, app_git_sha, app_git_tree, attempt_id, timestamp,
-        output_path, result_path, normalized_path):
+        output_path, result_path, normalized_path, application_identity=None):
     """Create identity only for the already-copied legacy adoption payload."""
     snapshot = load_json(snapshot_inventory_path)
     adoption = load_json(adoption_inventory_path)
     expected_commit = str(expected_commit or "").lower()
-    app_git_sha = str(app_git_sha or "").lower()
-    app_git_tree = str(app_git_tree or "").lower()
     if not COMMIT_RE.fullmatch(expected_commit):
         raise ValueError("expected legacy baseline SHA is not exact")
-    if app_git_sha != expected_commit or not COMMIT_RE.fullmatch(app_git_sha):
-        raise ValueError("application Git baseline does not match expected baseline")
-    if not COMMIT_RE.fullmatch(app_git_tree):
-        raise ValueError("application Git tree SHA is not exact")
+    if application_identity:
+        if isinstance(application_identity, str):
+            application_identity = load_json(application_identity)
+        if not isinstance(application_identity, dict):
+            raise ValueError("application identity result is invalid")
+        application_mode = str(
+            application_identity.get("application_identity_mode") or ""
+        )
+        if application_mode not in APPLICATION_IDENTITY_MODES:
+            raise ValueError("application identity mode is invalid")
+        provided_app_git_sha = str(
+            application_identity.get("application_git_sha") or ""
+        )
+        provided_app_git_tree = str(
+            application_identity.get("application_git_tree_sha") or ""
+        )
+        if application_mode == "GIT_CHECKOUT":
+            app_git_sha = provided_app_git_sha.lower()
+            app_git_tree = provided_app_git_tree.lower()
+            if app_git_sha != expected_commit or not _valid_git_object_sha(app_git_sha):
+                raise ValueError("application Git baseline does not match expected baseline")
+            if not _valid_git_object_sha(app_git_tree):
+                raise ValueError("application Git tree SHA is not exact")
+            packaged_anchor = None
+        else:
+            if provided_app_git_sha != APPLICATION_GIT_UNAVAILABLE or \
+                    provided_app_git_tree != APPLICATION_GIT_UNAVAILABLE:
+                raise ValueError("packaged application must not claim Git identity")
+            app_git_sha = APPLICATION_GIT_UNAVAILABLE
+            app_git_tree = APPLICATION_GIT_UNAVAILABLE
+            packaged_anchor = application_identity.get("packaged_release_anchor")
+            if not isinstance(packaged_anchor, dict) or \
+                    packaged_anchor.get("anchor_type") != "PACKAGED_RELEASE_MANIFEST" or \
+                    packaged_anchor.get("verified") is not True:
+                raise ValueError("verified packaged release anchor is missing")
+            if str(packaged_anchor.get("commit_sha") or "").lower() != expected_commit:
+                raise ValueError("packaged release anchor commit does not match baseline")
+            anchor_hash = str(packaged_anchor.get("asset_hash") or "").lower()
+            if not SHA256_RE.fullmatch(anchor_hash) or \
+                    anchor_hash != str(packaged_anchor.get(
+                        "asset_manifest_hash") or "").lower():
+                raise ValueError("packaged release anchor asset hash is invalid")
+            anchor_manifest_sha = str(
+                packaged_anchor.get("release_manifest_sha256") or ""
+            ).lower()
+            if not SHA256_RE.fullmatch(anchor_manifest_sha):
+                raise ValueError("packaged release anchor manifest hash is invalid")
+    else:
+        # Backward-compatible direct helper callers still use the strict Git
+        # checkout path.  The production operator always supplies the
+        # separately verified application identity result above.
+        application_mode = "GIT_CHECKOUT"
+        app_git_sha = str(app_git_sha or "").lower()
+        app_git_tree = str(app_git_tree or "").lower()
+        if app_git_sha != expected_commit or not _valid_git_object_sha(app_git_sha):
+            raise ValueError("application Git baseline does not match expected baseline")
+        if not _valid_git_object_sha(app_git_tree):
+            raise ValueError("application Git tree SHA is not exact")
+        packaged_anchor = None
     _identity_manifest_from_inventory(snapshot, "legacy snapshot inventory")
     declared = _identity_manifest_from_inventory(
         adoption, "legacy adoption inventory"
@@ -508,6 +860,20 @@ def build_legacy_adoption_identity(
     snapshot_tree = str(snapshot.get("tree_sha256") or "").lower()
     adoption_tree = str(adoption.get("tree_sha256") or "").lower()
     asset_hash = canonical(declared)
+    if application_mode == "PACKAGED_RELEASE_MANIFEST":
+        provenance = "packaged-release-manifest-plus-observed-legacy-snapshot"
+        provenance_claim = (
+            "verified packaged release manifest anchors the application release; "
+            "legacy Served Root bytes are an observed snapshot and the packaged "
+            "manifest does not attest historical generation of every legacy HTML "
+            "report"
+        )
+    else:
+        provenance = "git-checkout-plus-observed-legacy-snapshot"
+        provenance_claim = (
+            "observed/adopted legacy snapshot bound to a verified Git checkout; "
+            "not an original historical build attestation"
+        )
     identity = {
         "version": "legacy-pre-adoption",
         "commit_sha": expected_commit,
@@ -520,19 +886,25 @@ def build_legacy_adoption_identity(
         "asset_manifest_hash": asset_hash,
         "asset_manifest": declared,
         "schema_version": 2,
-        "build_provenance": "legacy-adoption-observed-snapshot",
+        "build_provenance": provenance,
         "built_at": str(timestamp),
         "identity_mode": "LEGACY_PRE_ADOPTION",
         "identity_origin": "legacy_adoption",
         "original_release_identity": "ABSENT",
         "historical_build_attestation": "NOT_AVAILABLE",
-        "provenance_claim": (
-            "observed/adopted legacy snapshot; not an original historical "
-            "build attestation"
-        ),
+        "provenance_claim": provenance_claim,
         "expected_baseline_sha": expected_commit,
         "application_git_sha": app_git_sha,
         "application_git_tree_sha": app_git_tree,
+        "application_identity_mode": application_mode,
+        "packaged_release_anchor": packaged_anchor,
+        "legacy_served_root_snapshot": {
+            "source_tree_sha256": snapshot_tree,
+            "adoption_source_tree_sha256": adoption_tree,
+            "file_count": snapshot.get("file_count"),
+            "total_size": snapshot.get("total_size"),
+            "byte_inventory_authoritative": True,
+        },
         "snapshot_tree_sha256": snapshot_tree,
         "adoption_source_tree_sha256": adoption_tree,
         "source_snapshot_file_count": snapshot.get("file_count"),
@@ -558,6 +930,9 @@ def build_legacy_adoption_identity(
         "expected_baseline_sha": expected_commit,
         "application_git_sha": app_git_sha,
         "application_git_tree_sha": app_git_tree,
+        "application_identity_mode": application_mode,
+        "packaged_release_anchor": packaged_anchor,
+        "legacy_served_root_snapshot": identity["legacy_served_root_snapshot"],
         "snapshot_tree_sha256": snapshot_tree,
         "adoption_source_tree_sha256": adoption_tree,
         "artifact_role": identity["artifact_role"],
@@ -775,80 +1150,211 @@ def sidecar_summary(root, output_path):
     return result
 
 
-def nginx_summary(config_path, expected_root, expected_proxy, output_path):
-    with open(config_path, "r", encoding="utf-8", errors="replace") as stream:
-        raw = stream.read()
-    config_paths = []
-    config_path_pattern = re.compile(
+def _nginx_clean(text):
+    return "\n".join(line.split("#", 1)[0] for line in text.splitlines())
+
+
+def _nginx_sections(raw):
+    sections = []
+    current = None
+    marker = re.compile(
         r"^\s*#\s*configuration file\s+(.+?):\s*$", re.IGNORECASE
     )
-    for raw_line in raw.splitlines():
-        config_match = config_path_pattern.match(raw_line)
-        if config_match:
-            config_paths.append(config_match.group(1).strip())
-    clean_lines = []
     for line in raw.splitlines():
-        clean_lines.append(line.split("#", 1)[0])
-    clean = "\n".join(clean_lines)
-    proxy_pattern = re.compile(
-        r"(?mi)^\s*proxy_pass\s+http://127\.0\.0\.1:9528\s*;"
-    )
-    proxy_match = proxy_pattern.search(clean)
-    location_pattern = re.compile(
-        r"(?mi)^\s*location\s+(?:(?:=|\^~|~\*?|~)\s+)?"
-        r"(/coverage/)\s*\{"
-    )
+        match = marker.match(line)
+        if match:
+            current = {"path": match.group(1).strip(), "lines": []}
+            sections.append(current)
+        elif current is not None:
+            current["lines"].append(line)
+    return sections
+
+
+def _nginx_block_end(text, opening):
+    depth = 0
+    quote = None
+    escaped = False
+    for index in range(opening, len(text)):
+        char = text[index]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in ("\"", "'"):
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+            if depth < 0:
+                break
+    raise ValueError("nginx block has unbalanced braces")
+
+
+def _nginx_depth_before(text, position):
+    depth = 0
+    quote = None
+    escaped = False
+    for char in text[:position]:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in ("\"", "'"):
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+    if quote is not None or depth < 0:
+        raise ValueError("nginx braces or quotes are unbalanced")
+    return depth
+
+
+def _nginx_directives(text):
+    """Return only directives at the block's direct nesting level."""
+    result = []
+    depth = 0
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if depth == 0:
+            match = re.match(r"(?i)^([a-z_][a-z0-9_]*)\s+([^;]+);\s*$", line)
+            if match:
+                result.append((match.group(1).lower(), match.group(2).strip()))
+        depth += line.count("{") - line.count("}")
+        if depth < 0:
+            raise ValueError("nginx block has unbalanced braces")
+    if depth != 0:
+        raise ValueError("nginx block has unbalanced braces")
+    return result
+
+
+def _nginx_locations(server_body):
     locations = []
-    for match in location_pattern.finditer(clean):
-        depth = 0
-        end = None
-        for index in range(match.end() - 1, len(clean)):
-            if clean[index] == "{":
-                depth += 1
-            elif clean[index] == "}":
-                depth -= 1
-                if depth == 0:
-                    end = index
-                    break
-        if end is None:
-            raise ValueError("coverage location has unbalanced braces")
-        block = clean[match.end():end]
-        alias = re.search(r"(?mi)^\s*alias\s+([^;]+);", block)
-        root = re.search(r"(?mi)^\s*root\s+([^;]+);", block)
-        selected = None
-        source = "UNRESOLVED"
-        if alias:
-            selected = alias.group(1).strip().strip("\"'")
-            source = "alias"
-        elif root:
-            selected = root.group(1).strip().strip("\"'")
-            source = "root"
-        if selected:
-            selected = os.path.normpath(selected)
+    pattern = re.compile(
+        r"(?mi)^\s*location\s+(?:(=|\^~|~\*?|~)\s+)?"
+        r"([^\s{]+)\s*\{"
+    )
+    for match in pattern.finditer(server_body):
+        if _nginx_depth_before(server_body, match.start()) != 0:
+            continue
+        end = _nginx_block_end(server_body, match.end() - 1)
         locations.append({
-            "prefix": match.group(1),
-            "static_root": selected,
-            "directive": source,
+            "modifier": match.group(1) or "",
+            "path": match.group(2),
+            "body": server_body[match.end():end],
         })
-    expected = os.path.normpath(str(expected_root))
-    matching = [item for item in locations
-                if item.get("static_root") == expected]
-    if not proxy_match:
-        raise ValueError("exact loopback proxy_pass was not found")
-    if len(locations) != 1 or len(matching) != 1:
+    return locations
+
+
+def _nginx_directive_values(directives, name):
+    return [value for directive, value in directives if directive == name]
+
+
+def nginx_summary(
+        config_path, expected_config, expected_listen, expected_server_name,
+        expected_static_location, expected_static_alias, expected_api_location,
+        expected_api_proxy, output_path):
+    with open(config_path, "r", encoding="utf-8", errors="replace") as stream:
+        raw = stream.read()
+    sections = _nginx_sections(raw)
+    matching_sections = [
+        section for section in sections if section["path"] == str(expected_config)
+    ]
+    if len(matching_sections) != 1:
         raise ValueError(
-            "effective /coverage/ static root is ambiguous or unresolved"
+            "expected production nginx configuration section is missing or duplicated"
         )
+    section_text = _nginx_clean("\n".join(matching_sections[0]["lines"]))
+    server_pattern = re.compile(r"(?mi)^\s*server\s*\{")
+    servers = []
+    for match in server_pattern.finditer(section_text):
+        if _nginx_depth_before(section_text, match.start()) != 0:
+            continue
+        end = _nginx_block_end(section_text, match.end() - 1)
+        body = section_text[match.end():end]
+        directives = _nginx_directives(body)
+        servers.append({
+            "body": body,
+            "listen": _nginx_directive_values(directives, "listen"),
+            "server_name": _nginx_directive_values(directives, "server_name"),
+        })
+    production_servers = [
+        server for server in servers
+        if server["listen"] == [str(expected_listen)] and
+        server["server_name"] == [str(expected_server_name)]
+    ]
+    if len(production_servers) != 1:
+        raise ValueError(
+            "production nginx server is missing, ambiguous, or duplicated"
+        )
+    production = production_servers[0]
+    locations = _nginx_locations(production["body"])
+    static_locations = [
+        location for location in locations
+        if location["path"] == str(expected_static_location)
+    ]
+    api_locations = [
+        location for location in locations
+        if location["path"] == str(expected_api_location)
+    ]
+    if len(static_locations) != 1:
+        raise ValueError("production static location is missing or duplicated")
+    if len(api_locations) != 1:
+        raise ValueError("production API location is missing or duplicated")
+    static = static_locations[0]
+    api = api_locations[0]
+    if static["modifier"] or api["modifier"]:
+        raise ValueError("production route location modifier is ambiguous")
+    static_directives = _nginx_directives(static["body"])
+    aliases = _nginx_directive_values(static_directives, "alias")
+    roots = _nginx_directive_values(static_directives, "root")
+    if len(aliases) != 1 or roots or aliases[0].strip() != str(expected_static_alias):
+        raise ValueError("production static alias does not match exact contract")
+    api_directives = _nginx_directives(api["body"])
+    proxies = _nginx_directive_values(api_directives, "proxy_pass")
+    if len(proxies) != 1 or proxies[0].strip() != str(expected_api_proxy):
+        raise ValueError("production API proxy_pass does not match exact contract")
+    proxy_match = re.fullmatch(
+        r"([a-z][a-z0-9+.-]*://[^/]+)(/.*)", str(expected_api_proxy)
+    )
+    if not proxy_match:
+        raise ValueError("expected API proxy contract is malformed")
     result = {
         "nginx_dump_sha256": sha256_file(config_path),
-        "proxy_pass": str(expected_proxy),
+        "nginx_config_path": str(expected_config),
+        "nginx_config_paths": str(expected_config),
+        "nginx_production_config_scoped": "MATCH",
+        "nginx_candidate_gateway_ignored": "MATCH",
+        "production_listen": str(expected_listen),
+        "production_server_name": str(expected_server_name),
+        "production_server_count": 1,
+        "production_static_location": str(expected_static_location),
+        "production_static_alias": aliases[0].strip(),
+        "production_static_alias_match": "MATCH",
+        "production_api_location": str(expected_api_location),
+        "production_api_proxy_origin": proxy_match.group(1),
+        "production_api_proxy_path": proxy_match.group(2),
+        "production_api_proxy": proxies[0].strip(),
+        "production_api_proxy_match": "MATCH",
+        # Preserve the original evidence names for downstream readers.
+        "proxy_pass": proxies[0].strip(),
         "proxy_pass_match": "MATCH",
-        "coverage_location_count": len(locations),
-        "coverage_prefix": locations[0]["prefix"],
-        "coverage_static_root": locations[0]["static_root"],
+        "coverage_location_count": 1,
+        "coverage_prefix": str(expected_static_location),
+        "coverage_static_root": aliases[0].strip().rstrip("/"),
         "coverage_static_root_match": "MATCH",
-        "coverage_static_root_directive": locations[0]["directive"],
-        "nginx_config_paths": "|".join(sorted(set(config_paths))) or "NOT_VERIFIED",
+        "coverage_static_root_directive": "alias",
     }
     with open(output_path, "w", encoding="utf-8") as stream:
         for key in sorted(result):
@@ -1197,6 +1703,13 @@ def main():
     item = sub.add_parser("identity-mode")
     item.add_argument("identity")
 
+    item = sub.add_parser("application-identity")
+    item.add_argument("application_root")
+    item.add_argument("expected_commit")
+    item.add_argument("expected_manifest_sha256")
+    item.add_argument("expected_asset_hash")
+    item.add_argument("output")
+
     item = sub.add_parser("adoption-identity")
     item.add_argument("adoption_inventory")
     item.add_argument("adoption_root")
@@ -1209,11 +1722,17 @@ def main():
     item.add_argument("output_identity")
     item.add_argument("result")
     item.add_argument("normalized")
+    item.add_argument("application_identity", nargs="?")
 
     item = sub.add_parser("nginx")
     item.add_argument("config")
-    item.add_argument("expected_root")
-    item.add_argument("expected_proxy")
+    item.add_argument("expected_config")
+    item.add_argument("expected_listen")
+    item.add_argument("expected_server_name")
+    item.add_argument("expected_static_location")
+    item.add_argument("expected_static_alias")
+    item.add_argument("expected_api_location")
+    item.add_argument("expected_api_proxy")
     item.add_argument("output")
 
     item = sub.add_parser("sanitize")
@@ -1245,7 +1764,7 @@ def main():
     item.add_argument("path")
 
     item = sub.add_parser("constants")
-    item.add_argument("values", nargs=9)
+    item.add_argument("values", nargs=18)
 
     args = parser.parse_args()
     try:
@@ -1292,13 +1811,42 @@ def main():
         if args.command == "identity-mode":
             print("IDENTITY_MODE={}".format(detect_identity_mode(args.identity)))
             return 0
+        if args.command == "application-identity":
+            result = validate_application_identity(
+                args.application_root, args.expected_commit,
+                args.expected_manifest_sha256, args.expected_asset_hash,
+            )
+            write_json(args.output, result)
+            print("APPLICATION_IDENTITY_MODE={}".format(
+                result["application_identity_mode"]
+            ))
+            print("APPLICATION_GIT_SHA={}".format(
+                result["application_git_sha"]
+            ))
+            print("APPLICATION_GIT_TREE_SHA={}".format(
+                result["application_git_tree_sha"]
+            ))
+            if result["application_identity_mode"] == "PACKAGED_RELEASE_MANIFEST":
+                print("RELEASE_MANIFEST_PATH={}".format(
+                    result["release_manifest_path"]
+                ))
+                print("RELEASE_MANIFEST_SHA256={}".format(
+                    result["release_manifest_sha256"]
+                ))
+                print("RELEASE_ASSET_HASH={}".format(
+                    result["release_manifest_asset_hash"]
+                ))
+                print("RELEASE_ASSET_COUNT={}".format(
+                    result["release_manifest_asset_count"]
+                ))
+            return 0
         if args.command == "adoption-identity":
             identity, result = build_legacy_adoption_identity(
                 args.adoption_inventory, args.adoption_root,
                 args.snapshot_inventory, args.expected_commit,
                 args.app_git_sha, args.app_git_tree, args.attempt_id,
                 args.timestamp, args.output_identity, args.result,
-                args.normalized,
+                args.normalized, args.application_identity,
             )
             print("IDENTITY_STATUS=PASS")
             print("IDENTITY_MODE={}".format(identity["identity_mode"]))
@@ -1311,7 +1859,10 @@ def main():
             return 0
         if args.command == "nginx":
             result = nginx_summary(
-                args.config, args.expected_root, args.expected_proxy, args.output
+                args.config, args.expected_config, args.expected_listen,
+                args.expected_server_name, args.expected_static_location,
+                args.expected_static_alias, args.expected_api_location,
+                args.expected_api_proxy, args.output,
             )
             for key in sorted(result):
                 print("{}={}".format(key.upper(), result[key]))
@@ -1363,8 +1914,13 @@ PY
 "$PYTHON_BIN" "$HELPER" constants \
     "$EXPECTED_HOST" "$EXPECTED_LEGACY_ROOT" "$EXPECTED_APP_ROOT" \
     "$EXPECTED_BASELINE_SHA" "$EXPECTED_PUBLISH_ROOT" \
-    "$EXPECTED_EXPORT_PARENT" "$EXPECTED_NGINX_PREFIX" \
-    "$EXPECTED_PROXY" "$EXPORT_TOOL_ID" >/dev/null ||
+    "$EXPECTED_EXPORT_PARENT" "$EXPECTED_NGINX_CONFIG" \
+    "$EXPECTED_PRODUCTION_LISTEN" "$EXPECTED_PRODUCTION_SERVER_NAME" \
+    "$EXPECTED_STATIC_LOCATION" "$EXPECTED_STATIC_ALIAS" \
+    "$EXPECTED_API_LOCATION" "$EXPECTED_API_PROXY_ORIGIN" \
+    "$EXPECTED_API_PROXY_PATH" "$EXPECTED_API_PROXY" \
+    "$KNOWN_RELEASE_MANIFEST_SHA256" "$KNOWN_RELEASE_ASSET_HASH" \
+    "$EXPORT_TOOL_ID" >/dev/null ||
     die "embedded export contract constants are inconsistent"
 TOOL_INFO="$TMP_DIR/tool-info.json"
 "$PYTHON_BIN" "$HELPER" info "$0" "$TOOL_INFO" >/dev/null ||
@@ -1372,10 +1928,121 @@ TOOL_INFO="$TMP_DIR/tool-info.json"
 
 if [ "$#" -gt 0 ] && [ "$1" = "--self-test" ]; then
     mkdir -p "$TMP_DIR/source" "$TMP_DIR/destination" \
+        "$TMP_DIR/packaged" "$TMP_DIR/gitapp" "$TMP_DIR/nginx-variants" \
         "$TMP_DIR/evidence" "$TMP_DIR/source/reports/.source_cache/report-v2" \
         "$TMP_DIR/source/home/git_for_coverage/git_fosip/fosip/fosip/nbm/source/comp/ssh/ssh/openssh/src" \
         "$TMP_DIR/source/ssh" "$TMP_DIR/source/coverage" \
         "$TMP_DIR/sensitive/etc" "$TMP_DIR/sensitive/root/.ssh"
+    "$PYTHON_BIN" - "$TMP_DIR/packaged" \
+        "$TMP_DIR/evidence/packaged-expected.txt" <<'PYFIXTURE'
+import hashlib
+import json
+import os
+import sys
+
+root = sys.argv[1]
+os.makedirs(os.path.join(root, "web"))
+assets = {
+    "app.js": b"packaged-fixture-js\n",
+    "web/index.html": b"<html>packaged-fixture</html>\n",
+}
+declared = []
+for relative in sorted(assets):
+    path = os.path.join(root, *relative.split("/"))
+    with open(path, "wb") as stream:
+        stream.write(assets[relative])
+    declared.append({
+        "path": relative,
+        "size": len(assets[relative]),
+        "sha256": hashlib.sha256(assets[relative]).hexdigest(),
+    })
+canonical = json.dumps(
+    declared, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+).encode("utf-8")
+asset_hash = hashlib.sha256(canonical).hexdigest()
+manifest = {
+    "version": "fixture-release",
+    "commit_sha": "e9fcc837a1ac9847f3966fc8ddb2aed92ca473fc",
+    "build_id": "fixture-release-e9fcc837-{}".format(asset_hash[:8]),
+    "asset_hash": asset_hash,
+    "schema_version": 2,
+    "asset_manifest_version": 1,
+    "asset_count": len(declared),
+    "asset_manifest_hash": asset_hash,
+    "asset_manifest": declared,
+}
+manifest_path = os.path.join(root, "release_manifest.json")
+with open(manifest_path, "w", encoding="utf-8") as stream:
+    json.dump(manifest, stream, ensure_ascii=False, indent=2, sort_keys=True)
+    stream.write("\n")
+with open(manifest_path, "rb") as stream:
+    manifest_hash = hashlib.sha256(stream.read()).hexdigest()
+with open(sys.argv[2], "w", encoding="utf-8") as stream:
+    stream.write("{} {}\n".format(manifest_hash, asset_hash))
+PYFIXTURE
+    read PACKAGE_MANIFEST_SHA PACKAGE_ASSET_HASH \
+        <"$TMP_DIR/evidence/packaged-expected.txt"
+    [ -n "$PACKAGE_MANIFEST_SHA" ] && [ -n "$PACKAGE_ASSET_HASH" ] ||
+        die "packaged identity fixture fingerprints are incomplete"
+    "$PYTHON_BIN" - "$TMP_DIR/packaged" "$TMP_DIR/nginx-variants" <<'PYVARIANT'
+import hashlib
+import json
+import os
+import shutil
+import sys
+
+source, variants = sys.argv[1:]
+for name in (
+        "commit-mismatch", "manifest-hash-mismatch",
+        "canonical-asset-hash-mismatch", "asset-byte-mismatch", "asset-missing"):
+    destination = os.path.join(variants, name)
+    shutil.copytree(source, destination)
+    manifest_path = os.path.join(destination, "release_manifest.json")
+    if name == "asset-byte-mismatch":
+        with open(os.path.join(destination, "app.js"), "ab") as stream:
+            stream.write(b"tampered\n")
+    elif name == "asset-missing":
+        os.unlink(os.path.join(destination, "web", "index.html"))
+    else:
+        with open(manifest_path, "r", encoding="utf-8") as stream:
+            manifest = json.load(stream)
+        if name == "commit-mismatch":
+            manifest["commit_sha"] = "f" * 40
+            manifest["build_id"] = "fixture-release-ffffffff-{}".format(
+                manifest["asset_hash"][:8]
+            )
+        elif name == "canonical-asset-hash-mismatch":
+            manifest["asset_manifest_hash"] = "0" * 64
+        if name != "manifest-hash-mismatch":
+            with open(manifest_path, "w", encoding="utf-8") as stream:
+                json.dump(manifest, stream, ensure_ascii=False, indent=2, sort_keys=True)
+                stream.write("\n")
+    with open(manifest_path, "rb") as stream:
+        manifest_hash = hashlib.sha256(stream.read()).hexdigest()
+    with open(os.path.join(variants, name + "-expected.txt"), "w", encoding="utf-8") as stream:
+        stream.write(manifest_hash + "\n")
+PYVARIANT
+    cat >"$TMP_DIR/nginx.dump" <<'NGINX'
+# configuration file /etc/nginx/conf.d/coverage-candidate.conf:
+server {
+    listen 10.190.162.33:19529;
+    server_name 10.190.162.33;
+    location /coverage/ {
+        alias /home/zcyu/coverage_published/VALIDATION_CURRENT/reports/;
+    }
+}
+# configuration file /etc/nginx/conf.d/coverage.conf:
+server {
+    listen 80;
+    server_name 10.190.162.33;
+    location /coverage/ {
+        alias /home/zcyu/coverage/export0810/onesensor/;
+    }
+    location /api/coverage {
+        proxy_pass http://127.0.0.1:9528/api/coverage;
+    }
+}
+NGINX
     printf '<html><head><title>fixture</title></head><body>fixture</body></html>\n' \
         >"$TMP_DIR/source/report.html"
     printf 'fixture-static\n' >"$TMP_DIR/source/report.css"
@@ -1392,15 +2059,133 @@ SIDECAR
     printf 'not-exportable\n' >"$TMP_DIR/sensitive/etc/passwd"
     printf 'not-exportable\n' >"$TMP_DIR/sensitive/root/.ssh/id_rsa"
     printf 'not-exportable\n' >"$TMP_DIR/sensitive/server.key"
-    cat >"$TMP_DIR/nginx.dump" <<'NGINX'
+    PACKAGE_IDENTITY_RESULT="$TMP_DIR/evidence/packaged-identity.json"
+    "$PYTHON_BIN" "$HELPER" application-identity \
+        "$TMP_DIR/packaged" "$EXPECTED_BASELINE_SHA" \
+        "$PACKAGE_MANIFEST_SHA" "$PACKAGE_ASSET_HASH" \
+        "$PACKAGE_IDENTITY_RESULT" \
+        >"$TMP_DIR/evidence/packaged-identity.stdout" ||
+        die "valid packaged release manifest did not verify"
+    grep -F -q 'APPLICATION_IDENTITY_MODE=PACKAGED_RELEASE_MANIFEST' \
+        "$TMP_DIR/evidence/packaged-identity.stdout" ||
+        die "packaged application mode was not selected"
+    grep -F -q 'APPLICATION_GIT_SHA=NOT_AVAILABLE_PACKAGED_DEPLOYMENT' \
+        "$TMP_DIR/evidence/packaged-identity.stdout" ||
+        die "packaged application fabricated a Git SHA"
+    grep -F -q "RELEASE_MANIFEST_SHA256=$PACKAGE_MANIFEST_SHA" \
+        "$TMP_DIR/evidence/packaged-identity.stdout" ||
+        die "packaged release manifest hash was not recorded"
+    printf 'PACKAGED_APP_NO_GIT_VALID_MANIFEST=PASS\n'
+    for variant in commit-mismatch manifest-hash-mismatch \
+            canonical-asset-hash-mismatch asset-byte-mismatch asset-missing; do
+        variant_root="$TMP_DIR/nginx-variants/$variant"
+        if [ "$variant" = "asset-byte-mismatch" ] || \
+                [ "$variant" = "asset-missing" ]; then
+            variant_manifest_sha="$PACKAGE_MANIFEST_SHA"
+        elif [ "$variant" = "manifest-hash-mismatch" ]; then
+            variant_manifest_sha="0000000000000000000000000000000000000000000000000000000000000000"
+        else
+            variant_manifest_sha="$(cat "$TMP_DIR/nginx-variants/$variant-expected.txt")"
+        fi
+        if "$PYTHON_BIN" "$HELPER" application-identity \
+            "$variant_root" "$EXPECTED_BASELINE_SHA" \
+            "$variant_manifest_sha" "$PACKAGE_ASSET_HASH" \
+            "$TMP_DIR/evidence/$variant.json" \
+            >"$TMP_DIR/evidence/$variant.stdout" 2>&1; then
+            die "packaged identity variant unexpectedly passed: $variant"
+        fi
+    done
+    printf 'PACKAGED_APP_COMMIT_MISMATCH=BLOCK\n'
+    printf 'PACKAGED_APP_MANIFEST_HASH_MISMATCH=BLOCK\n'
+    printf 'PACKAGED_APP_CANONICAL_ASSET_MANIFEST_HASH_MISMATCH=BLOCK\n'
+    printf 'PACKAGED_APP_ASSET_BYTE_MISMATCH=BLOCK\n'
+    printf 'PACKAGED_APP_ASSET_MISSING=BLOCK\n'
+
+    command -v git >/dev/null 2>&1 || die "git is unavailable for checkout self-test"
+    git -C "$TMP_DIR/gitapp" init -q || die "Git fixture initialization failed"
+    git -C "$TMP_DIR/gitapp" config user.email selftest@example.invalid
+    git -C "$TMP_DIR/gitapp" config user.name selftest
+    printf 'checkout-fixture\n' >"$TMP_DIR/gitapp/app.py"
+    git -C "$TMP_DIR/gitapp" add app.py || die "Git fixture staging failed"
+    git -C "$TMP_DIR/gitapp" commit -qm fixture || die "Git fixture commit failed"
+    GIT_FIXTURE_SHA="$(git -C "$TMP_DIR/gitapp" rev-parse HEAD)"
+    [ -n "$GIT_FIXTURE_SHA" ] || die "Git fixture SHA is unavailable"
+    "$PYTHON_BIN" "$HELPER" application-identity \
+        "$TMP_DIR/gitapp" "$GIT_FIXTURE_SHA" \
+        "$PACKAGE_MANIFEST_SHA" "$PACKAGE_ASSET_HASH" \
+        "$TMP_DIR/evidence/git-identity.json" \
+        >"$TMP_DIR/evidence/git-identity.stdout" ||
+        die "valid Git checkout identity did not verify"
+    grep -F -q 'APPLICATION_IDENTITY_MODE=GIT_CHECKOUT' \
+        "$TMP_DIR/evidence/git-identity.stdout" ||
+        die "Git checkout mode was not selected"
+    printf 'GIT_CHECKOUT_IDENTITY=PASS\n'
+    if "$PYTHON_BIN" "$HELPER" application-identity \
+        "$TMP_DIR/gitapp" "$EXPECTED_BASELINE_SHA" \
+        "$PACKAGE_MANIFEST_SHA" "$PACKAGE_ASSET_HASH" \
+        "$TMP_DIR/evidence/git-mismatch.json" \
+        >"$TMP_DIR/evidence/git-mismatch.stdout" 2>&1; then
+        die "Git checkout SHA mismatch unexpectedly passed"
+    fi
+    printf 'GIT_CHECKOUT_SHA_MISMATCH=BLOCK\n'
+
+    NGINX_EXPECTED_ARGS=(
+        "$TMP_DIR/nginx.dump" "/etc/nginx/conf.d/coverage.conf" "80"
+        "10.190.162.33" "/coverage/"
+        "/home/zcyu/coverage/export0810/onesensor/" "/api/coverage"
+        "http://127.0.0.1:9528/api/coverage"
+    )
+    "$PYTHON_BIN" "$HELPER" nginx "${NGINX_EXPECTED_ARGS[@]}" \
+        "$TMP_DIR/evidence/nginx.txt" \
+        >"$TMP_DIR/evidence/nginx.stdout" ||
+        die "real production nginx topology fixture did not verify"
+    grep -F -q 'NGINX_CANDIDATE_GATEWAY_IGNORED=MATCH' \
+        "$TMP_DIR/evidence/nginx.stdout" ||
+        die "candidate nginx gateway was not safely ignored"
+    grep -F -q 'PRODUCTION_STATIC_ALIAS_MATCH=MATCH' \
+        "$TMP_DIR/evidence/nginx.stdout" ||
+        die "production static alias was not verified"
+    grep -F -q 'PRODUCTION_API_PROXY_MATCH=MATCH' \
+        "$TMP_DIR/evidence/nginx.stdout" ||
+        die "production API proxy was not verified"
+    printf 'PRODUCTION_NGINX_WITH_CANDIDATE_GATEWAY=PASS\n'
+    printf 'PRODUCTION_NGINX_STATIC_ROOT_MATCH=PASS\n'
+    printf 'PRODUCTION_NGINX_API_PROXY_MATCH=PASS\n'
+    cp "$TMP_DIR/nginx.dump" "$TMP_DIR/nginx-variants/wrong-api-port.conf"
+    sed -i 's#127.0.0.1:9528/api/coverage#127.0.0.1:9530/api/coverage#' \
+        "$TMP_DIR/nginx-variants/wrong-api-port.conf"
+    cp "$TMP_DIR/nginx.dump" "$TMP_DIR/nginx-variants/wrong-api-path.conf"
+    sed -i 's#127.0.0.1:9528/api/coverage#127.0.0.1:9528/api/wrong#' \
+        "$TMP_DIR/nginx-variants/wrong-api-path.conf"
+    cp "$TMP_DIR/nginx.dump" "$TMP_DIR/nginx-variants/wrong-static-alias.conf"
+    sed -i 's#/home/zcyu/coverage/export0810/onesensor/#/home/zcyu/coverage/wrong/#' \
+        "$TMP_DIR/nginx-variants/wrong-static-alias.conf"
+    cp "$TMP_DIR/nginx.dump" "$TMP_DIR/nginx-variants/duplicate-production.conf"
+    cat >>"$TMP_DIR/nginx-variants/duplicate-production.conf" <<'NGINXDUP'
 server {
     listen 80;
+    server_name 10.190.162.33;
     location /coverage/ {
-        alias /fixture/legacy/onesensor/;
-        proxy_pass http://127.0.0.1:9528;
+        alias /home/zcyu/coverage/export0810/onesensor/;
+    }
+    location /api/coverage {
+        proxy_pass http://127.0.0.1:9528/api/coverage;
     }
 }
-NGINX
+NGINXDUP
+    for variant in wrong-api-port wrong-api-path wrong-static-alias duplicate-production; do
+        if "$PYTHON_BIN" "$HELPER" nginx \
+            "$TMP_DIR/nginx-variants/$variant.conf" \
+            "${NGINX_EXPECTED_ARGS[@]:1}" \
+            "$TMP_DIR/evidence/$variant-nginx.txt" \
+            >"$TMP_DIR/evidence/$variant-nginx.stdout" 2>&1; then
+            die "nginx contract variant unexpectedly passed: $variant"
+        fi
+    done
+    printf 'PRODUCTION_NGINX_WRONG_API_PORT=BLOCK\n'
+    printf 'PRODUCTION_NGINX_WRONG_API_PATH=BLOCK\n'
+    printf 'PRODUCTION_NGINX_WRONG_STATIC_ALIAS=BLOCK\n'
+    printf 'PRODUCTION_NGINX_DUPLICATE_PRODUCTION_SERVER=BLOCK\n'
     "$PYTHON_BIN" "$HELPER" inventory "$TMP_DIR/source" \
         "$TMP_DIR/evidence/source-before.json" >/dev/null ||
         die "synthetic inventory failed"
@@ -1431,6 +2216,7 @@ NGINX
         "$TMP_DIR/pre-adoption/release_identity.json" \
         "$TMP_DIR/evidence/pre-adoption-identity.json" \
         "$TMP_DIR/evidence/pre-adoption-normalized.json" \
+        "$PACKAGE_IDENTITY_RESULT" \
         >"$TMP_DIR/evidence/pre-adoption.stdout" ||
         die "pre-adoption identity generation failed"
     for required in \
@@ -1439,7 +2225,9 @@ NGINX
         '"original_release_identity": "ABSENT"' \
         '"historical_build_attestation": "NOT_AVAILABLE"' \
         '"artifact_role": "validation_input_baseline_only"' \
-        '"production_publishable": false'; do
+        '"production_publishable": false' \
+        '"application_identity_mode": "PACKAGED_RELEASE_MANIFEST"' \
+        'packaged manifest does not attest historical generation of every legacy HTML report'; do
         if ! grep -F -q "$required" \
             "$TMP_DIR/pre-adoption/release_identity.json"; then
             die "pre-adoption identity contract is incomplete"
@@ -1494,17 +2282,6 @@ NGINX
         "$TMP_DIR/evidence/source-before.json" \
         "$TMP_DIR/evidence/source-after.json" >/dev/null ||
         die "legacy source changed during synthetic adoption"
-    "$PYTHON_BIN" "$HELPER" nginx "$TMP_DIR/nginx.dump" \
-        "/fixture/legacy/onesensor" "$EXPECTED_PROXY" \
-        "$TMP_DIR/evidence/nginx.txt" >"$TMP_DIR/evidence/nginx.stdout" ||
-        die "synthetic nginx parsing failed"
-    if ! grep -F -q 'PROXY_PASS_MATCH=MATCH' "$TMP_DIR/evidence/nginx.stdout"; then
-        die "synthetic proxy_pass regression did not match"
-    fi
-    if ! grep -F -q 'COVERAGE_STATIC_ROOT_MATCH=MATCH' \
-        "$TMP_DIR/evidence/nginx.stdout"; then
-        die "synthetic served-root regression did not match"
-    fi
     "$PYTHON_BIN" "$HELPER" sidecar "$TMP_DIR/source" \
         "$TMP_DIR/evidence/sidecar.txt" >"$TMP_DIR/evidence/sidecar.stdout" ||
         die "synthetic .source_cache/meta.json scan failed"
@@ -1521,7 +2298,7 @@ NGINX
         die "synthetic sensitive-path guard did not fail closed"
     fi
     printf 'BASELINE_EXPORT_SELF_TEST=PASS\n'
-    printf 'NGINX_PROXY_PASS_REGRESSION=127.0.0.1:9528 -> MATCH\n'
+    printf 'NGINX_PROXY_PASS_REGRESSION=http://127.0.0.1:9528/api/coverage -> MATCH\n'
     printf 'SIDECAR_META_JSON_REGRESSION=reports/.source_cache/**/meta.json -> PASS\n'
     printf 'SENSITIVE_PATH_REGRESSION=coverage source artifacts allowed, secret material blocked\n'
     printf 'LEGACY_PRE_ADOPTION_NO_RELEASE_IDENTITY=PASS\n'
@@ -1605,6 +2382,58 @@ SOURCE_AFTER="$TMP_DIR/source-after.json"
 RAW_COPY="$TMP_DIR/raw-copy.json"
 ADOPTION_COPY="$TMP_DIR/adoption-copy.json"
 IDENTITY_RESULT="$TMP_DIR/identity-result.json"
+APPLICATION_IDENTITY_RESULT="$TMP_DIR/application-identity.json"
+
+"$PYTHON_BIN" "$HELPER" application-identity \
+    "$EXPECTED_APP_ROOT" "$EXPECTED_BASELINE_SHA" \
+    "$KNOWN_RELEASE_MANIFEST_SHA256" "$KNOWN_RELEASE_ASSET_HASH" \
+    "$APPLICATION_IDENTITY_RESULT" >"$TMP_DIR/application-identity.stdout" ||
+    die "packaged or Git application identity cannot be verified"
+APPLICATION_IDENTITY_MODE="$(sed -n 's/^APPLICATION_IDENTITY_MODE=//p' \
+    "$TMP_DIR/application-identity.stdout")"
+APP_GIT_SHA="$(sed -n 's/^APPLICATION_GIT_SHA=//p' \
+    "$TMP_DIR/application-identity.stdout")"
+APP_GIT_TREE="$(sed -n 's/^APPLICATION_GIT_TREE_SHA=//p' \
+    "$TMP_DIR/application-identity.stdout")"
+case "$APPLICATION_IDENTITY_MODE" in
+    GIT_CHECKOUT)
+        [ "$APP_GIT_SHA" = "$EXPECTED_BASELINE_SHA" ] ||
+            die "application Git HEAD does not match expected baseline"
+        [ -n "$APP_GIT_TREE" ] ||
+            die "application Git tree cannot be verified"
+        : >"$TMP_DIR/git.status"
+        (cd "$EXPECTED_APP_ROOT" &&
+            git status --porcelain --untracked-files=all) \
+            >"$TMP_DIR/git.status" 2>/dev/null ||
+            die "application Git status cannot be collected"
+        printf 'APPLICATION_GIT_BASELINE=PASS\n' >>"$REPORT"
+        ;;
+    PACKAGED_RELEASE_MANIFEST)
+        [ "$APP_GIT_SHA" = "$APPLICATION_GIT_UNAVAILABLE" ] ||
+            die "packaged application reported fabricated Git SHA"
+        [ "$APP_GIT_TREE" = "$APPLICATION_GIT_UNAVAILABLE" ] ||
+            die "packaged application reported fabricated Git tree SHA"
+        : >"$TMP_DIR/git.status"
+        printf 'APPLICATION_GIT_BASELINE=NOT_APPLICABLE_PACKAGED_RELEASE_MANIFEST\n' \
+            >>"$REPORT"
+        ;;
+    *)
+        die "application identity mode is invalid"
+        ;;
+esac
+cat "$TMP_DIR/application-identity.stdout" >>"$REPORT" ||
+    die "application identity report recording failed"
+cp "$APPLICATION_IDENTITY_RESULT" \
+    "$STAGING_DIR/evidence/application-identity.json" ||
+    die "application identity evidence copy failed"
+{
+    printf 'APPLICATION_IDENTITY_MODE=%s\n' "$APPLICATION_IDENTITY_MODE"
+    printf 'APP_GIT_SHA=%s\n' "$APP_GIT_SHA"
+    printf 'APP_GIT_TREE_SHA=%s\n' "$APP_GIT_TREE"
+} >"$STAGING_DIR/evidence/application-git-summary.txt"
+"$PYTHON_BIN" "$HELPER" sanitize "$TMP_DIR/git.status" \
+    "$STAGING_DIR/evidence/application-git-status.txt" ||
+    die "application Git status sanitization failed"
 
 "$PYTHON_BIN" "$HELPER" inventory "$EXPECTED_LEGACY_ROOT" \
     "$SOURCE_BEFORE" >/dev/null ||
@@ -1617,53 +2446,18 @@ IDENTITY_PATH="$EXPECTED_LEGACY_ROOT/release_identity.json"
 "$PYTHON_BIN" "$HELPER" identity-mode "$IDENTITY_PATH" \
     >"$TMP_DIR/identity-mode.stdout" ||
     die "legacy release identity mode cannot be determined"
-IDENTITY_MODE="$(sed -n 's/^IDENTITY_MODE=//p' \
+LEGACY_IDENTITY_MODE="$(sed -n 's/^IDENTITY_MODE=//p' \
     "$TMP_DIR/identity-mode.stdout")"
-case "$IDENTITY_MODE" in
+case "$LEGACY_IDENTITY_MODE" in
     EXISTING_VERIFIED_IDENTITY|LEGACY_PRE_ADOPTION)
-        printf 'IDENTITY_MODE=%s\n' "$IDENTITY_MODE" >>"$REPORT"
+        printf 'IDENTITY_MODE=%s\n' "$LEGACY_IDENTITY_MODE" >>"$REPORT"
         ;;
     *)
         die "legacy release identity mode is invalid"
         ;;
 esac
 
-APP_GIT_SHA=""
-APP_GIT_TREE=""
-if command -v git >/dev/null 2>&1 && [ -e "$EXPECTED_APP_ROOT/.git" ]; then
-    APP_GIT_SHA="$(cd "$EXPECTED_APP_ROOT" &&
-        git rev-parse HEAD 2>/dev/null || true)"
-    APP_GIT_TREE="$(cd "$EXPECTED_APP_ROOT" &&
-        git rev-parse 'HEAD^{tree}' 2>/dev/null || true)"
-    (cd "$EXPECTED_APP_ROOT" &&
-        git status --porcelain) >"$TMP_DIR/git.status" 2>/dev/null || true
-else
-    : >"$TMP_DIR/git.status"
-fi
-{
-    printf 'APP_GIT_SHA='
-    if [ -n "$APP_GIT_SHA" ]; then printf '%s\n' "$APP_GIT_SHA"; else printf 'NOT_VERIFIED\n'; fi
-    printf 'APP_GIT_TREE_SHA='
-    if [ -n "$APP_GIT_TREE" ]; then printf '%s\n' "$APP_GIT_TREE"; else printf 'NOT_VERIFIED\n'; fi
-} >"$STAGING_DIR/evidence/application-git-summary.txt"
-"$PYTHON_BIN" "$HELPER" sanitize "$TMP_DIR/git.status" \
-    "$STAGING_DIR/evidence/application-git-status.txt" ||
-    die "application Git status sanitization failed"
-if [ "$IDENTITY_MODE" = "LEGACY_PRE_ADOPTION" ]; then
-    [ "$APP_GIT_SHA" = "$EXPECTED_BASELINE_SHA" ] ||
-        die "pre-adoption application Git HEAD does not match expected baseline"
-    [ -n "$APP_GIT_TREE" ] ||
-        die "pre-adoption application Git tree cannot be verified"
-    printf 'APPLICATION_GIT_BASELINE=PASS\n' >>"$REPORT"
-else
-    if [ "$APP_GIT_SHA" = "$EXPECTED_BASELINE_SHA" ]; then
-        printf 'APPLICATION_GIT_BASELINE=PASS\n' >>"$REPORT"
-    else
-        printf 'APPLICATION_GIT_BASELINE=NOT_VERIFIED\n' >>"$REPORT"
-    fi
-fi
-
-if [ "$IDENTITY_MODE" = "EXISTING_VERIFIED_IDENTITY" ]; then
+if [ "$LEGACY_IDENTITY_MODE" = "EXISTING_VERIFIED_IDENTITY" ]; then
     "$PYTHON_BIN" "$HELPER" identity "$IDENTITY_PATH" \
         "$EXPECTED_LEGACY_ROOT" "$EXPECTED_BASELINE_SHA" \
         "$STAGING_DIR/adoption/release_identity.json" \
@@ -1692,13 +2486,14 @@ fi
 "$PYTHON_BIN" "$HELPER" compare "$SOURCE_BEFORE" "$RAW_COPY" \
     >>"$REPORT" || die "exported legacy bytes do not match source bytes"
 
-if [ "$IDENTITY_MODE" = "LEGACY_PRE_ADOPTION" ]; then
+if [ "$LEGACY_IDENTITY_MODE" = "LEGACY_PRE_ADOPTION" ]; then
     "$PYTHON_BIN" "$HELPER" adoption-identity \
         "$ADOPTION_COPY" "$STAGING_DIR/adoption-source" \
         "$SOURCE_BEFORE" "$EXPECTED_BASELINE_SHA" "$APP_GIT_SHA" \
         "$APP_GIT_TREE" "$ATTEMPT_ID" "$STAMP" \
         "$STAGING_DIR/adoption/release_identity.json" \
         "$IDENTITY_RESULT" "$TMP_DIR/normalized-adoption-identity.json" \
+        "$APPLICATION_IDENTITY_RESULT" \
         >>"$REPORT" ||
         die "legacy pre-adoption identity generation or validation failed"
 fi
@@ -1720,7 +2515,10 @@ NGINX_RC=$?
 [ "$NGINX_RC" -eq 0 ] ||
     die "nginx -T failed; effective Served Root is not verified"
 "$PYTHON_BIN" "$HELPER" nginx "$TMP_DIR/nginx.dump" \
-    "$EXPECTED_LEGACY_ROOT" "$EXPECTED_PROXY" \
+    "$EXPECTED_NGINX_CONFIG" "$EXPECTED_PRODUCTION_LISTEN" \
+    "$EXPECTED_PRODUCTION_SERVER_NAME" "$EXPECTED_STATIC_LOCATION" \
+    "$EXPECTED_STATIC_ALIAS" "$EXPECTED_API_LOCATION" \
+    "$EXPECTED_API_PROXY" \
     "$STAGING_DIR/evidence/nginx-summary.txt" >>"$REPORT" ||
     die "effective /coverage/ Nginx root or proxy_pass is not verified"
 printf 'NGINX_CONFIG=PASS\n' >>"$REPORT"
@@ -1809,8 +2607,8 @@ META="$TMP_DIR/metadata.json"
     "$SOURCE_BEFORE" "$SOURCE_AFTER" "$RAW_COPY" "$ADOPTION_COPY" \
     "$IDENTITY_RESULT" "$STAGING_DIR/evidence/nginx-summary.txt" \
     "$STAGING_DIR/evidence/systemd-summary.txt" \
-    "$STAGING_DIR/evidence/database-readonly-summary.txt" "$IDENTITY_MODE" \
-    "$APP_GIT_SHA" "$APP_GIT_TREE" <<'PYMETA'
+    "$STAGING_DIR/evidence/database-readonly-summary.txt" \
+    "$LEGACY_IDENTITY_MODE" "$APPLICATION_IDENTITY_RESULT" <<'PYMETA'
 from __future__ import print_function
 import hashlib
 import json
@@ -1833,6 +2631,8 @@ def key_values(path):
 
 
 identity_evidence = load(sys.argv[10])
+application_identity = load(sys.argv[15])
+nginx_evidence = key_values(sys.argv[11])
 output = {
     "attempt_id": sys.argv[2],
     "collection_timestamp_utc": sys.argv[3],
@@ -1852,6 +2652,9 @@ output = {
     "adoption_source_tree_sha256": load(sys.argv[9])["tree_sha256"],
     "identity_evidence": identity_evidence,
     "identity_mode": sys.argv[14],
+    "application_identity_mode": application_identity.get(
+        "application_identity_mode", "NOT_VERIFIED"
+    ),
     "identity_origin": identity_evidence.get(
         "identity_origin", "NOT_VERIFIED"
     ),
@@ -1861,13 +2664,49 @@ output = {
     "historical_build_attestation": identity_evidence.get(
         "historical_build_attestation", "NOT_VERIFIED"
     ),
-    "application_git_sha": sys.argv[15] or "NOT_VERIFIED",
-    "application_git_tree_sha": sys.argv[16] or "NOT_VERIFIED",
-    "resolved_nginx_config_paths": key_values(sys.argv[11]).get(
+    "application_git_sha": application_identity.get(
+        "application_git_sha", "NOT_VERIFIED"
+    ),
+    "application_git_tree_sha": application_identity.get(
+        "application_git_tree_sha", "NOT_VERIFIED"
+    ),
+    "packaged_release_manifest_sha256": application_identity.get(
+        "release_manifest_sha256", "NOT_APPLICABLE"
+    ),
+    "packaged_release_asset_hash": application_identity.get(
+        "release_manifest_asset_hash", "NOT_APPLICABLE"
+    ),
+    "packaged_release_asset_bytes_verified": (
+        application_identity.get("application_identity_mode") ==
+        "PACKAGED_RELEASE_MANIFEST"
+    ),
+    "packaged_release_anchor": application_identity.get(
+        "packaged_release_anchor"
+    ),
+    "legacy_payload_byte_inventory_authoritative": True,
+    "resolved_nginx_config_paths": nginx_evidence.get(
         "NGINX_CONFIG_PATHS", "NOT_VERIFIED"
     ),
-    "resolved_nginx_config_sha256": key_values(sys.argv[11]).get(
+    "resolved_nginx_config_sha256": nginx_evidence.get(
         "NGINX_DUMP_SHA256", "NOT_VERIFIED"
+    ),
+    "production_api_location": nginx_evidence.get(
+        "PRODUCTION_API_LOCATION", "NOT_VERIFIED"
+    ),
+    "production_api_proxy_origin": nginx_evidence.get(
+        "PRODUCTION_API_PROXY_ORIGIN", "NOT_VERIFIED"
+    ),
+    "production_api_proxy_path": nginx_evidence.get(
+        "PRODUCTION_API_PROXY_PATH", "NOT_VERIFIED"
+    ),
+    "production_api_proxy": nginx_evidence.get(
+        "PRODUCTION_API_PROXY", "NOT_VERIFIED"
+    ),
+    "production_static_location": nginx_evidence.get(
+        "PRODUCTION_STATIC_LOCATION", "NOT_VERIFIED"
+    ),
+    "production_static_alias": nginx_evidence.get(
+        "PRODUCTION_STATIC_ALIAS", "NOT_VERIFIED"
     ),
     "nginx_summary_sha256": __import__("hashlib").sha256(
         open(sys.argv[11], "rb").read()).hexdigest(),
@@ -1875,8 +2714,12 @@ output = {
         open(sys.argv[12], "rb").read()).hexdigest(),
     "database_summary_sha256": __import__("hashlib").sha256(
         open(sys.argv[13], "rb").read()).hexdigest(),
-    "legacy_git_sha": sys.argv[15] or "NOT_VERIFIED",
-    "legacy_git_tree_sha": sys.argv[16] or "NOT_VERIFIED",
+    "legacy_git_sha": application_identity.get(
+        "application_git_sha", "NOT_VERIFIED"
+    ),
+    "legacy_git_tree_sha": application_identity.get(
+        "application_git_tree_sha", "NOT_VERIFIED"
+    ),
     "artifact_role": "validation_input_baseline_only",
     "production_publishable": False,
     "project_name": "FOS_V6R2",
