@@ -1,21 +1,25 @@
-# Gate A～F 外部环境证据运行手册
+# Gate A～F 外部环境证据运行手册（VFOS 人工阶段）
 
-本手册只描述必须在 Candidate、MariaDB 兼容主机或生产环境执行的证据。仓库内的 SQLite/fixture、合成浏览器 benchmark 和旧 checkout 结果不能替代这些证据。所有命令都必须从待验收的 exact commit checkout 执行：
+本手册只描述必须在 Candidate、MariaDB 兼容主机或生产环境执行的证据。仓库内的 SQLite/fixture、合成浏览器 benchmark 和旧 checkout 结果不能替代这些证据。非生产源码验证先由仓库内的 Local Release Gate 完成；本手册中的真实 Candidate/生产 gate 只能由人工在 VFOS 环境执行。GitHub 只保存源码，不是 workflow、runner、artifact、attestation 或 readiness authority。所有命令都必须从待验收的 exact commit checkout 执行：
 
 ```bash
-git fetch --tags --prune origin
 git checkout --detach <candidate-sha>
 test -z "$(git status --porcelain)"
 git rev-parse HEAD
 ```
 
-## CI 状态语义
+## Local Release Gate 与 VFOS Gate 状态语义
 
-普通 push/PR 的 `Candidate source gate (required source lanes)` 只表示源码候选
-检查通过，不代表 Production READY。真实 Candidate 浏览器、生产备份恢复和
-`release_eligible` 跨层性能证据只由手动 `workflow_dispatch` 的
-`Production READY gate (manual external evidence)` 汇总；其中任一 lane 未运行或
-失败，Production READY 都不成立。
+`scripts/release/local_release_gate.py` 的 PASS 只表示 exact source/tooling、定向
+测试、离线 Operator 和本地安全检查通过，不代表 Production READY。真实 Candidate
+浏览器、生产备份恢复、目标 runtime compatibility、`release_eligible` 跨层性能、
+rollback 和 cutover 证据只能由人工在 VFOS 环境产生；这些证据缺失、过期或失败时，
+Production READY 都不成立。Local Gate 不调用 GitHub API，也不读取 workflow/run、
+runner、environment、secret、artifact 或 attestation 状态。
+
+当兼容性结果为 `DEFERRED_TO_TARGET_RUNTIME` 时，只能进入 isolated Candidate staging，
+并设置 `READY_FOR_MANUAL_VFOS_COMPATIBILITY_PREFLIGHT=YES`；在目标 runtime preflight
+通过前不得进入 publication/cutover。
 
 ## 证据文件统一要求
 
@@ -75,14 +79,14 @@ python3 scripts/upgrade/run_verified_backup_rehearsal.py \
 1. 验证 dump 的 SHA256 和 gzip framing；
 2. 验证独立 `backup-manifest.json`：`production_backup`、`synthetic=false`、
    外置 backup root、restore smoke、源库快照，以及 production/operator/时间戳
-   attestation；manifest 中的 dump SHA 和大小必须与输入一致；
+   provenance；manifest 中的 dump SHA 和大小必须与输入一致；
 3. 拒绝位于部署树内的 backup 或 provenance manifest；
 4. 检查 source/target disposable 数据库在执行前不存在；
 5. 将 dump 恢复到 Legacy source，再迁移到独立 Empty VNext target；
 6. 检查 MariaDB runtime identity、semantic hash、重跑幂等和目标表清单；
 7. 只删除本次创建的两个数据库。
 
-`backup-manifest.json` 必须来自真实 backup workflow，并包含如下来源证明：
+`backup-manifest.json` 必须来自 VFOS 人工 backup/operator 流程，并包含如下来源证明：
 
 生成生产 backup 时，应显式提供来源环境和操作者身份，例如：
 
@@ -91,8 +95,8 @@ export COVERAGE_BACKUP_SOURCE_ENVIRONMENT=production
 export COVERAGE_BACKUP_OPERATOR="$USER"
 ```
 
-backup workflow 会把这两个值和 attestation 时间写入 manifest；未设置时保持空值，
-后续 rehearsal 会 fail closed。
+人工 operator 会把这两个值和创建时间写入 manifest；未设置时保持空值，后续
+rehearsal 会 fail closed。
 
 ```json
 {
@@ -103,7 +107,7 @@ backup workflow 会把这两个值和 attestation 时间写入 manifest；未设
   "provenance": {
     "source_environment": "production",
     "operator": "operator-id",
-    "attested_at": "2026-08-21T00:00:00Z"
+    "created_at": "2026-08-21T00:00:00Z"
   }
 }
 ```
@@ -250,22 +254,15 @@ node scripts/diagnostics/release_performance_ab.js \
   --output "/secure/evidence/gate-e/release-performance-ab-${RELEASE_VALIDATION_SESSION_ID}.json"
 ```
 
-同一采集器也接入 `.github/workflows/ci.yml` 的手动
-`real-browser-candidate` lane。触发 `workflow_dispatch` 时提供
-`real_browser_url`（可选提供 `real_browser_expected_revision`），并在仓库/环境
-Secret 中配置 `COVERAGE_BROWSER_AUTH_HEADER`（例如完整的
-`Authorization=Basic ...`，不要把 `X-Remote-User` 当作凭据）；job 会上传三个
-exact-SHA JSON artifact。
-未提供 Candidate URL 时该 lane 不运行，普通 CI 仍只保留明确标记为 synthetic 的
-fixture/browser evidence。
+当前没有 GitHub Actions 的 browser lane。人工在 Candidate Gateway 上运行同一采集器，
+直接把三个 exact-SHA JSON evidence 文件写入本地 evidence 目录；凭据只能由人工在
+目标环境的受控 secret store 注入，不写入仓库或 Operator。Local Gate 只校验源码和
+静态/fixture 契约，不能把 fixture evidence 提升为 Production Gate。
 
-CI 的 `cross-layer-performance` job 不再接收或读取一个来自其他主机的本地路径。
-`real-browser-candidate` 会先把本次 run/attempt 的完整 evidence package 上传为
-不可变 artifact，并输出 `performance-evidence.json` 的 SHA256；下游 performance
-job 按同一个 run/attempt 下载该 artifact，先校验 SHA256，再对下载后的原始 evidence
-执行 `--require-cross-layer --require-release-eligible` 审计。这样 Hosted Runner
-之间传递的是本次 Candidate 实际产生的 evidence，而不是 checkout 内或操作员临时
-准备的同名文件。
+跨层性能 evidence 必须在同一个 validation session 中绑定 Candidate artifact SHA、
+Served Root SHA、exact commit 和实际环境身份；采集后由人工校验 SHA256，再执行
+`--require-cross-layer --require-release-eligible` 审计。不存在 run/attempt 下载链，
+也不依赖 Hosted Runner。
 
 `run_upgrade.py` 对这两类证据也采用同一口径：`npm run test:browser` 只写入
 `browser_fixture_regression`，不能写入生产 Browser Gate。正式升级必须在配置中
@@ -276,12 +273,10 @@ served release identity、真实 HTTP、Chromium、artifact SHA、当前
 `synthetic=false`，否则 Final Gate 保持 `NOT_READY`。三类外部 evidence 的路径都必须
 按 attempt 隔离；即使两个 attempt 使用同一 Candidate SHA，也不能复用旧 JSON。
 
-生产 vfoswind 主机不需要安装 Node/npm，也不在本机重跑 fixture。CI 的
-`browser-fixture-regression` job 会上传 `browser-fixture-evidence.json`；将该文件复制到
-`upgrade.ci_browser_fixture_evidence_path`（支持 `{commit_sha}`）后，升级器会严格校验
-exact commit、source tree、GitHub Actions repository/run/attempt、`exit_code=0` 和
-artifact SHA。缺失或不匹配时在 PRE_CUTOVER_READY 前失败；外部真实 Candidate
-Chromium evidence 仍不可省略。
+生产 vfoswind 主机不需要安装 Node/npm，也不在本机重跑 fixture。历史
+`ci_browser_fixture_evidence_path` 仅用于读取旧 validation fixture evidence；它不属于
+当前 Production Publication authority。缺失或不匹配的历史 fixture 仍不能绕过真实
+Candidate Chromium evidence，外部真实 Candidate evidence 仍不可省略。
 
 ## 首次接管：建立 immutable previous baseline
 
@@ -367,79 +362,34 @@ python3 scripts/upgrade/run_rollback_rehearsal.py \
 Served Root SHA 必须全部与当前 attempt 一致；否则 rollback evidence 不能进入
 Final Gate。
 
-Candidate 必须先按用途分成两个互斥对象。受保护的
-`trusted-candidate-builder.yml` 和 `build_candidate_artifact.py` 生成的是
-`validation_candidate_root`：它包含确定性的浏览器/100k 性能夹具，manifest 必须是
+Candidate 必须先按用途分成两个互斥对象。Local Release Gate 或 validation fixture
+生成的是 `validation_candidate_root`：manifest 必须是
 `artifact_role=validation_fixture`、`production_publishable=false`。它可以用于浏览器、
 性能、功能和生命周期验证，但永远不能传给 Publisher，也永远不能成为 `CURRENT`。
 
-正式发布使用独立的 `production_candidate_root`。它必须由真实的
-`FOS_V6R2` Served Root 构建，包含真实 `reports/`、`registry/`、Sidecar 和静态页面，
-再用目标 clean checkout 的 release identity `asset_manifest` 中声明的完整资产契约刷新
-所有静态资源（包括 root/web 兼容副本和目标版本新增的文件）。构建器只接受
-`publish_root/CURRENT` 这个不可变指针，并把 previous release SHA、CURRENT tree hash
-和 CURRENT identity 一起写入 provenance；构建、normalize 和 manifest 必须在发布前完成；Publisher
-只复制并验证最终字节，不再把验证夹具升级成生产页面：
+正式发布使用独立的 `production_candidate_root`。它必须由人工带入 VFOS 的 standalone
+offline Operator，依据同一份 immutable `release_input_manifest.json` 构建真实
+`FOS_V6R2` Served Root；source commit/tree、source/tooling bundle SHA256、production
+baseline、host、validation session 和 Served Root binding 必须全部 exact match。
+构建前后都要重新验证 `publish_root/CURRENT`、release manifest、完整文件清单和
+Candidate identity；任何 validation fixture、缺少 provenance 或 binding 不匹配的输入
+都 fail closed。当前生产路径不读取 workflow identity、run ID、runner、Environment、
+GitHub artifact 或 attestation 作为信任条件。
 
-配置必须同时维护两套不可互换的 Builder policy：
-`validation_candidate_builder_workflow_*` 只对应验证夹具，
-`production_candidate_builder_workflow_*` 只对应生产构建器，并且每个 SHA 必须固定到
-包含相应 workflow 的不可变 Git commit。生产升级只读取后者。
-
-受保护的 `trusted-production-candidate-build` Environment 必须配置一个固定的
-Environment Variable `PRODUCTION_PUBLISH_ROOT`，其值是
-`coverage-production-builder` runner 上唯一权威的 immutable publication root 绝对路径。
-`trusted-production-candidate-builder.yml` 只从 `${{ vars.PRODUCTION_PUBLISH_ROOT }}`
-读取该值；`workflow_dispatch` 和 reusable-workflow caller 都不再接受
-`publish_root`/`production_publish_root` 路径输入。变量缺失时构建器必须立即失败。
-本地 observation-only 的 `production_current_binding.py --publish-root` 仍可接受路径，
-但该 CLI 输入不属于受保护的正式生产构建路径。
+在本地 clean checkout 生成并自校验 Operator：
 
 ```bash
-python3 scripts/release/build_production_candidate_artifact.py \
-  --publish-root /srv/fos-coverage/publish-root \
-  --source-repo-root /srv/fos-coverage/source-checkout \
-  --production-candidate-root /srv/fos-coverage/production-candidate \
-  --release-identity-output /secure/evidence/production-release-identity.json \
-  --build-workflow-identity "$PRODUCTION_BUILD_WORKFLOW_IDENTITY" \
-  --build-workflow-run-id "$GITHUB_RUN_ID" \
-  --build-workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
-  --build-workflow-sha "$PRODUCTION_BUILD_WORKFLOW_SHA" \
-  --expected-previous-release-sha "$CURRENT_PREVIOUS_RELEASE_SHA" \
-  --expected-served-root-tree-sha256 "$CURRENT_SERVED_ROOT_TREE_SHA256" \
-  --expected-current-identity-sha256 "$CURRENT_IDENTITY_SHA256"
+python3 -m scripts.release.generate_flat_production_candidate_operator \
+  --release-input-manifest /secure/evidence/release_input_manifest.json \
+  --source-bundle /secure/evidence/source.bundle \
+  --tooling-bundle /secure/evidence/tooling.bundle \
+  --output /secure/evidence/offline_operator.txt
 ```
 
-这里的 `--publish-root` 必须是权威 immutable publication root；构建器自行解析
-`publish_root/CURRENT`，不接受人工挑选的旧 release 目录。构建前应使用
-`scripts/diagnostics/production_current_binding.py` 从同一个权威 CURRENT 读取并
-冻结三个 expected binding 值；它们在构建开始时和复制完成后都会重检。CURRENT
-必须有完整且通过 `validate_release_manifest()` 的 `release_manifest.json`，不会再
-降级读取 `release_identity.json`。命令输出的 manifest 必须明确为
-`artifact_role=production_candidate`、`production_publishable=true`、
-`project_name=FOS_V6R2`。之后在受保护 Build job 中为这个 production manifest
-生成 GitHub Actions attestation 和 detached receipt：
-
-```bash
-python3 scripts/release/sign_candidate_build_receipt.py \
-  --candidate-root /srv/fos-coverage/production-candidate \
-  --release-identity /secure/evidence/production-release-identity.json \
-  --source-repo-root /srv/fos-coverage/source-checkout \
-  --build-workflow-identity "$PRODUCTION_BUILD_WORKFLOW_IDENTITY" \
-  --build-workflow-run-id "$GITHUB_RUN_ID" \
-  --build-workflow-run-attempt "$GITHUB_RUN_ATTEMPT" \
-  --build-workflow-sha "$PRODUCTION_BUILD_WORKFLOW_SHA" \
-  --attestation-bundle /secure/evidence/production-candidate-attestation.bundle.json
-```
-
-Publisher 和 `run_upgrade.py` 只接受 `production_candidate_root`，并重新验证 clean
-source checkout、Candidate manifest、生产项目内容、attestation、receipt 和完整
-文件清单；任何 `validation_fixture`、`Coverage Candidate`、缺少 source/build
-provenance 或 Served Root binding 的输入都硬失败。Validation Candidate 的
-attestation 强制 `--deny-self-hosted-runners`；Production Candidate 使用受保护的
-`coverage-production-builder` self-hosted lane，但仍强制 exact signer workflow SHA、
-run ID/attempt、HMAC receipt、GitHub attestation 和 source SHA。`served-root-bootstrap` 只能由
-`bootstrap_previous_release.py` 的专用 API 使用。
+Operator 只负责在 VFOS 上验证 baseline、构建 isolated Candidate 并输出 evidence；它不
+发布 `CURRENT`，不修改 Nginx/systemd/数据库，不停止服务，也不访问网络。只有人工在
+Candidate 完成 exact validation session、server/browser gate、backup/restore 和 rollback
+rehearsal 后，才可以判断 `PRE_CUTOVER_READY` 并执行最终 cutover。
 
 发布后的静态服务也必须遵守同一条路径契约：配置中的
 `served_root_path` 必须是字面量 `publish_root/CURRENT/reports`，不能指向旧的
