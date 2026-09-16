@@ -62,6 +62,8 @@ class InheritanceEngine(object):
         self._failed_index_pairs = set()
         self._ancestry_cache = OrderedDict()
         self._ancestry_cache_evictions = 0
+        self._candidate_record_cache = {}
+        self._candidate_block_cache = {}
         self._metrics = {}
         self.max_source_cache_bytes = max(1, int(max_source_cache_bytes))
         self.max_source_cache_total_bytes = max(
@@ -320,6 +322,8 @@ class InheritanceEngine(object):
         # Source indexes are useful within one scan only. Drop historical
         # commit ownership before a long-lived runtime starts the next scan.
         self.clear_caches()
+        self._candidate_record_cache = {}
+        self._candidate_block_cache = {}
         self._metrics = {
             "parser_candidate_total": 0,
             "parser_unresolved_total": 0,
@@ -605,32 +609,101 @@ class InheritanceEngine(object):
                     connection, candidate_scan_id, target_line["id"]
                 )):
             return
-        record = self.domain.get_record(
-            connection, relation["analysis_record_id"]
-        )
+        source_record_id = int(relation["analysis_record_id"])
+        record = self.domain.get_record(connection, source_record_id)
         state = (
             CARRIED_COVERED
             if str(target_line.get("coverage_state") or "").lower()
             in ("covered", "1") else INHERITED_PENDING
         )
-        clone = self.domain.create_record(connection, {
-            "conclusion_status": record.get("conclusion_status", ""),
-            "coverage_method": record.get("coverage_method", ""),
-            "uncovered_reason": record.get("uncovered_reason", ""),
-            "comment": record.get("comment", ""),
-        }, origin="MANUAL")
+        clone = self._candidate_record_cache.get((int(candidate_scan_id), source_record_id))
+        if clone is None:
+            clone = self.domain.create_record(connection, {
+                "conclusion_status": record.get("conclusion_status", ""),
+                "coverage_method": record.get("coverage_method", ""),
+                "uncovered_reason": record.get("uncovered_reason", ""),
+                "comment": record.get("comment", ""),
+            }, origin="INHERITED")
+            self._candidate_record_cache[(int(candidate_scan_id), source_record_id)] = clone
+        candidate_block_id = self._candidate_block_for_relation(
+            connection, candidate_scan_id, relation, target_line, mapping,
+            clone,
+        )
         group_id = self._ensure_group(
             connection, run_id, candidate_scan_id, predecessor_id,
             relation, target_line, mapping,
         )
         self.domain.create_link(
             connection, candidate_scan_id, target_line["id"], clone["id"],
+            block_id=candidate_block_id,
             review_state=state, relation_origin="INHERITANCE",
             inheritance_group_id=group_id,
             source_scan_id=predecessor_id,
             source_line_id=relation["line_id"],
             source_relation_id=relation["id"],
         )
+
+    def _candidate_block_for_relation(self, connection, candidate_scan_id,
+                                      relation, target_line, mapping, record):
+        """Materialize the verified candidate range for one source Block.
+
+        A source Block may cover more than one line and a Git mapping may
+        contain insertions.  Split the mapped source interval into contiguous
+        target runs, then bind the relation to the run containing its target
+        line.  This keeps a candidate Block precise without inventing a range
+        across an insertion/deletion gap.
+        """
+        source_block_id = int(
+            relation.get("source_block_id") or relation.get("analysis_block_id") or 0
+        )
+        if not source_block_id:
+            raise ValueError("BLOCK_AMBIGUOUS")
+        source_start = int(
+            relation.get("source_block_start_line") or relation.get("source_line_number") or 0
+        )
+        source_end = int(
+            relation.get("source_block_end_line") or relation.get("source_line_number") or 0
+        )
+        target_number = int(target_line.get("line_number") or 0)
+        mapping_fingerprint = str(getattr(mapping, "fingerprint", ""))
+        record_id = int(record.get("id") or 0)
+        cache_key = (
+            int(candidate_scan_id), source_block_id, int(target_line["file_id"]),
+            mapping_fingerprint, source_start, source_end, record_id,
+        )
+        cached = self._candidate_block_cache.get(cache_key)
+        if cached:
+            return int(cached)
+        runs = []
+        current = []
+        span = max(0, source_end - source_start + 1)
+        if source_start < 1 or source_end < source_start or span > 20000:
+            mapped_numbers = [(int(relation["source_line_number"]), target_number)]
+        else:
+            mapped_numbers = []
+            for source_number in range(source_start, source_end + 1):
+                target_number_for_source = mapping.get(source_number)
+                if target_number_for_source is not None:
+                    mapped_numbers.append((source_number, int(target_number_for_source)))
+        for _, mapped_number in mapped_numbers:
+            if not current or mapped_number == current[-1] + 1:
+                current.append(mapped_number)
+            else:
+                runs.append(current)
+                current = [mapped_number]
+        if current:
+            runs.append(current)
+        selected = next((run for run in runs if target_number in run), None)
+        if not selected:
+            selected = [target_number]
+        block = self.domain.create_block(
+            connection, int(candidate_scan_id), int(target_line["file_id"]),
+            int(selected[0]), int(selected[-1]), record_id=record_id,
+            created_by="INHERITANCE", verified=True,
+            content_hash_value=record.get("content_hash"), origin="INHERITANCE",
+        )
+        self._candidate_block_cache[cache_key] = int(block["id"])
+        return int(block["id"])
 
     def _record_read_set_page(self, relation_page, read_set):
         self._metrics["source_relation_page_peak"] = max(
@@ -736,6 +809,8 @@ class InheritanceEngine(object):
                        l.coverage_state AS source_coverage_state,
                        f.file_path, f.repository_name, f.file_path_hash,
                        b.block_identity_verified, b.id AS source_block_id,
+                       b.start_line AS source_block_start_line,
+                       b.end_line AS source_block_end_line,
                        r.content_revision AS source_content_revision
                 FROM coverage_analysis_line_links q
                 JOIN coverage_lines l ON l.id=q.line_id

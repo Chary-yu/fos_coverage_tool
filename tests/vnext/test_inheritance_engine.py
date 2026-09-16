@@ -22,6 +22,7 @@ from app.db.repositories import (
     ProjectStateRepository, RepositoryRepository,
 )
 from app.services.project_service import ProjectService
+from app.services.inheritance_review_service import InheritanceReviewService
 from scripts.diagnostics.inheritance_rules_audit import audit as audit_rules
 from scripts.upgrade.migration_runner import create_sqlite_schema
 
@@ -291,6 +292,90 @@ class InheritanceEngineTest(unittest.TestCase):
                     connection, result["read_set"], candidate["id"], old["id"]
                 )
             self.assertEqual(str(raised.exception), "READ_SET_CHANGED")
+        finally:
+            root.cleanup()
+            connection.close()
+
+    def test_confirm_only_inheritance_retains_block_for_next_scan(self):
+        connection, root, old, candidate = self._inheritance_db_fixture()
+        try:
+            engine = InheritanceEngine()
+            first = engine.run(
+                connection, candidate["id"],
+                repository_paths={"repo-a": root.name}, batch_size=1,
+            )
+            self.assertEqual(first["inherited"], 1)
+            candidate_line = connection.execute(
+                "SELECT l.id FROM coverage_lines l "
+                "JOIN coverage_files f ON f.id=l.file_id "
+                "WHERE f.scan_id=? AND l.line_number=3", (candidate["id"],)
+            ).fetchone()[0]
+            block = connection.execute(
+                "SELECT b.scan_id, b.file_id, b.start_line, b.end_line, "
+                "b.originating_record_id "
+                "FROM coverage_analysis_line_links q "
+                "JOIN coverage_analysis_blocks b ON b.id=q.analysis_block_id "
+                "WHERE q.scan_id=? AND q.line_id=?", (candidate["id"], candidate_line)
+            ).fetchone()
+            self.assertEqual(tuple(block[:4]), (candidate["id"], block[1], 3, 3))
+            self.assertTrue(block[4])
+
+            relation = connection.execute(
+                "SELECT relation_revision FROM coverage_analysis_line_links "
+                "WHERE scan_id=? AND line_id=?", (candidate["id"], candidate_line)
+            ).fetchone()[0]
+            project_id = candidate["project_id"]
+            InheritanceReviewService().confirm(
+                connection, project_id, candidate["id"], [candidate_line],
+                default_expected_revision=relation, reviewer="reviewer",
+            )
+
+            next_scan = ProjectService(
+                ProjectRepository(), ProjectStateRepository(),
+                LineIndexRepository(), repository_repo=RepositoryRepository(),
+            ).create_scan_and_ingest(
+                connection, "engine-fixture", [{
+                    "repository_name": "repo-a", "file_path": "src/a.c",
+                    "file_path_hash": "s" * 32,
+                    "lines": [
+                        {"line_number": 1, "line_text": "int f() {", "coverage_state": "covered"},
+                        {"line_number": 2, "line_text": "  // formatting-only context", "coverage_state": "covered"},
+                        {"line_number": 3, "line_text": "  return 0;", "coverage_state": "uncovered"},
+                        {"line_number": 4, "line_text": "}", "coverage_state": "covered"},
+                    ],
+                }], repositories=[{
+                    "repository_name": "repo-a", "repository_path": root.name,
+                    "branch_name": "main", "commit_sha": candidate["id"] and
+                    connection.execute(
+                        "SELECT new_commit_sha FROM coverage_scan_repositories "
+                        "WHERE scan_id=? AND repository_name='repo-a'",
+                        (candidate["id"],)
+                    ).fetchone()[0],
+                    "old_commit_sha": connection.execute(
+                        "SELECT new_commit_sha FROM coverage_scan_repositories "
+                        "WHERE scan_id=? AND repository_name='repo-a'",
+                        (candidate["id"],)
+                    ).fetchone()[0],
+                    "new_commit_sha": connection.execute(
+                        "SELECT new_commit_sha FROM coverage_scan_repositories "
+                        "WHERE scan_id=? AND repository_name='repo-a'",
+                        (candidate["id"],)
+                    ).fetchone()[0],
+                    "identity_verified": True, "identity_provenance": "test",
+                }], info_sha256="engine-next",
+            )
+            second = engine.run(
+                connection, next_scan["id"],
+                repository_paths={"repo-a": root.name}, batch_size=1,
+            )
+            self.assertEqual(second["inherited"], 1)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM coverage_analysis_line_links "
+                    "WHERE scan_id=? AND relation_origin='INHERITANCE' "
+                    "AND analysis_block_id IS NOT NULL", (next_scan["id"],)
+                ).fetchone()[0], 1,
+            )
         finally:
             root.cleanup()
             connection.close()

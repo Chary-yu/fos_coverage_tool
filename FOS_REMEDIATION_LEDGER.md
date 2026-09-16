@@ -10,7 +10,7 @@ completed skill execution.
 | Finding ID | Severity | Original root owner | Current revalidation | Status | Remaining evidence |
 | --- | --- | --- | --- | --- | --- |
 | FOS-001 | P1 | Change Review | CONFIRMED: `_resolve_records` shared `_operation_key` across ranges and the save planner created one same-file Block from the first range; repository links did not enforce line containment. | FIXED_VERIFIED | Legacy malformed historical ranges require separate evidence-bound repair. |
-| FOS-002 | P1 | Change Review | CONFIRMED: successful inheritance creates a candidate LineLink without a candidate `AnalysisBlock`; confirm-only rolling inheritance loses the next-generation block identity. | BLOCKED | Remediation in progress; full external parser corpus remains pending. |
+| FOS-002 | P1 | Change Review | CONFIRMED: successful inheritance created a candidate LineLink without a candidate `AnalysisBlock`; confirm-only rolling inheritance lost the next-generation block identity. | FIXED_VERIFIED | Full external parser corpus remains pending. |
 | FOS-003 | P1 | Runtime Reliability | CONFIRMED: generic `JobRepository.upsert` updates by `job_id` only and runner heartbeat can race terminal persistence. | BLOCKED | Remediation in progress; MariaDB concurrency evidence remains pending. |
 | FOS-004 | P1 | Runtime Reliability | CONFIRMED structural gap / NEEDS_EXTERNAL_EVIDENCE for real dual-connection MariaDB ordering: analysis/review/publication paths lack a shared project-state lock boundary. | PRODUCTION_ACCEPTANCE_PENDING | Disposable MariaDB/production-like concurrency run must be executed outside this task. |
 | FOS-005 | P2 | Change Review | CONFIRMED: affected-file path rebases every `coverage_file_state` row and validates a full authoritative fact aggregate inside the mutation transaction. | BLOCKED | Remediation in progress; fixed-hardware workload measurement remains pending. |
@@ -50,3 +50,19 @@ The following fields are updated after each root-cause commit:
 - Commit SHA: recorded after the focused commit below.
 - Status: FIXED_VERIFIED
 - Remaining Evidence: full API/browser multi-select corpus and any historical malformed-block repair remain outside offline source acceptance.
+
+### FOS-002
+
+- Original Severity: P1
+- Original Root Cause: inherited output did not satisfy the candidate Scan Block contract required by the next inheritance run.
+- Current Revalidation Result: CONFIRMED at the start of Phase 1; the new three-generation fixture failed when S2 had no candidate Block.
+- Root Owner: Change Review
+- Changed Files: `app/inheritance/engine.py`, `tests/vnext/test_inheritance_engine.py`
+- Changed Functions: `InheritanceEngine.run`, `_persist_relation_decision`, `_candidate_block_for_relation`, `_iter_source_relation_pages`
+- Regression Test: `test_confirm_only_inheritance_retains_block_for_next_scan` — PASS; it runs S1 manual → S2 inheritance → S2 confirm-only → S3 inheritance and verifies candidate scan/file/range/originating record identity.
+- Integration Test: `python3 -m unittest -v tests.vnext.test_inheritance_engine` — PASS (38 tests).
+- Browser Test: NOT_RUN; no UI code changed.
+- Compatibility Check: existing inheritance parser, Git mapping, rejection and publication fixtures pass; source triple/group evidence remains intact and historical rows are not rewritten.
+- Commit SHA: recorded after the focused commit below.
+- Status: FIXED_VERIFIED
+- Remaining Evidence: full production parser corpus, MariaDB concurrency, and historical incomplete relation repair remain pending.
