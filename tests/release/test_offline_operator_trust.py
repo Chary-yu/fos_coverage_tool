@@ -5,15 +5,36 @@ import subprocess
 import tempfile
 import unittest
 
+import app.candidate_artifact as candidate_artifact
 from app.candidate_artifact import (
     CandidateArtifactManifest, OFFLINE_OPERATOR_PROVENANCE_CLASS,
     PRODUCTION_PROJECT_NAME, PRODUCTION_RELEASE_ARTIFACT_ROLE,
-    RELEASE_TRUST_MODE_OFFLINE_OPERATOR, verify_offline_operator_trust,
+    RELEASE_TRUST_MODE_OFFLINE_OPERATOR, RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+    verify_offline_operator_trust,
     build_git_source_provenance,
 )
 
 
 class OfflineOperatorTrustTest(unittest.TestCase):
+    def test_current_production_trust_policy_is_offline_operator_only(self):
+        self.assertEqual(
+            getattr(candidate_artifact, "CURRENT_PRODUCTION_RELEASE_TRUST_MODE", ""),
+            RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+        )
+        self.assertEqual(
+            getattr(candidate_artifact, "CURRENT_PRODUCTION_RELEASE_TRUST_MODES", ()),
+            (RELEASE_TRUST_MODE_OFFLINE_OPERATOR,),
+        )
+
+    def test_current_production_trust_policy_rejects_protected_builder(self):
+        verifier = getattr(
+            candidate_artifact, "verify_current_production_candidate_trust", None
+        )
+        self.assertIsNotNone(verifier)
+        with self.assertRaisesRegex(
+                ValueError, "PROTECTED_BUILDER_CURRENT_PUBLICATION_ALLOWED=NO"):
+            verifier(RELEASE_TRUST_MODE_PROTECTED_BUILDER)
+
     def _fixture(self):
         root = tempfile.TemporaryDirectory(prefix="offline-operator-trust-")
         self.addCleanup(root.cleanup)

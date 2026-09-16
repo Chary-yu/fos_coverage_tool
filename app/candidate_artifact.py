@@ -18,6 +18,14 @@ import subprocess
 from datetime import datetime
 
 from app.release_identity import build_asset_manifest, is_valid_commit_sha
+from app.release_trust_policy import (
+    CURRENT_PRODUCTION_RELEASE_TRUST_MODE,
+    CURRENT_PRODUCTION_RELEASE_TRUST_MODES,
+    RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+    RELEASE_TRUST_MODE_PROTECTED_BUILDER,
+    RELEASE_TRUST_MODES,
+    verify_current_production_candidate_trust,
+)
 from app.time_utils import utc_iso
 
 
@@ -34,12 +42,6 @@ OFFLINE_OPERATOR_PROVENANCE_CLASS = "offline-operator"
 TRUSTED_PROVENANCE_CLASSES = (
     TRUSTED_CI_PROVENANCE_CLASS, SERVED_ROOT_BOOTSTRAP_PROVENANCE_CLASS,
     OFFLINE_OPERATOR_PROVENANCE_CLASS,
-)
-RELEASE_TRUST_MODE_PROTECTED_BUILDER = "protected_builder"
-RELEASE_TRUST_MODE_OFFLINE_OPERATOR = "offline_operator"
-RELEASE_TRUST_MODES = (
-    RELEASE_TRUST_MODE_PROTECTED_BUILDER,
-    RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
 )
 VALIDATION_FIXTURE_ARTIFACT_ROLE = "validation_fixture"
 # The signed artifact contract distinguishes a publishable Production
