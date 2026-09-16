@@ -49,8 +49,10 @@ security result, compatibility result, and detached evidence manifest:
 
 ```bash
 SOURCE_SHA=$(git rev-parse HEAD)
+BASELINE_SHA=<exact-compatibility-baseline-sha>
 python3 scripts/release/local_release_gate.py \
   --source-sha "$SOURCE_SHA" \
+  --baseline-sha "$BASELINE_SHA" \
   --output ".artifacts/release/$SOURCE_SHA/SESSION_ID"
 ```
 

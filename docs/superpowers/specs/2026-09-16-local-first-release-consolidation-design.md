@@ -37,7 +37,11 @@ blocked pending the manual VFOS compatibility preflight.
 
 ## Workflow retirement
 
-The existing workflow responsibilities are represented by local targeted tests, local orchestration checks, the compatibility gate, and the immutable local evidence manifest before workflow files are removed. Historical parsers and protected-builder verification code may retain GitHub vocabulary when they only read old records; current production execution paths may not require it.
+The former workflow responsibilities are represented by local targeted tests,
+local orchestration checks, the compatibility gate, and the immutable local
+evidence manifest; the workflow files are retired. Historical parsers and
+protected-builder verification code may retain GitHub vocabulary when they
+only read old records; current production execution paths may not require it.
 
 ## Safety invariants
 

@@ -119,13 +119,13 @@
 - Test: `tests/database/test_mariadb_compatibility_contract.py`
 
 **Interfaces:**
-- `local_compatibility_gate.py` uses digest-pinned images and emits `compatibility_tests.json`; missing Docker yields `LOCAL_COMPATIBILITY_GATE=NOT_VERIFIED` and nonzero status.
+- `compatibility_surface.py` classifies changed production surfaces and `local_compatibility_gate.py` emits `PASS`, `NOT_APPLICABLE`, `DEFERRED_TO_TARGET_RUNTIME`, or `FAIL` in `compatibility_tests.json`; missing target runtimes are deferred only for isolated staging and never authorize publication/cutover.
 - Evidence contains explicit `PYTHON36_COMPAT` and `MARIADB55_COMPAT` values and never fabricates PASS.
 
 - [ ] Write failing tests for missing Docker and fixed image digest enforcement.
 - [ ] Run the compatibility-specific tests and confirm red status.
 - [ ] Implement Python syntax/import and disposable MariaDB grant/revoke commands with no production paths or credentials in evidence.
-- [ ] Run the compatibility tests; record `NOT_VERIFIED` if Docker is unavailable.
+- [ ] Run the compatibility tests; record the truthful four-state result if Docker or a target runtime is unavailable.
 - [ ] Commit with `feat(release): move production compatibility validation local`.
 
 ### Task 6: Local-first/no-GitHub regression coverage
