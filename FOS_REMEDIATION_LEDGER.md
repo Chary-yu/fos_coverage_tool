@@ -15,7 +15,7 @@ completed skill execution.
 | FOS-004 | P1 | Runtime Reliability | CONFIRMED structural gap / NEEDS_EXTERNAL_EVIDENCE for real dual-connection MariaDB ordering: analysis/review/publication paths lacked a shared project-state lock boundary. | PRODUCTION_ACCEPTANCE_PENDING | Source lock boundary is fixed and tested; disposable MariaDB/production-like concurrency run remains external. |
 | FOS-005 | P2 | Change Review | CONFIRMED: affected-file path rebased every `coverage_file_state` row and validated a full authoritative fact aggregate inside the mutation transaction. | FIXED_VERIFIED | Fixed-hardware workload measurement remains pending. |
 | FOS-006 | P2 | Change Review | CONFIRMED: `execute` and `executemany` shared one `db_query_count`, while returned and affected rows were not separately named from server-examined rows. | FIXED_VERIFIED | Real driver/session statement count remains pending. |
-| FOS-007 | P2 | Change Review | CONFIRMED: inheritance records all predecessor active relations even for unready repositories or missing candidate files, then publication replays the full predecessor set. | BLOCKED | Remediation in progress; large-scope checkpoint measurement remains pending. |
+| FOS-007 | P2 | Change Review | CONFIRMED: inheritance recorded all predecessor active relations even for unready repositories or missing candidate files, then publication replayed the full predecessor set. | FIXED_VERIFIED | Large-scope checkpoint measurement remains pending. |
 | FOS-008 | P1 | Change Review | CONFIRMED: orphan query considered only LineLink references and the candidate gate consumed the global count, ignoring historical Block/rejection references. | FIXED_VERIFIED | Historical production data acceptance remains pending. |
 | FOS-009 | P2 | Runtime Reliability | CONFIRMED: LRU removal does not remove `_identity_index`; an oversize/disabled store can index a non-existent cache entry. | BLOCKED | Remediation in progress; long-running RSS workload remains pending. |
 
@@ -146,3 +146,19 @@ The following fields are updated after each root-cause commit:
 - Commit SHA: pending focused commit.
 - Status: FIXED_VERIFIED
 - Remaining Evidence: actual PyMySQL/MariaDB session statement expansion, server rows examined, and network round trips require a disposable matching driver/database; no production/network-log claim is made.
+
+### FOS-007
+
+- Original Severity: P2
+- Original Root Cause: the inheritance read-set was defined as every predecessor active relation, so source files with no candidate correspondence or an unready repository could block publication despite never affecting the candidate decision.
+- Current Revalidation Result: CONFIRMED at the start of Phase 2; the missing-candidate and unready-repository fixtures would previously add their source relations to the compact read-set.
+- Root Owner: Change Review
+- Changed Files: `app/inheritance/read_set.py`, `app/inheritance/engine.py`, `app/scan_import/publication.py`, `tests/vnext/test_inheritance_engine.py`
+- Changed Functions: `ReadSetAccumulator.add_source_file`, `to_payload`, `matches`; `InheritanceEngine.run`; `ScanPublicationService._validate_compact_read_set`
+- Regression Test: `test_read_set_excludes_source_files_without_candidate_correspondence`, `test_read_set_excludes_unready_repository_source_relations`, and the existing true-dependency mutation test — PASS; only consulted candidate-corresponding source scopes are replayed, while a changed consulted record still returns `READ_SET_CHANGED`.
+- Integration Test: `python3 -m unittest -v tests.vnext.test_inheritance_engine tests.vnext.test_scan_import_lifecycle` — PASS (54 tests).
+- Browser Test: NOT_RUN; this is an inheritance/publication dependency contract and no UI code changed.
+- Compatibility Check: compact read-set format is explicitly upgraded to v2; old v1 payloads fail closed rather than being interpreted as empty dependencies; legacy list-form read-set validation remains unchanged.
+- Commit SHA: pending focused commit.
+- Status: FIXED_VERIFIED
+- Remaining Evidence: large production-like source-scope checkpoint size and validation timing require a fixed workload measurement; no production data was used.

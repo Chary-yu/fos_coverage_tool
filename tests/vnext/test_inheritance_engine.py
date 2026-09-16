@@ -52,7 +52,7 @@ class InheritanceEngineTest(unittest.TestCase):
         ).strip()
         return root, old_commit, new_commit
 
-    def _inheritance_db_fixture(self, branch="main"):
+    def _inheritance_db_fixture(self, branch="main", include_unmatched_source=False):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         create_sqlite_schema(connection)
@@ -63,8 +63,7 @@ class InheritanceEngineTest(unittest.TestCase):
         service = ProjectService(
             projects, states, LineIndexRepository(), repository_repo=repositories
         )
-        old = service.create_scan_and_ingest(
-            connection, "engine-fixture", [{
+        old_files = [{
                 "repository_name": "repo-a", "file_path": "src/a.c",
                 "file_path_hash": "o" * 32,
                 "lines": [
@@ -72,7 +71,18 @@ class InheritanceEngineTest(unittest.TestCase):
                     {"line_number": 2, "line_text": "  return 0;", "coverage_state": "uncovered"},
                     {"line_number": 3, "line_text": "}", "coverage_state": "covered"},
                 ],
-            }], repositories=[{
+            }]
+        if include_unmatched_source:
+            old_files.append({
+                "repository_name": "repo-a", "file_path": "src/unmatched.c",
+                "file_path_hash": "u" * 32,
+                "lines": [{
+                    "line_number": 1, "line_text": "return 9;",
+                    "coverage_state": "uncovered",
+                }],
+            })
+        old = service.create_scan_and_ingest(
+            connection, "engine-fixture", old_files, repositories=[{
                 "repository_name": "repo-a", "repository_path": root.name,
                 "branch_name": "main", "commit_sha": old_commit,
                 "old_commit_sha": old_commit, "new_commit_sha": old_commit,
@@ -104,6 +114,28 @@ class InheritanceEngineTest(unittest.TestCase):
             block_id=block["id"], review_state="MANUAL_CONFIRMED",
             relation_origin="MANUAL",
         )
+        if include_unmatched_source:
+            unmatched_file = projects.get_file(
+                connection, old["id"], "repo-a", "u" * 32
+            )
+            unmatched_line = connection.execute(
+                "SELECT * FROM coverage_lines WHERE file_id=? AND line_number=1",
+                (unmatched_file["id"],),
+            ).fetchone()
+            unmatched_record = domain.create_record(
+                connection, {"status": "可覆盖", "coverage_method": "unit"},
+                origin="MANUAL",
+            )
+            unmatched_block = domain.create_block(
+                connection, old["id"], unmatched_file["id"], 1, 1,
+                record_id=unmatched_record["id"], repository_id=repo_id,
+                verified=True,
+            )
+            domain.create_link(
+                connection, old["id"], unmatched_line["id"],
+                unmatched_record["id"], block_id=unmatched_block["id"],
+                review_state="MANUAL_CONFIRMED", relation_origin="MANUAL",
+            )
         candidate = service.create_scan_and_ingest(
             connection, "engine-fixture", [{
                 "repository_name": "repo-a", "file_path": "src/a.c",
@@ -271,7 +303,11 @@ class InheritanceEngineTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(result["inherited"], 1)
             self.assertEqual(tuple(decision), (candidate_line, "INHERITED", "INHERITED"))
-            self.assertEqual(result["read_set"]["format"], "inheritance-read-set-v1")
+            self.assertEqual(result["read_set"]["format"], "inheritance-read-set-v2")
+            self.assertEqual(
+                result["read_set"]["source_files"],
+                [{"repository_name": "repo-a", "file_path": "src/a.c"}],
+            )
             self.assertEqual(result["read_set"]["relations"]["count"], 1)
             self.assertEqual(result["read_set"]["records"]["count"], 1)
             self.assertEqual(result["metrics"]["source_relation_page_peak"], 1)
@@ -292,6 +328,62 @@ class InheritanceEngineTest(unittest.TestCase):
                     connection, result["read_set"], candidate["id"], old["id"]
                 )
             self.assertEqual(str(raised.exception), "READ_SET_CHANGED")
+        finally:
+            root.cleanup()
+            connection.close()
+
+    def test_read_set_excludes_source_files_without_candidate_correspondence(self):
+        connection, root, old, candidate = self._inheritance_db_fixture(
+            include_unmatched_source=True
+        )
+        try:
+            result = InheritanceEngine().run(
+                connection, candidate["id"],
+                repository_paths={"repo-a": root.name}, batch_size=1,
+            )
+            self.assertEqual(
+                result["read_set"]["source_files"],
+                [{"repository_name": "repo-a", "file_path": "src/a.c"}],
+            )
+            unmatched_record_id = connection.execute(
+                "SELECT r.id FROM coverage_analysis_records r "
+                "JOIN coverage_analysis_blocks b ON b.originating_record_id=r.id "
+                "JOIN coverage_files f ON f.id=b.file_id "
+                "WHERE b.scan_id=? AND f.file_path=?",
+                (old["id"], "src/unmatched.c"),
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE coverage_analysis_records SET content_revision="
+                "content_revision + 1 WHERE id=?", (unmatched_record_id,)
+            )
+            ScanPublicationService._validate_compact_read_set(
+                connection, result["read_set"], candidate["id"], old["id"]
+            )
+        finally:
+            root.cleanup()
+            connection.close()
+
+    def test_read_set_excludes_unready_repository_source_relations(self):
+        connection, root, old, candidate = self._inheritance_db_fixture()
+        try:
+            class UnreadyPredecessor(object):
+                def resolve(self, connection, candidate_scan_id):
+                    return {
+                        "predecessor_scan_id": old["id"],
+                        "repositories": [{
+                            "candidate_repository": "repo-a",
+                            "reason_code": "REPOSITORY_NOT_READY",
+                        }],
+                    }
+
+            result = InheritanceEngine(
+                predecessor=UnreadyPredecessor()
+            ).run(connection, candidate["id"], batch_size=1)
+            self.assertEqual(result["read_set"]["source_files"], [])
+            self.assertEqual(result["read_set"]["relations"]["count"], 0)
+            ScanPublicationService._validate_compact_read_set(
+                connection, result["read_set"], candidate["id"], old["id"]
+            )
         finally:
             root.cleanup()
             connection.close()

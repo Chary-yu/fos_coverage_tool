@@ -5,7 +5,7 @@ from __future__ import absolute_import
 import hashlib
 
 
-READ_SET_FORMAT = "inheritance-read-set-v1"
+READ_SET_FORMAT = "inheritance-read-set-v2"
 READ_SET_HASH_ALGORITHM = "sha256-sum-xor-v1"
 _MASK = (1 << 256) - 1
 
@@ -31,6 +31,13 @@ class ReadSetAccumulator(object):
         self.record_count = 0
         self.record_sum = 0
         self.record_xor = 0
+        self.source_files = set()
+
+    def add_source_file(self, repository_name, file_path):
+        """Bind the accumulator to a source file actually consulted."""
+        self.source_files.add((
+            str(repository_name or ""), str(file_path or ""),
+        ))
 
     def add_relation(self, relation_id, relation_revision):
         value = _item_digest("relation", relation_id, relation_revision)
@@ -64,6 +71,10 @@ class ReadSetAccumulator(object):
                 "sum": format(self.record_sum, "064x"),
                 "xor": format(self.record_xor, "064x"),
             },
+            "source_files": [
+                {"repository_name": repository_name, "file_path": file_path}
+                for repository_name, file_path in sorted(self.source_files)
+            ],
         }
 
     def matches(self, payload):
@@ -79,4 +90,5 @@ class ReadSetAccumulator(object):
             and payload.get("hash_algorithm") == READ_SET_HASH_ALGORITHM
             and payload.get("relations") == expected["relations"]
             and payload.get("records") == expected["records"]
+            and payload.get("source_files") == expected["source_files"]
         )

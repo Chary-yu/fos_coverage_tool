@@ -152,25 +152,39 @@ class ScanPublicationService(object):
                 raise ValueError("READ_SET_CHANGED")
             return
 
+        source_files = read_set.get("source_files")
+        if not isinstance(source_files, list):
+            raise ValueError("READ_SET_CHANGED")
         accumulator = ReadSetAccumulator()
-        for row in iter_rows(connection, """
-                SELECT q.id, q.relation_revision, q.analysis_record_id,
-                       r.content_revision AS source_content_revision
-                FROM coverage_analysis_line_links q
-                LEFT JOIN coverage_analysis_records r
-                  ON r.id=q.analysis_record_id
-                WHERE q.scan_id=? AND q.is_active=1
-                ORDER BY q.id
-            """, (expected_predecessor,)):
-            if row.get("id") is not None:
-                accumulator.add_relation(
-                    row["id"], row.get("relation_revision") or 0
-                )
-            if (row.get("analysis_record_id") is not None and
-                    row.get("source_content_revision") is not None):
-                accumulator.add_record(
-                    row["analysis_record_id"],
-                    row["source_content_revision"] or 0,
-                )
+        for source_file in source_files:
+            if not isinstance(source_file, dict):
+                raise ValueError("READ_SET_CHANGED")
+            repository_name = str(source_file.get("repository_name") or "")
+            file_path = str(source_file.get("file_path") or "")
+            if not repository_name or not file_path:
+                raise ValueError("READ_SET_CHANGED")
+            accumulator.add_source_file(repository_name, file_path)
+            for row in iter_rows(connection, """
+                    SELECT q.id, q.relation_revision, q.analysis_record_id,
+                           r.content_revision AS source_content_revision
+                    FROM coverage_analysis_line_links q
+                    JOIN coverage_lines l ON l.id=q.line_id
+                    JOIN coverage_files f ON f.id=l.file_id
+                    LEFT JOIN coverage_analysis_records r
+                      ON r.id=q.analysis_record_id
+                    WHERE q.scan_id=? AND q.is_active=1
+                      AND f.repository_name=? AND f.file_path=?
+                    ORDER BY q.id
+                """, (expected_predecessor, repository_name, file_path)):
+                if row.get("id") is not None:
+                    accumulator.add_relation(
+                        row["id"], row.get("relation_revision") or 0
+                    )
+                if (row.get("analysis_record_id") is not None and
+                        row.get("source_content_revision") is not None):
+                    accumulator.add_record(
+                        row["analysis_record_id"],
+                        row["source_content_revision"] or 0,
+                    )
         if not accumulator.matches(read_set):
             raise ValueError("READ_SET_CHANGED")

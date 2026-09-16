@@ -423,8 +423,6 @@ class InheritanceEngine(object):
             if repository_resolution_available and (
                     not repository_status or
                     str(repository_status.get("reason_code") or "NO_PREDECESSOR") != "READY"):
-                for relation_page in source_relation_pages:
-                    self._record_read_set_page(relation_page, read_set)
                 release_scope_if_complete(source_file, repository_name)
                 continue
             key = (repository_name, str(source_file.get("file_path") or ""))
@@ -432,11 +430,10 @@ class InheritanceEngine(object):
                 connection, candidate_scan_id, repository_name, key[1]
             )
             if not target_file:
-                for relation_page in source_relation_pages:
-                    self._record_read_set_page(relation_page, read_set)
                 release_scope_if_complete(source_file, repository_name)
                 continue
 
+            read_set.add_source_file(repository_name, key[1])
             source_snapshot = None
             for relation_page in source_relation_pages:
                 self._record_read_set_page(relation_page, read_set)
