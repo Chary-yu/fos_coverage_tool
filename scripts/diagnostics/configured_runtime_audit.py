@@ -2,7 +2,6 @@
 
 import json
 import os
-import subprocess
 import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
@@ -10,45 +9,12 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from app.config.runtime_config import load_application_config
-from app.release_identity import is_valid_commit_sha
+from app.release_trust_policy import CURRENT_PRODUCTION_RELEASE_TRUST_MODE
 
 try:
     from scripts.diagnostics.contract import with_contract
 except ModuleNotFoundError:
     from contract import with_contract
-
-
-def _workflow_policy(upgrade, identity_key, sha_key, label):
-    identity = str(upgrade.get(identity_key) or "").strip()
-    sha = str(upgrade.get(sha_key) or "").strip()
-    violations = []
-    if not identity:
-        violations.append("Candidate {} is missing".format(identity_key))
-    if not sha:
-        violations.append("Candidate {} is missing".format(sha_key))
-    elif "REPLACE_WITH" in sha.upper():
-        violations.append("Candidate {} is still a placeholder".format(sha_key))
-    elif not is_valid_commit_sha(sha):
-        violations.append(
-            "Candidate {} must be an exact commit SHA".format(sha_key)
-        )
-    return identity, sha, violations
-
-
-def _workflow_revision_contains(repo_root, workflow_sha, workflow_path):
-    """Require a pinned builder revision to contain its claimed workflow."""
-    try:
-        subprocess.check_call(
-            ["git", "cat-file", "-e", "{}^{{commit}}".format(workflow_sha)],
-            cwd=repo_root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        output = subprocess.check_output(
-            ["git", "ls-tree", "-r", "--name-only", workflow_sha, "--", workflow_path],
-            cwd=repo_root, stderr=subprocess.STDOUT,
-        ).decode("utf-8", "replace")
-    except (OSError, subprocess.CalledProcessError, UnicodeError):
-        return False
-    return workflow_path in output.splitlines()
 
 
 def audit(repo_root=ROOT):
@@ -65,38 +31,18 @@ def audit(repo_root=ROOT):
     if int((candidate.get("server") or {}).get("port") or 0) != 19528:
         violations.append("Candidate server port is not 19528")
     upgrade = candidate.get("upgrade") or {}
-    validation_workflow_identity, validation_workflow_sha, workflow_violations = \
-        _workflow_policy(
-            upgrade,
-            "validation_candidate_builder_workflow_identity",
-            "validation_candidate_builder_workflow_sha",
-            "validation Candidate builder",
-        )
-    violations.extend(workflow_violations)
-    production_workflow_identity, production_workflow_sha, workflow_violations = \
-        _workflow_policy(
-            upgrade,
-            "production_candidate_builder_workflow_identity",
-            "production_candidate_builder_workflow_sha",
-            "production Candidate builder",
-        )
-    violations.extend(workflow_violations)
-    if validation_workflow_sha and is_valid_commit_sha(validation_workflow_sha) and \
-            not _workflow_revision_contains(
-                repo_root, validation_workflow_sha,
-                ".github/workflows/trusted-candidate-builder.yml",
-            ):
+    release_trust_mode = str(upgrade.get("release_trust_mode") or "").strip()
+    if release_trust_mode != CURRENT_PRODUCTION_RELEASE_TRUST_MODE:
         violations.append(
-            "validation Candidate builder SHA does not contain its pinned workflow"
+            "Candidate release_trust_mode must be {}".format(
+                CURRENT_PRODUCTION_RELEASE_TRUST_MODE
+            )
         )
-    if production_workflow_sha and is_valid_commit_sha(production_workflow_sha) and \
-            not _workflow_revision_contains(
-                repo_root, production_workflow_sha,
-                ".github/workflows/trusted-production-candidate-builder.yml",
-            ):
-        violations.append(
-            "production Candidate builder SHA does not contain its pinned workflow"
-        )
+    offline_operator_repository = str(
+        upgrade.get("offline_operator_repository") or ""
+    ).strip()
+    if not offline_operator_repository:
+        violations.append("Candidate offline_operator_repository is missing")
     if not upgrade.get("previous_release_endpoint"):
         violations.append("Candidate previous_release_endpoint is missing")
     elif upgrade.get("previous_release_endpoint") == upgrade.get("release_endpoint"):
@@ -140,9 +86,6 @@ def audit(repo_root=ROOT):
             "validation_candidate_root", "validation_candidate_artifact_manifest",
             "production_candidate_root", "production_candidate_artifact_manifest",
             "production_candidate_build_receipt",
-            "production_candidate_attestation_bundle",
-            "production_candidate_attestation_repository",
-            "production_candidate_attestation_workflow",
             "publish_root",
             "served_root_path",
             "validation_session_manifest", "validation_teardown_evidence_path",
@@ -154,7 +97,13 @@ def audit(repo_root=ROOT):
         "candidate_root", "candidate_artifact_manifest", "candidate_build_receipt",
         "candidate_build_attestation_bundle", "candidate_build_attestation_repository",
         "candidate_build_attestation_workflow", "trusted_build_workflow_identity",
-        "trusted_build_workflow_sha",
+        "trusted_build_workflow_sha", "production_candidate_attestation_bundle",
+        "production_candidate_attestation_repository",
+        "production_candidate_attestation_workflow",
+        "validation_candidate_builder_workflow_identity",
+        "validation_candidate_builder_workflow_sha",
+        "production_candidate_builder_workflow_identity",
+        "production_candidate_builder_workflow_sha",
     )
     for field in legacy_fields:
         if field in upgrade:
@@ -173,15 +122,6 @@ def audit(repo_root=ROOT):
     )
     production_candidate_build_receipt = str(
         upgrade.get("production_candidate_build_receipt") or ""
-    )
-    production_candidate_attestation_bundle = str(
-        upgrade.get("production_candidate_attestation_bundle") or ""
-    )
-    production_candidate_attestation_repository = str(
-        upgrade.get("production_candidate_attestation_repository") or ""
-    )
-    production_candidate_attestation_workflow = str(
-        upgrade.get("production_candidate_attestation_workflow") or ""
     )
     publish_root = str(upgrade.get("publish_root") or "")
     served_root_path = str(upgrade.get("served_root_path") or "")
@@ -273,18 +213,13 @@ def audit(repo_root=ROOT):
             "served_root_probe_relative_path", ""
         ),
         "candidate_previous_release_endpoint": upgrade.get("previous_release_endpoint", ""),
-        "validation_candidate_builder_workflow_identity": validation_workflow_identity,
-        "validation_candidate_builder_workflow_sha": validation_workflow_sha,
-        "production_candidate_builder_workflow_identity": production_workflow_identity,
-        "production_candidate_builder_workflow_sha": production_workflow_sha,
+        "release_trust_mode": release_trust_mode,
+        "offline_operator_repository": offline_operator_repository,
         "validation_candidate_root": validation_candidate_root,
         "validation_candidate_artifact_manifest": validation_candidate_manifest,
         "production_candidate_root": production_candidate_root,
         "production_candidate_artifact_manifest": production_candidate_manifest,
         "production_candidate_build_receipt": production_candidate_build_receipt,
-        "production_candidate_attestation_bundle": production_candidate_attestation_bundle,
-        "production_candidate_attestation_repository": production_candidate_attestation_repository,
-        "production_candidate_attestation_workflow": production_candidate_attestation_workflow,
         "candidate_publish_root": publish_root,
         "served_root_path": served_root_path,
         "validation_session_manifest": upgrade.get("validation_session_manifest", ""),

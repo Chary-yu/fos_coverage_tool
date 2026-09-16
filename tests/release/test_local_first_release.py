@@ -40,6 +40,26 @@ class LocalFirstReleaseTest(unittest.TestCase):
         self.assertIn("GITHUB_SOURCE_REPOSITORY_ONLY=YES", rendered)
         self.assertIn("STALE_GITHUB_WORKFLOW_AFFECTS_RELEASE=NO", rendered)
 
+    def test_staging_example_uses_offline_operator_contract(self):
+        with open(
+                "config/coverage_config.staging.example.json",
+                encoding="utf-8",
+        ) as stream:
+            config = json.load(stream)
+        upgrade = config["upgrade"]
+        self.assertEqual(upgrade["release_trust_mode"], "offline_operator")
+        for field in (
+                "production_candidate_attestation_bundle",
+                "production_candidate_attestation_repository",
+                "production_candidate_attestation_workflow",
+                "validation_candidate_builder_workflow_identity",
+                "validation_candidate_builder_workflow_sha",
+                "production_candidate_builder_workflow_identity",
+                "production_candidate_builder_workflow_sha",
+        ):
+            with self.subTest(field=field):
+                self.assertNotIn(field, upgrade)
+
     def test_release_readiness_local_first_reports_current_authority(self):
         from scripts.diagnostics.release_readiness import build
 
