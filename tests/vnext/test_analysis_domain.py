@@ -164,6 +164,8 @@ class AnalysisDomainTest(unittest.TestCase):
         audit = AnalysisDomainService().audit_consistency(self.connection)
         self.assertEqual(audit["checks"]["orphan_records"], 0)
         self.assertEqual(audit["checks"]["historical_referenced_records"], 1)
+        self.assertEqual(audit["status"], "PASSED")
+        self.assertEqual(audit["global_status"], "PASSED")
 
     def test_scoped_consistency_gate_ignores_unrelated_true_orphan(self):
         domain = AnalysisDomainService().repository

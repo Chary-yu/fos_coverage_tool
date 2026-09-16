@@ -168,13 +168,14 @@ class AnalysisDomainService(object):
             key: value for key, value in counts.items()
             if key not in diagnostic_only
         }
+        all_blocking = dict(global_blocking)
         # Historical graph hygiene is reported globally, but a candidate
         # consistency gate must not fail because of an unrelated truly
         # unreferenced record that cannot affect this Scan. Link/block/review
         # identity checks remain scoped by the candidate scan above.
         if scan_id is not None:
             global_blocking.pop("orphan_records", None)
-        global_status = "PASSED" if not any(counts.values()) else "FAILED"
+        global_status = "PASSED" if not any(all_blocking.values()) else "FAILED"
         return {
             "status": "PASSED" if not any(global_blocking.values()) else "FAILED",
             "global_status": global_status,
