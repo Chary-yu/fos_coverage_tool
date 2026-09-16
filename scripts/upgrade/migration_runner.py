@@ -3673,7 +3673,7 @@ def _migrate_legacy_materialized(source_connection, target_connection, anomaly_p
                     "job_id": old_job["job_id"], "legacy_state": state,
                 })
                 state = "interrupted"
-            job_repo.upsert(conn, {
+            job_repo.restore(conn, {
                 "job_id": old_job["job_id"], "project_id": project["id"],
                 "kind": old_job["kind"], "state": state,
                 "progress": 0, "input_payload": json.dumps(
@@ -3940,7 +3940,7 @@ def _migrate_legacy_with_source_spool(source_connection, target_connection,
         if state in ("queued", "running", "interrupted"):
             state = "interrupted"
         with transaction(target_connection) as conn:
-            job_repo.upsert(conn, {
+            job_repo.restore(conn, {
                 "job_id": old_job["job_id"], "project_id": project,
                 "kind": old_job["kind"], "state": state, "progress": 0,
                 "input_payload": json.dumps(old_job, sort_keys=True,

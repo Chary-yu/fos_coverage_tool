@@ -60,11 +60,19 @@ class VNextBackgroundJobService(object):
         self.execution_guard = execution_guard
         self._submit_lock = threading.Lock()
 
-    def _save(self, job):
+    def _save(self, job, transition):
         connection = self.connection_factory()
         try:
             with transaction(connection) as conn:
-                return self.repository.upsert(conn, job)
+                method = {
+                    "create": "create",
+                    "start": "start",
+                    "heartbeat": "heartbeat",
+                    "terminal": "transition_terminal",
+                }.get(str(transition or ""))
+                if not method:
+                    raise ValueError("unknown job transition")
+                return getattr(self.repository, method)(conn, job)
         finally:
             close = getattr(connection, "close", None)
             if close:
@@ -96,7 +104,7 @@ class VNextBackgroundJobService(object):
                     "VNEXT_JOB_HANDLER_V1"
                 ),
             }
-            persisted = self._save(job)
+            persisted = self._save(job, "create")
             try:
                 self._enqueue(job, callback, resource_class=resource_class)
             except Exception as error:
@@ -108,7 +116,7 @@ class VNextBackgroundJobService(object):
                     "state": "failed", "error_message": str(error),
                     "finished_at": _now(), "heartbeat_at": _now(),
                 })
-                self._save(failed)
+                self._save(failed, "terminal")
                 raise
         return persisted
 
@@ -142,7 +150,10 @@ class VNextBackgroundJobService(object):
             started.update({"state": "running", "heartbeat_at": _now(),
                             "lease_owner": self.lease_owner,
                             "started_at": _now()})
-            self._save(started)
+            if self._save(started, "start") is None:
+                # Recovery or another executor may have claimed this durable
+                # row after it was queued.  A stale callback must not run.
+                return None
             stop_heartbeat = threading.Event()
 
             def heartbeat():
@@ -150,7 +161,7 @@ class VNextBackgroundJobService(object):
                     heartbeat_job = dict(started)
                     heartbeat_job.update({"state": "running", "heartbeat_at": _now()})
                     try:
-                        self._save(heartbeat_job)
+                        self._save(heartbeat_job, "heartbeat")
                     except Exception:
                         # The callback still owns the terminal state.
                         pass
@@ -160,6 +171,9 @@ class VNextBackgroundJobService(object):
                 name="CoverageJobHeartbeat-{}".format(job["job_id"]), daemon=True,
             )
             heartbeat_thread.start()
+            terminal = None
+            result = None
+            raised = None
             try:
                 if self.execution_guard is not None:
                     self.execution_guard(dict(started))
@@ -170,8 +184,7 @@ class VNextBackgroundJobService(object):
                     "result_path": result if isinstance(result, str) else "",
                     "finished_at": _now(), "heartbeat_at": _now(),
                 })
-                self._save(completed)
-                return result
+                terminal = completed
             except JobSupersededError as exc:
                 superseded = dict(started)
                 superseded.update({
@@ -179,19 +192,30 @@ class VNextBackgroundJobService(object):
                     "error_message": str(exc) or "JOB_SUPERSEDED",
                     "finished_at": _now(), "heartbeat_at": _now(),
                 })
-                self._save(superseded)
-                return None
+                terminal = superseded
             except Exception as exc:
                 failed = dict(started)
                 failed.update({
                     "state": "failed", "error_message": str(exc),
                     "finished_at": _now(), "heartbeat_at": _now(),
                 })
-                self._save(failed)
-                raise
+                terminal = failed
+                raised = exc
             finally:
                 stop_heartbeat.set()
                 heartbeat_thread.join(timeout=min(self.heartbeat_interval, 1.0))
+                # Stop and join the heartbeat before the terminal CAS.  The
+                # database fence below remains mandatory because a late
+                # callback from an old process can still exist.
+                terminal_saved = self._save(terminal, "terminal") if terminal else None
+            if raised is not None:
+                raise raised
+            if terminal_saved is None:
+                # A successful callback whose lease was reclaimed is no
+                # longer the durable owner; never report its result as the
+                # authoritative job completion.
+                return None
+            return result
         return run
 
     @staticmethod
@@ -271,7 +295,7 @@ class VNextBackgroundJobService(object):
                                     "state": "failed", "error_message": str(error),
                                     "finished_at": _now(), "heartbeat_at": _now(),
                                 })
-                                self.repository.upsert(conn, failed)
+                                self.repository.transition_terminal(conn, failed)
                         finally:
                             close = getattr(failure_connection, "close", None)
                             if close:

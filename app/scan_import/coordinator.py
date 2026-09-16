@@ -153,7 +153,7 @@ class ScanImportCoordinator(object):
                     "algorithm_version": algorithm_version,
                     "handler_version": self.HANDLER_VERSION,
                 }
-                job = self.jobs.upsert(conn, {
+                job = self.jobs.create(conn, {
                     "job_id": job_id, "project_id": project["id"],
                     "scan_id": scan["id"], "kind": "scan_import", "state": "queued",
                     "progress": 0, "input_payload": json.dumps(

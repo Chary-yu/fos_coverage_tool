@@ -11,7 +11,7 @@ completed skill execution.
 | --- | --- | --- | --- | --- | --- |
 | FOS-001 | P1 | Change Review | CONFIRMED: `_resolve_records` shared `_operation_key` across ranges and the save planner created one same-file Block from the first range; repository links did not enforce line containment. | FIXED_VERIFIED | Legacy malformed historical ranges require separate evidence-bound repair. |
 | FOS-002 | P1 | Change Review | CONFIRMED: successful inheritance created a candidate LineLink without a candidate `AnalysisBlock`; confirm-only rolling inheritance lost the next-generation block identity. | FIXED_VERIFIED | Full external parser corpus remains pending. |
-| FOS-003 | P1 | Runtime Reliability | CONFIRMED: generic `JobRepository.upsert` updates by `job_id` only and runner heartbeat can race terminal persistence. | BLOCKED | Remediation in progress; MariaDB concurrency evidence remains pending. |
+| FOS-003 | P1 | Runtime Reliability | CONFIRMED: generic `JobRepository.upsert` updated by `job_id` only and runner heartbeat could race terminal persistence. | FIXED_VERIFIED | MariaDB driver-level concurrency evidence remains pending. |
 | FOS-004 | P1 | Runtime Reliability | CONFIRMED structural gap / NEEDS_EXTERNAL_EVIDENCE for real dual-connection MariaDB ordering: analysis/review/publication paths lack a shared project-state lock boundary. | PRODUCTION_ACCEPTANCE_PENDING | Disposable MariaDB/production-like concurrency run must be executed outside this task. |
 | FOS-005 | P2 | Change Review | CONFIRMED: affected-file path rebases every `coverage_file_state` row and validates a full authoritative fact aggregate inside the mutation transaction. | BLOCKED | Remediation in progress; fixed-hardware workload measurement remains pending. |
 | FOS-006 | P2 | Change Review | CONFIRMED: `execute` and `executemany` share one `db_query_count`, while returned and affected rows are not separately named from server-examined rows. | BLOCKED | Remediation in progress; real driver/session statement count remains pending. |
@@ -66,3 +66,19 @@ The following fields are updated after each root-cause commit:
 - Commit SHA: recorded after the focused commit below.
 - Status: FIXED_VERIFIED
 - Remaining Evidence: full production parser corpus, MariaDB concurrency, and historical incomplete relation repair remain pending.
+
+### FOS-003
+
+- Original Severity: P1
+- Original Root Cause: the generic full-row `job_id` update had no lease-owner/state CAS and the runner stopped heartbeat after writing terminal state.
+- Current Revalidation Result: CONFIRMED at the start of Phase 2; the new stale-owner/reclaim/terminal test would fail because the required transition API did not exist.
+- Root Owner: Runtime Reliability
+- Changed Files: `app/db/repositories/job_repository.py`, `app/jobs/service.py`, `app/scan_import/coordinator.py`, `scripts/upgrade/migration_runner.py`, `tests/vnext/test_jobs.py`
+- Changed Functions: `JobRepository.create`, `start`, `heartbeat`, `transition_terminal`, `restore`, `VNextBackgroundJobService._save`, `_runner`
+- Regression Test: `test_job_transitions_fence_stale_owner_and_preserve_creation_identity` — PASS; stale old-owner writes affect zero rows, terminal state remains terminal, and input/created-at identity is immutable.
+- Integration Test: `python3 -m unittest -v tests.vnext.test_jobs tests.vnext.test_migration_runner tests.vnext.test_scan_import_lifecycle` — PASS (44 tests).
+- Browser Test: NOT_RUN; job persistence is not a browser-only invariant.
+- Compatibility Check: migration paths use explicit `restore`; scan-import creation uses `create`; existing recovery and queue rejection tests pass.
+- Commit SHA: recorded after the focused commit below.
+- Status: FIXED_VERIFIED
+- Remaining Evidence: real MariaDB lock/driver interleaving and an external long-running process shutdown remain pending.

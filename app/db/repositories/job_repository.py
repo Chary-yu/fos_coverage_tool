@@ -58,38 +58,132 @@ class JobRepository(object):
             ORDER BY created_at, job_id LIMIT 1
         """, (project_id, scan_id, kind, data_version))
 
-    def upsert(self, connection, job: dict):
-        existing = self.get(connection, job["job_id"])
-        fields = (
+    @staticmethod
+    def _full_fields(job, created_at=None):
+        stamp = created_at or job.get("created_at") or _now()
+        return (
             job.get("project_id"), job.get("scan_id"), job.get("kind") or "",
             job.get("state") or "queued", float(job.get("progress") or 0),
             job.get("input_payload") or "{}", job.get("result_path") or "",
             job.get("error_message") or "", job.get("data_version"),
-            job.get("heartbeat_at"), job.get("created_at") or _now(),
-            job.get("started_at"), job.get("finished_at"), utc_sql(),
-            job.get("lease_owner") or "",
-            job.get("handler_version") or "",
+            job.get("heartbeat_at"), stamp, job.get("started_at"),
+            job.get("finished_at"), job.get("updated_at") or utc_sql(),
+            job.get("lease_owner") or "", job.get("handler_version") or "",
         )
-        if existing:
-            cursor = execute(connection, """
-                UPDATE coverage_background_jobs SET project_id = ?, scan_id = ?, kind = ?,
-                    state = ?, progress = ?, input_payload = ?, result_path = ?,
-                    error_message = ?, data_version = ?, heartbeat_at = ?, created_at = ?,
-                    started_at = ?, finished_at = ?, updated_at = ?, lease_owner = ?,
-                    handler_version = ?
-                WHERE job_id = ?
-            """, fields + (job["job_id"],))
-            cursor.close()
-        else:
-            cursor = execute(connection, """
-                INSERT INTO coverage_background_jobs(
-                    job_id, project_id, scan_id, kind, state, progress, input_payload,
-                    result_path, error_message, data_version, heartbeat_at, created_at,
-                    started_at, finished_at, updated_at, lease_owner, handler_version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (job["job_id"],) + fields)
-            cursor.close()
+
+    def _insert_full(self, connection, job):
+        fields = self._full_fields(job)
+        cursor = execute(connection, """
+            INSERT INTO coverage_background_jobs(
+                job_id, project_id, scan_id, kind, state, progress, input_payload,
+                result_path, error_message, data_version, heartbeat_at, created_at,
+                started_at, finished_at, updated_at, lease_owner, handler_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (str(job["job_id"]),) + fields)
+        cursor.close()
         return self.get(connection, job["job_id"])
+
+    def create(self, connection, job: dict):
+        """Create one durable job; creation identity is never an update."""
+        if self.get(connection, job["job_id"]):
+            raise ValueError("JOB_ID_ALREADY_EXISTS")
+        return self._insert_full(connection, job)
+
+    def restore(self, connection, job: dict):
+        """Restore an explicitly trusted historical migration row.
+
+        This is intentionally separate from runtime transitions.  Migration
+        code may replay an immutable legacy snapshot, while live workers must
+        use create/start/heartbeat/transition_terminal and their CAS fences.
+        """
+        existing = self.get(connection, job["job_id"])
+        if not existing:
+            return self._insert_full(connection, job)
+        fields = self._full_fields(
+            job, created_at=job.get("created_at") or existing.get("created_at")
+        )
+        cursor = execute(connection, """
+            UPDATE coverage_background_jobs SET project_id=?, scan_id=?, kind=?,
+                state=?, progress=?, input_payload=?, result_path=?,
+                error_message=?, data_version=?, heartbeat_at=?, created_at=?,
+                started_at=?, finished_at=?, updated_at=?, lease_owner=?,
+                handler_version=?
+            WHERE job_id=?
+        """, fields + (job["job_id"],))
+        cursor.close()
+        return self.get(connection, job["job_id"])
+
+    def start(self, connection, job: dict):
+        """Fence the queued-to-running transition to the current owner."""
+        job_id = str(job["job_id"])
+        owner = str(job.get("lease_owner") or "")
+        if not owner:
+            return None
+        stamp = job.get("heartbeat_at") or _now()
+        started_at = job.get("started_at") or stamp
+        cursor = execute(connection, """
+            UPDATE coverage_background_jobs
+            SET state='running', started_at=COALESCE(started_at, ?),
+                heartbeat_at=?, updated_at=?
+            WHERE job_id=? AND state='queued' AND lease_owner=?
+        """, (started_at, stamp, utc_sql(), job_id, owner))
+        count = int(getattr(cursor, "rowcount", 0) or 0)
+        cursor.close()
+        return self.get(connection, job_id) if count == 1 else None
+
+    def heartbeat(self, connection, job: dict):
+        """Update only live progress for the current running lease."""
+        job_id = str(job["job_id"])
+        owner = str(job.get("lease_owner") or "")
+        if not owner:
+            return None
+        stamp = job.get("heartbeat_at") or _now()
+        cursor = execute(connection, """
+            UPDATE coverage_background_jobs
+            SET progress=?, heartbeat_at=?, updated_at=?
+            WHERE job_id=? AND state='running' AND lease_owner=?
+        """, (float(job.get("progress") or 0), stamp, utc_sql(), job_id, owner))
+        count = int(getattr(cursor, "rowcount", 0) or 0)
+        cursor.close()
+        return self.get(connection, job_id) if count == 1 else None
+
+    def transition_terminal(self, connection, job: dict):
+        """Atomically complete/fail/supersede the current queued/running lease."""
+        job_id = str(job["job_id"])
+        owner = str(job.get("lease_owner") or "")
+        state = str(job.get("state") or "")
+        if not owner or state in ("", "queued", "running"):
+            return None
+        stamp = job.get("heartbeat_at") or job.get("finished_at") or _now()
+        finished = job.get("finished_at") or stamp
+        cursor = execute(connection, """
+            UPDATE coverage_background_jobs
+            SET state=?, progress=?, result_path=?, error_message=?,
+                heartbeat_at=?, finished_at=?, updated_at=?
+            WHERE job_id=? AND state IN ('queued', 'running') AND lease_owner=?
+        """, (state, float(job.get("progress") or 0),
+              job.get("result_path") or "", job.get("error_message") or "",
+              stamp, finished, utc_sql(), job_id, owner))
+        count = int(getattr(cursor, "rowcount", 0) or 0)
+        cursor.close()
+        return self.get(connection, job_id) if count == 1 else None
+
+    def upsert(self, connection, job: dict):
+        """Compatibility dispatcher; never performs an unfenced live update."""
+        existing = self.get(connection, job["job_id"])
+        if not existing:
+            return self.create(connection, job)
+        state = str(job.get("state") or "queued")
+        if state == "running":
+            return self.heartbeat(connection, job)
+        if state not in ("queued", "running"):
+            return self.transition_terminal(connection, job)
+        if (state == "queued" and
+                str(existing.get("state") or "") == "queued" and
+                str(existing.get("lease_owner") or "") ==
+                str(job.get("lease_owner") or "")):
+            return existing
+        raise ValueError("UNFENCED_JOB_UPSERT")
 
     def mark_stale(self, connection, timeout_seconds: float, now=None, lease_owner=None,
                    exclude_kinds=None):

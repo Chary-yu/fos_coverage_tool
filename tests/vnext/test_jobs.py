@@ -8,11 +8,66 @@ import unittest
 from app.bootstrap import VNextRuntime
 from app.jobs.bounded_executor import BoundedJobExecutor
 from app.jobs.service import VNextBackgroundJobService
+from app.db.repositories.job_repository import JobRepository
 from scripts.upgrade.migration_runner import create_sqlite_schema
 from tests.vnext.release_fixture import prepare_release_root
 
 
 class VNextJobsTest(unittest.TestCase):
+    def test_job_transitions_fence_stale_owner_and_preserve_creation_identity(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        create_sqlite_schema(connection)
+        repository = JobRepository()
+        initial = repository.create(connection, {
+            "job_id": "fenced-job", "project_id": 1, "scan_id": 2,
+            "kind": "export", "state": "queued", "progress": 0,
+            "input_payload": '{"immutable":true}', "data_version": 3,
+            "lease_owner": "old-worker", "created_at": "2026-09-16 10:00:00",
+        })
+        self.assertEqual(initial["created_at"], "2026-09-16 10:00:00")
+        started = repository.start(connection, {
+            "job_id": "fenced-job", "state": "running",
+            "lease_owner": "old-worker", "started_at": "2026-09-16 10:00:01",
+            "heartbeat_at": "2026-09-16 10:00:01",
+        })
+        self.assertEqual(started["state"], "running")
+        reclaimed = repository.claim_for_recovery(
+            connection, "fenced-job", "new-worker",
+            now="2026-09-16 10:01:00", expected_state="running",
+            expected_lease_owner="old-worker",
+            expected_heartbeat_at="2026-09-16 10:00:01",
+        )
+        self.assertEqual(reclaimed["lease_owner"], "new-worker")
+        self.assertIsNone(repository.heartbeat(connection, {
+            "job_id": "fenced-job", "state": "running", "progress": .5,
+            "lease_owner": "old-worker", "heartbeat_at": "2026-09-16 10:01:01",
+        }))
+        self.assertEqual(repository.get(connection, "fenced-job")["state"], "queued")
+        started_new = repository.start(connection, {
+            "job_id": "fenced-job", "state": "running",
+            "lease_owner": "new-worker", "started_at": "2026-09-16 10:01:01",
+            "heartbeat_at": "2026-09-16 10:01:01",
+        })
+        self.assertEqual(started_new["state"], "running")
+        completed = repository.transition_terminal(connection, {
+            "job_id": "fenced-job", "state": "completed", "progress": 1,
+            "lease_owner": "new-worker", "result_path": "result",
+            "finished_at": "2026-09-16 10:02:00",
+            "heartbeat_at": "2026-09-16 10:02:00",
+        })
+        self.assertEqual(completed["state"], "completed")
+        self.assertIsNone(repository.transition_terminal(connection, {
+            "job_id": "fenced-job", "state": "failed", "lease_owner": "old-worker",
+            "error_message": "late old callback", "finished_at": "2026-09-16 10:03:00",
+        }))
+        final = repository.get(connection, "fenced-job")
+        self.assertEqual(final["state"], "completed")
+        self.assertEqual(final["lease_owner"], "new-worker")
+        self.assertEqual(final["created_at"], "2026-09-16 10:00:00")
+        self.assertEqual(final["input_payload"], '{"immutable":true}')
+
     def test_executor_rejection_does_not_leave_a_queued_orphan(self):
         class RejectingExecutor(object):
             def submit_job(self, **kwargs):
