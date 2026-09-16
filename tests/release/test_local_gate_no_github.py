@@ -27,13 +27,17 @@ class LocalGateNoGithubTest(unittest.TestCase):
             environment.pop(name, None)
         with tempfile.TemporaryDirectory(
                 prefix="local-gate-no-github-", dir=output_parent) as root:
+            clean_repo = os.path.join(root, "repo")
+            subprocess.check_call(
+                ["git", "clone", "-q", "--no-hardlinks", repo_root, clean_repo]
+            )
             output = os.path.join(root, "evidence")
             with mock.patch.dict(os.environ, environment, clear=True):
                 self.assertIsNone(shutil.which("gh"))
                 self.assertNotIn("GITHUB_TOKEN", os.environ)
                 self.assertNotIn("GH_TOKEN", os.environ)
                 result = run_gate(
-                    repo_root, source_sha, output,
+                    clean_repo, source_sha, output,
                     session_id="no-github-local-gate",
                     baseline_sha=source_sha,
                     test_modules=("tests.release.test_compatibility_surface",),
