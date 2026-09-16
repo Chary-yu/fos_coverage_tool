@@ -1,3 +1,4 @@
+import base64
 import json
 import os
 import tempfile
@@ -112,6 +113,22 @@ class LocalFirstReleaseTest(unittest.TestCase):
             environment = _clean_env()
         self.assertNotIn("GITHUB_TOKEN", environment)
         self.assertNotIn("GH_TOKEN", environment)
+
+    def test_security_scan_does_not_treat_encoded_operator_payload_as_shell(self):
+        from scripts.release.local_release_gate import _security_scan
+
+        with tempfile.TemporaryDirectory(prefix="operator-security-scan-") as root:
+            operator = os.path.join(root, "offline_operator.txt")
+            encoded = base64.b64encode(b"scp should not be executed").decode("ascii")
+            with open(operator, "w", encoding="ascii") as stream:
+                stream.write("#!/usr/bin/env bash\n")
+                stream.write("echo safe\n")
+                stream.write("__SOURCE_BUNDLE_BEGIN__\n")
+                stream.write(encoded + "\n")
+                stream.write("scp\n")
+                stream.write("__SOURCE_BUNDLE_END__\n")
+            result = _security_scan(os.getcwd(), operator)
+            self.assertEqual(result["status"], "PASS")
 
 
 if __name__ == "__main__":

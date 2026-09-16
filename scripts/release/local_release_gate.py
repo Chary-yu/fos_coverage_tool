@@ -283,6 +283,32 @@ def _script_record(repo_root, command, output_path, label):
 
 
 def _security_scan(repo_root, operator_path):
+    payload_markers = {
+        "__RUNTIME_BEGIN__", "__RUNTIME_END__",
+        "__MANIFEST_BEGIN__", "__MANIFEST_END__",
+        "__SOURCE_BUNDLE_BEGIN__", "__SOURCE_BUNDLE_END__",
+        "__TOOLING_BUNDLE_BEGIN__", "__TOOLING_BUNDLE_END__",
+    }
+
+    def executable_operator_text(value):
+        """Exclude opaque Base64 payloads while retaining shell text.
+
+        Git bundles and the embedded runtime are binary/encoded data.  A
+        lexical scan over those bytes can report a random ``scp``/``ssh``
+        substring as an executable command.  The runtime source is scanned
+        separately above; this view is only for the generated shell wrapper.
+        """
+        lines = []
+        in_payload = False
+        for line in value.splitlines():
+            marker = line.strip()
+            if marker in payload_markers:
+                in_payload = marker.endswith("_BEGIN__")
+                continue
+            if not in_payload:
+                lines.append(line)
+        return "\n".join(lines)
+
     paths = (
         "app/release_trust_policy.py",
         "app/candidate_artifact.py",
@@ -308,7 +334,7 @@ def _security_scan(repo_root, operator_path):
                 findings.append({"path": relative, "finding": label})
     if operator_path and os.path.isfile(operator_path):
         with open(operator_path, "r", encoding="utf-8", errors="replace") as stream:
-            operator = stream.read()
+            operator = executable_operator_text(stream.read())
         for pattern, label in FORBIDDEN_RUNTIME_PATTERNS:
             if re.search(pattern, operator, re.IGNORECASE):
                 findings.append({"path": os.path.basename(operator_path), "finding": label})
