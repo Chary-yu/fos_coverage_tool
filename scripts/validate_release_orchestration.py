@@ -27,6 +27,7 @@ REQUIRED_FILES = (
     "scripts/release/local_release_gate.py",
     "scripts/release/local_compatibility_gate.py",
     "scripts/release/compatibility_surface.py",
+    "scripts/release/generate_vfos_compatibility_preflight.py",
     "scripts/diagnostics/production_release_authority.py",
     "scripts/diagnostics/release_performance_revision.js",
     "scripts/upgrade/performance_evidence.py",
@@ -121,6 +122,9 @@ def validate(repo_root, tool_path="", bundle_path=""):
     compatibility_surface_path = os.path.join(
         repo_root, "scripts/release/compatibility_surface.py"
     )
+    vfos_preflight_generator_path = os.path.join(
+        repo_root, "scripts/release/generate_vfos_compatibility_preflight.py"
+    )
     authority_path = os.path.join(
         repo_root, "scripts/diagnostics/production_release_authority.py"
     )
@@ -136,12 +140,14 @@ def validate(repo_root, tool_path="", bundle_path=""):
         local_gate = _read(local_gate_path)
         compatibility_gate = _read(compatibility_gate_path)
         compatibility_surface = _read(compatibility_surface_path)
+        vfos_preflight_generator = _read(vfos_preflight_generator_path)
         authority = _read(authority_path)
     except (OSError, IOError) as exc:
         failures.append(str(exc))
         conductor = run_upgrade = flat = perf = generator = ""
         manifest = runtime = generic_generator = ""
         local_gate = compatibility_gate = compatibility_surface = authority = ""
+        vfos_preflight_generator = ""
 
     evidence_match = re.search(r"EVIDENCE_NAMES\s*=\s*\((.*?)\)\s*\n", conductor,
                                re.DOTALL)
@@ -225,6 +231,9 @@ def validate(repo_root, tool_path="", bundle_path=""):
     )) and all(token in compatibility_surface for token in (
         "classify_compatibility_surface", "PRODUCTION_PYTHON_CHANGED",
         "NOT_DB_SENSITIVE", "DB_SENSITIVE_CHANGED",
+    )) and all(token in vfos_preflight_generator for token in (
+        "PYTHON36_COMPAT", "READY_FOR_ISOLATED_CANDIDATE_STAGING",
+        "PRODUCTION_MUTATION", "EXPECTED_SOURCE_SHA",
     )) and all(token in authority for token in (
         "PRODUCTION_RELEASE_AUTHORITY", "GITHUB_ACTIONS_REQUIRED",
         "GITHUB_API_REQUIRED_FOR_READINESS", "PROTECTED_BUILDER_NEW_PUBLICATION_ALLOWED",
@@ -242,6 +251,7 @@ def validate(repo_root, tool_path="", bundle_path=""):
             (local_gate_path, "local release gate"),
             (compatibility_gate_path, "local compatibility gate"),
             (compatibility_surface_path, "compatibility surface classifier"),
+            (vfos_preflight_generator_path, "VFOS compatibility preflight generator"),
             (authority_path, "production release authority")):
         try:
             compile(_read(path), path, "exec")

@@ -38,6 +38,7 @@ TEST_MODULES = (
     "tests.release.test_upgrade_manifest",
     "tests.release.test_release_input_manifest",
     "tests.release.test_local_first_release",
+    "tests.release.test_vfos_compatibility_preflight",
 )
 SHA40 = re.compile(r"^[0-9a-fA-F]{40}$")
 SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
