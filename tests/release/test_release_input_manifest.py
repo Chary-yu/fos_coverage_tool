@@ -214,6 +214,60 @@ class ReleaseInputManifestTest(unittest.TestCase):
             manifest_sha,
         )
 
+    def test_operator_rejects_non_python36_before_candidate_state_creation(self):
+        from scripts.release.generate_flat_production_candidate_operator import generate
+
+        with tempfile.TemporaryDirectory(prefix="operator-python36-gate-") as root:
+            source_commit, source_tree, source_bundle = self._git_repo(
+                os.path.join(root, "source"), {"README.md": "source\n"}
+            )
+            tooling_files = {
+                "app/release_trust_policy.py":
+                    "CURRENT_PRODUCTION_RELEASE_TRUST_MODE = 'offline_operator'\n"
+                    "CURRENT_PRODUCTION_RELEASE_TRUST_MODES = ('offline_operator',)\n",
+                "scripts/release/build_production_candidate_artifact.py":
+                    "release_trust_mode = 'offline_operator'\n",
+                "scripts/release/build_flat_production_candidate_artifact.py":
+                    "release_trust_mode = 'offline_operator'\n",
+            }
+            tooling_commit, tooling_tree, tooling_bundle = self._git_repo(
+                os.path.join(root, "tooling"), tooling_files
+            )
+            manifest = self._manifest()
+            manifest.update({
+                "source_commit_sha": source_commit,
+                "source_tree_sha": source_tree,
+                "source_bundle_sha256": _sha256(source_bundle),
+                "tooling_commit_sha": tooling_commit,
+                "tooling_tree_sha": tooling_tree,
+                "tooling_bundle_sha256": _sha256(tooling_bundle),
+                "candidate_parent": os.path.join(root, "candidate-parent"),
+                "production_host": "local-validation",
+                "candidate_build_mode": "production",
+            })
+            manifest_path = os.path.join(root, "release_input_manifest.json")
+            write_release_input_manifest(
+                manifest_path, build_release_input_manifest(manifest)
+            )
+            operator = os.path.join(root, "offline_operator.txt")
+            generate(manifest_path, source_bundle, tooling_bundle, operator)
+            fake_python = os.path.join(root, "python-not-36")
+            with open(fake_python, "w", encoding="ascii") as stream:
+                stream.write("#!/bin/sh\n")
+                stream.write("if [ \"$1\" = \"-c\" ]; then echo 3.14; exit 0; fi\n")
+                stream.write("exec python3 \"$@\"\n")
+            os.chmod(fake_python, 0o750)
+            environment = dict(os.environ)
+            environment["FOS_OPERATOR_PYTHON"] = fake_python
+            completed = subprocess.run(
+                ["bash", operator], cwd=root, env=environment,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                universal_newlines=True,
+            )
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("PYTHON36_COMPAT=FAIL", completed.stdout)
+            self.assertFalse(os.path.exists(os.path.join(root, "candidate-parent")))
+
 
 def _sha256(path):
     digest = hashlib.sha256()
