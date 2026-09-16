@@ -165,6 +165,54 @@ class ScanImportLifecycleTest(unittest.TestCase):
             )
         self.assertEqual(str(raised.exception), "STALE_IMPORT_CHECKPOINT")
 
+    def test_stale_recovery_failure_cannot_clobber_reclaimed_owner_or_lock(self):
+        coordinator = ScanImportCoordinator()
+        result = coordinator.create(
+            self.connection, "recovery-fence", self.info_path,
+            repository_resource_ids=[self.resource_id],
+            staging_root=os.path.join(self.temp.name, "recovery-fence-stage"),
+        )
+        old_owner = result["owner_token"]
+        old_fence = result["locks"][0]["fencing_token"]
+        recovery = ScanImportRecoveryService(coordinator=coordinator)
+        reclaimed = recovery.reclaim(
+            self.connection, result["job"]["job_id"],
+            os.path.join(self.temp.name, "recovery-fence-stage"),
+            owner_token="restarted-owner",
+        )
+        self.assertEqual(reclaimed["owner_token"], "restarted-owner")
+
+        recovery.record_failure(
+            self.connection, result["job"]["job_id"], "RESUME", "ValueError",
+            "late old worker failure", owner_token=old_owner,
+            fencing_token=old_fence,
+        )
+
+        job = self.connection.execute(
+            "SELECT state, lease_owner FROM coverage_background_jobs WHERE job_id=?",
+            (result["job"]["job_id"],),
+        ).fetchone()
+        self.assertEqual(tuple(job), ("running", "restarted-owner"))
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT status FROM coverage_scans WHERE id=?",
+                (result["scan"]["id"],),
+            ).fetchone()[0],
+            "IMPORTING",
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM coverage_import_failures WHERE job_id=?",
+                (result["job"]["job_id"],),
+            ).fetchone()[0],
+            1,
+        )
+        lock = self.connection.execute(
+            "SELECT owner_token, fencing_token FROM coverage_repository_resource_locks "
+            "WHERE physical_resource_id=?", (self.resource_id,),
+        ).fetchone()
+        self.assertEqual(tuple(lock), ("restarted-owner", reclaimed["locks"][0]["fencing_token"]))
+
     def test_recovery_handler_version_mismatch_fails_closed(self):
         coordinator = ScanImportCoordinator()
         result = coordinator.create(

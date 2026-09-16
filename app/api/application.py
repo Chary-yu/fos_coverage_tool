@@ -1037,6 +1037,7 @@ class VNextApplication(object):
                                         callback_connection, import_job_id, "EXECUTE",
                                         exc.__class__.__name__, str(exc),
                                         fencing_token=import_fence,
+                                        owner_token=import_owner,
                                     )
                                 raise
 
@@ -1057,7 +1058,7 @@ class VNextApplication(object):
                     self.runtime.scan_import_recovery.record_failure(
                         connection, import_job_id, "ENQUEUE", exc.__class__.__name__,
                         str(exc), fencing_token=import_fence,
-                        scan_status="ABORTED",
+                        scan_status="ABORTED", owner_token=import_owner,
                     )
                     raise
                 # Internal lock ownership and filesystem paths are not API

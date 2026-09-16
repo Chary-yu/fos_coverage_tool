@@ -148,7 +148,7 @@ class JobRepository(object):
         return self.get(connection, job_id) if count == 1 else None
 
     def transition_terminal(self, connection, job: dict):
-        """Atomically complete/fail/supersede the current queued/running lease."""
+        """Atomically complete/fail/supersede the current lease."""
         job_id = str(job["job_id"])
         owner = str(job.get("lease_owner") or "")
         state = str(job.get("state") or "")
@@ -160,7 +160,8 @@ class JobRepository(object):
             UPDATE coverage_background_jobs
             SET state=?, progress=?, result_path=?, error_message=?,
                 heartbeat_at=?, finished_at=?, updated_at=?
-            WHERE job_id=? AND state IN ('queued', 'running') AND lease_owner=?
+            WHERE job_id=? AND state IN ('queued', 'running', 'interrupted')
+              AND lease_owner=?
         """, (state, float(job.get("progress") or 0),
               job.get("result_path") or "", job.get("error_message") or "",
               stamp, finished, utc_sql(), job_id, owner))
@@ -296,13 +297,63 @@ class JobRepository(object):
         cursor.close()
         return self.get(connection, job_id) if claimed else None
 
-    def mark_interrupted(self, connection, job_id, message="worker lease expired"):
+    def reclaim(self, connection, job_id, lease_owner, now=None,
+                expected_state=None, expected_lease_owner=None,
+                expected_heartbeat_at=None):
+        """Reclaim a Scan Import job with the observed-row CAS fence.
+
+        This transition differs from claim_for_recovery only in its target
+        state: a Scan Import callback owns a running lease immediately after
+        its physical resource lock is reclaimed. The observed state, owner,
+        and heartbeat are part of the predicate so a stale recovery callback
+        cannot take over a job that another worker already changed.
+        """
+        stamp = now or utc_sql()
+        clauses = [
+            "job_id=?", "state IN ('queued', 'running', 'interrupted')",
+        ]
+        params = [str(job_id)]
+        if expected_state is not None:
+            clauses.append("state=?")
+            params.append(str(expected_state))
+        if expected_lease_owner is not None:
+            clauses.append("COALESCE(lease_owner, '')=?")
+            params.append(str(expected_lease_owner or ""))
+        if expected_heartbeat_at is not None:
+            clauses.append("COALESCE(heartbeat_at, '')=COALESCE(?, '')")
+            params.append(expected_heartbeat_at)
+        cursor = execute(connection, """
+            UPDATE coverage_background_jobs
+            SET state='running', lease_owner=?, heartbeat_at=?,
+                error_message='', finished_at=NULL, updated_at=?
+            WHERE {}
+        """.format(" AND ".join(clauses)),
+                       (str(lease_owner or ""), stamp, stamp) + tuple(params))
+        claimed = int(getattr(cursor, "rowcount", 0) or 0)
+        cursor.close()
+        return self.get(connection, job_id) if claimed else None
+
+    def mark_interrupted(self, connection, job_id, message="worker lease expired",
+                         expected_state=None, expected_lease_owner=None,
+                         expected_heartbeat_at=None):
+        """Interrupt only the exact recoverable row that was observed."""
+        clauses = ["job_id=?", "state IN ('queued', 'running')"]
+        params = [str(job_id)]
+        if expected_state is not None:
+            clauses.append("state=?")
+            params.append(str(expected_state))
+        if expected_lease_owner is not None:
+            clauses.append("COALESCE(lease_owner, '')=?")
+            params.append(str(expected_lease_owner or ""))
+        if expected_heartbeat_at is not None:
+            clauses.append("COALESCE(heartbeat_at, '')=COALESCE(?, '')")
+            params.append(expected_heartbeat_at)
         cursor = execute(connection, """
             UPDATE coverage_background_jobs
             SET state='interrupted', error_message=?,
                 updated_at=CURRENT_TIMESTAMP, finished_at=CURRENT_TIMESTAMP
-            WHERE job_id=? AND state IN ('queued', 'running')
-        """, (str(message), str(job_id)))
+            WHERE {}
+        """.format(" AND ".join(clauses)), (str(message),) + tuple(params))
         count = int(getattr(cursor, "rowcount", 0) or 0)
         cursor.close()
         return count

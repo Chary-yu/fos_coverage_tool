@@ -100,27 +100,28 @@ class ScanImportRecoveryService(object):
                 lease_seconds=lease_seconds,
             )
             token = locks[0]["fencing_token"] if locks else 0
+            reclaimed_job = self.jobs.reclaim(
+                conn, job_id, owner_token,
+                expected_state=state["job"].get("state"),
+                expected_lease_owner=state["job"].get("lease_owner"),
+                expected_heartbeat_at=state["job"].get("heartbeat_at"),
+            )
+            if reclaimed_job is None:
+                self.locks.release(conn, job_id, owner_token)
+                raise ValueError("INVALID_JOB_TRANSITION")
             checkpoint = self.checkpoints.claim_fencing(
                 conn, job_id, token
             ) if locks else state["checkpoint"]
-            cursor = execute(conn, """
-                UPDATE coverage_background_jobs
-                SET state='running', lease_owner=?, heartbeat_at=?, updated_at=?
-                WHERE job_id=? AND state IN ('queued', 'running', 'interrupted')
-            """, (owner_token, utc_sql(), utc_sql(), str(job_id)))
-            if int(getattr(cursor, "rowcount", 0) or 0) != 1:
-                cursor.close()
-                raise ValueError("INVALID_JOB_TRANSITION")
-            cursor.close()
             return {
-                "job": self.jobs.get(conn, job_id),
+                "job": reclaimed_job,
                 "checkpoint": checkpoint,
                 "locks": locks,
                 "owner_token": owner_token,
             }
 
     def record_failure(self, connection, job_id, phase, error_class,
-                       message="", fencing_token=None, scan_status="FAILED"):
+                       message="", fencing_token=None, scan_status="FAILED",
+                       owner_token=None):
         scan_status = str(scan_status or "FAILED").upper()
         if scan_status not in ("FAILED", "ABORTED"):
             raise ValueError("invalid scan failure status")
@@ -136,6 +137,21 @@ class ScanImportRecoveryService(object):
             if not job:
                 raise KeyError("scan_import job not found")
             scan_id = job.get("scan_id")
+            if not owner_token:
+                observed_locks = self.coordinator._locks_for_job(conn, job_id)
+                matching_locks = [
+                    lock for lock in observed_locks
+                    if fencing_token is not None and
+                    int(lock.get("fencing_token") or 0) == int(fencing_token)
+                ]
+                owners = {
+                    str(lock.get("owner_token") or "")
+                    for lock in matching_locks
+                }
+                if len(owners) == 1 and "" not in owners:
+                    owner_token = next(iter(owners))
+            if not owner_token:
+                raise ValueError("JOB_OWNER_REQUIRED")
             insert_prefix = "INSERT OR IGNORE" if is_sqlite(conn) else "INSERT IGNORE"
             insert_sql = """
                     {prefix} INTO coverage_import_failures(
@@ -151,12 +167,17 @@ class ScanImportRecoveryService(object):
                 utc_sql(),
             ))
             cursor.close()
-            cursor = execute(conn, """
-                UPDATE coverage_background_jobs
-                SET state='failed', error_message=?, finished_at=?, updated_at=?
-                WHERE job_id=? AND state IN ('queued', 'running', 'interrupted')
-            """, (redacted, utc_sql(), utc_sql(), str(job_id)))
-            cursor.close()
+            failed = dict(job)
+            failed.update({
+                "state": "failed", "error_message": redacted,
+                "finished_at": utc_sql(), "heartbeat_at": utc_sql(),
+                "lease_owner": owner_token,
+            })
+            terminal = self.jobs.transition_terminal(conn, failed)
+            if terminal is None:
+                # A stale callback may still record its failure fingerprint,
+                # but it must not change the current job, scan, or lock owner.
+                return self.jobs.get(conn, job_id)
             if scan_id:
                 cursor = execute(conn, """
                     UPDATE coverage_scans SET status=?
@@ -171,7 +192,8 @@ class ScanImportRecoveryService(object):
                 """, (scan_status, int(scan_id)))
                 cursor.close()
             for lock in self.coordinator._locks_for_job(conn, job_id):
-                self.locks.release(
-                    conn, job_id, lock["owner_token"], lock["fencing_token"]
-                )
-            return self.jobs.get(conn, job_id)
+                if str(lock.get("owner_token") or "") == str(owner_token):
+                    self.locks.release(
+                        conn, job_id, owner_token, lock["fencing_token"]
+                    )
+            return terminal

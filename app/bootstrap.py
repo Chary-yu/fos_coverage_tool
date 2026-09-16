@@ -324,15 +324,17 @@ class VNextRuntime(object):
                         scan_id=job.get("scan_id"),
                         workload_id="scan-import:{}".format(job_id)):
                     fence = 0
+                    owner_token = ""
                     try:
                         reclaimed = self.scan_import_recovery.reclaim(
                             connection, job_id, self.scan_import_staging_root,
                         )
+                        owner_token = reclaimed.get("owner_token") or ""
                         locks = reclaimed.get("locks") or []
                         fence = int(locks[0].get("fencing_token") if locks else 0)
                         return self.scan_import_coordinator.execute(
                             connection, job_id,
-                            owner_token=reclaimed.get("owner_token") or "",
+                            owner_token=owner_token,
                             fencing_token=fence, verify_artifact=True,
                         )
                     except Exception as exc:
@@ -343,6 +345,7 @@ class VNextRuntime(object):
                                 self.scan_import_recovery.record_failure(
                                     connection, job_id, "RESUME", exc.__class__.__name__,
                                     str(exc), fencing_token=(fence or None),
+                                    owner_token=owner_token,
                                 )
                             except Exception:
                                 # Preserve the recovery error.  The job executor
@@ -364,7 +367,7 @@ class VNextRuntime(object):
             with self.connection_context(read_only=False) as connection:
                 self.scan_import_recovery.record_failure(
                     connection, job_id, "RESUME_ENQUEUE", exc.__class__.__name__,
-                    str(exc),
+                    str(exc), owner_token=str(job.get("lease_owner") or ""),
                 )
 
     @contextmanager

@@ -160,12 +160,8 @@ class ScanImportCoordinator(object):
                         job_payload, ensure_ascii=False, sort_keys=True
                     ), "data_version": state.get("data_version") or 0,
                     "lease_owner": owner_token,
+                    "handler_version": self.HANDLER_VERSION,
                 })
-                cursor = execute(conn, """
-                    UPDATE coverage_background_jobs SET handler_version=?, updated_at=?
-                    WHERE job_id=?
-                """, (self.HANDLER_VERSION, utc_sql(), job_id))
-                cursor.close()
                 token = acquired[0]["fencing_token"] if acquired else 0
                 checkpoint = self.checkpoints.create(
                     conn, job_id, scan["id"], expected_current_scan_id=predecessor,
@@ -885,6 +881,8 @@ class ScanImportCoordinator(object):
 
     def publish(self, connection, job_id, expected_current_scan_id=None,
                 read_set=None):
+        observed_job = self.jobs.get(connection, job_id) or {}
+        observed_owner = str(observed_job.get("lease_owner") or "")
         try:
             return self._publish_transaction(
                 connection, job_id,
@@ -908,7 +906,7 @@ class ScanImportCoordinator(object):
                     checkpoints=self.checkpoints, locks=self.locks,
                 ).record_failure(
                     connection, job_id, "PUBLISH", type(exc).__name__, str(exc),
-                    scan_status=scan_status,
+                    scan_status=scan_status, owner_token=observed_owner,
                 )
             except Exception:
                 # Preserve the original publish error.  Recovery itself is
@@ -957,13 +955,15 @@ class ScanImportCoordinator(object):
                 checkpoint.get("fencing_token") or 0, "PUBLISHED",
                 payload={"scan_id": scan_id},
             )
-            cursor = execute(conn, """
-                UPDATE coverage_background_jobs
-                SET state='completed', progress=1, finished_at=?, heartbeat_at=?,
-                    updated_at=?
-                WHERE job_id=? AND state IN ('queued', 'running', 'completed')
-            """, (utc_sql(), utc_sql(), utc_sql(), str(job_id)))
-            cursor.close()
+            completed_at = utc_sql()
+            completed = self.jobs.transition_terminal(conn, {
+                "job_id": job_id, "state": "completed", "progress": 1,
+                "result_path": "", "error_message": "",
+                "heartbeat_at": completed_at, "finished_at": completed_at,
+                "lease_owner": job.get("lease_owner"),
+            })
+            if completed is None:
+                raise ValueError("JOB_STATE_FENCE_FAILED")
             for lock in locks:
                 self.locks.release(conn, job_id, lock["owner_token"],
                                    lock["fencing_token"])

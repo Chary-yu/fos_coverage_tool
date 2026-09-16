@@ -269,7 +269,12 @@ class VNextBackgroundJobService(object):
                                 self.repository, "mark_interrupted", None
                             )
                             recovered_count += (
-                                mark_interrupted(conn, candidate["job_id"])
+                                mark_interrupted(
+                                    conn, candidate["job_id"],
+                                    expected_state=candidate.get("state"),
+                                    expected_lease_owner=candidate.get("lease_owner"),
+                                    expected_heartbeat_at=candidate.get("heartbeat_at"),
+                                )
                                 if mark_interrupted else 0
                             )
                             continue
