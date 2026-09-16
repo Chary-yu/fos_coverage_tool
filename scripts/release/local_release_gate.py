@@ -37,6 +37,9 @@ TEST_MODULES = (
     "tests.release.test_production_ready_evidence_join",
     "tests.release.test_upgrade_manifest",
     "tests.release.test_release_input_manifest",
+    "tests.release.test_compatibility_surface",
+    "tests.release.test_local_compatibility_gate",
+    "tests.release.test_local_gate_no_github",
     "tests.release.test_local_first_release",
     "tests.release.test_vfos_compatibility_preflight",
 )
