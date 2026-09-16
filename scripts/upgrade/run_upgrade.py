@@ -95,6 +95,7 @@ from scripts.release.current_adoption import (
     FLAT, IMMUTABLE_CURRENT, validate_current_or_plan_flat,
     bootstrap_flat_current,
 )
+from scripts.release.local_release_gate import compatibility_scope
 from app.upgrade.lifecycle import UpgradeLifecycle
 from scripts.upgrade.validation_session import (
     SESSION_SCHEMA_VERSION, ValidationSession,
@@ -640,10 +641,15 @@ def _validate_local_release_evidence(
     if payload.get("production_mutation") != "NONE":
         errors.append("local release evidence reports production mutation")
     compatibility = payload.get("compatibility") or {}
-    if compatibility.get("status") != "PASS" or \
-            compatibility.get("PYTHON36_COMPAT") != "PASS" or \
-            compatibility.get("MARIADB55_COMPAT") != "PASS":
-        errors.append("local compatibility evidence is incomplete")
+    compatibility_result = compatibility_scope(compatibility)
+    if compatibility_result["invalid_statuses"]:
+        errors.append("local compatibility evidence has invalid status")
+    if not compatibility_result["isolated_candidate_staging_allowed"]:
+        errors.append("local compatibility evidence contains FAIL")
+    if not compatibility_result["publication_allowed"]:
+        errors.append(
+            "TARGET_RUNTIME_COMPATIBILITY_REQUIRED_BEFORE_PUBLICATION"
+        )
     authority = payload.get("authority") or {}
     for field, expected in (
             ("PRODUCTION_RELEASE_AUTHORITY", "OFFLINE_OPERATOR_ONLY"),
@@ -1186,6 +1192,37 @@ class UpgradeOrchestrator:
             raise RuntimeError(
                 "production requires release_input_manifest_sha256"
             )
+        if self._upgrade_mode == "production":
+            configured_local_evidence = str(
+                upgrade_config.get("local_release_evidence_path") or
+                upgrade_config.get("local_release_evidence") or
+                os.environ.get("FOS_LOCAL_RELEASE_EVIDENCE", "")
+            ).strip()
+            if not configured_local_evidence:
+                raise RuntimeError(
+                    "production requires local_release_evidence_path; "
+                    "hosted fixture evidence is retired"
+                )
+            self.local_release_evidence_path = _resolve_revision_path(
+                self.repo_root, configured_local_evidence,
+                "local_release_evidence_path", identity.get("commit_sha", "")
+            )
+            try:
+                with open(self.local_release_evidence_path, "r", encoding="utf-8") as stream:
+                    local_evidence = json.load(stream)
+            except (OSError, ValueError, TypeError) as exc:
+                raise RuntimeError(
+                    "local release evidence is unreadable before publication: {}".format(exc)
+                )
+            local_errors = _validate_local_release_evidence(
+                self.local_release_evidence_path, local_evidence, identity
+            )
+            if local_errors:
+                raise RuntimeError(
+                    "local release evidence blocks publication/cutover: {}".format(
+                        "; ".join(local_errors)
+                    )
+                )
         self.candidate_preflight = validate_candidate_publication_preflight(
             self.repo_root, production_candidate_root, identity,
             upgrade_config.get("production_candidate_artifact_manifest", ""),

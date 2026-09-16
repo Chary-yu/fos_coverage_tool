@@ -18,6 +18,7 @@ from scripts.upgrade.run_upgrade import (
     _validate_candidate_authenticated_mutation_evidence,
     _validate_candidate_browser_evidence,
     _validate_ci_browser_fixture_evidence,
+    _validate_local_release_evidence,
     _validate_external_candidate_browser_url,
     UpgradeOrchestrator,
     validate_candidate_publication_preflight,
@@ -658,6 +659,31 @@ class TestUpgradeManifest(unittest.TestCase):
             self.assertFalse(result["local_execution"])
             self.assertEqual(result["source"], "offline_local_repository")
             self.assertFalse(result["production_gate"])
+
+    def test_deferred_compatibility_is_rejected_before_publication_scope(self):
+        revision = "a" * 40
+        with tempfile.TemporaryDirectory(prefix="deferred-compatibility-") as root:
+            evidence_path = os.path.join(root, "local_release_gate.json")
+            with open(evidence_path, "w", encoding="utf-8") as stream:
+                stream.write("{}\n")
+            errors = _validate_local_release_evidence(
+                evidence_path,
+                {
+                    "local_release_gate": "PASS",
+                    "source_sha": revision,
+                    "production_mutation": "NONE",
+                    "compatibility": {
+                        "status": "DEFERRED_TO_TARGET_RUNTIME",
+                        "PYTHON36_COMPAT": "DEFERRED_TO_TARGET_RUNTIME",
+                        "MARIADB55_COMPAT": "NOT_APPLICABLE",
+                    },
+                },
+                {"commit_sha": revision},
+            )
+        self.assertTrue(any(
+            "TARGET_RUNTIME_COMPATIBILITY_REQUIRED_BEFORE_PUBLICATION" in item
+            for item in errors
+        ), errors)
 
     def test_production_browser_fixture_rejects_wrong_ci_revision(self):
         revision = "a" * 40

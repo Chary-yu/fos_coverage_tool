@@ -30,6 +30,9 @@ from scripts.diagnostics.dod_status import EXPECTED_DOD_IDS
 DECISIONS = ("READY", "READY_WITH_ACCEPTED_RISK", "NOT_READY")
 SEVERITIES = {"P0", "P1", "P2", "INFO"}
 RISK_STATUSES = {"OPEN", "APPROVED", "CLOSED"}
+COMPATIBILITY_STATUSES = {
+    "PASS", "NOT_APPLICABLE", "DEFERRED_TO_TARGET_RUNTIME", "FAIL",
+}
 
 
 def _revision(repo_root):
@@ -50,6 +53,43 @@ def _load(path):
     if not isinstance(value, dict):
         raise ValueError("JSON root must be an object")
     return value
+
+
+def _local_compatibility_preflight(local_evidence, candidate_revision):
+    """Evaluate local compatibility without converting deferred to PASS."""
+    errors = []
+    payload = local_evidence if isinstance(local_evidence, dict) else {}
+    if not isinstance(local_evidence, dict):
+        errors.append("local release evidence is missing")
+    if payload.get("local_release_gate") != "PASS":
+        errors.append("local release gate evidence is not PASS")
+    if str(payload.get("source_sha") or "").lower() != \
+            str(candidate_revision or "").lower():
+        errors.append("local release evidence source SHA does not match readiness")
+    if payload.get("production_mutation") != "NONE":
+        errors.append("local release evidence reports production mutation")
+    compatibility = payload.get("compatibility") or {}
+    statuses = (
+        str(compatibility.get("PYTHON36_COMPAT") or ""),
+        str(compatibility.get("MARIADB55_COMPAT") or ""),
+    )
+    invalid = [status for status in statuses if status not in COMPATIBILITY_STATUSES]
+    if invalid:
+        errors.append("local compatibility evidence has invalid status")
+    if "FAIL" in statuses:
+        errors.append("local compatibility evidence contains FAIL")
+    deferred = "DEFERRED_TO_TARGET_RUNTIME" in statuses
+    scope = payload.get("compatibility_scope") or {}
+    if scope.get("isolated_candidate_staging_allowed") is False:
+        errors.append("local compatibility evidence does not allow isolated staging")
+    return {
+        "valid": not errors,
+        "deferred": deferred,
+        "errors": errors,
+        "status": str(compatibility.get("status") or ""),
+        "PYTHON36_COMPAT": statuses[0],
+        "MARIADB55_COMPAT": statuses[1],
+    }
 
 
 def _gate_blockers(matrix):
@@ -235,7 +275,8 @@ def _dod_blockers(dod_status, candidate_revision):
 
 def build(repo_root=ROOT, matrix=None, task_status=None, risk_register=None,
           dod_status=None, matrix_path="", task_status_path="",
-          dod_status_path="", risk_register_path="", local_first=False):
+          dod_status_path="", risk_register_path="", local_first=False,
+          local_release_evidence=None, local_release_evidence_path=""):
     repo_root = os.path.abspath(repo_root)
     current_revision = _revision(repo_root)
     matrix = matrix if isinstance(matrix, dict) else {}
@@ -255,6 +296,15 @@ def build(repo_root=ROOT, matrix=None, task_status=None, risk_register=None,
     risk_blockers, accepted_risks = _risk_findings(risk_register, candidate_revision)
     blockers.extend(risk_blockers)
     authority = {}
+    local_compatibility = {
+        "valid": False,
+        "deferred": False,
+        "errors": [],
+        "status": "",
+        "PYTHON36_COMPAT": "",
+        "MARIADB55_COMPAT": "",
+    }
+    ready_for_manual_vfos_compatibility_preflight = "NO"
     if local_first:
         from scripts.diagnostics.production_release_authority import evaluate
         authority = evaluate(repo_root)
@@ -269,6 +319,7 @@ def build(repo_root=ROOT, matrix=None, task_status=None, risk_register=None,
             "GITHUB_ARTIFACT_REQUIRED": "NO",
             "GITHUB_ATTESTATION_REQUIRED": "NO",
             "GITHUB_API_REQUIRED_FOR_READINESS": "NO",
+            "STALE_GITHUB_WORKFLOW_AFFECTS_RELEASE": "NO",
             "PROTECTED_BUILDER_NEW_PUBLICATION_ALLOWED": "NO",
             "VALIDATION_FIXTURE_PRODUCTION_PUBLISHABLE": "NO",
             "DUAL_PRODUCTION_AUTHORITY": "NO",
@@ -282,6 +333,22 @@ def build(repo_root=ROOT, matrix=None, task_status=None, risk_register=None,
                     "expected": value,
                     "observed": authority.get(key, ""),
                 })
+        local_compatibility = _local_compatibility_preflight(
+            local_release_evidence, candidate_revision
+        )
+        if not local_compatibility["valid"]:
+            for error in local_compatibility["errors"]:
+                blockers.append({
+                    "type": "compatibility",
+                    "reason": error,
+                })
+        elif local_compatibility["deferred"]:
+            ready_for_manual_vfos_compatibility_preflight = "YES"
+            blockers.append({
+                "type": "compatibility",
+                "reason": "TARGET_RUNTIME_COMPATIBILITY_REQUIRED_BEFORE_PUBLICATION",
+                "scope": "publication/cutover",
+            })
 
     if blockers:
         decision = "NOT_READY"
@@ -307,6 +374,13 @@ def build(repo_root=ROOT, matrix=None, task_status=None, risk_register=None,
         "accepted_risks": accepted_risks,
         "blockers": blockers,
         "production_release_authority": authority,
+        "local_compatibility": local_compatibility,
+        "local_release_evidence_path": (
+            os.path.abspath(local_release_evidence_path)
+            if local_release_evidence_path else ""
+        ),
+        "READY_FOR_MANUAL_VFOS_COMPATIBILITY_PREFLIGHT":
+        ready_for_manual_vfos_compatibility_preflight,
         "gate_statuses": {
             gate: str((payload or {}).get("status") or "INCOMPLETE").upper()
             for gate, payload in sorted((matrix.get("gates") or {}).items())
@@ -324,12 +398,16 @@ def main(argv=None):
     parser.add_argument("--output", default=".artifacts/vnext/release-readiness.json")
     parser.add_argument("--allow-not-ready", action="store_true")
     parser.add_argument("--local-first", action="store_true")
+    parser.add_argument("--local-release-evidence", default="")
     args = parser.parse_args(argv)
     repo_root = os.path.abspath(args.repo_root)
     matrix_path = os.path.abspath(args.matrix)
     task_path = os.path.abspath(args.task_status)
     dod_path = os.path.abspath(args.dod_status)
     risk_path = os.path.abspath(args.risk_register)
+    local_evidence_path = ""
+    if args.local_release_evidence:
+        local_evidence_path = os.path.abspath(args.local_release_evidence)
     try:
         result = build(
             repo_root,
@@ -342,6 +420,10 @@ def main(argv=None):
             dod_status_path=dod_path,
             risk_register_path=risk_path,
             local_first=args.local_first,
+            local_release_evidence=(
+                _load(local_evidence_path) if local_evidence_path else None
+            ),
+            local_release_evidence_path=local_evidence_path,
         )
     except (OSError, ValueError, TypeError) as exc:
         result = with_contract({

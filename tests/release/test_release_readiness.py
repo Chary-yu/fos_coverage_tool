@@ -1,5 +1,6 @@
 import os
 import unittest
+from unittest import mock
 
 from scripts.diagnostics.release_readiness import build
 from scripts.diagnostics.dod_status import EXPECTED_DOD_IDS
@@ -94,6 +95,51 @@ class ReleaseReadinessTest(unittest.TestCase):
         )
         self.assertEqual(result["decision"], "NOT_READY")
         self.assertTrue(any(item["type"] == "provenance" for item in result["blockers"]))
+
+    def test_deferred_compatibility_exposes_manual_vfos_preflight(self):
+        matrix, tasks, dod, risk = self._inputs()
+        local_evidence = {
+            "local_release_gate": "PASS",
+            "source_sha": self.revision,
+            "production_mutation": "NONE",
+            "compatibility": {
+                "status": "DEFERRED_TO_TARGET_RUNTIME",
+                "PYTHON36_COMPAT": "DEFERRED_TO_TARGET_RUNTIME",
+                "MARIADB55_COMPAT": "NOT_APPLICABLE",
+            },
+        }
+        authority = {
+            "PRODUCTION_RELEASE_AUTHORITY": "OFFLINE_OPERATOR_ONLY",
+            "GITHUB_SOURCE_REPOSITORY_ONLY": "YES",
+            "GITHUB_ACTIONS_REQUIRED": "NO",
+            "GITHUB_CI_REQUIRED": "NO",
+            "GITHUB_RUNNER_REQUIRED": "NO",
+            "GITHUB_ENVIRONMENT_REQUIRED": "NO",
+            "GITHUB_SECRETS_REQUIRED_FOR_RELEASE": "NO",
+            "GITHUB_ARTIFACT_REQUIRED": "NO",
+            "GITHUB_ATTESTATION_REQUIRED": "NO",
+            "GITHUB_API_REQUIRED_FOR_READINESS": "NO",
+            "PROTECTED_BUILDER_NEW_PUBLICATION_ALLOWED": "NO",
+            "VALIDATION_FIXTURE_PRODUCTION_PUBLISHABLE": "NO",
+            "DUAL_PRODUCTION_AUTHORITY": "NO",
+            "LOCAL_FIRST_AUTHORITY_READY": "YES",
+        }
+        with mock.patch(
+                "scripts.diagnostics.production_release_authority.evaluate",
+                return_value=authority):
+            result = build(
+                self.repo_root, matrix=matrix, task_status=tasks,
+                dod_status=dod, risk_register=risk, local_first=True,
+                local_release_evidence=local_evidence,
+            )
+        self.assertEqual(
+            result["READY_FOR_MANUAL_VFOS_COMPATIBILITY_PREFLIGHT"], "YES"
+        )
+        self.assertEqual(result["decision"], "NOT_READY")
+        self.assertTrue(any(
+            item["type"] == "compatibility"
+            for item in result["blockers"]
+        ))
 
 
 if __name__ == "__main__":
