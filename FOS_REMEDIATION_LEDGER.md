@@ -44,10 +44,10 @@ The following fields are updated after each root-cause commit:
 - Changed Files: `app/services/analysis_service.py`, `app/db/repositories/analysis_domain_repository.py`, `tests/vnext/test_analysis_domain.py`
 - Changed Functions: `AnalysisService._resolve_records`, `AnalysisService._save_domain_records`, `AnalysisDomainRepository.create_block`, `create_link`, `create_links_many`
 - Regression Test: `test_multi_range_selection_creates_one_exact_block_per_interval`, `test_direct_line_id_rejects_conflicting_client_line_number`; both pass after the fix.
-- Integration Test: `python3 -m unittest -v tests.vnext.test_analysis_domain` — PASS (11 tests).
+- Integration Test: `python3 -m unittest -v tests.vnext.test_analysis_domain` — PASS (13 tests).
 - Browser Test: NOT_RUN; no UI code changed and browser acceptance is not required to prove the persistence invariant.
 - Compatibility Check: legacy single-range/manual and rejection/undo domain tests pass; historical malformed data is not rewritten.
-- Commit SHA: recorded after the focused commit below.
+- Commit SHA: `a741c1596d656e43e22e3649b052b45fb1e38338`
 - Status: FIXED_VERIFIED
 - Remaining Evidence: full API/browser multi-select corpus and any historical malformed-block repair remain outside offline source acceptance.
 
@@ -60,10 +60,10 @@ The following fields are updated after each root-cause commit:
 - Changed Files: `app/inheritance/engine.py`, `tests/vnext/test_inheritance_engine.py`
 - Changed Functions: `InheritanceEngine.run`, `_persist_relation_decision`, `_candidate_block_for_relation`, `_iter_source_relation_pages`
 - Regression Test: `test_confirm_only_inheritance_retains_block_for_next_scan` — PASS; it runs S1 manual → S2 inheritance → S2 confirm-only → S3 inheritance and verifies candidate scan/file/range/originating record identity.
-- Integration Test: `python3 -m unittest -v tests.vnext.test_inheritance_engine` — PASS (38 tests).
+- Integration Test: `python3 -m unittest -v tests.vnext.test_inheritance_engine` — PASS (40 tests).
 - Browser Test: NOT_RUN; no UI code changed.
 - Compatibility Check: existing inheritance parser, Git mapping, rejection and publication fixtures pass; source triple/group evidence remains intact and historical rows are not rewritten.
-- Commit SHA: recorded after the focused commit below.
+- Commit SHA: `b832178dcb195bba834aea711f39ee9ed093dfbb`
 - Status: FIXED_VERIFIED
 - Remaining Evidence: full production parser corpus, MariaDB concurrency, and historical incomplete relation repair remain pending.
 
@@ -73,13 +73,13 @@ The following fields are updated after each root-cause commit:
 - Original Root Cause: the generic full-row `job_id` update had no lease-owner/state CAS and the runner stopped heartbeat after writing terminal state.
 - Current Revalidation Result: CONFIRMED at the start of Phase 2; the new stale-owner/reclaim/terminal test would fail because the required transition API did not exist.
 - Root Owner: Runtime Reliability
-- Changed Files: `app/db/repositories/job_repository.py`, `app/jobs/service.py`, `app/scan_import/coordinator.py`, `scripts/upgrade/migration_runner.py`, `tests/vnext/test_jobs.py`
-- Changed Functions: `JobRepository.create`, `start`, `heartbeat`, `transition_terminal`, `restore`, `VNextBackgroundJobService._save`, `_runner`
-- Regression Test: `test_job_transitions_fence_stale_owner_and_preserve_creation_identity` — PASS; stale old-owner writes affect zero rows, terminal state remains terminal, and input/created-at identity is immutable.
-- Integration Test: `python3 -m unittest -v tests.vnext.test_jobs tests.vnext.test_migration_runner tests.vnext.test_scan_import_lifecycle` — PASS (44 tests).
+- Changed Files: `app/db/repositories/job_repository.py`, `app/jobs/service.py`, `app/scan_import/coordinator.py`, `app/scan_import/recovery.py`, `app/bootstrap.py`, `app/api/application.py`, `scripts/upgrade/migration_runner.py`, `tests/vnext/test_jobs.py`, `tests/vnext/test_scan_import_lifecycle.py`
+- Changed Functions: `JobRepository.create`, `start`, `heartbeat`, `transition_terminal`, `reclaim`, `restore`, `mark_interrupted`, `VNextBackgroundJobService._save`, `_runner`, `ScanImportRecoveryService.reclaim`, `record_failure`, `ScanImportCoordinator.publish`
+- Regression Test: `test_job_transitions_fence_stale_owner_and_preserve_creation_identity`, `test_stale_recovery_failure_cannot_clobber_reclaimed_owner_or_lock` — PASS; stale old-owner writes affect zero rows, terminal state remains terminal, input/created-at identity is immutable, and a late recovery failure cannot change the reclaimed job or release its lock.
+- Integration Test: `python3 -m unittest -v tests.vnext.test_jobs tests.vnext.test_migration_runner tests.vnext.test_scan_import_lifecycle` — PASS (44 tests) before the recovery extension; the follow-up `python3 -m unittest -v tests.vnext.test_jobs tests.vnext.test_scan_import_lifecycle tests.vnext.test_current_review_publication_race` passed (25 tests).
 - Browser Test: NOT_RUN; job persistence is not a browser-only invariant.
 - Compatibility Check: migration paths use explicit `restore`; scan-import creation uses `create`; existing recovery and queue rejection tests pass.
-- Commit SHA: recorded after the focused commit below.
+- Commit SHA: `506440cae4bc849eae4e2bf5945c2b9412e4d696`, follow-up `72656c2654a85e5f8027f2a643bf71ee9135ce65`
 - Status: FIXED_VERIFIED
 - Remaining Evidence: real MariaDB lock/driver interleaving and an external long-running process shutdown remain pending.
 
@@ -92,10 +92,10 @@ The following fields are updated after each root-cause commit:
 - Changed Files: `app/db/repositories/project_state_repository.py`, `app/services/analysis_service.py`, `app/services/inheritance_review_service.py`, `app/inheritance/rejections.py`, `app/scan_import/publication.py`, `tests/vnext/test_current_review_publication_race.py`
 - Changed Functions: `ProjectStateRepository.lock_for_update`, `advance`, `set_current_scan`, `invalidate`, `mark_ready`, and the analysis/review/reject/undo/publication entry boundaries.
 - Regression Test: `test_project_state_lock_uses_for_update_on_mysql_connections`, `test_analysis_and_publication_share_project_state_lock_boundary` — PASS.
-- Integration Test: Phase 1 gate command `python3 -m unittest -v tests.vnext.test_analysis_domain tests.vnext.test_inheritance_engine tests.vnext.test_scan_import_lifecycle tests.vnext.test_reliability_repairs` — PASS (74 tests), including CURRENT CAS and rejection/undo paths.
+- Integration Test: Phase 1 gate command `python3 -m unittest -v tests.vnext.test_analysis_domain tests.vnext.test_inheritance_engine tests.vnext.test_scan_import_lifecycle tests.vnext.test_reliability_repairs tests.vnext.test_current_review_publication_race` — PASS (80 tests), including CURRENT CAS and rejection/undo paths.
 - Browser Test: NOT_RUN; no UI code changed.
 - Compatibility Check: SQLite omits MySQL-only syntax while its writer transaction remains serialized; existing publication/import/review tests pass.
-- Commit SHA: recorded after the focused commit below.
+- Commit SHA: `94a9c15b8c5819d36b98d1b09fa6b0119b03b86a`
 - Status: PRODUCTION_ACCEPTANCE_PENDING
 - Remaining Evidence: real disposable MariaDB dual-connection barriers for review/edit/reject/undo/read-set/publication, plus production deployment outer serialization, must be executed by an authorized operator.
 
@@ -111,7 +111,7 @@ The following fields are updated after each root-cause commit:
 - Integration Test: `python3 -m unittest -v tests.vnext.test_reliability_repairs tests.vnext.test_scan_import_lifecycle` — PASS (25 tests).
 - Browser Test: NOT_RUN; this is a persistence/transaction workload invariant and no UI code changed.
 - Compatibility Check: full rebuild/import paths remain authoritative and retain full reconciliation; stale/partial previous projections fail closed to the full rebuild path; SQLite and MariaDB SQL remain bounded by parameterized file-id sets.
-- Commit SHA: pending focused commit.
+- Commit SHA: `6a0f3770c08a1ed149869cccac01c5eaa16389e4`, follow-up `e9f52d00a149d049518e61f7cb49ea3a38b21dba`
 - Status: FIXED_VERIFIED
 - Remaining Evidence: fixed-hardware before/after rows examined/affected, lock wait, transaction and response measurements remain pending; no production performance claim is made.
 
@@ -127,7 +127,7 @@ The following fields are updated after each root-cause commit:
 - Integration Test: `python3 -m unittest -v tests.vnext.test_analysis_domain` — PASS (13 tests).
 - Browser Test: NOT_RUN; this is a domain consistency gate and no UI code changed.
 - Compatibility Check: `orphan_records` remains the true-unreferenced compatibility count; new diagnostic counts are additive; Block/rejection rows are not rewritten or deleted.
-- Commit SHA: `be07fb1`
+- Commit SHA: `be07fb1a9542b6a385ed2ba9c3dd2a345eac7660`, follow-up `e97dc60f9062e6ba86cb248cb17fcdc4d9341ac6`
 - Status: FIXED_VERIFIED
 - Remaining Evidence: historical production data and the full migration/legacy semantic corpus remain production acceptance evidence, not local proof.
 
@@ -143,7 +143,7 @@ The following fields are updated after each root-cause commit:
 - Integration Test: `python3 -m unittest -v tests.vnext.test_performance_observability` — PASS (9 tests).
 - Browser Test: NOT_RUN; this is instrumentation semantics and no UI code changed.
 - Compatibility Check: `db_query_count`, `db_rows`, `db_rows_read` and `db_rows_affected` remain available; the evidence schema version remains compatible and the additive metrics have their own version/scope declaration.
-- Commit SHA: pending focused commit.
+- Commit SHA: `c00e0184f4ad1821ecc4a801800447a684304366`
 - Status: FIXED_VERIFIED
 - Remaining Evidence: actual PyMySQL/MariaDB session statement expansion, server rows examined, and network round trips require a disposable matching driver/database; no production/network-log claim is made.
 
@@ -156,10 +156,10 @@ The following fields are updated after each root-cause commit:
 - Changed Files: `app/inheritance/read_set.py`, `app/inheritance/engine.py`, `app/scan_import/publication.py`, `tests/vnext/test_inheritance_engine.py`
 - Changed Functions: `ReadSetAccumulator.add_source_file`, `to_payload`, `matches`; `InheritanceEngine.run`; `ScanPublicationService._validate_compact_read_set`
 - Regression Test: `test_read_set_excludes_source_files_without_candidate_correspondence`, `test_read_set_excludes_unready_repository_source_relations`, and the existing true-dependency mutation test — PASS; only consulted candidate-corresponding source scopes are replayed, while a changed consulted record still returns `READ_SET_CHANGED`.
-- Integration Test: `python3 -m unittest -v tests.vnext.test_inheritance_engine tests.vnext.test_scan_import_lifecycle` — PASS (54 tests).
+- Integration Test: `python3 -m unittest -v tests.vnext.test_inheritance_engine tests.vnext.test_scan_import_lifecycle` — PASS (55 tests).
 - Browser Test: NOT_RUN; this is an inheritance/publication dependency contract and no UI code changed.
 - Compatibility Check: compact read-set format is explicitly upgraded to v2; old v1 payloads fail closed rather than being interpreted as empty dependencies; legacy list-form read-set validation remains unchanged.
-- Commit SHA: pending focused commit.
+- Commit SHA: `f5d4cfb1e5d2a195feb4ffa967fe3c41f06f9007`
 - Status: FIXED_VERIFIED
 - Remaining Evidence: large production-like source-scope checkpoint size and validation timing require a fixed workload measurement; no production data was used.
 
@@ -175,6 +175,6 @@ The following fields are updated after each root-cause commit:
 - Integration Test: `python3 -m unittest -v tests.vnext.test_identity_cache_index_budget` — PASS (2 tests).
 - Browser Test: NOT_RUN; the invariant is internal cache ownership and no UI code changed.
 - Compatibility Check: identity cache lookup still uses the existing base/full identity and freshness CAS; only stale auxiliary mappings are removed, and cache metrics are additive.
-- Commit SHA: pending focused commit.
+- Commit SHA: `815a9d186fd53de67d97f8228e99e006c9195e2a`
 - Status: FIXED_VERIFIED
 - Remaining Evidence: long-running RSS/key-cardinality workload under production-scale identity diversity remains pending; no memory-growth percentage is claimed.

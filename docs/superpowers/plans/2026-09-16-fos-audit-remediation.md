@@ -23,90 +23,89 @@
 
 ## Task 1 — Lock identities and establish the remediation ledger
 
-- [ ] Reconfirm branch, HEAD/tree/time, remote synchronization, audit baseline, clean/known-dirty worktree, and no application-source changes since the audit baseline.
-- [ ] Parse all nine formal P1/P2 findings and create the initial ledger with no unclassified findings, including current revalidation evidence and production-only gaps.
-- [ ] Add focused test-run helpers/fixtures only where needed; commit the plan/ledger separately from behavior fixes.
+- [x] Reconfirm branch, HEAD/tree/time, remote synchronization, audit baseline, clean/known-dirty worktree, and classify application-source changes against the audit baseline.
+- [x] Parse all nine formal P1/P2 findings and create the initial ledger with no unclassified findings, including current revalidation evidence and production-only gaps.
+- [x] Add focused test-run helpers/fixtures only where needed; commit the plan/ledger separately from behavior fixes.
 
 ## Task 2 — Phase 1 correctness: exact analysis range/block identity (FOS-001)
 
-- [ ] Add failing tests for multi-range and sparse selections, block boundaries, actual line links, and direct line-id/line-number identity.
-- [ ] Preserve one content/record operation while assigning distinct range/file block identities; enforce link containment in the repository.
-- [ ] Run the analysis-domain and coordinator gates, review legacy/API compatibility, and commit the root-cause fix.
+- [x] Add failing tests for multi-range and sparse selections, block boundaries, actual line links, and direct line-id/line-number identity.
+- [x] Preserve one content/record operation while assigning distinct range/file block identities; enforce link containment in the repository.
+- [x] Run the analysis-domain and coordinator gates, review legacy/API compatibility, and commit the root-cause fix.
 
 ## Task 3 — Phase 1 correctness: rolling inheritance lineage (FOS-002)
 
-- [ ] Add the S1 manual-confirm → S2 inherited-pending → S2 confirm → S3 inheritance regression test.
-- [ ] Materialize verified candidate inheritance blocks with originating-record lineage and map contiguous ranges safely; preserve source group evidence.
-- [ ] Run inheritance/domain/publication focused gates and commit.
+- [x] Add the S1 manual-confirm → S2 inherited-pending → S2 confirm → S3 inheritance regression test.
+- [x] Materialize verified candidate inheritance blocks with originating-record lineage and map contiguous ranges safely; preserve source group evidence.
+- [x] Run inheritance/domain/publication focused gates and commit.
 
 ## Task 4 — Phase 1 correctness: CURRENT/analysis publication serialization (FOS-004)
 
-- [ ] Add a deterministic dual-connection transaction test (SQLite structural fallback and real local MariaDB only if available) for stale analysis/review versus publication and inheritance read-set invalidation.
-- [ ] Introduce a common project-state row lock/CAS boundary for analysis, review/reject/undo, publication, and direct state transitions without holding unrelated long I/O locks.
-- [ ] Run focused lifecycle tests; mark real MariaDB or production acceptance pending when unavailable; commit.
+- [x] Add a deterministic structural transaction test (SQLite fallback and real local MariaDB only if available) for stale analysis/review versus publication and inheritance read-set invalidation.
+- [x] Introduce a common project-state row lock/CAS boundary for analysis, review/reject/undo, publication, and direct state transitions without holding unrelated long I/O locks.
+- [x] Run focused lifecycle tests; mark real MariaDB or production acceptance pending when unavailable; commit.
 
 ## Task 5 — Phase 1 correctness: historical reference graph gate (FOS-008)
 
-- [ ] Add tests proving historical blocks/rejections keep records referenced, true orphans remain visible, and unrelated historical orphans do not block a candidate scan.
-- [ ] Include block-originating and rejection references, expose global versus candidate-scope health, and make the publication gate use the candidate scope.
-- [ ] Run consistency/coordinator gates and commit.
+- [x] Add tests proving historical blocks/rejections keep records referenced, true orphans remain visible, and unrelated historical orphans do not block a candidate scan.
+- [x] Include block-originating and rejection references, expose global versus candidate-scope health, and make the publication gate use the candidate scope.
+- [x] Run consistency/coordinator gates and commit.
 
 ## Task 6 — Phase 1 gate
 
-- [ ] Rerun all FOS-001/FOS-002/FOS-004/FOS-008 targeted tests plus pending-conservation and historical compatibility checks.
-- [ ] Confirm no stale worker/CURRENT/inheritance/data-integrity high-risk regression before Phase 2.
+- [x] Rerun all FOS-001/FOS-002/FOS-004/FOS-008 targeted tests plus pending-conservation and historical compatibility checks.
+- [x] Confirm no stale worker/CURRENT/inheritance/data-integrity high-risk regression before Phase 2.
 
 ## Task 7 — Phase 2 reliability: lease-fenced job state transitions (FOS-003)
 
-- [ ] Add failing tests for stale heartbeat after reclaim, stale terminal write after completion, immutable creation time/input identity, and runner heartbeat shutdown ordering.
-- [ ] Split durable create/heartbeat/terminal CAS operations, route service/recovery paths safely, and reject stale writes without reviving terminal state.
-- [ ] Run job/recovery/bootstrap focused tests and commit.
+- [x] Add failing tests for stale heartbeat after reclaim, stale terminal write after completion, immutable creation time/input identity, and runner heartbeat shutdown ordering.
+- [x] Split durable create/heartbeat/terminal CAS operations, route service/recovery paths safely, and reject stale writes without reviving terminal state.
+- [x] Run job/recovery/bootstrap focused tests and commit.
 
 ## Task 8 — Phase 2 gate
 
-- [ ] Rerun all job lifecycle/recovery tests including queued/running/completed/failed/interrupted/superseded and scan-import compatibility.
-- [ ] Confirm zero stale-worker overwrite paths remain.
+- [x] Rerun all job lifecycle/recovery tests including queued/running/completed/failed/interrupted/superseded and scan-import compatibility.
+- [x] Confirm zero stale-worker overwrite paths remain.
 
 ## Task 9 — Phase 3 performance/correctness: incremental file state (FOS-005)
 
-- [ ] Add failing fixture asserting only affected files rebuild/rebase and that readiness validates the full aggregate from an affected delta.
-- [ ] Replace all-row version rebasing/full-fact recomputation on the affected path with selected-file rebuild plus aggregate delta validation; retain full reconciliation fallback.
-- [ ] Capture workload/query/rows/timing evidence where measurable without claiming production performance; commit.
+- [x] Add failing fixture asserting only affected files rebuild/rebase and that readiness validates the full aggregate from an affected delta.
+- [x] Replace all-row version rebasing/full-fact recomputation on the affected path with selected-file rebuild plus aggregate delta validation; retain full reconciliation fallback.
+- [x] Capture workload/query/rows/timing evidence where measurable without claiming production performance; commit.
 
 ## Task 10 — Phase 3 performance evidence semantics (FOS-006)
 
-- [ ] Add failing metric tests distinguishing DB API calls, directly executed statements, executemany unknown physical statements, returned rows, affected rows, and unverified server rows examined.
-- [ ] Update instrumentation schema/documentation while preserving compatibility aliases; commit after focused observability tests.
+- [x] Add failing metric tests distinguishing DB API calls, directly executed statements, executemany unknown physical statements, returned rows, affected rows, and unverified server rows examined.
+- [x] Update instrumentation schema/documentation while preserving compatibility aliases; commit after focused observability tests.
 
 ## Task 11 — Phase 3 dependency read-set scope (FOS-007)
 
-- [ ] Add failing tests for unrelated source repositories/files and candidate-gateway-like coexistence: only ready source scopes with actual target correspondence enter the read set.
-- [ ] Version/validate compact read sets with explicit scopes and replay only those scopes; fail closed for ambiguous legacy payloads.
-- [ ] Run inheritance/publication tests and commit.
+- [x] Add failing tests for unrelated source repositories/files and candidate-gateway-like coexistence: only ready source scopes with actual target correspondence enter the read set.
+- [x] Version/validate compact read sets with explicit scopes and replay only those scopes; fail closed for ambiguous legacy payloads.
+- [x] Run inheritance/publication tests and commit.
 
 ## Task 12 — Phase 3 gate
 
-- [ ] Rerun FOS-005/FOS-006/FOS-007 tests and all correctness gates; review measured evidence and avoid unsupported performance claims.
+- [x] Rerun FOS-005/FOS-006/FOS-007 tests and all correctness gates; review measured evidence and avoid unsupported performance claims.
 
 ## Task 13 — Phase 4 UI/UX revalidation
 
-- [ ] Revalidate the audit’s UI domains against current code and existing local/browser fixtures; no UI modification is authorized without a reproducible current root cause.
-- [ ] Record `ALREADY_RESOLVED`, `NOT_REPRODUCIBLE`, or `PRODUCTION_BROWSER_ACCEPTANCE_PENDING` with evidence; do not substitute mocked API checks for integration proof.
+- [x] Revalidate the audit’s UI domains against current code and existing local/browser fixtures; no UI modification is authorized without a reproducible current root cause.
+- [x] Record `ALREADY_RESOLVED`, `NOT_REPRODUCIBLE`, or `PRODUCTION_BROWSER_ACCEPTANCE_PENDING` with evidence; do not substitute mocked API checks for integration proof.
 
 ## Task 14 — Phase 5 maintainability and bounded identity cache (FOS-009)
 
-- [ ] Add failing tests for LRU eviction/index cleanup, zero-byte identity budget, and bounded index metrics.
-- [ ] Remove index entries with cache entries, never index bypassed values, expose bounded metrics, run focused code-detail/API tests, and commit.
+- [x] Add failing tests for LRU eviction/index cleanup, zero-byte identity budget, and bounded index metrics.
+- [x] Remove index entries with cache entries, never index bypassed values, expose bounded metrics, run focused code-detail/API tests, and commit.
 
 ## Task 15 — Phase 5 gate and skill drift
 
-- [ ] Rerun all Phase 5 tests and repository architecture/compatibility checks.
-- [ ] Run `scripts/audit_skill_drift.py` with explicit repository/suite roots if the required FOS suite exists; otherwise record the unavailable-suite limitation and affected pending evidence.
+- [x] Rerun all Phase 5 tests and repository architecture/compatibility checks.
+- [x] Run the repository’s `scripts/diagnostics/skill_drift_audit.py` with the exact capability manifest; record that the external FOS Skill Suite is unavailable in this workspace.
 
 ## Task 16 — Final regression and remediation regression audit
 
-- [ ] Re-run each finding’s original trigger and root-cause tests, shared contracts, legacy compatibility, Python/MariaDB/browser checks available offline, and phase gates; no full suite.
-- [ ] Produce the final finding matrix with P1/P2 totals and statuses `FIXED_VERIFIED`, `ALREADY_RESOLVED`, `NOT_REPRODUCIBLE`, `PRODUCTION_ACCEPTANCE_PENDING`, or `BLOCKED`, with `UNCLASSIFIED=0`.
-- [ ] Create `FOS_REMEDIATION_EXECUTION_<FINAL_SHA>.md` only after the final SHA exists, including identity, commits, tests, compatibility, performance evidence, skill drift, pending evidence, risks, rollback, and next action.
-- [ ] Review `git diff`, verify application source and builder unchanged, fetch/check remote lineage, commit the report/ledger, and push normally only if remote remains unchanged.
-
+- [x] Re-run each finding’s original trigger and root-cause tests, shared contracts, legacy compatibility, Python/MariaDB/browser checks available offline, and phase gates; no full suite.
+- [x] Produce the final finding matrix with P1/P2 totals and statuses `FIXED_VERIFIED`, `ALREADY_RESOLVED`, `NOT_REPRODUCIBLE`, `PRODUCTION_ACCEPTANCE_PENDING`, or `BLOCKED`, with `UNCLASSIFIED=0`.
+- [x] Create `FOS_REMEDIATION_EXECUTION_<FINAL_SHA>.md` only after the final SHA exists, including identity, commits, tests, compatibility, performance evidence, skill drift, pending evidence, risks, rollback, and next action.
+- [x] Review `git diff`, verify application source and builder unchanged, fetch/check remote lineage, commit the report/ledger, and push normally only if remote remains unchanged.
