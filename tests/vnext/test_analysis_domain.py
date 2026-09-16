@@ -65,6 +65,41 @@ class AnalysisDomainTest(unittest.TestCase):
             "analysis save must not publish a Scan",
         )
 
+    def test_multi_range_selection_creates_one_exact_block_per_interval(self):
+        AnalysisService().save(
+            self.connection, "domain", self.scan["id"],
+            [{"file_path_hash": "f" * 32,
+              "line_ranges": [[10, 10], [11, 11]],
+              "status": "可覆盖", "coverage_method": "unit"}],
+        )
+        rows = self.connection.execute(
+            "SELECT l.line_number, b.start_line, b.end_line "
+            "FROM coverage_analysis_line_links q "
+            "JOIN coverage_lines l ON l.id=q.line_id "
+            "JOIN coverage_analysis_blocks b ON b.id=q.analysis_block_id "
+            "ORDER BY l.line_number"
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [(10, 10, 10), (11, 11, 11)],
+        )
+
+    def test_direct_line_id_rejects_conflicting_client_line_number(self):
+        line_id = self.connection.execute(
+            "SELECT id FROM coverage_lines WHERE line_number=10"
+        ).fetchone()[0]
+        with self.assertRaisesRegex(ValueError, "LINE_NUMBER_IDENTITY_MISMATCH"):
+            AnalysisService().save(
+                self.connection, "domain", self.scan["id"],
+                [{"line_id": line_id, "line_number": 11,
+                  "status": "可覆盖", "coverage_method": "unit"}],
+            )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM coverage_analysis_line_links"
+            ).fetchone()[0], 0
+        )
+
     def test_backfill_is_idempotent_and_does_not_fabricate_verified_block(self):
         self.connection.execute("""
             INSERT INTO coverage_analyses(

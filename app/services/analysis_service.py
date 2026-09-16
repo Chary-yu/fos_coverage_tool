@@ -231,13 +231,27 @@ class AnalysisService(object):
             record = plan["content"]
             if not record or not plan["record_id"]:
                 raise RuntimeError("analysis operation has no content record")
-            file_ids = plan["file_ids"]
-            if len(file_ids) == 1:
-                first = items[0]
-                block_keys.append((plan["operation_key"], None))
+            # A content operation may cover several independently selected
+            # ranges.  Keep the content record shared, but give every
+            # (range, file) pair its own Block identity.  In particular, do
+            # not derive one broad min/max range that invents unselected
+            # lines between sparse selections.
+            block_groups = {}
+            for item in items:
+                file_id = line_file_ids[int(item["line_id"])]
+                range_key = item.get("_range_key")
+                key = (range_key, file_id)
+                block_groups.setdefault(key, []).append(item)
+            for (range_key, file_id), group_items in sorted(
+                    block_groups.items(), key=lambda pair: (
+                        repr(pair[0][0]), int(pair[0][1])
+                    )):
+                first = group_items[0]
+                key = (plan["operation_key"], range_key, int(file_id))
+                block_keys.append(key)
                 block_values.append({
                     "scan_id": scan_id,
-                    "file_id": next(iter(file_ids)),
+                    "file_id": int(file_id),
                     "start_line": int(first.get("_range_start") or first["line_number"]),
                     "end_line": int(first.get("_range_end") or first["line_number"]),
                     "record_id": plan["record_id"],
@@ -245,22 +259,6 @@ class AnalysisService(object):
                     "verified": True,
                     "content_hash": record.get("content_hash"),
                 })
-            else:
-                # One user operation cannot create a cross-file human block.
-                # Split into exact one-line blocks while retaining content.
-                for item in items:
-                    key = (plan["operation_key"], int(item["line_id"]))
-                    block_keys.append(key)
-                    block_values.append({
-                        "scan_id": scan_id,
-                        "file_id": line_file_ids[int(item["line_id"])],
-                        "start_line": int(item["line_number"]),
-                        "end_line": int(item["line_number"]),
-                        "record_id": plan["record_id"],
-                        "created_by": item.get("reviewer", ""),
-                        "verified": True,
-                        "content_hash": record.get("content_hash"),
-                    })
 
         created_blocks = self.domain.create_blocks_many(
             connection, block_values, origin="MANUAL"
@@ -272,9 +270,10 @@ class AnalysisService(object):
         }
         for plan in plans:
             for item in plan["items"]:
-                key = (plan["operation_key"], None)
-                if len(plan["file_ids"]) != 1:
-                    key = (plan["operation_key"], int(item["line_id"]))
+                key = (
+                    plan["operation_key"], item.get("_range_key"),
+                    int(line_file_ids[int(item["line_id"])]),
+                )
                 block = block_by_key[key]
                 links.append({
                     "scan_id": scan_id, "line_id": item["line_id"],
@@ -310,13 +309,14 @@ class AnalysisService(object):
             if ranges is None and isinstance(item.get("line_numbers"), (list, tuple)):
                 ranges = [(line, line) for line in item.pop("line_numbers")]
             if ranges is None and item.get("line_id") and item.get("line_number") is None:
-                item["_range_start"] = item.get("line_number") or 0
-                item["_range_end"] = item.get("line_number") or 0
+                item["_range_key"] = 0
+                item["_range_start"] = 0
+                item["_range_end"] = 0
                 resolved.append(item)
                 continue
             if ranges is None:
                 ranges = [(item.get("line_number"), item.get("line_number"))]
-            for range_item in ranges:
+            for range_index, range_item in enumerate(ranges):
                 if isinstance(range_item, dict):
                     start_line = range_item.get("start_line")
                     end_line = range_item.get("end_line", start_line)
@@ -330,6 +330,7 @@ class AnalysisService(object):
                 for line_number in range(start_line, end_line + 1):
                     row = dict(item)
                     row["line_number"] = line_number
+                    row["_range_key"] = range_index
                     row["_range_start"] = start_line
                     row["_range_end"] = end_line
                     resolved.append(row)
@@ -375,6 +376,9 @@ class AnalysisService(object):
                 line = direct_rows.get(line_id)
                 if not line or int(line.get("scan_id")) != int(scan_id):
                     raise KeyError("physical source line is not in scan")
+                if (item.get("line_number") is not None and
+                        int(item["line_number"]) != int(line.get("line_number") or 0)):
+                    raise ValueError("LINE_NUMBER_IDENTITY_MISMATCH")
             else:
                 identity = (
                     str(item.get("repository_name") or ""),
@@ -386,7 +390,7 @@ class AnalysisService(object):
                     raise KeyError("physical source line not found")
                 line_id = int(line["id"])
             item["line_id"] = line_id
-            item["line_number"] = int(item.get("line_number") or line.get("line_number") or 0)
+            item["line_number"] = int(line.get("line_number") or 0)
             if not item.get("_range_start"):
                 item["_range_start"] = item["line_number"]
             if not item.get("_range_end"):

@@ -505,7 +505,7 @@ class AnalysisDomainRepository(object):
 
     def create_block(self, connection, scan_id, file_id, start_line, end_line,
                      record_id=None, created_by="", repository_id=None,
-                     verified=True, content_hash_value=None):
+                     verified=True, content_hash_value=None, origin="MANUAL"):
         start_line, end_line = int(start_line), int(end_line)
         if start_line < 1 or end_line < start_line:
             raise ValueError("invalid analysis block range")
@@ -526,10 +526,10 @@ class AnalysisDomainRepository(object):
                 scan_id, repository_id, file_id, start_line, end_line, origin,
                 block_identity_verified, originating_record_id, initial_content_hash,
                 created_by, created_at
-            ) VALUES (?, ?, ?, ?, ?, 'MANUAL', ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (int(scan_id), repository_id, int(file_id), start_line, end_line,
-              int(bool(verified)), record_id, content_hash_value, created_by or "",
-              utc_sql()))
+              str(origin or "MANUAL"), int(bool(verified)), record_id,
+              content_hash_value, created_by or "", utc_sql()))
         block_id = insert_id(cursor)
         cursor.close()
         return fetchone(connection, "SELECT * FROM coverage_analysis_blocks WHERE id=?",
@@ -625,7 +625,7 @@ class AnalysisDomainRepository(object):
                     source_line_id=None, source_relation_id=None,
                     inheritance_group_id=None, expected_relation_revision=None):
         line = fetchone(connection, """
-            SELECT l.id, f.scan_id, l.file_id
+            SELECT l.id, f.scan_id, l.file_id, l.line_number
             FROM coverage_lines l JOIN coverage_files f ON f.id=l.file_id
             WHERE l.id=?
         """, (int(line_id),))
@@ -635,11 +635,15 @@ class AnalysisDomainRepository(object):
             raise ValueError("ANALYSIS_RECORD_NOT_FOUND")
         if block_id is not None:
             block = fetchone(connection, """
-                SELECT scan_id, file_id FROM coverage_analysis_blocks WHERE id=?
+                SELECT scan_id, file_id, start_line, end_line
+                FROM coverage_analysis_blocks WHERE id=?
             """, (int(block_id),))
             if (not block or int(block.get("scan_id") or 0) != int(scan_id) or
                     int(block.get("file_id") or 0) != int(line.get("file_id") or 0)):
                 raise ValueError("ANALYSIS_BLOCK_IDENTITY_MISMATCH")
+            if (int(line.get("line_number") or 0) < int(block.get("start_line") or 0) or
+                    int(line.get("line_number") or 0) > int(block.get("end_line") or 0)):
+                raise ValueError("ANALYSIS_BLOCK_LINE_RANGE_MISMATCH")
         if inheritance_group_id is not None:
             group = fetchone(connection, """
                 SELECT candidate_scan_id, candidate_file_id
@@ -745,7 +749,7 @@ class AnalysisDomainRepository(object):
             return rows
 
         line_rows = fetch_in("""
-            SELECT l.id, l.file_id, f.scan_id
+            SELECT l.id, l.file_id, l.line_number, f.scan_id
             FROM coverage_lines l
             JOIN coverage_files f ON f.id=l.file_id
             WHERE l.id IN ({placeholders})
@@ -772,7 +776,7 @@ class AnalysisDomainRepository(object):
         blocks_by_id = {}
         if block_ids:
             block_rows = fetch_in("""
-                SELECT id, scan_id, file_id
+                SELECT id, scan_id, file_id, start_line, end_line
                 FROM coverage_analysis_blocks
                 WHERE id IN ({placeholders})
             """, block_ids)
@@ -832,6 +836,10 @@ class AnalysisDomainRepository(object):
                 if (int(block.get("scan_id") or 0) != scan_id or
                         int(block.get("file_id") or 0) != int(line["file_id"])):
                     raise ValueError("ANALYSIS_BLOCK_IDENTITY_MISMATCH")
+                line_number = int(line.get("line_number") or 0)
+                if (line_number < int(block.get("start_line") or 0) or
+                        line_number > int(block.get("end_line") or 0)):
+                    raise ValueError("ANALYSIS_BLOCK_LINE_RANGE_MISMATCH")
             group_id = (int(item["inheritance_group_id"])
                         if item.get("inheritance_group_id") is not None else None)
             if group_id is not None:
