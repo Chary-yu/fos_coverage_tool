@@ -53,6 +53,10 @@ class AnalysisService(object):
             # Analysis mutations never create or change the project CURRENT
             # pointer.  Publication owns that state transition exclusively.
             state = self.states.lock_for_update(conn, project["id"])
+            previous_projection_ready = (
+                int(state.get("file_state_version") or 0) ==
+                int(state.get("data_version") or 0)
+            )
             if enforce_current and int(state.get("current_scan_id") or 0) != int(scan_id):
                 raise ValueError("MUTATION_REQUIRES_CURRENT_SCAN")
             if not records:
@@ -75,6 +79,7 @@ class AnalysisService(object):
                 conn, project["id"], int(scan_id),
                 int(next_state["data_version"]),
                 affected_file_ids=affected_file_ids,
+                previous_ready=previous_projection_ready,
             )
         return {"saved": saved, "data_version": next_state["data_version"]}
 

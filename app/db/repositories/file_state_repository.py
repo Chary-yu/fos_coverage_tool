@@ -250,8 +250,22 @@ class FileStateRepository(object):
                             else len(selected_file_ids)),
         }
 
-    def scan_aggregate(self, connection, scan_id: int):
-        """Aggregate derived file state in SQL without loading every file row."""
+    @staticmethod
+    def _normalized_file_ids(file_ids):
+        if file_ids is None:
+            return None
+        return sorted({int(file_id) for file_id in file_ids if int(file_id) > 0})
+
+    def scan_aggregate(self, connection, scan_id: int, file_ids=None):
+        """Aggregate derived file state without loading every file row."""
+        selected_file_ids = self._normalized_file_ids(file_ids)
+        file_filter = ""
+        params = [int(scan_id)]
+        if selected_file_ids is not None:
+            file_filter = " AND file_id IN ({})".format(
+                ",".join("?" for _ in selected_file_ids)
+            ) if selected_file_ids else " AND 1=0"
+            params.extend(selected_file_ids)
         return fetchone(connection, """
             SELECT COUNT(*) AS file_count,
                    COALESCE(SUM(total_lines), 0) AS total_lines,
@@ -263,11 +277,15 @@ class FileStateRepository(object):
                    COALESCE(SUM(ordinary_pending_total), 0) AS ordinary_pending_total,
                    COALESCE(SUM(inherited_pending_total), 0) AS inherited_pending_total,
                    COALESCE(SUM(manual_draft_pending_total), 0) AS manual_draft_pending_total
-            FROM coverage_file_state WHERE scan_id = ?
-        """, (scan_id,))
+            FROM coverage_file_state WHERE scan_id = ?{file_filter}
+        """.format(file_filter=file_filter), tuple(params))
+
+    def file_state_aggregate(self, connection, scan_id: int, file_ids):
+        """Return the bounded derived aggregate for a mutation's file set."""
+        return self.scan_aggregate(connection, scan_id, file_ids=file_ids)
 
     def file_state_completeness(self, connection, scan_id: int,
-                                data_version=None):
+                                data_version=None, affected_file_ids=None):
         """Return the file-state coverage/version gate for one immutable Scan.
 
         ``coverage_file_state`` is a rebuildable projection.  A row count that
@@ -276,32 +294,62 @@ class FileStateRepository(object):
         published.  Keep this check in SQL so the online read path never has
         to materialize a large project.
         """
+        selected_file_ids = self._normalized_file_ids(affected_file_ids)
+        selected_expected_sql = (
+            "COUNT(DISTINCT CASE WHEN f.id IN ({}) THEN f.id END)".format(
+                ",".join("?" for _ in selected_file_ids)
+            ) if selected_file_ids else "0"
+        ) if selected_file_ids is not None else "NULL"
         if data_version is not None:
+            if selected_file_ids is None:
+                stale_sql = """
+                    COALESCE(SUM(CASE WHEN fs.file_id IS NOT NULL
+                                           AND fs.data_version <> ?
+                                      THEN 1 ELSE 0 END), 0)
+                """
+                version_params = [int(data_version)]
+            else:
+                if selected_file_ids:
+                    stale_sql = """
+                        COALESCE(SUM(CASE WHEN fs.file_id IN ({})
+                                               AND fs.data_version <> ?
+                                          THEN 1 ELSE 0 END), 0)
+                    """.format(",".join("?" for _ in selected_file_ids))
+                    version_params = list(selected_file_ids) + [int(data_version)]
+                else:
+                    stale_sql = "0"
+                    version_params = []
             row = fetchone(connection, """
                 SELECT COUNT(DISTINCT f.id) AS expected_file_count,
                        COUNT(DISTINCT fs.file_id) AS state_file_count,
                        COALESCE(SUM(CASE WHEN fs.file_id IS NULL THEN 1 ELSE 0 END), 0)
                            AS missing_file_count,
-                       COALESCE(SUM(CASE WHEN fs.file_id IS NOT NULL
-                                              AND fs.data_version = ?
-                                         THEN 0 ELSE 1 END), 0) AS stale_file_count
+                       {selected_expected_sql} AS selected_file_count,
+                       {stale_sql} AS stale_file_count
                 FROM coverage_files f
                 LEFT JOIN coverage_file_state fs
                   ON fs.scan_id = f.scan_id AND fs.file_id = f.id
                 WHERE f.scan_id = ?
-                """, (int(data_version), int(scan_id)))
+                """.format(selected_expected_sql=selected_expected_sql,
+                           stale_sql=stale_sql),
+                tuple((list(selected_file_ids) if selected_file_ids else []) +
+                      version_params + [int(scan_id)]))
         else:
             row = fetchone(connection, """
                 SELECT COUNT(DISTINCT f.id) AS expected_file_count,
                        COUNT(DISTINCT fs.file_id) AS state_file_count,
                        COALESCE(SUM(CASE WHEN fs.file_id IS NULL THEN 1 ELSE 0 END), 0)
                            AS missing_file_count,
+                       {selected_expected_sql} AS selected_file_count,
                        0 AS stale_file_count
                 FROM coverage_files f
                 LEFT JOIN coverage_file_state fs
                   ON fs.scan_id = f.scan_id AND fs.file_id = f.id
                 WHERE f.scan_id = ?
-            """, (int(scan_id),))
+            """.format(selected_expected_sql=selected_expected_sql,
+                       ),
+                tuple((list(selected_file_ids) if selected_file_ids else []) +
+                      [int(scan_id)]))
         orphan_row = fetchone(connection, """
             SELECT COUNT(*) AS orphan_state_count
             FROM coverage_file_state fs
@@ -314,7 +362,12 @@ class FileStateRepository(object):
         states = int(row.get("state_file_count") or 0)
         missing = int(row.get("missing_file_count") or 0)
         stale = int(row.get("stale_file_count") or 0)
+        selected_count = (None if selected_file_ids is None else
+                          int(row.get("selected_file_count") or 0))
         orphaned = int(orphan_row.get("orphan_state_count") or 0)
+        selected_complete = (
+            selected_file_ids is None or selected_count == len(selected_file_ids)
+        )
         return {
             "scan_id": int(scan_id),
             "data_version": None if data_version is None else int(data_version),
@@ -322,14 +375,25 @@ class FileStateRepository(object):
             "state_file_count": states,
             "missing_file_count": missing,
             "stale_file_count": stale,
+            "selected_file_count": selected_count,
+            "requested_file_count": (None if selected_file_ids is None
+                                      else len(selected_file_ids)),
             "orphan_state_count": orphaned,
             "status": "PASSED" if expected == states and not missing and
-                       not stale and not orphaned
+                       not stale and not orphaned and selected_complete
                        else "FAILED",
         }
 
-    def pending_conservation(self, connection, scan_id: int):
+    def pending_conservation(self, connection, scan_id: int, file_ids=None):
         """Verify pending partition and file-row completeness in one query."""
+        selected_file_ids = self._normalized_file_ids(file_ids)
+        file_filter = ""
+        params = [int(scan_id)]
+        if selected_file_ids is not None:
+            file_filter = " AND f.id IN ({})".format(
+                ",".join("?" for _ in selected_file_ids)
+            ) if selected_file_ids else " AND 1=0"
+            params.extend(selected_file_ids)
         row = fetchone(connection, """
                 SELECT COUNT(DISTINCT f.id) AS expected_file_count,
                        COUNT(DISTINCT fs.file_id) AS state_file_count,
@@ -351,8 +415,8 @@ class FileStateRepository(object):
             FROM coverage_files f
             LEFT JOIN coverage_file_state fs
               ON fs.scan_id = f.scan_id AND fs.file_id = f.id
-            WHERE f.scan_id=?
-        """, (int(scan_id),)) or {}
+            WHERE f.scan_id=?{file_filter}
+        """.format(file_filter=file_filter), tuple(params)) or {}
         expected = int(row.get("expected_file_count") or 0)
         states = int(row.get("state_file_count") or 0)
         missing = int(row.get("missing_file_count") or 0)
@@ -384,8 +448,16 @@ class FileStateRepository(object):
             "status": "PASSED" if expected == states and not mismatched else "FAILED",
         }
 
-    def scan_summary_from_facts(self, connection, scan_id: int):
+    def scan_summary_from_facts(self, connection, scan_id: int, file_ids=None):
         """Aggregate authoritative facts in SQL for stale/empty derived state."""
+        selected_file_ids = self._normalized_file_ids(file_ids)
+        file_filter = ""
+        params = [int(scan_id)]
+        if selected_file_ids is not None:
+            file_filter = " AND f.id IN ({})".format(
+                ",".join("?" for _ in selected_file_ids)
+            ) if selected_file_ids else " AND 1=0"
+            params.extend(selected_file_ids)
         uncovered = self._UNCOVERED_SQL
         confirmed = self._CONFIRMED_SQL
         ordinary = self._ORDINARY_PENDING_SQL
@@ -408,10 +480,11 @@ class FileStateRepository(object):
             LEFT JOIN coverage_analysis_line_links q
               ON q.scan_id = f.scan_id AND q.line_id = l.id AND q.is_active = 1
             LEFT JOIN coverage_analysis_records r ON r.id = q.analysis_record_id
-            WHERE f.scan_id = ?
+            WHERE f.scan_id = ?{file_filter}
         """.format(uncovered=uncovered, status=self._STATUS_SQL,
                    draft=self._DRAFT_SQL, confirmed=confirmed, ordinary=ordinary,
-                   inherited=inherited, manual_draft=manual_draft), (scan_id,))
+                   inherited=inherited, manual_draft=manual_draft,
+                   file_filter=file_filter), tuple(params))
         row = row or {}
         return {
             "scan_id": scan_id,
@@ -448,7 +521,7 @@ class FileStateRepository(object):
             coverage_sql = """
                 SELECT COUNT(DISTINCT f.id) AS files,
                        COUNT(DISTINCT fs.file_id) AS states,
-                       COUNT(DISTINCT CASE WHEN fs.data_version = ?
+                       COUNT(DISTINCT CASE WHEN fs.data_version <= ?
                                            THEN fs.file_id END) AS matching_states
                 FROM coverage_files f
                 LEFT JOIN coverage_file_state fs

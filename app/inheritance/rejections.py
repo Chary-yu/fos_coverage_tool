@@ -19,7 +19,11 @@ class InheritanceRejectionService(object):
     def reject(self, connection, project_id, scan_id, line_id, rejected_by,
                expected_relation_revision):
         with transaction(connection) as conn:
-            self._assert_current(conn, project_id, scan_id)
+            state = self._assert_current(conn, project_id, scan_id)
+            previous_projection_ready = (
+                int(state.get("file_state_version") or 0) ==
+                int(state.get("data_version") or 0)
+            )
             relation = fetchone(conn, """
                 SELECT * FROM coverage_analysis_line_links
                 WHERE scan_id=? AND line_id=? AND is_active=1
@@ -59,6 +63,7 @@ class InheritanceRejectionService(object):
             self.file_state_service.rebuild_validate_and_mark_ready_in_transaction(
                 conn, int(project_id), int(scan_id), int(state["data_version"]),
                 affected_file_ids=affected_file_ids,
+                previous_ready=previous_projection_ready,
             )
             return fetchone(conn, """
                 SELECT * FROM coverage_inheritance_rejections
@@ -68,7 +73,11 @@ class InheritanceRejectionService(object):
     def undo(self, connection, project_id, scan_id, line_id, rejection_id,
              expected_rejection_revision, expected_relation_revision):
         with transaction(connection) as conn:
-            self._assert_current(conn, project_id, scan_id)
+            state = self._assert_current(conn, project_id, scan_id)
+            previous_projection_ready = (
+                int(state.get("file_state_version") or 0) ==
+                int(state.get("data_version") or 0)
+            )
             rejection = fetchone(conn, """
                 SELECT * FROM coverage_inheritance_rejections
                 WHERE id=? AND scan_id=? AND line_id=? AND is_active=1
@@ -110,6 +119,7 @@ class InheritanceRejectionService(object):
             self.file_state_service.rebuild_validate_and_mark_ready_in_transaction(
                 conn, int(project_id), int(scan_id), int(state["data_version"]),
                 affected_file_ids=affected_file_ids,
+                previous_ready=previous_projection_ready,
             )
             return fetchone(conn, """
                 SELECT * FROM coverage_inheritance_rejections WHERE id=?

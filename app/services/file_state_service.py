@@ -32,7 +32,9 @@ class FileStateService(object):
         self.file_states = file_state_repo or FileStateRepository()
         self.states = state_repo or ProjectStateRepository()
 
-    def validate_rebuilt(self, connection, project_id, scan_id, data_version):
+    def validate_rebuilt(self, connection, project_id, scan_id, data_version,
+                         affected_file_ids=None, before_aggregate=None,
+                         before_affected_aggregate=None):
         state = self.states.get(connection, int(project_id)) or {}
         expected_version = int(data_version)
         if int(state.get("data_version") or 0) != expected_version:
@@ -41,22 +43,56 @@ class FileStateService(object):
                 "project_id": int(project_id), "scan_id": int(scan_id),
                 "data_version": expected_version,
             }
+        selected_file_ids = self.file_states._normalized_file_ids(
+            affected_file_ids
+        )
+        incremental = (
+            selected_file_ids is not None and
+            before_aggregate is not None and
+            before_affected_aggregate is not None
+        )
         completeness = self.file_states.file_state_completeness(
-            connection, int(scan_id), expected_version
+            connection, int(scan_id), expected_version,
+            affected_file_ids=selected_file_ids if incremental else None,
         )
         conservation = self.file_states.pending_conservation(
-            connection, int(scan_id)
+            connection, int(scan_id),
+            file_ids=selected_file_ids if incremental else None,
         )
-        derived = self.file_states.scan_aggregate(connection, int(scan_id)) or {}
-        authoritative = self.file_states.scan_summary_from_facts(
-            connection, int(scan_id)
-        ) or {}
+        if incremental:
+            affected_derived = self.file_states.file_state_aggregate(
+                connection, int(scan_id), selected_file_ids
+            ) or {}
+            derived = {}
+            for field in SUMMARY_FIELDS:
+                derived[field] = (
+                    int(before_aggregate.get(field) or 0) -
+                    int(before_affected_aggregate.get(field) or 0) +
+                    int(affected_derived.get(field) or 0)
+                )
+            authoritative = self.file_states.scan_summary_from_facts(
+                connection, int(scan_id), file_ids=selected_file_ids
+            ) or {}
+            reconciled_derived = affected_derived
+            reconciliation_scope = "AFFECTED_FILES"
+        else:
+            derived = self.file_states.scan_aggregate(
+                connection, int(scan_id)
+            ) or {}
+            authoritative = self.file_states.scan_summary_from_facts(
+                connection, int(scan_id)
+            ) or {}
+            reconciled_derived = derived
+            reconciliation_scope = "FULL_SCAN"
         mismatches = {}
-        for field in SUMMARY_FIELDS:
-            if int(derived.get(field) or 0) != int(authoritative.get(field) or 0):
+        compare_fields = SUMMARY_FIELDS
+        for field in compare_fields:
+            derived_value = int(reconciled_derived.get(field) or 0)
+            authoritative_value = int(authoritative.get(field) or 0)
+            if derived_value != authoritative_value:
                 mismatches[field] = {
-                    "derived": int(derived.get(field) or 0),
-                    "authoritative": int(authoritative.get(field) or 0),
+                    "derived": derived_value,
+                    "authoritative": authoritative_value,
                 }
         gate = {
             "status": "PASSED" if (
@@ -70,6 +106,7 @@ class FileStateService(object):
             "pending_conservation": conservation,
             "reconciliation": {
                 "status": "PASSED" if not mismatches else "FAILED",
+                "scope": reconciliation_scope,
                 "mismatches": mismatches,
             },
         }
@@ -86,34 +123,64 @@ class FileStateService(object):
 
     def rebuild_validate_and_mark_ready_in_transaction(
             self, connection, project_id, scan_id, data_version,
-            affected_file_ids=None):
+            affected_file_ids=None, previous_ready=None):
         """Run the complete gate inside a caller-owned transaction."""
         project_id = int(project_id)
         scan_id = int(scan_id)
         data_version = int(data_version)
+        selected_file_ids = self.file_states._normalized_file_ids(
+            affected_file_ids
+        )
+        incremental = selected_file_ids is not None
+        if incremental:
+            previous_completeness = self.file_states.file_state_completeness(
+                connection, scan_id, max(0, data_version - 1)
+            )
+            if previous_ready is None:
+                previous_ready = (
+                    data_version > 0 and
+                    previous_completeness.get("status") == "PASSED"
+                )
+            else:
+                previous_ready = bool(previous_ready) and (
+                    previous_completeness.get("status") == "PASSED"
+                )
+        if incremental and not previous_ready:
+            # A previous failed or partial projection cannot be used as the
+            # unchanged side of a delta. Fall back to the authoritative full
+            # rebuild and full reconciliation; never weaken the Ready gate.
+            incremental = False
+        before_aggregate = None
+        before_affected_aggregate = None
+        if incremental:
+            before_aggregate = self.file_states.scan_aggregate(
+                connection, scan_id
+            ) or {}
+            before_affected_aggregate = self.file_states.file_state_aggregate(
+                connection, scan_id, selected_file_ids
+            ) or {}
         # Invalidate before touching the projection.  If a caller catches the
         # gate error and commits its surrounding transaction, the state still
         # advertises that the projection is stale.
         self.states.invalidate(connection, project_id)
-        if affected_file_ids is None:
+        if not incremental:
             self.file_states.rebuild_scan(
                 connection, scan_id, data_version, None
             )
         else:
             # The mutation boundary supplies the exact files whose facts
-            # changed. Rebase unchanged rows to the new version, then
-            # recompute only that bounded file set. The complete Ready gate
-            # below remains mandatory, so this is a performance optimization
-            # rather than a weaker correctness condition.
-            self.file_states.rebase_scan_version(
-                connection, scan_id, data_version
-            )
+            # changed. Unchanged rows retain their last verified projection
+            # version; the delta validation below proves the affected facts
+            # and the project aggregate without a full-Scan UPDATE.
             self.file_states.rebuild_scan(
                 connection, scan_id, data_version, None,
-                file_ids=affected_file_ids,
+                file_ids=selected_file_ids,
             )
         gate = self.validate_rebuilt(
-            connection, project_id, scan_id, data_version
+            connection, project_id, scan_id, data_version,
+            affected_file_ids=selected_file_ids if incremental else None,
+            before_aggregate=before_aggregate,
+            before_affected_aggregate=before_affected_aggregate,
         )
         if gate.get("status") != "PASSED":
             raise FileStateReadyGateError(gate)

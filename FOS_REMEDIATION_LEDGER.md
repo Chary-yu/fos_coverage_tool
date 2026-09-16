@@ -13,10 +13,10 @@ completed skill execution.
 | FOS-002 | P1 | Change Review | CONFIRMED: successful inheritance created a candidate LineLink without a candidate `AnalysisBlock`; confirm-only rolling inheritance lost the next-generation block identity. | FIXED_VERIFIED | Full external parser corpus remains pending. |
 | FOS-003 | P1 | Runtime Reliability | CONFIRMED: generic `JobRepository.upsert` updated by `job_id` only and runner heartbeat could race terminal persistence. | FIXED_VERIFIED | MariaDB driver-level concurrency evidence remains pending. |
 | FOS-004 | P1 | Runtime Reliability | CONFIRMED structural gap / NEEDS_EXTERNAL_EVIDENCE for real dual-connection MariaDB ordering: analysis/review/publication paths lacked a shared project-state lock boundary. | PRODUCTION_ACCEPTANCE_PENDING | Source lock boundary is fixed and tested; disposable MariaDB/production-like concurrency run remains external. |
-| FOS-005 | P2 | Change Review | CONFIRMED: affected-file path rebases every `coverage_file_state` row and validates a full authoritative fact aggregate inside the mutation transaction. | BLOCKED | Remediation in progress; fixed-hardware workload measurement remains pending. |
+| FOS-005 | P2 | Change Review | CONFIRMED: affected-file path rebased every `coverage_file_state` row and validated a full authoritative fact aggregate inside the mutation transaction. | FIXED_VERIFIED | Fixed-hardware workload measurement remains pending. |
 | FOS-006 | P2 | Change Review | CONFIRMED: `execute` and `executemany` share one `db_query_count`, while returned and affected rows are not separately named from server-examined rows. | BLOCKED | Remediation in progress; real driver/session statement count remains pending. |
 | FOS-007 | P2 | Change Review | CONFIRMED: inheritance records all predecessor active relations even for unready repositories or missing candidate files, then publication replays the full predecessor set. | BLOCKED | Remediation in progress; large-scope checkpoint measurement remains pending. |
-| FOS-008 | P1 | Change Review | CONFIRMED: orphan query considers only LineLink references and the candidate gate consumes the global count, ignoring historical Block/rejection references. | BLOCKED | Remediation in progress; historical production data acceptance remains pending. |
+| FOS-008 | P1 | Change Review | CONFIRMED: orphan query considered only LineLink references and the candidate gate consumed the global count, ignoring historical Block/rejection references. | FIXED_VERIFIED | Historical production data acceptance remains pending. |
 | FOS-009 | P2 | Runtime Reliability | CONFIRMED: LRU removal does not remove `_identity_index`; an oversize/disabled store can index a non-existent cache entry. | BLOCKED | Remediation in progress; long-running RSS workload remains pending. |
 
 UNCLASSIFIED: 0
@@ -98,3 +98,35 @@ The following fields are updated after each root-cause commit:
 - Commit SHA: recorded after the focused commit below.
 - Status: PRODUCTION_ACCEPTANCE_PENDING
 - Remaining Evidence: real disposable MariaDB dual-connection barriers for review/edit/reject/undo/read-set/publication, plus production deployment outer serialization, must be executed by an authorized operator.
+
+### FOS-005
+
+- Original Severity: P2
+- Original Root Cause: a bounded analysis/review mutation still rewrote every `coverage_file_state` row and ran a full authoritative fact aggregate before the Ready gate.
+- Current Revalidation Result: CONFIRMED at the start of Phase 3; the regression expectation failed before the change because `rebase_scan_version` and an unscoped `scan_summary_from_facts` were both invoked.
+- Root Owner: Change Review
+- Changed Files: `app/db/repositories/file_state_repository.py`, `app/services/file_state_service.py`, `app/services/analysis_service.py`, `app/services/inheritance_review_service.py`, `app/inheritance/rejections.py`, `tests/vnext/test_reliability_repairs.py`
+- Changed Functions: `FileStateRepository.scan_aggregate`, `file_state_completeness`, `pending_conservation`, `scan_summary_from_facts`, `FileStateService.validate_rebuilt`, `rebuild_validate_and_mark_ready_in_transaction`, and the analysis/review/reject/undo callers.
+- Regression Test: `test_partial_rebuild_rebases_unchanged_files_and_keeps_full_ready_gate` — PASS; the affected file is rebuilt, the unchanged row retains its previously verified version, the rebase UPDATE is not called, and the fact reconciliation is scoped to the affected file.
+- Integration Test: `python3 -m unittest -v tests.vnext.test_reliability_repairs tests.vnext.test_scan_import_lifecycle` — PASS (25 tests).
+- Browser Test: NOT_RUN; this is a persistence/transaction workload invariant and no UI code changed.
+- Compatibility Check: full rebuild/import paths remain authoritative and retain full reconciliation; stale/partial previous projections fail closed to the full rebuild path; SQLite and MariaDB SQL remain bounded by parameterized file-id sets.
+- Commit SHA: pending focused commit.
+- Status: FIXED_VERIFIED
+- Remaining Evidence: fixed-hardware before/after rows examined/affected, lock wait, transaction and response measurements remain pending; no production performance claim is made.
+
+### FOS-008
+
+- Original Severity: P1
+- Original Root Cause: the orphan-record audit treated a record as live only when a current or historical LineLink referenced it, ignoring historical `AnalysisBlock.originating_record_id` and rejection references; its global result could also block an unrelated candidate Scan.
+- Current Revalidation Result: CONFIRMED at the start of Phase 1; the new historical Block fixture and scoped orphan fixture both captured the prior false orphan/gate behavior before the fix.
+- Root Owner: Change Review
+- Changed Files: `app/services/analysis_domain_service.py`, `tests/vnext/test_analysis_domain.py`
+- Changed Functions: `AnalysisDomainService.audit_consistency`
+- Regression Test: `test_consistency_audit_counts_historical_block_reference_as_live_identity`, `test_scoped_consistency_gate_ignores_unrelated_true_orphan` — PASS; historical graph edges are retained as live references, while a true unrelated orphan remains visible globally without blocking the scoped candidate gate.
+- Integration Test: `python3 -m unittest -v tests.vnext.test_analysis_domain` — PASS (13 tests).
+- Browser Test: NOT_RUN; this is a domain consistency gate and no UI code changed.
+- Compatibility Check: `orphan_records` remains the true-unreferenced compatibility count; new diagnostic counts are additive; Block/rejection rows are not rewritten or deleted.
+- Commit SHA: `be07fb1`
+- Status: FIXED_VERIFIED
+- Remaining Evidence: historical production data and the full migration/legacy semantic corpus remain production acceptance evidence, not local proof.

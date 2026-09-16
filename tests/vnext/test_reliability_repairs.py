@@ -289,14 +289,19 @@ class ProgressReadyGateTest(unittest.TestCase):
                 wraps=self.file_states.rebase_scan_version) as rebase, \
                 mock.patch.object(
                     self.file_states, "rebuild_scan",
-                    wraps=self.file_states.rebuild_scan) as rebuild:
+                    wraps=self.file_states.rebuild_scan) as rebuild, \
+                mock.patch.object(
+                    self.file_states, "scan_summary_from_facts",
+                    wraps=self.file_states.scan_summary_from_facts) as facts:
             ready = service.rebuild_validate_and_mark_ready_in_transaction(
                 self.connection, self.project["id"], self.scan["id"],
                 int(next_state["data_version"]),
                 affected_file_ids=[self.file["id"]],
             )
         self.assertEqual(int(ready["file_state_version"]), 2)
-        self.assertEqual(rebase.call_count, 1)
+        self.assertEqual(rebase.call_count, 0)
+        self.assertEqual(facts.call_count, 1)
+        self.assertEqual(facts.call_args.kwargs["file_ids"], [self.file["id"]])
         args, kwargs = rebuild.call_args
         self.assertEqual(
             kwargs["file_ids"], [self.file["id"]]
@@ -311,7 +316,7 @@ class ProgressReadyGateTest(unittest.TestCase):
         self.assertEqual(int(first_state["pending_total"]), 0)
         self.assertEqual(int(other_state["total_uncovered"]), 1)
         self.assertEqual(int(other_state["pending_total"]), 1)
-        self.assertEqual(int(other_state["data_version"]), 2)
+        self.assertEqual(int(other_state["data_version"]), 1)
 
 
 if __name__ == "__main__":

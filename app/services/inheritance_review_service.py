@@ -38,7 +38,11 @@ class InheritanceReviewService(object):
             raise ValueError("selected_line_ids exceeds limit")
         expected_map = expected_relation_revisions or {}
         with transaction(connection) as conn:
-            self._assert_current(conn, project_id, scan_id)
+            state = self._assert_current(conn, project_id, scan_id)
+            previous_projection_ready = (
+                int(state.get("file_state_version") or 0) ==
+                int(state.get("data_version") or 0)
+            )
             affected_file_ids = self.file_state_service.file_states.file_ids_for_lines(
                 conn, int(scan_id), selected
             )
@@ -79,6 +83,7 @@ class InheritanceReviewService(object):
             self.file_state_service.rebuild_validate_and_mark_ready_in_transaction(
                 conn, int(project_id), int(scan_id), int(state["data_version"]),
                 affected_file_ids=affected_file_ids,
+                previous_ready=previous_projection_ready,
             )
         return {"scan_id": int(scan_id), "items": results,
                 "reviewed_by": reviewer or ""}
