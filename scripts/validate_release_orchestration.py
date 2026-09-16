@@ -26,6 +26,7 @@ REQUIRED_FILES = (
     "scripts/release/generate_flat_production_candidate_operator.py",
     "scripts/release/local_release_gate.py",
     "scripts/release/local_compatibility_gate.py",
+    "scripts/release/compatibility_surface.py",
     "scripts/diagnostics/production_release_authority.py",
     "scripts/diagnostics/release_performance_revision.js",
     "scripts/upgrade/performance_evidence.py",
@@ -117,6 +118,9 @@ def validate(repo_root, tool_path="", bundle_path=""):
     compatibility_gate_path = os.path.join(
         repo_root, "scripts/release/local_compatibility_gate.py"
     )
+    compatibility_surface_path = os.path.join(
+        repo_root, "scripts/release/compatibility_surface.py"
+    )
     authority_path = os.path.join(
         repo_root, "scripts/diagnostics/production_release_authority.py"
     )
@@ -131,12 +135,13 @@ def validate(repo_root, tool_path="", bundle_path=""):
         generic_generator = _read(generic_generator_path)
         local_gate = _read(local_gate_path)
         compatibility_gate = _read(compatibility_gate_path)
+        compatibility_surface = _read(compatibility_surface_path)
         authority = _read(authority_path)
     except (OSError, IOError) as exc:
         failures.append(str(exc))
         conductor = run_upgrade = flat = perf = generator = ""
         manifest = runtime = generic_generator = ""
-        local_gate = compatibility_gate = authority = ""
+        local_gate = compatibility_gate = compatibility_surface = authority = ""
 
     evidence_match = re.search(r"EVIDENCE_NAMES\s*=\s*\((.*?)\)\s*\n", conductor,
                                re.DOTALL)
@@ -217,6 +222,9 @@ def validate(repo_root, tool_path="", bundle_path=""):
         "PYTHON36_IMAGE", "MARIADB55_IMAGE", "--network",
         "PYTHON36_COMPAT", "MARIADB55_COMPAT", "COMPATIBILITY_STATUSES",
         "NOT_APPLICABLE", "DEFERRED_TO_TARGET_RUNTIME",
+    )) and all(token in compatibility_surface for token in (
+        "classify_compatibility_surface", "PRODUCTION_PYTHON_CHANGED",
+        "NOT_DB_SENSITIVE", "DB_SENSITIVE_CHANGED",
     )) and all(token in authority for token in (
         "PRODUCTION_RELEASE_AUTHORITY", "GITHUB_ACTIONS_REQUIRED",
         "GITHUB_API_REQUIRED_FOR_READINESS", "PROTECTED_BUILDER_NEW_PUBLICATION_ALLOWED",
@@ -233,6 +241,7 @@ def validate(repo_root, tool_path="", bundle_path=""):
             (generic_generator_path, "generic operator generator"),
             (local_gate_path, "local release gate"),
             (compatibility_gate_path, "local compatibility gate"),
+            (compatibility_surface_path, "compatibility surface classifier"),
             (authority_path, "production release authority")):
         try:
             compile(_read(path), path, "exec")

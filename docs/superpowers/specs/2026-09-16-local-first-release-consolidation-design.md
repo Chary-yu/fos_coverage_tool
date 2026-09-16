@@ -20,7 +20,16 @@ Make the local repository and Codex/local tooling the sole non-production releas
 
 `scripts/release/local_release_gate.py` creates one offline evidence directory for one exact source SHA. It records source/environment identity, the selected release tests and orchestration regressions, static release-path security findings, authority policy, operator self-test, release-input manifest integrity, and compatibility evidence. It creates a clean exact-commit checkout/bundle from Git when the working directory contains unrelated untracked files, without touching those files. The gate exits non-zero unless every required local check is verified.
 
-`scripts/release/local_compatibility_gate.py` runs pinned Python 3.6 and MariaDB 5.5.64 checks in Docker, including candidate privilege revoke/conservation behavior and release-tooling syntax/import checks. Docker image references are digest-pinned. Missing Docker or unavailable images produces `NOT_VERIFIED`, never PASS, and therefore blocks the local release gate.
+`scripts/release/compatibility_surface.py` first classifies whether the
+changed source actually touches production-executed Python or DB-sensitive
+surfaces. `scripts/release/local_compatibility_gate.py` then runs pinned
+Python 3.6 and MariaDB 5.5.64 checks in Docker when those surfaces apply,
+including candidate privilege revoke/conservation behavior and release-tooling
+syntax/import checks. Docker image references are digest-pinned. Each lane
+reports exactly `PASS`, `NOT_APPLICABLE`, `DEFERRED_TO_TARGET_RUNTIME`, or
+`FAIL`. Missing local target runtimes produces a truthful deferred result:
+isolated Candidate staging may continue, while publication and cutover remain
+blocked pending the manual VFOS compatibility preflight.
 
 ## Readiness and evidence
 

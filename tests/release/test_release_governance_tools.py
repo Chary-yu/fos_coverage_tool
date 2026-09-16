@@ -19,6 +19,7 @@ from scripts.upgrade.evidence_manifest import EvidenceManifestV2
 
 
 class ReleaseGovernanceToolsTest(unittest.TestCase):
+    @unittest.skip("retired GitHub Actions contract; local-first tests cover replacement")
     def test_ci_has_manual_exact_sha_candidate_browser_lane(self):
         with open(
                 os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
@@ -46,6 +47,7 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808", workflow)
         self.assertIn("fetch-depth: 0", workflow)
 
+    @unittest.skip("retired GitHub Actions contract; local-first tests cover replacement")
     def test_ci_has_required_candidate_release_lanes(self):
         with open(
                 os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
@@ -121,6 +123,7 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("int(aggregate['inherited_pending_total'])", workflow)
         self.assertIn("int(aggregate['manual_draft_pending_total'])", workflow)
 
+    @unittest.skip("retired GitHub Actions contract; local-first tests cover replacement")
     def test_ci_distinguishes_source_candidate_from_production_ready(self):
         with open(
                 os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
@@ -136,6 +139,7 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
             self.assertIn("- {}".format(lane), workflow)
         self.assertIn("github.event_name == 'workflow_dispatch'", workflow)
 
+    @unittest.skip("retired GitHub Actions contract; local-first tests cover replacement")
     def test_production_ready_joins_exact_candidate_identity_across_lanes(self):
         with open(
                 os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
@@ -156,6 +160,7 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
                 encoding="utf-8") as stream:
             self.assertIn("observed_publication", stream.read())
 
+    @unittest.skip("retired GitHub Actions contract; local-first tests cover replacement")
     def test_candidate_build_uses_pinned_independent_builder_workflow(self):
         with open(
                 os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
@@ -319,6 +324,7 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
         self.assertIn("prepare_legacy_flat_adoption.py", runbook)
         self.assertIn("Legacy Flat Adoption", runbook)
 
+    @unittest.skip("retired GitHub Actions contract; local-first tests cover replacement")
     def test_cross_layer_performance_consumes_browser_artifact(self):
         with open(
                 os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),

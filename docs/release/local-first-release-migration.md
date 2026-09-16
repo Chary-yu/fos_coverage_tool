@@ -31,8 +31,8 @@ Candidate cannot enter Current Production Publication.
 | GitHub artifact and external attestation | Local evidence files, `evidence_manifest.json`, `SHA256SUMS`, and Candidate integrity metadata | Implemented; external GitHub attestation is not required |
 | Workflow status / GitHub API readiness gate | `scripts/diagnostics/production_release_authority.py` and local evidence validation | Implemented; no API call |
 | CI browser fixture consumed by production | Transferred local-release evidence as a non-production input; real Candidate browser validation remains manual on VFOS | Implemented; local evidence never masquerades as a production gate |
-| Python 3.6 and MariaDB 5.5 CI lane | `scripts/release/local_compatibility_gate.py` with digest-pinned Docker images | Implemented; must be verified before release readiness |
-| R8 exact-revision performance lane | Existing exact-revision producer/join tools run from a local clean checkout | Local replacement retained; workflow retirement waits for verification |
+| Python 3.6 and MariaDB 5.5 CI lane | `scripts/release/compatibility_surface.py` plus `scripts/release/local_compatibility_gate.py` with digest-pinned Docker images | Implemented; reports `PASS`, `NOT_APPLICABLE`, `DEFERRED_TO_TARGET_RUNTIME`, or `FAIL` |
+| R8 exact-revision performance lane | Existing exact-revision producer/join tools run from a local clean checkout | Local replacement retained; GitHub workflow retired |
 | Independent evidence platform | Offline evidence directory and detached hashes | Implemented |
 
 The local gate does not contact GitHub, download Internet resources, access
@@ -76,24 +76,34 @@ valid operator for a new source revision.
 
 ## Compatibility behavior
 
-`local_compatibility_gate.py` uses these fixed image references:
+`local_compatibility_gate.py` uses these fixed image references when the
+corresponding surface is changed:
 
 ```text
 python@sha256:f8652afaf88c25f0d22354d547d892591067aa4026a7fa9a6819df9f300af6fc
 mariadb@sha256:8665c074af5a5fb7e04b9570fcf8551e9d82955182be50375d5013838d4f9137
 ```
 
-The Python lane compiles/imports the release tooling under Python 3.6. The
-MariaDB lane executes disposable grant/revoke/cleanup checks only. If Docker
-or its daemon is unavailable, the result is explicitly:
+The compatibility surface classifier decides whether each lane applies. A
+MariaDB lane is `NOT_APPLICABLE` when no DB-sensitive production surface was
+changed. A changed production-executed Python surface is checked with Python
+3.6; if neither Docker nor a local Python 3.6 interpreter is available, it is
+reported as `DEFERRED_TO_TARGET_RUNTIME`. A changed DB-sensitive surface is
+similarly deferred when no disposable MariaDB 5.5 runtime is available. The
+four-state result is explicit:
 
 ```text
-LOCAL_COMPATIBILITY_GATE=NOT_VERIFIED
-PYTHON36_COMPAT=NOT_VERIFIED
-MARIADB55_COMPAT=NOT_VERIFIED
+PASS
+NOT_APPLICABLE
+DEFERRED_TO_TARGET_RUNTIME
+FAIL
 ```
 
-That result is fail-closed and cannot produce release readiness.
+`DEFERRED_TO_TARGET_RUNTIME` permits isolated Candidate staging only. It sets
+`READY_FOR_MANUAL_VFOS_COMPATIBILITY_PREFLIGHT=YES`, but publication and
+cutover remain blocked until the target runtime preflight passes. A runtime
+`FAIL` exits closed and permits no Candidate publication or production
+mutation. Local release evidence never turns a deferred check into a pass.
 
 ## Production boundary
 
@@ -111,14 +121,13 @@ production facts.
 
 ## Workflow retirement and stale runs
 
-The five existing `.github/workflows/` files are retained until the local
-compatibility and other replacement checks are actually verified PASS. Their
-presence is reported as legacy workflow residue and prevents strict
-`LOCAL_FIRST_AUTHORITY_READY` until the retirement commit is safe. They are
-not consulted for current trust or readiness.
+The five former `.github/workflows/` files have been retired after the local
+replacement contract and targeted regressions were added. The directory is
+not a current release input. If a workflow file is reintroduced, the static
+authority diagnostic reports `GITHUB_WORKFLOW_RESIDUE=YES` and strict
+`LOCAL_FIRST_AUTHORITY_READY` becomes `NO`.
 
 The stale workflow run `34938889492` is legacy infrastructure residue. It is
 not queried, cancelled, or used as a release prerequisite. Even if it starts,
 the current policy gives it no authority to create a Current Production
 Candidate.
-

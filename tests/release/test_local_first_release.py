@@ -7,6 +7,22 @@ from unittest import mock
 
 
 class LocalFirstReleaseTest(unittest.TestCase):
+    def test_github_actions_workflows_are_retired(self):
+        from scripts.diagnostics.production_release_authority import evaluate
+
+        for relative in (
+                ".github/workflows/ci.yml",
+                ".github/workflows/trusted-candidate-builder.yml",
+                ".github/workflows/trusted-production-candidate-builder.yml",
+                ".github/workflows/r8-production-compat-regression.yml",
+                ".github/workflows/r8-release-performance.yml"):
+            with self.subTest(path=relative):
+                self.assertFalse(os.path.exists(relative))
+
+        contract = evaluate(os.getcwd())
+        self.assertEqual(contract["GITHUB_WORKFLOW_RESIDUE"], "NO")
+        self.assertEqual(contract["LOCAL_FIRST_AUTHORITY_READY"], "YES")
+
     def test_production_authority_is_offline_and_has_no_github_readiness_dependency(self):
         from scripts.diagnostics.production_release_authority import (
             evaluate, render_contract,
@@ -24,7 +40,7 @@ class LocalFirstReleaseTest(unittest.TestCase):
         self.assertIn("GITHUB_SOURCE_REPOSITORY_ONLY=YES", rendered)
         self.assertIn("STALE_GITHUB_WORKFLOW_AFFECTS_RELEASE=NO", rendered)
 
-    def test_release_readiness_local_first_blocks_legacy_workflow_residue(self):
+    def test_release_readiness_local_first_reports_current_authority(self):
         from scripts.diagnostics.release_readiness import build
 
         result = build(
@@ -32,10 +48,14 @@ class LocalFirstReleaseTest(unittest.TestCase):
             dod_status={}, local_first=True,
         )
         self.assertEqual(result["status"], "NOT_READY")
-        self.assertTrue(any(
+        self.assertFalse(any(
             item.get("type") == "production_release_authority"
             for item in result["blockers"]
         ))
+        self.assertEqual(
+            result["production_release_authority"]["GITHUB_WORKFLOW_RESIDUE"],
+            "NO",
+        )
 
     def test_evidence_manifest_detects_tampered_json(self):
         from scripts.release.local_release_gate import (
@@ -83,6 +103,7 @@ class LocalFirstReleaseTest(unittest.TestCase):
         for required in (
                 "scripts/release/local_release_gate.py",
                 "scripts/release/local_compatibility_gate.py",
+                "scripts/release/compatibility_surface.py",
                 "scripts/diagnostics/production_release_authority.py"):
             self.assertIn("required_file:" + required, names)
         self.assertIn("generic_offline_source_transfer", names)
