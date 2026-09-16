@@ -129,6 +129,10 @@ class VNextCodeDetailService(object):
         entry = cache.pop(key, None)
         if entry is None:
             return None
+        if cache_name == "identity" and isinstance(key, tuple) and key:
+            base_key = key[0]
+            if self._identity_index.get(base_key) == key:
+                self._identity_index.pop(base_key, None)
         value, size = entry
         self._set_cache_bytes_for(
             cache_name, self._cache_bytes_for(cache_name) - int(size)
@@ -361,8 +365,7 @@ class VNextCodeDetailService(object):
                         self._identity_cache, full_key, result, "identity",
                         self.max_identity_entries, self.max_identity_bytes,
                     )
-                    if (full_key in self._identity_cache or
-                            self.max_identity_bytes <= 0):
+                    if full_key in self._identity_cache:
                         self._identity_index[base_key] = full_key
                     current = self._identity_inflight.pop(base_key, None)
                     if current is not None:
@@ -504,11 +507,19 @@ class VNextCodeDetailService(object):
             overlay_bytes = self._overlay_cache_bytes
             process_bytes = self._process_cache_budget.current_bytes()
             cache_metrics = dict(self._metrics)
+            identity_index_entries = len(self._identity_index)
+            identity_index_orphans = sum(
+                1 for full_key in self._identity_index.values()
+                if full_key not in self._identity_cache
+            )
         return {
             "identity_cache_entries": identity_count,
             "max_identity_entries": self.max_identity_entries,
             "identity_cache_bytes": identity_bytes,
             "max_identity_bytes": self.max_identity_bytes,
+            "identity_index_entries": identity_index_entries,
+            "max_identity_index_entries": self.max_identity_entries,
+            "identity_index_orphan_entries": identity_index_orphans,
             "overlay_cache_entries": overlay_count,
             "max_overlay_entries": self.max_overlay_entries,
             "overlay_cache_bytes": overlay_bytes,

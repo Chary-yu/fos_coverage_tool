@@ -17,7 +17,7 @@ completed skill execution.
 | FOS-006 | P2 | Change Review | CONFIRMED: `execute` and `executemany` shared one `db_query_count`, while returned and affected rows were not separately named from server-examined rows. | FIXED_VERIFIED | Real driver/session statement count remains pending. |
 | FOS-007 | P2 | Change Review | CONFIRMED: inheritance recorded all predecessor active relations even for unready repositories or missing candidate files, then publication replayed the full predecessor set. | FIXED_VERIFIED | Large-scope checkpoint measurement remains pending. |
 | FOS-008 | P1 | Change Review | CONFIRMED: orphan query considered only LineLink references and the candidate gate consumed the global count, ignoring historical Block/rejection references. | FIXED_VERIFIED | Historical production data acceptance remains pending. |
-| FOS-009 | P2 | Runtime Reliability | CONFIRMED: LRU removal does not remove `_identity_index`; an oversize/disabled store can index a non-existent cache entry. | BLOCKED | Remediation in progress; long-running RSS workload remains pending. |
+| FOS-009 | P2 | Runtime Reliability | CONFIRMED: LRU removal did not remove `_identity_index`; an oversize/disabled store could index a non-existent cache entry. | FIXED_VERIFIED | Long-running RSS workload remains pending. |
 
 UNCLASSIFIED: 0
 
@@ -162,3 +162,19 @@ The following fields are updated after each root-cause commit:
 - Commit SHA: pending focused commit.
 - Status: FIXED_VERIFIED
 - Remaining Evidence: large production-like source-scope checkpoint size and validation timing require a fixed workload measurement; no production data was used.
+
+### FOS-009
+
+- Original Severity: P2
+- Original Root Cause: `_remove_service_entry_locked` released identity cache bytes without removing the matching `_identity_index` entry, and `_identity` indexed a full key even when its cache entry was bypassed by a zero/oversize budget.
+- Current Revalidation Result: CONFIRMED at the start of Phase 2; the LRU and exact-removal regressions failed because evicted identity keys remained in the auxiliary index.
+- Root Owner: Runtime Reliability
+- Changed Files: `app/code_detail/vnext_service.py`, `tests/vnext/test_identity_cache_index_budget.py`
+- Changed Functions: `VNextCodeDetailService._remove_service_entry_locked`, `_identity`, `metrics`
+- Regression Test: `test_identity_index_is_evicted_with_lru_entry`, `test_identity_entry_removal_cleans_exact_index_mapping` — PASS; index entries remain one-to-one with cached identity entries and cleanup is exact.
+- Integration Test: `python3 -m unittest -v tests.vnext.test_identity_cache_index_budget` — PASS (2 tests).
+- Browser Test: NOT_RUN; the invariant is internal cache ownership and no UI code changed.
+- Compatibility Check: identity cache lookup still uses the existing base/full identity and freshness CAS; only stale auxiliary mappings are removed, and cache metrics are additive.
+- Commit SHA: pending focused commit.
+- Status: FIXED_VERIFIED
+- Remaining Evidence: long-running RSS/key-cardinality workload under production-scale identity diversity remains pending; no memory-growth percentage is claimed.
