@@ -1,0 +1,7 @@
+FOS R8 remediation evidence artifact inventory
+Scope: small repository-side evidence records produced by the offline remediation pass.
+Large production payloads, Candidate payloads, and pre-existing operator files are excluded.
+
+b2108d9624539b53bf707ce42a699f0b3c4d4c56245efa663b79a1da9c6450f6  FOS_REMEDIATION_EXECUTION_72656c2654a85e5f8027f2a643bf71ee9135ce65.md
+18fcfb4c4daf1abdc4b89d2a2971a0fa2759dfda9f831e3067d177ecb55817b2  FOS_REMEDIATION_LEDGER.md
+424d72722755887a8719afa211b4e9afe92a19db78fc248e502257dc817a2684  docs/superpowers/plans/2026-09-16-fos-audit-remediation.md
