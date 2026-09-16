@@ -1,6 +1,8 @@
 import base64
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -59,6 +61,20 @@ class LocalFirstReleaseTest(unittest.TestCase):
         ):
             with self.subTest(field=field):
                 self.assertNotIn(field, upgrade)
+
+    def test_canonical_operator_generator_supports_direct_script_invocation(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "scripts/release/generate_flat_production_candidate_operator.py",
+                "--help",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("--release-input-manifest", completed.stdout)
 
     def test_release_readiness_local_first_reports_current_authority(self):
         from scripts.diagnostics.release_readiness import build

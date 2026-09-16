@@ -16,7 +16,13 @@ import hashlib
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
+
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
 
 from scripts.release.release_input_manifest import (
     canonical_json_bytes,
@@ -26,7 +32,6 @@ from scripts.release.release_input_manifest import (
 )
 
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 RUNTIME_PATH = os.path.join(
     ROOT, "scripts", "release", "flat_candidate_operator_runtime.py"
 )

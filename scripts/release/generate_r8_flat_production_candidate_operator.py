@@ -9,6 +9,13 @@ source, baseline, host, or tooling identities.
 
 from __future__ import print_function
 
+import os
+import sys
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+
 from scripts.release.generate_flat_production_candidate_operator import generate
 
 
@@ -38,5 +45,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(main())
