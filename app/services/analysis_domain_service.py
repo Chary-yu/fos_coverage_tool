@@ -28,12 +28,35 @@ class AnalysisDomainService(object):
               AND (r.id IS NULL OR l.id IS NULL OR f.id IS NULL
                    OR f.scan_id<>q.scan_id)
         """.format(scope=scope), scope_params)
-        orphan_records = fetchone(connection, """
-            SELECT COUNT(*) AS total
+        record_references = fetchone(connection, """
+            SELECT
+                COALESCE(SUM(CASE WHEN q.analysis_record_id IS NULL AND
+                                      b.originating_record_id IS NULL AND
+                                      x.rejected_analysis_record_id IS NULL
+                                  THEN 1 ELSE 0 END), 0)
+                    AS truly_unreferenced,
+                COALESCE(SUM(CASE WHEN q.analysis_record_id IS NULL AND
+                                      (b.originating_record_id IS NOT NULL OR
+                                       x.rejected_analysis_record_id IS NOT NULL)
+                                  THEN 1 ELSE 0 END), 0)
+                    AS historical_referenced,
+                COALESCE(SUM(CASE WHEN q.analysis_record_id IS NULL THEN 1 ELSE 0 END), 0)
+                    AS not_linked_to_line
             FROM coverage_analysis_records r
-            LEFT JOIN coverage_analysis_line_links q ON q.analysis_record_id=r.id
-            WHERE q.id IS NULL
-        """)
+            LEFT JOIN (
+                SELECT DISTINCT analysis_record_id
+                FROM coverage_analysis_line_links
+            ) q ON q.analysis_record_id=r.id
+            LEFT JOIN (
+                SELECT DISTINCT originating_record_id
+                FROM coverage_analysis_blocks
+                WHERE originating_record_id IS NOT NULL
+            ) b ON b.originating_record_id=r.id
+            LEFT JOIN (
+                SELECT DISTINCT rejected_analysis_record_id
+                FROM coverage_inheritance_rejections
+            ) x ON x.rejected_analysis_record_id=r.id
+        """) or {}
         cross_scan_blocks = fetchone(connection, """
             SELECT COUNT(*) AS total
             FROM coverage_analysis_blocks b
@@ -59,7 +82,8 @@ class AnalysisDomainService(object):
                     l.id IS NULL OR f.id IS NULL OR f.scan_id<>q.scan_id
                     OR (b.id IS NOT NULL AND
                         (b.scan_id<>q.scan_id OR b.file_id<>l.file_id OR
-                         b.start_line<1 OR b.end_line<b.start_line))
+                         b.start_line<1 OR b.end_line<b.start_line OR
+                         l.line_number<b.start_line OR l.line_number>b.end_line))
                     OR (q.inheritance_group_id IS NOT NULL AND
                         (g.id IS NULL OR g.candidate_scan_id<>q.scan_id OR
                          g.candidate_file_id<>l.file_id OR
@@ -118,7 +142,17 @@ class AnalysisDomainService(object):
         """)
         counts = {
             "orphan_links": int((orphan_links or {}).get("total") or 0),
-            "orphan_records": int((orphan_records or {}).get("total") or 0),
+            # ``orphan_records`` is retained as the compatibility alias for
+            # the genuinely unreferenced subset. Historical Block/rejection
+            # references are valid audit graph edges even without a current
+            # LineLink.
+            "orphan_records": int(record_references.get("truly_unreferenced") or 0),
+            "not_linked_to_current_line": int(
+                record_references.get("not_linked_to_line") or 0
+            ),
+            "historical_referenced_records": int(
+                record_references.get("historical_referenced") or 0
+            ),
             "cross_scan_blocks": int((cross_scan_blocks or {}).get("total") or 0),
             "duplicate_current_links": int((duplicate_links or {}).get("total") or 0),
             "link_identity_mismatches": int((link_identity or {}).get("total") or 0),
@@ -127,8 +161,26 @@ class AnalysisDomainService(object):
             "rejection_identity_mismatches": int((rejection_identity or {}).get("total") or 0),
             "duplicate_active_rejections": int((duplicate_rejections or {}).get("total") or 0),
         }
-        return {"status": "PASSED" if not any(counts.values()) else "FAILED",
-                "checks": counts, "scan_id": scan_id}
+        diagnostic_only = {
+            "not_linked_to_current_line", "historical_referenced_records",
+        }
+        global_blocking = {
+            key: value for key, value in counts.items()
+            if key not in diagnostic_only
+        }
+        # Historical graph hygiene is reported globally, but a candidate
+        # consistency gate must not fail because of an unrelated truly
+        # unreferenced record that cannot affect this Scan. Link/block/review
+        # identity checks remain scoped by the candidate scan above.
+        if scan_id is not None:
+            global_blocking.pop("orphan_records", None)
+        global_status = "PASSED" if not any(counts.values()) else "FAILED"
+        return {
+            "status": "PASSED" if not any(global_blocking.values()) else "FAILED",
+            "global_status": global_status,
+            "checks": counts,
+            "scan_id": scan_id,
+        }
 
     def read_line(self, connection, scan_id, line_id):
         return self.repository.read_line(connection, scan_id, line_id)

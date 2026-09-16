@@ -151,6 +151,33 @@ class AnalysisDomainTest(unittest.TestCase):
         self.connection.commit()
         self.assertEqual(service.audit_consistency(self.connection)["status"], "FAILED")
 
+    def test_consistency_audit_counts_historical_block_reference_as_live_identity(self):
+        domain = AnalysisDomainService().repository
+        record = domain.create_record(
+            self.connection, {"status": "可覆盖"}, origin="MANUAL"
+        )
+        block = domain.create_block(
+            self.connection, self.scan["id"], self.file_id, 10, 10,
+            record_id=record["id"], verified=True,
+        )
+        self.assertEqual(block["originating_record_id"], record["id"])
+        audit = AnalysisDomainService().audit_consistency(self.connection)
+        self.assertEqual(audit["checks"]["orphan_records"], 0)
+        self.assertEqual(audit["checks"]["historical_referenced_records"], 1)
+
+    def test_scoped_consistency_gate_ignores_unrelated_true_orphan(self):
+        domain = AnalysisDomainService().repository
+        domain.create_record(self.connection, {"status": "未确认"}, origin="MANUAL")
+        global_audit = AnalysisDomainService().audit_consistency(self.connection)
+        scoped_audit = AnalysisDomainService().audit_consistency(
+            self.connection, scan_id=self.scan["id"]
+        )
+        self.assertEqual(global_audit["status"], "FAILED")
+        self.assertEqual(global_audit["checks"]["orphan_records"], 1)
+        self.assertEqual(scoped_audit["status"], "PASSED")
+        self.assertEqual(scoped_audit["checks"]["orphan_records"], 1)
+        self.assertEqual(scoped_audit["global_status"], "FAILED")
+
     def test_shared_record_partial_edit_splits_only_selected_line(self):
         service = AnalysisService()
         service.save(
