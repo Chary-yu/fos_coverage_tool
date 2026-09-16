@@ -201,6 +201,40 @@ class PerformanceObservabilityTest(unittest.TestCase):
         self.assertEqual(counters["db_rows_affected"], 2)
         self.assertEqual(counters["db_rows"], 4)
 
+    def test_db_metrics_distinguish_api_calls_statements_and_row_semantics(self):
+        collector = PerformanceEvidenceCollector(
+            {"commit_sha": "i" * 40, "build_id": "build"},
+            workload_id="db-metric-semantics-fixture",
+        )
+        raw = sqlite3.connect(":memory:")
+        self.addCleanup(raw.close)
+        connection = instrument_connection(raw, collector)
+        with bind_collector(collector):
+            cursor = connection.cursor()
+            cursor.execute("CREATE TABLE fixture (value INTEGER)")
+            cursor.executemany(
+                "INSERT INTO fixture VALUES (?)", [(1,), (2,)]
+            )
+            cursor.execute("SELECT * FROM fixture")
+            self.assertEqual(cursor.fetchall(), [(1,), (2,)])
+            cursor.close()
+        evidence = collector.snapshot("db-metric-semantics-fixture")
+        counters = evidence["counters"]
+        self.assertEqual(counters["db_api_call_count"], 3)
+        self.assertEqual(counters["db_statement_count"], 2)
+        self.assertEqual(counters["db_statement_count_unverified"], 1)
+        self.assertEqual(counters["db_rows_returned"], 2)
+        self.assertEqual(counters["db_rows_affected"], 2)
+        self.assertEqual(counters["db_rows"], 4)
+        self.assertEqual(
+            evidence["measurement_scope"]["db_round_trip_count"],
+            "NOT_MEASURED",
+        )
+        self.assertEqual(
+            evidence["measurement_scope"]["db_rows_examined"],
+            "NOT_MEASURED",
+        )
+
     def test_buffered_select_rowcount_is_not_counted_as_affected_rows(self):
         class BufferedCursor(object):
             def __init__(self):

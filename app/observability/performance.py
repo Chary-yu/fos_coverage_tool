@@ -87,7 +87,8 @@ class InstrumentedCursor(object):
             collector = self._active_collector()
             if collector is not None:
                 collector.record_db_query(
-                    (time.perf_counter() - started) * 1000.0
+                    (time.perf_counter() - started) * 1000.0,
+                    method=method,
                 )
 
     def execute(self, *args, **kwargs):
@@ -206,7 +207,8 @@ class InstrumentedConnection(object):
             collector = self._active_collector()
             if collector is not None:
                 collector.record_db_query(
-                    (time.perf_counter() - started) * 1000.0
+                    (time.perf_counter() - started) * 1000.0,
+                    method="executescript",
                 )
         if getattr(result, "_performance_instrumented", False):
             return result
@@ -232,6 +234,7 @@ def instrument_connection(connection, collector=None):
 
 class PerformanceEvidenceCollector(object):
     SCHEMA_VERSION = 2
+    METRICS_SCHEMA_VERSION = 1
 
     def __init__(self, release_identity=None, project_id=None, scan_id=None,
                  workload_id="runtime"):
@@ -249,7 +252,13 @@ class PerformanceEvidenceCollector(object):
         self._error_class = ""
         self._counters = {
             "request_count": 0, "request_bytes": 0, "response_bytes": 0,
-            "db_query_count": 0, "db_rows": 0, "db_rows_read": 0,
+            # db_query_count is retained as the historical DB-API operation
+            # alias. It is deliberately not presented as physical SQL or a
+            # network round-trip count.
+            "db_query_count": 0, "db_api_call_count": 0,
+            "db_statement_count": 0,
+            "db_statement_count_unverified": 0,
+            "db_rows": 0, "db_rows_read": 0, "db_rows_returned": 0,
             "db_rows_affected": 0, "db_time_ms": 0.0,
             "git_subprocess_count": 0, "git_bytes_read": 0,
             "bytes_read": 0, "bytes_written": 0,
@@ -422,8 +431,16 @@ class PerformanceEvidenceCollector(object):
         self.increment("response_bytes", int(response_bytes or 0))
         self.observe_duration("http_request", float(elapsed_ms or 0.0))
 
-    def record_db_query(self, elapsed_ms=0.0):
+    def record_db_query(self, elapsed_ms=0.0, method="execute"):
         self.increment("db_query_count")
+        self.increment("db_api_call_count")
+        if str(method or "execute").lower() == "execute":
+            self.increment("db_statement_count")
+        else:
+            # executemany/executescript may expand to multiple server-side
+            # statements. The wrapper knows the API call, not that physical
+            # expansion, so keep it explicitly outside the verified count.
+            self.increment("db_statement_count_unverified")
         self.increment("db_time_ms", float(elapsed_ms or 0.0))
 
     def record_db_rows(self, count):
@@ -433,6 +450,7 @@ class PerformanceEvidenceCollector(object):
     def record_db_rows_read(self, count):
         value = int(count or 0)
         self.increment("db_rows_read", value)
+        self.increment("db_rows_returned", value)
         self.increment("db_rows", value)
 
     def record_db_rows_affected(self, count):
@@ -503,6 +521,16 @@ class PerformanceEvidenceCollector(object):
             "operation": str(operation or "runtime"),
             "elapsed_ms": elapsed_ms,
             "peak_rss_bytes": _peak_rss_bytes(),
+            "performance_metrics_schema_version": self.METRICS_SCHEMA_VERSION,
+            "measurement_scope": {
+                "db_api_call_count": "DB-API execute/executemany/executescript calls",
+                "db_statement_count": "verified execute API calls only",
+                "db_statement_count_unverified": "executemany/executescript calls with unknown physical expansion",
+                "db_rows_returned": "rows returned by fetch/iteration",
+                "db_rows_affected": "driver rowcount for non-result statements",
+                "db_rows_examined": "NOT_MEASURED",
+                "db_round_trip_count": "NOT_MEASURED",
+            },
             "counters": counters,
             "durations": durations,
             "scan_phases": phases,

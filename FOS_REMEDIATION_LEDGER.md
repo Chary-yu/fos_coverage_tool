@@ -14,7 +14,7 @@ completed skill execution.
 | FOS-003 | P1 | Runtime Reliability | CONFIRMED: generic `JobRepository.upsert` updated by `job_id` only and runner heartbeat could race terminal persistence. | FIXED_VERIFIED | MariaDB driver-level concurrency evidence remains pending. |
 | FOS-004 | P1 | Runtime Reliability | CONFIRMED structural gap / NEEDS_EXTERNAL_EVIDENCE for real dual-connection MariaDB ordering: analysis/review/publication paths lacked a shared project-state lock boundary. | PRODUCTION_ACCEPTANCE_PENDING | Source lock boundary is fixed and tested; disposable MariaDB/production-like concurrency run remains external. |
 | FOS-005 | P2 | Change Review | CONFIRMED: affected-file path rebased every `coverage_file_state` row and validated a full authoritative fact aggregate inside the mutation transaction. | FIXED_VERIFIED | Fixed-hardware workload measurement remains pending. |
-| FOS-006 | P2 | Change Review | CONFIRMED: `execute` and `executemany` share one `db_query_count`, while returned and affected rows are not separately named from server-examined rows. | BLOCKED | Remediation in progress; real driver/session statement count remains pending. |
+| FOS-006 | P2 | Change Review | CONFIRMED: `execute` and `executemany` shared one `db_query_count`, while returned and affected rows were not separately named from server-examined rows. | FIXED_VERIFIED | Real driver/session statement count remains pending. |
 | FOS-007 | P2 | Change Review | CONFIRMED: inheritance records all predecessor active relations even for unready repositories or missing candidate files, then publication replays the full predecessor set. | BLOCKED | Remediation in progress; large-scope checkpoint measurement remains pending. |
 | FOS-008 | P1 | Change Review | CONFIRMED: orphan query considered only LineLink references and the candidate gate consumed the global count, ignoring historical Block/rejection references. | FIXED_VERIFIED | Historical production data acceptance remains pending. |
 | FOS-009 | P2 | Runtime Reliability | CONFIRMED: LRU removal does not remove `_identity_index`; an oversize/disabled store can index a non-existent cache entry. | BLOCKED | Remediation in progress; long-running RSS workload remains pending. |
@@ -130,3 +130,19 @@ The following fields are updated after each root-cause commit:
 - Commit SHA: `be07fb1`
 - Status: FIXED_VERIFIED
 - Remaining Evidence: historical production data and the full migration/legacy semantic corpus remain production acceptance evidence, not local proof.
+
+### FOS-006
+
+- Original Severity: P2
+- Original Root Cause: the instrumentation collapsed DB-API `execute` and `executemany` into one query counter and used names that could be mistaken for physical statements, network round trips, or server-examined rows.
+- Current Revalidation Result: CONFIRMED at the start of Phase 3; the new metric-semantics regression initially failed because the new counters and measurement scope were absent.
+- Root Owner: Change Review
+- Changed Files: `app/observability/performance.py`, `tests/vnext/test_performance_observability.py`
+- Changed Functions: `InstrumentedCursor._query`, `InstrumentedConnection.executescript`, `PerformanceEvidenceCollector.record_db_query`, `record_db_rows_read`, `snapshot`
+- Regression Test: `test_db_metrics_distinguish_api_calls_statements_and_row_semantics` — PASS; execute calls, executemany calls, returned rows and affected rows are separated, while round trips and server-examined rows are explicitly `NOT_MEASURED`.
+- Integration Test: `python3 -m unittest -v tests.vnext.test_performance_observability` — PASS (9 tests).
+- Browser Test: NOT_RUN; this is instrumentation semantics and no UI code changed.
+- Compatibility Check: `db_query_count`, `db_rows`, `db_rows_read` and `db_rows_affected` remain available; the evidence schema version remains compatible and the additive metrics have their own version/scope declaration.
+- Commit SHA: pending focused commit.
+- Status: FIXED_VERIFIED
+- Remaining Evidence: actual PyMySQL/MariaDB session statement expansion, server rows examined, and network round trips require a disposable matching driver/database; no production/network-log claim is made.
