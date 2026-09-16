@@ -41,6 +41,7 @@ _LOCAL_ONLY_PYTHON_PATHS = (
     "scripts/release/local_release_gate.py",
     "scripts/release/generate_flat_production_candidate_operator.py",
     "scripts/release/generate_r8_flat_production_candidate_operator.py",
+    "scripts/release/generate_vfos_compatibility_preflight.py",
 )
 
 # A path in these areas is DB-sensitive even if a particular change is only

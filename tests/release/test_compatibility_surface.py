@@ -135,6 +135,25 @@ class CompatibilitySurfaceTest(unittest.TestCase):
         self.assertEqual(result["python"]["status"], "NOT_PRODUCTION_PYTHON")
         self.assertEqual(result["mariadb"]["status"], "NOT_DB_SENSITIVE")
 
+    def test_vfos_preflight_tool_is_not_production_db_surface(self):
+        from scripts.release.compatibility_surface import (
+            classify_compatibility_surface,
+        )
+
+        root, baseline, source = self._repo(
+            {"scripts/release/generate_vfos_compatibility_preflight.py":
+             "def check():\n    return True\n"},
+            {"scripts/release/generate_vfos_compatibility_preflight.py":
+             "def check():\n    return 'MariaDB mysql PyMySQL'\n"},
+        )
+        try:
+            result = classify_compatibility_surface(root, source, baseline)
+        finally:
+            import shutil
+            shutil.rmtree(root)
+        self.assertEqual(result["python"]["status"], "NOT_PRODUCTION_PYTHON")
+        self.assertEqual(result["mariadb"]["status"], "NOT_DB_SENSITIVE")
+
     def test_documentation_about_mariadb_is_not_db_surface(self):
         from scripts.release.compatibility_surface import (
             classify_compatibility_surface,
