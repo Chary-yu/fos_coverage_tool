@@ -6,6 +6,9 @@ import tempfile
 import unittest
 
 import app.candidate_artifact as candidate_artifact
+from scripts.release.release_input_manifest import (
+    build_release_input_manifest, release_input_manifest_sha256,
+)
 from app.candidate_artifact import (
     CandidateArtifactManifest, OFFLINE_OPERATOR_PROVENANCE_CLASS,
     PRODUCTION_PROJECT_NAME, PRODUCTION_RELEASE_ARTIFACT_ROLE,
@@ -156,6 +159,54 @@ class OfflineOperatorTrustTest(unittest.TestCase):
             verify_offline_operator_trust(
                 candidate, identity, manifest, source, evidence=evidence,
                 source_bundle_path=other_bundle,
+            )
+
+    def test_release_input_manifest_binds_all_offline_trust_inputs(self):
+        root, source, candidate, identity, manifest, evidence = self._fixture()
+        input_manifest = build_release_input_manifest({
+            "schema_version": 1,
+            "repository": evidence["repository"],
+            "source_commit_sha": evidence["commit_sha"],
+            "source_tree_sha": evidence["tree_sha"],
+            "source_bundle_sha256": evidence["source_bundle_sha256"],
+            "tooling_commit_sha": "5" * 40,
+            "tooling_tree_sha": "6" * 40,
+            "tooling_bundle_sha256": "7" * 64,
+            "production_host": evidence["production_host"],
+            "baseline_commit_sha": evidence["production_baseline_sha"],
+            "baseline_attempt_id": "offline-baseline-1",
+            "baseline_tree_sha256": "8" * 64,
+            "baseline_manifest_sha256": "9" * 64,
+            "baseline_adoption_identity_sha256": "a" * 64,
+            "project_name": PRODUCTION_PROJECT_NAME,
+            "candidate_parent": os.path.join(root.name, "candidate-parent"),
+            "release_trust_mode": RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+            "validation_session_id": evidence["validation_session_id"],
+        })
+        input_manifest_sha = release_input_manifest_sha256(input_manifest)
+        evidence = dict(evidence,
+                        release_input_manifest_sha256=input_manifest_sha,
+                        tooling_commit_sha=input_manifest["tooling_commit_sha"],
+                        tooling_tree_sha=input_manifest["tooling_tree_sha"],
+                        tooling_bundle_sha256=input_manifest["tooling_bundle_sha256"])
+        result = verify_offline_operator_trust(
+            candidate, identity, manifest, source, evidence=evidence,
+            source_bundle_path=evidence["source_bundle_path"],
+            expected_repository=evidence["repository"],
+            expected_production_host=evidence["production_host"],
+            expected_production_baseline_sha=evidence["production_baseline_sha"],
+            expected_validation_session_id=evidence["validation_session_id"],
+            release_input_manifest=input_manifest,
+            release_input_manifest_sha256=input_manifest_sha,
+        )
+        self.assertEqual(result["release_input_manifest_sha256"], input_manifest_sha)
+        tampered = dict(input_manifest, production_host="other-host")
+        with self.assertRaisesRegex(ValueError, "manifest SHA256 mismatch"):
+            verify_offline_operator_trust(
+                candidate, identity, manifest, source, evidence=evidence,
+                source_bundle_path=evidence["source_bundle_path"],
+                release_input_manifest=tampered,
+                release_input_manifest_sha256=input_manifest_sha,
             )
 
 

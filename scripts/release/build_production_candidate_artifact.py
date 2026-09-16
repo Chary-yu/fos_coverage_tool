@@ -483,7 +483,8 @@ def _reject_validation_fixture(candidate_root):
 def _offline_operator_evidence(
         candidate_root, provenance, candidate_manifest, output_path, source_bundle_path,
         repository, production_host, production_baseline_sha,
-        validation_session_id):
+        validation_session_id, release_input_manifest_path="",
+        release_input_manifest_sha256=""):
     """Write the explicit operator trust record after Candidate hashing.
 
     The evidence is intentionally external to the Candidate tree: the
@@ -514,6 +515,29 @@ def _offline_operator_evidence(
     output_path = os.path.abspath(str(output_path))
     if candidate_root and _inside(candidate_root, output_path):
         raise ValueError("offline operator evidence must be outside Candidate root")
+    input_manifest = None
+    input_manifest_digest = ""
+    if release_input_manifest_path:
+        from scripts.release.release_input_manifest import (
+            load_release_input_manifest, release_input_manifest_sha256 as
+            compute_release_input_manifest_sha256,
+        )
+        input_manifest = load_release_input_manifest(
+            release_input_manifest_path,
+            expected_sha256=release_input_manifest_sha256 or None,
+        )
+        input_manifest_digest = compute_release_input_manifest_sha256(input_manifest)
+        if input_manifest.get("source_commit_sha") != \
+                str(provenance.get("source_commit_sha") or "").lower() or \
+                input_manifest.get("source_tree_sha") != \
+                str(provenance.get("source_tree_sha") or "").lower():
+            raise ValueError("release input manifest source identity does not match build")
+        if input_manifest.get("repository") != str(repository).strip() or \
+                input_manifest.get("production_host") != str(production_host).strip() or \
+                input_manifest.get("baseline_commit_sha") != production_baseline_sha or \
+                (input_manifest.get("validation_session_id") and
+                 input_manifest.get("validation_session_id") != str(validation_session_id).strip()):
+            raise ValueError("release input manifest release identity does not match build")
     evidence = {
         "schema_version": 1,
         "release_trust_mode": RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
@@ -533,6 +557,16 @@ def _offline_operator_evidence(
         "protected_builder": "SKIPPED_BY_OPERATOR",
         "offline_operator_source_integrity": "PASSED",
     }
+    if input_manifest is not None:
+        evidence.update({
+            "release_input_manifest_path": os.path.abspath(
+                str(release_input_manifest_path)
+            ),
+            "release_input_manifest_sha256": input_manifest_digest,
+            "tooling_commit_sha": input_manifest["tooling_commit_sha"],
+            "tooling_tree_sha": input_manifest["tooling_tree_sha"],
+            "tooling_bundle_sha256": input_manifest["tooling_bundle_sha256"],
+        })
     _write_json(output_path, evidence)
     return output_path, evidence
 
@@ -547,7 +581,8 @@ def build_production_candidate(
         release_trust_mode=CURRENT_PRODUCTION_RELEASE_TRUST_MODE,
         offline_operator_evidence_output="", offline_operator_source_bundle="",
         offline_operator_repository="", production_host="",
-        production_baseline_sha="", validation_session_id=""):
+        production_baseline_sha="", validation_session_id="",
+        release_input_manifest_path="", release_input_manifest_sha256=""):
     """Create and validate one production-role Candidate artifact."""
     release_trust_mode = assert_current_production_trust_mode(
         release_trust_mode, operation="production Candidate build"
@@ -661,6 +696,7 @@ def build_production_candidate(
             candidate_root, provenance, manifest, offline_operator_evidence_output,
             offline_operator_source_bundle, offline_operator_repository,
             production_host, production_baseline_sha, validation_session_id,
+            release_input_manifest_path, release_input_manifest_sha256,
         )
         verify_current_production_candidate_trust(
             release_trust_mode, candidate_root, identity, manifest,
@@ -670,6 +706,9 @@ def build_production_candidate(
             expected_production_host=production_host,
             expected_production_baseline_sha=production_baseline_sha,
             expected_validation_session_id=validation_session_id,
+            release_input_manifest=release_input_manifest_path or None,
+            release_input_manifest_sha256=release_input_manifest_sha256 or
+            (offline_evidence.get("release_input_manifest_sha256") or ""),
         )
     # This is a pre-publication validation only.  It does not write a release
     # manifest into the Candidate and therefore cannot create a CURRENT.
@@ -751,6 +790,8 @@ def main(argv=None):
     parser.add_argument("--production-host", default="")
     parser.add_argument("--production-baseline-sha", default="")
     parser.add_argument("--validation-session-id", default="")
+    parser.add_argument("--release-input-manifest", default="")
+    parser.add_argument("--release-input-manifest-sha256", default="")
     args = parser.parse_args(argv)
     try:
         result = build_production_candidate(
@@ -769,6 +810,8 @@ def main(argv=None):
             production_host=args.production_host,
             production_baseline_sha=args.production_baseline_sha,
             validation_session_id=args.validation_session_id,
+            release_input_manifest_path=args.release_input_manifest,
+            release_input_manifest_sha256=args.release_input_manifest_sha256,
         )
     except (OSError, RuntimeError, ValueError, TypeError) as exc:
         raise SystemExit("production Candidate build failed: {}".format(exc))

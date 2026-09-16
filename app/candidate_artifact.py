@@ -578,7 +578,8 @@ def verify_offline_operator_trust(
         source_repo_root, evidence=None, evidence_path="",
         source_bundle_path="", expected_repository="",
         expected_production_host="", expected_production_baseline_sha="",
-        expected_validation_session_id=""):
+        expected_validation_session_id="", release_input_manifest=None,
+        release_input_manifest_sha256=""):
     """Verify the explicit, non-GitHub trust contract for an operator build.
 
     This path is intentionally independent from the protected-builder receipt
@@ -606,6 +607,34 @@ def verify_offline_operator_trust(
     if evidence.get("offline_operator_source_integrity") != "PASSED":
         raise ValueError("offline operator source integrity evidence is incomplete")
 
+    input_manifest = None
+    input_manifest_sha = ""
+    if release_input_manifest is not None:
+        from scripts.release.release_input_manifest import (
+            load_release_input_manifest, release_input_manifest_sha256 as
+            compute_release_input_manifest_sha256,
+            validate_release_input_manifest,
+        )
+        if isinstance(release_input_manifest, str):
+            input_manifest = load_release_input_manifest(
+                release_input_manifest,
+                expected_sha256=release_input_manifest_sha256 or None,
+            )
+        else:
+            input_manifest = validate_release_input_manifest(release_input_manifest)
+        input_manifest_sha = compute_release_input_manifest_sha256(input_manifest)
+        if release_input_manifest_sha256 and input_manifest_sha != \
+                str(release_input_manifest_sha256).strip().lower():
+            raise ValueError("release input manifest SHA256 mismatch")
+        declared_input_sha = str(
+            evidence.get("release_input_manifest_sha256") or ""
+        ).strip().lower()
+        if declared_input_sha != input_manifest_sha:
+            raise ValueError("offline operator release input manifest mismatch")
+        if input_manifest.get("release_trust_mode") != \
+                RELEASE_TRUST_MODE_OFFLINE_OPERATOR:
+            raise ValueError("release input manifest trust mode is not offline_operator")
+
     provenance = dict((candidate_manifest or {}).get("source_provenance") or {})
     if provenance.get("provenance_class") != OFFLINE_OPERATOR_PROVENANCE_CLASS:
         raise ValueError("offline operator publication requires offline-operator provenance")
@@ -617,6 +646,8 @@ def verify_offline_operator_trust(
         raise ValueError("offline operator evidence repository is required")
     if expected_repository and repository != str(expected_repository).strip():
         raise ValueError("offline operator repository does not match policy")
+    if input_manifest is not None and repository != input_manifest["repository"]:
+        raise ValueError("offline operator repository does not match release input manifest")
     commit_sha = _offline_required_hash(evidence.get("commit_sha"), "commit_sha", length=40)
     tree_sha = _offline_required_hash(evidence.get("tree_sha"), "tree_sha", length=40)
     if commit_sha != str(release_identity.get("commit_sha") or "").lower():
@@ -625,6 +656,11 @@ def verify_offline_operator_trust(
         raise ValueError("offline operator commit_sha does not match source checkout")
     if tree_sha != str(observed_source.get("source_tree_sha") or "").lower():
         raise ValueError("offline operator tree_sha does not match source checkout")
+    if input_manifest is not None:
+        if commit_sha != input_manifest["source_commit_sha"]:
+            raise ValueError("offline operator source commit does not match release input manifest")
+        if tree_sha != input_manifest["source_tree_sha"]:
+            raise ValueError("offline operator source tree does not match release input manifest")
 
     declared_bundle = str(evidence.get("source_bundle_path") or "").strip()
     expected_bundle = str(source_bundle_path or "").strip()
@@ -648,6 +684,18 @@ def verify_offline_operator_trust(
     observed_bundle_sha = _sha256(bundle)
     if observed_bundle_sha.lower() != bundle_sha:
         raise ValueError("offline operator source bundle SHA256 mismatch")
+    if input_manifest is not None and bundle_sha != input_manifest["source_bundle_sha256"]:
+        raise ValueError("offline operator source bundle does not match release input manifest")
+    if input_manifest is not None:
+        for field in ("tooling_commit_sha", "tooling_tree_sha",
+                      "tooling_bundle_sha256"):
+            if str(evidence.get(field) or "").strip().lower() != \
+                    input_manifest[field]:
+                raise ValueError(
+                    "offline operator {} does not match release input manifest".format(
+                        field
+                    )
+                )
 
     candidate_sha = _offline_required_hash(
         evidence.get("candidate_tree_sha256"), "candidate_tree_sha256"
@@ -664,18 +712,25 @@ def verify_offline_operator_trust(
         raise ValueError("offline operator production_host is required")
     if expected_production_host and production_host != str(expected_production_host).strip():
         raise ValueError("offline operator production host does not match policy")
+    if input_manifest is not None and production_host != input_manifest["production_host"]:
+        raise ValueError("offline operator production host does not match release input manifest")
     baseline_sha = _offline_required_hash(
         evidence.get("production_baseline_sha"), "production_baseline_sha", length=40
     )
     if expected_production_baseline_sha and baseline_sha != \
             str(expected_production_baseline_sha).strip().lower():
         raise ValueError("offline operator production baseline SHA mismatch")
+    if input_manifest is not None and baseline_sha != input_manifest["baseline_commit_sha"]:
+        raise ValueError("offline operator baseline SHA does not match release input manifest")
     session_id = str(evidence.get("validation_session_id") or "").strip()
     if not session_id:
         raise ValueError("offline operator validation_session_id is required")
     if expected_validation_session_id and session_id != \
             str(expected_validation_session_id).strip():
         raise ValueError("offline operator validation session mismatch")
+    if input_manifest is not None and input_manifest.get("validation_session_id") and \
+            session_id != input_manifest["validation_session_id"]:
+        raise ValueError("offline operator validation session does not match release input manifest")
     if not _offline_evidence_timestamp_is_valid(evidence.get("build_timestamp")):
         raise ValueError("offline operator build_timestamp is invalid")
     return {
@@ -696,6 +751,7 @@ def verify_offline_operator_trust(
         "production_baseline_sha": baseline_sha,
         "build_timestamp": str(evidence.get("build_timestamp")),
         "validation_session_id": session_id,
+        "release_input_manifest_sha256": input_manifest_sha,
     }
 
 

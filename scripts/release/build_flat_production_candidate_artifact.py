@@ -58,7 +58,8 @@ def build_flat_production_candidate(
         offline_operator_evidence_output="", offline_operator_source_bundle="",
         offline_operator_repository="", production_host="",
         production_baseline_sha="", validation_session_id="",
-        flat_baseline_session_id=""):
+        flat_baseline_session_id="", release_input_manifest_path="",
+        release_input_manifest_sha256=""):
     release_trust_mode = assert_current_production_trust_mode(
         release_trust_mode, operation="flat production Candidate build"
     )
@@ -180,6 +181,43 @@ def build_flat_production_candidate(
                 "protected_builder": "SKIPPED_BY_OPERATOR",
                 "offline_operator_source_integrity": "PASSED",
             }
+            if release_input_manifest_path:
+                from scripts.release.release_input_manifest import (
+                    load_release_input_manifest, release_input_manifest_sha256 as
+                    compute_release_input_manifest_sha256,
+                )
+                input_manifest = load_release_input_manifest(
+                    release_input_manifest_path,
+                    expected_sha256=release_input_manifest_sha256 or None,
+                )
+                input_manifest_digest = compute_release_input_manifest_sha256(
+                    input_manifest
+                )
+                if input_manifest.get("source_commit_sha") != \
+                        provenance["source_commit_sha"] or \
+                        input_manifest.get("source_tree_sha") != \
+                        provenance["source_tree_sha"] or \
+                        input_manifest.get("repository") != \
+                        str(offline_operator_repository).strip() or \
+                        input_manifest.get("production_host") != \
+                        str(production_host).strip() or \
+                        input_manifest.get("baseline_commit_sha") != \
+                        str(production_baseline_sha).strip().lower() or \
+                        (input_manifest.get("validation_session_id") and
+                         input_manifest.get("validation_session_id") !=
+                         str(validation_session_id).strip()):
+                    raise ValueError(
+                        "release input manifest release identity does not match build"
+                    )
+                offline_payload.update({
+                    "release_input_manifest_path": os.path.abspath(
+                        str(release_input_manifest_path)
+                    ),
+                    "release_input_manifest_sha256": input_manifest_digest,
+                    "tooling_commit_sha": input_manifest["tooling_commit_sha"],
+                    "tooling_tree_sha": input_manifest["tooling_tree_sha"],
+                    "tooling_bundle_sha256": input_manifest["tooling_bundle_sha256"],
+                })
             offline_path = os.path.abspath(str(offline_operator_evidence_output))
             _write_json(offline_path, offline_payload)
             verify_current_production_candidate_trust(
@@ -190,6 +228,9 @@ def build_flat_production_candidate(
                 expected_production_host=production_host,
                 expected_production_baseline_sha=production_baseline_sha,
                 expected_validation_session_id=validation_session_id,
+                release_input_manifest=release_input_manifest_path or None,
+                release_input_manifest_sha256=release_input_manifest_sha256 or
+                (offline_payload.get("release_input_manifest_sha256") or ""),
             )
         # Adoption performs a before/after scan around its isolated copy.  A
         # final scan here closes the whole Candidate construction window as
@@ -264,6 +305,8 @@ def main(argv=None):
     parser.add_argument("--production-baseline-sha", default="")
     parser.add_argument("--validation-session-id", default="")
     parser.add_argument("--flat-baseline-session-id", default="")
+    parser.add_argument("--release-input-manifest", default="")
+    parser.add_argument("--release-input-manifest-sha256", default="")
     args = parser.parse_args(argv)
     expected = None
     if args.expected_source_binding:
@@ -287,6 +330,8 @@ def main(argv=None):
         production_baseline_sha=args.production_baseline_sha,
         validation_session_id=args.validation_session_id,
         flat_baseline_session_id=args.flat_baseline_session_id,
+        release_input_manifest_path=args.release_input_manifest,
+        release_input_manifest_sha256=args.release_input_manifest_sha256,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
