@@ -209,10 +209,10 @@ def _resolve_revision_path(repo_root: str, configured: Optional[str], field: str
                            revision: str) -> str:
     """Resolve an evidence path bound to one exact Candidate revision.
 
-    CI fixture evidence is reusable across validation attempts, but it must
-    never be silently reused across Candidate SHAs.  ``{commit_sha}`` is the
-    only supported interpolation so the operator can keep one immutable file
-    per exact source revision.
+    Evidence is reusable across validation attempts, but it must never be
+    silently reused across Candidate SHAs.  ``{commit_sha}`` is the only
+    supported interpolation so the operator can keep one immutable file per
+    exact source revision.
     """
     if not configured:
         raise RuntimeError("upgrade.{} is required".format(field))
@@ -256,7 +256,9 @@ def validate_candidate_publication_preflight(
         offline_operator_repository: Optional[str] = "",
         production_host: Optional[str] = "",
         production_baseline_sha: Optional[str] = "",
-        validation_session_id: Optional[str] = "") -> Dict[str, Any]:
+        validation_session_id: Optional[str] = "",
+        release_input_manifest: Optional[str] = "",
+        release_input_manifest_sha256: Optional[str] = "") -> Dict[str, Any]:
     """Verify all candidate/source/trust inputs before maintenance begins."""
     try:
         release_trust_mode = assert_current_production_trust_mode(
@@ -305,6 +307,11 @@ def validate_candidate_publication_preflight(
         source_bundle = os.path.join(
             os.path.realpath(os.path.abspath(repo_root)), source_bundle
         )
+    input_manifest_path = str(release_input_manifest or "")
+    if input_manifest_path and not os.path.isabs(input_manifest_path):
+        input_manifest_path = os.path.join(
+            os.path.realpath(os.path.abspath(repo_root)), input_manifest_path
+        )
     trust_evidence = verify_current_production_candidate_trust(
         release_trust_mode, production_candidate_root, release_identity,
         manifest, repo_root,
@@ -314,6 +321,8 @@ def validate_candidate_publication_preflight(
         expected_production_host=production_host,
         expected_production_baseline_sha=production_baseline_sha,
         expected_validation_session_id=validation_session_id,
+        release_input_manifest=input_manifest_path or None,
+        release_input_manifest_sha256=release_input_manifest_sha256 or "",
     )
     served_root_binding = served_root_provenance_binding(provenance)
     observed_source = trust_evidence
@@ -350,6 +359,10 @@ def validate_candidate_publication_preflight(
         "candidate_build_attestation_workflow": "",
         "release_trust": trust_evidence,
         "release_trust_mode": release_trust_mode,
+        "release_input_manifest": input_manifest_path,
+        "release_input_manifest_sha256": trust_evidence.get(
+            "release_input_manifest_sha256", ""
+        ),
     }
 
 
@@ -532,6 +545,9 @@ def _normalize_evidence_url(value: Any) -> str:
     return str(value or "").strip().rstrip("/")
 
 
+# These constants and the verifier below are retained only for historical
+# evidence inspection. The current production path consumes local-release
+# evidence and never calls this CI parser.
 _LOOPBACK_BROWSER_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
 CI_BROWSER_FIXTURE_REPOSITORY = "Chary-yu/fos_coverage_tool"
 CI_BROWSER_FIXTURE_WORKFLOW_PATH = ".github/workflows/ci.yml"
@@ -603,6 +619,54 @@ def _external_candidate_gateway_origin(value: Any):
     if port is None:
         port = 443 if parsed.scheme.lower() == "https" else 80
     return parsed.scheme.lower(), hostname, port
+
+
+def _validate_local_release_evidence(
+        path: str, payload: Dict[str, Any], identity: Dict[str, Any]) -> List[str]:
+    """Validate local evidence as a non-production input, never as a gate.
+
+    Local checks establish source/tooling readiness before an operator carries
+    the inputs to VFOS.  They do not prove the production browser, server, DB,
+    rollback, or CURRENT state; those remain separate human-run gates.
+    """
+    errors = []
+    if not isinstance(payload, dict):
+        return ["local release evidence is not a JSON object"]
+    if payload.get("local_release_gate") != "PASS":
+        errors.append("local release gate evidence is not PASS")
+    if str(payload.get("source_sha") or "").lower() != \
+            str(identity.get("commit_sha") or "").lower():
+        errors.append("local release evidence source SHA does not match Candidate")
+    if payload.get("production_mutation") != "NONE":
+        errors.append("local release evidence reports production mutation")
+    compatibility = payload.get("compatibility") or {}
+    if compatibility.get("status") != "PASS" or \
+            compatibility.get("PYTHON36_COMPAT") != "PASS" or \
+            compatibility.get("MARIADB55_COMPAT") != "PASS":
+        errors.append("local compatibility evidence is incomplete")
+    authority = payload.get("authority") or {}
+    for field, expected in (
+            ("PRODUCTION_RELEASE_AUTHORITY", "OFFLINE_OPERATOR_ONLY"),
+            ("GITHUB_SOURCE_REPOSITORY_ONLY", "YES"),
+            ("GITHUB_ACTIONS_REQUIRED", "NO"),
+            ("GITHUB_CI_REQUIRED", "NO"),
+            ("GITHUB_RUNNER_REQUIRED", "NO"),
+            ("GITHUB_ENVIRONMENT_REQUIRED", "NO"),
+            ("GITHUB_SECRETS_REQUIRED_FOR_RELEASE", "NO"),
+            ("GITHUB_ARTIFACT_REQUIRED", "NO"),
+            ("GITHUB_ATTESTATION_REQUIRED", "NO"),
+            ("GITHUB_API_REQUIRED_FOR_READINESS", "NO"),
+            ("STALE_GITHUB_WORKFLOW_AFFECTS_RELEASE", "NO"),
+            ("PROTECTED_BUILDER_NEW_PUBLICATION_ALLOWED", "NO"),
+            ("DUAL_PRODUCTION_AUTHORITY", "NO"),
+            ("LOCAL_FIRST_AUTHORITY_READY", "YES")):
+        if authority.get(field) != expected:
+            errors.append("local release authority {} is not {}".format(
+                field, expected
+            ))
+    if not path or not os.path.isfile(path) or os.path.islink(path):
+        errors.append("local_release_evidence_path must be a regular file")
+    return errors
 
 
 def _validate_candidate_gateway_endpoint(
@@ -866,12 +930,11 @@ def _validate_ci_browser_fixture_evidence(
         expected_source_tree_sha: str = "", expected_repository: str = "",
         expected_workflow_path: str = "", expected_workflow_identity: str = "",
         expected_artifact_name: str = "", expected_digest_path: str = "") -> List[str]:
-    """Validate exact-SHA CI fixture evidence consumed by production.
+    """Validate historical exact-SHA CI fixture evidence.
 
-    Production hosts intentionally do not need Node/npm.  The fixture lane is
-    executed in CI and transferred as a hashed JSON artifact.  This record is
-    only regression evidence; the external real Candidate Chromium evidence
-    remains the production browser authority.
+    This parser is legacy-verify-only. Current production readiness uses the
+    local release gate; the external real Candidate Chromium evidence remains
+    the production browser authority.
     """
     errors = []
     expected_repository = str(
@@ -999,6 +1062,7 @@ class UpgradeOrchestrator:
         self.serving_session_id = ""
         self.release_validation_session_id = ""
         self.previous_published_session_id = ""
+        self.local_release_evidence_path = ""
         self.ci_browser_fixture_evidence_path = ""
         self.ci_browser_fixture_evidence_digest_path = ""
         self.candidate_browser_evidence_path = ""
@@ -1106,6 +1170,22 @@ class UpgradeOrchestrator:
             upgrade_config.get("release_trust_mode") or
             CURRENT_PRODUCTION_RELEASE_TRUST_MODE
         ).strip()
+        release_input_manifest = str(
+            upgrade_config.get("release_input_manifest") or
+            upgrade_config.get("release_input_manifest_path") or ""
+        ).strip()
+        release_input_manifest_sha256 = str(
+            upgrade_config.get("release_input_manifest_sha256") or ""
+        ).strip()
+        if self._upgrade_mode == "production" and not release_input_manifest:
+            raise RuntimeError(
+                "production requires release_input_manifest; "
+                "version-specific hosted provenance is retired"
+            )
+        if self._upgrade_mode == "production" and not release_input_manifest_sha256:
+            raise RuntimeError(
+                "production requires release_input_manifest_sha256"
+            )
         self.candidate_preflight = validate_candidate_publication_preflight(
             self.repo_root, production_candidate_root, identity,
             upgrade_config.get("production_candidate_artifact_manifest", ""),
@@ -1130,6 +1210,12 @@ class UpgradeOrchestrator:
             validation_session_id=upgrade_config.get(
                 "release_validation_session_id"
             ) or upgrade_config.get("validation_session_id", ""),
+            release_input_manifest=upgrade_config.get(
+                "release_input_manifest"
+            ) or upgrade_config.get("release_input_manifest_path", ""),
+            release_input_manifest_sha256=upgrade_config.get(
+                "release_input_manifest_sha256", ""
+            ),
         )
 
         self.production_candidate_root = production_candidate_root
@@ -1264,68 +1350,26 @@ class UpgradeOrchestrator:
             )
             if browser_url_errors:
                 raise RuntimeError("; ".join(browser_url_errors))
-            configured_fixture_path = str(
-                upgrade_config.get("ci_browser_fixture_evidence_path") or
-                os.environ.get("COVERAGE_CI_BROWSER_FIXTURE_EVIDENCE", "")
+            configured_local_evidence = str(
+                upgrade_config.get("local_release_evidence_path") or
+                upgrade_config.get("local_release_evidence") or
+                os.environ.get("FOS_LOCAL_RELEASE_EVIDENCE", "")
             ).strip()
-            configured_fixture_digest = str(
-                upgrade_config.get("ci_browser_fixture_evidence_digest_path") or ""
-            ).strip()
-            if not configured_fixture_path:
+            if not configured_local_evidence:
                 raise RuntimeError(
-                    "production requires ci_browser_fixture_evidence_path"
+                    "production requires local_release_evidence_path; "
+                    "hosted fixture evidence is retired"
                 )
-            if not configured_fixture_digest:
-                raise RuntimeError(
-                    "production requires ci_browser_fixture_evidence_digest_path"
-                )
-            configured_repository = str(
-                upgrade_config.get("ci_browser_fixture_repository") or
-                CI_BROWSER_FIXTURE_REPOSITORY
-            ).strip()
-            if configured_repository != CI_BROWSER_FIXTURE_REPOSITORY:
-                raise RuntimeError(
-                    "ci_browser_fixture_repository is not the approved repository"
-                )
-            configured_workflow_path = str(
-                upgrade_config.get("ci_browser_fixture_workflow_path") or
-                CI_BROWSER_FIXTURE_WORKFLOW_PATH
-            ).strip()
-            if configured_workflow_path != CI_BROWSER_FIXTURE_WORKFLOW_PATH:
-                raise RuntimeError(
-                    "ci_browser_fixture_workflow_path is not the approved workflow"
-                )
-            configured_workflow_identity = str(
-                upgrade_config.get("ci_browser_fixture_workflow_identity") or
-                CI_BROWSER_FIXTURE_WORKFLOW_IDENTITY
-            ).strip()
-            if configured_workflow_identity != CI_BROWSER_FIXTURE_WORKFLOW_IDENTITY:
-                raise RuntimeError(
-                    "ci_browser_fixture_workflow_identity is not the approved job"
-                )
-            configured_artifact_name = str(
-                upgrade_config.get("ci_browser_fixture_artifact_name") or
-                CI_BROWSER_FIXTURE_ARTIFACT_PREFIX + "{commit_sha}"
-            ).strip()
-            if configured_artifact_name != \
-                    CI_BROWSER_FIXTURE_ARTIFACT_PREFIX + "{commit_sha}":
-                raise RuntimeError(
-                    "ci_browser_fixture_artifact_name is not the approved artifact"
-                )
-            self.ci_browser_fixture_evidence_path = _resolve_revision_path(
+            self.local_release_evidence_path = _resolve_revision_path(
                 self.repo_root,
-                configured_fixture_path,
-                "ci_browser_fixture_evidence_path",
+                configured_local_evidence,
+                "local_release_evidence_path",
                 identity.get("commit_sha", ""),
             )
-            self.ci_browser_fixture_evidence_digest_path = (
-                _resolve_revision_path(
-                    self.repo_root, configured_fixture_digest,
-                    "ci_browser_fixture_evidence_digest_path",
-                    identity.get("commit_sha", ""),
-                ) if configured_fixture_digest else ""
-            )
+            self.ci_browser_fixture_evidence_path = ""
+            self.ci_browser_fixture_evidence_digest_path = ""
         else:
+            self.local_release_evidence_path = ""
             self.ci_browser_fixture_evidence_path = ""
             self.ci_browser_fixture_evidence_digest_path = ""
 
@@ -2210,21 +2254,21 @@ class UpgradeOrchestrator:
     def _browser_fixture_regression_evidence(
             self, mode: str, upgrade_config: Dict[str, Any],
             identity: Dict[str, Any]) -> Dict[str, Any]:
-        """Return browser fixture evidence without running CI tools in production.
+        """Return local release-gate evidence without running CI tools in production.
 
         The production host may intentionally have no Node/npm installation.
-        In that mode only an exact-SHA CI artifact is consumed.  Staging keeps
+        In that mode only transferred local evidence is consumed. Staging keeps
         the local smoke/Playwright regression, but command lookup failures are
         converted into an ordinary failed evidence record for ``_fail``.
         """
         if mode == "production":
-            path = self.ci_browser_fixture_evidence_path
+            path = self.local_release_evidence_path
             payload = {}
             errors = []
             if not path or not os.path.isfile(path):
                 errors.append(
-                    "upgrade.ci_browser_fixture_evidence_path must point to "
-                    "exact-SHA CI evidence"
+                    "upgrade.local_release_evidence_path must point to "
+                    "the transferred local release-gate evidence"
                 )
             else:
                 try:
@@ -2232,43 +2276,25 @@ class UpgradeOrchestrator:
                         payload = json.load(stream)
                 except (OSError, ValueError, TypeError) as exc:
                     errors.append(
-                        "CI browser fixture evidence is unreadable: {}".format(exc)
+                        "local release evidence is unreadable: {}".format(exc)
                     )
             if not errors:
-                upgrade = dict(upgrade_config or {})
-                errors.extend(_validate_ci_browser_fixture_evidence(
-                    path,
-                    payload,
-                    identity,
-                    expected_source_tree_sha=str(
-                        (self.candidate_preflight or {}).get("source_tree_sha") or ""
-                    ),
-                    expected_repository=str(
-                        upgrade.get("ci_browser_fixture_repository") or ""
-                    ).strip(),
-                    expected_workflow_path=str(
-                        upgrade.get("ci_browser_fixture_workflow_path") or ""
-                    ).strip(),
-                    expected_workflow_identity=str(
-                        upgrade.get("ci_browser_fixture_workflow_identity") or ""
-                    ).strip(),
-                    expected_artifact_name=str(
-                        upgrade.get("ci_browser_fixture_artifact_name") or ""
-                    ).strip(),
-                    expected_digest_path=self.ci_browser_fixture_evidence_digest_path,
+                errors.extend(_validate_local_release_evidence(
+                    path, payload, identity
                 ))
             result = dict(payload) if isinstance(payload, dict) else {}
             result.update({
                 "status": "PASSED" if not errors else "FAILED",
                 "revision": identity.get("commit_sha"),
-                "evidence_class": "browser_fixture_regression",
-                "source": "exact_sha_ci",
+                "evidence_class": "local_release_gate_input",
+                "source": "offline_local_repository",
                 "local_execution": False,
+                "production_gate": False,
+                "production_publishable": False,
                 "command": result.get("command") or
-                "consume exact-SHA GitHub Actions browser fixture evidence",
+                "consume transferred local release-gate evidence",
                 "exit_code": 0 if not errors else 1,
                 "artifact_path": path if path and os.path.isfile(path) else "",
-                "detached_digest_path": self.ci_browser_fixture_evidence_digest_path,
                 "violations": errors,
             })
             return result
@@ -3418,6 +3444,12 @@ class UpgradeOrchestrator:
                 production_baseline_sha=upgrade_config.get("production_baseline_sha") or
                 previous_release.get("commit_sha", ""),
                 validation_session_id=session_id,
+                release_input_manifest=upgrade_config.get(
+                    "release_input_manifest"
+                ) or upgrade_config.get("release_input_manifest_path", ""),
+                release_input_manifest_sha256=upgrade_config.get(
+                    "release_input_manifest_sha256", ""
+                ),
             )
             candidate_manifest_summary = prepared.get("candidate_artifact_manifest") or {}
             self._candidate_artifact_sha256 = str(
@@ -3616,12 +3648,12 @@ class UpgradeOrchestrator:
             
         self.manifest.record("targeted_tests", test_results)
 
-        # Step 6: Consume CI fixture evidence or run the staging-only fixture.
+        # Step 6: Consume local release-gate evidence or run the staging-only fixture.
         # Production vfoswind hosts are not required to have Node/npm.  The
         # external real Candidate browser evidence below remains mandatory.
         if mode == "production":
             self.log(
-                "[Step 6/10] Consuming exact-SHA CI Browser Fixture Evidence "
+                "[Step 6/10] Consuming transferred local Release Gate evidence "
                 "(Node/npm not executed on production host)..."
             )
         else:

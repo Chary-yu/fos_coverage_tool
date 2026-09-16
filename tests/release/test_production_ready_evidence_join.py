@@ -1,5 +1,6 @@
 import unittest
 
+from app.candidate_artifact import RELEASE_TRUST_MODE_PROTECTED_BUILDER
 from scripts.diagnostics.production_ready_evidence_join import (
     backup_identity, browser_identity, candidate_build_identity,
     join_identities, performance_identity,
@@ -99,6 +100,16 @@ class ProductionReadyEvidenceJoinTest(unittest.TestCase):
                 artifact_role="validation_fixture",
                 production_publishable=False,
                 project_name="Coverage Candidate",
+            )
+
+    def test_protected_builder_cannot_supply_current_publication_identity(self):
+        with self.assertRaisesRegex(ValueError, "PROTECTED_BUILDER_CURRENT_PUBLICATION_ALLOWED=NO"):
+            candidate_build_identity(
+                "a" * 40, "b" * 64,
+                previous_release_commit_sha="d" * 40,
+                served_root_tree_sha256="e" * 64,
+                served_root_identity_sha256="f" * 64,
+                release_trust_mode=RELEASE_TRUST_MODE_PROTECTED_BUILDER,
             )
 
     def test_browser_identity_requires_observed_not_expected_only_binding(self):

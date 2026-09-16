@@ -54,9 +54,10 @@ class VfoswindProductionLifecycleTest(unittest.TestCase):
             "/home/zcyu/coverage_published/VALIDATION_CURRENT/reports",
         )
         self.assertIn(
-            "{commit_sha}",
-            config["upgrade"]["ci_browser_fixture_evidence_path"],
+            "local_release_gate.json",
+            config["upgrade"]["local_release_evidence_path"],
         )
+        self.assertNotIn("ci_browser_fixture_evidence_path", config["upgrade"])
 
     def _fixture(self, flat=False):
         root = tempfile.TemporaryDirectory(prefix="vfoswind-lifecycle-")

@@ -616,18 +616,39 @@ class TestUpgradeManifest(unittest.TestCase):
             [],
         )
 
-    def test_production_browser_fixture_consumes_ci_evidence_without_node_or_npm(self):
+    def test_production_browser_gate_consumes_local_release_evidence_without_node_or_npm(self):
         revision = "a" * 40
-        tree = "b" * 40
-        with tempfile.TemporaryDirectory(prefix="ci-browser-fixture-") as root:
-            evidence_path = os.path.join(root, "fixture.json")
+        with tempfile.TemporaryDirectory(prefix="local-release-evidence-") as root:
+            evidence_path = os.path.join(root, "local_release_gate.json")
             with open(evidence_path, "w", encoding="utf-8") as stream:
-                json.dump(build_evidence(
-                    revision, tree, "Chary-yu/fos_coverage_tool", "123", "1",
-                ), stream)
+                json.dump({
+                    "local_release_gate": "PASS",
+                    "source_sha": revision,
+                    "production_mutation": "NONE",
+                    "compatibility": {
+                        "status": "PASS",
+                        "PYTHON36_COMPAT": "PASS",
+                        "MARIADB55_COMPAT": "PASS",
+                    },
+                    "authority": {
+                        "PRODUCTION_RELEASE_AUTHORITY": "OFFLINE_OPERATOR_ONLY",
+                        "GITHUB_SOURCE_REPOSITORY_ONLY": "YES",
+                        "GITHUB_ACTIONS_REQUIRED": "NO",
+                        "GITHUB_CI_REQUIRED": "NO",
+                        "GITHUB_RUNNER_REQUIRED": "NO",
+                        "GITHUB_ENVIRONMENT_REQUIRED": "NO",
+                        "GITHUB_SECRETS_REQUIRED_FOR_RELEASE": "NO",
+                        "GITHUB_ARTIFACT_REQUIRED": "NO",
+                        "GITHUB_ATTESTATION_REQUIRED": "NO",
+                        "GITHUB_API_REQUIRED_FOR_READINESS": "NO",
+                        "STALE_GITHUB_WORKFLOW_AFFECTS_RELEASE": "NO",
+                        "PROTECTED_BUILDER_NEW_PUBLICATION_ALLOWED": "NO",
+                        "DUAL_PRODUCTION_AUTHORITY": "NO",
+                        "LOCAL_FIRST_AUTHORITY_READY": "YES",
+                    },
+                }, stream)
             orchestrator = UpgradeOrchestrator(repo_root=root)
-            orchestrator.ci_browser_fixture_evidence_path = evidence_path
-            orchestrator.candidate_preflight = {"source_tree_sha": tree}
+            orchestrator.local_release_evidence_path = evidence_path
             with mock.patch("scripts.upgrade.run_upgrade.subprocess.run") as runner:
                 result = orchestrator._browser_fixture_regression_evidence(
                     "production", {}, {"commit_sha": revision}
@@ -635,7 +656,8 @@ class TestUpgradeManifest(unittest.TestCase):
             runner.assert_not_called()
             self.assertEqual(result["status"], "PASSED")
             self.assertFalse(result["local_execution"])
-            self.assertEqual(result["source"], "exact_sha_ci")
+            self.assertEqual(result["source"], "offline_local_repository")
+            self.assertFalse(result["production_gate"])
 
     def test_production_browser_fixture_rejects_wrong_ci_revision(self):
         revision = "a" * 40
@@ -814,7 +836,7 @@ class TestUpgradeManifest(unittest.TestCase):
         validation = source.index("lifecycle.start_validation_api()")
         candidate_endpoint = source.index('"candidate_release_endpoint"')
         targeted = source.index("# Step 5: Run Targeted Unit Test Suites")
-        browser = source.index("# Step 6: Consume CI fixture evidence or run the staging-only fixture.")
+        browser = source.index("# Step 6: Consume local release-gate evidence or run the staging-only fixture.")
         pre_cutover_gate = source.index("self._validate_pre_cutover_ready(identity, mode)")
         freeze = source.index("lifecycle.freeze(identity.get(\"commit_sha\", \"\"))")
         stop = source.index("lifecycle.stop_current_api()")

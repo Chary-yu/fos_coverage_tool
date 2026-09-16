@@ -2,6 +2,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 
 class LocalFirstReleaseTest(unittest.TestCase):
@@ -16,9 +17,24 @@ class LocalFirstReleaseTest(unittest.TestCase):
         self.assertEqual(contract["GITHUB_API_REQUIRED_FOR_READINESS"], "NO")
         self.assertEqual(contract["PROTECTED_BUILDER_NEW_PUBLICATION_ALLOWED"], "NO")
         self.assertEqual(contract["DUAL_PRODUCTION_AUTHORITY"], "NO")
+        self.assertEqual(contract["STALE_GITHUB_WORKFLOW_AFFECTS_RELEASE"], "NO")
         rendered = render_contract(contract)
         self.assertIn("PRODUCTION_RELEASE_AUTHORITY=OFFLINE_OPERATOR_ONLY", rendered)
         self.assertIn("GITHUB_SOURCE_REPOSITORY_ONLY=YES", rendered)
+        self.assertIn("STALE_GITHUB_WORKFLOW_AFFECTS_RELEASE=NO", rendered)
+
+    def test_release_readiness_local_first_blocks_legacy_workflow_residue(self):
+        from scripts.diagnostics.release_readiness import build
+
+        result = build(
+            os.getcwd(), matrix={}, task_status={}, risk_register={},
+            dod_status={}, local_first=True,
+        )
+        self.assertEqual(result["status"], "NOT_READY")
+        self.assertTrue(any(
+            item.get("type") == "production_release_authority"
+            for item in result["blockers"]
+        ))
 
     def test_evidence_manifest_detects_tampered_json(self):
         from scripts.release.local_release_gate import (
@@ -50,6 +66,52 @@ class LocalFirstReleaseTest(unittest.TestCase):
                     text = stream.read().lower()
                 self.assertNotIn("api.github.com", text)
                 self.assertNotIn("gh run", text)
+
+    def test_orchestration_validator_checks_generic_offline_operator_contract(self):
+        from scripts.validate_release_orchestration import validate
+
+        result = validate(os.getcwd())
+        names = {item["name"] for item in result["checks"]}
+        self.assertIn(
+            "required_file:scripts/release/release_input_manifest.py", names
+        )
+        self.assertIn(
+            "required_file:scripts/release/generate_flat_production_candidate_operator.py",
+            names,
+        )
+        for required in (
+                "scripts/release/local_release_gate.py",
+                "scripts/release/local_compatibility_gate.py",
+                "scripts/diagnostics/production_release_authority.py"):
+            self.assertIn("required_file:" + required, names)
+        self.assertIn("generic_offline_source_transfer", names)
+        self.assertEqual(result["status"], "PASSED")
+
+    def test_release_gate_requires_exact_clean_source_identity(self):
+        from scripts.release.local_release_gate import _source_identity_ready
+
+        identity = {
+            "head_sha": "a" * 40,
+            "tree_sha": "b" * 40,
+            "worktree_clean": True,
+            "clean_checkout": True,
+        }
+        self.assertTrue(_source_identity_ready(identity, "a" * 40))
+        identity["worktree_clean"] = False
+        self.assertFalse(_source_identity_ready(identity, "a" * 40))
+        identity["worktree_clean"] = True
+        self.assertFalse(_source_identity_ready(identity, "c" * 40))
+
+    def test_local_release_gate_removes_hosted_credentials_from_child_processes(self):
+        from scripts.release.local_release_gate import _clean_env
+
+        with mock.patch.dict(
+                os.environ,
+                {"GITHUB_TOKEN": "secret", "GH_TOKEN": "secret"},
+                clear=False):
+            environment = _clean_env()
+        self.assertNotIn("GITHUB_TOKEN", environment)
+        self.assertNotIn("GH_TOKEN", environment)
 
 
 if __name__ == "__main__":

@@ -235,7 +235,7 @@ def _dod_blockers(dod_status, candidate_revision):
 
 def build(repo_root=ROOT, matrix=None, task_status=None, risk_register=None,
           dod_status=None, matrix_path="", task_status_path="",
-          dod_status_path="", risk_register_path=""):
+          dod_status_path="", risk_register_path="", local_first=False):
     repo_root = os.path.abspath(repo_root)
     current_revision = _revision(repo_root)
     matrix = matrix if isinstance(matrix, dict) else {}
@@ -254,6 +254,34 @@ def build(repo_root=ROOT, matrix=None, task_status=None, risk_register=None,
     blockers.extend(_dod_blockers(dod_status, candidate_revision))
     risk_blockers, accepted_risks = _risk_findings(risk_register, candidate_revision)
     blockers.extend(risk_blockers)
+    authority = {}
+    if local_first:
+        from scripts.diagnostics.production_release_authority import evaluate
+        authority = evaluate(repo_root)
+        expected = {
+            "PRODUCTION_RELEASE_AUTHORITY": "OFFLINE_OPERATOR_ONLY",
+            "GITHUB_SOURCE_REPOSITORY_ONLY": "YES",
+            "GITHUB_ACTIONS_REQUIRED": "NO",
+            "GITHUB_CI_REQUIRED": "NO",
+            "GITHUB_RUNNER_REQUIRED": "NO",
+            "GITHUB_ENVIRONMENT_REQUIRED": "NO",
+            "GITHUB_SECRETS_REQUIRED_FOR_RELEASE": "NO",
+            "GITHUB_ARTIFACT_REQUIRED": "NO",
+            "GITHUB_ATTESTATION_REQUIRED": "NO",
+            "GITHUB_API_REQUIRED_FOR_READINESS": "NO",
+            "PROTECTED_BUILDER_NEW_PUBLICATION_ALLOWED": "NO",
+            "VALIDATION_FIXTURE_PRODUCTION_PUBLISHABLE": "NO",
+            "DUAL_PRODUCTION_AUTHORITY": "NO",
+            "LOCAL_FIRST_AUTHORITY_READY": "YES",
+        }
+        for key, value in sorted(expected.items()):
+            if authority.get(key) != value:
+                blockers.append({
+                    "type": "production_release_authority",
+                    "field": key,
+                    "expected": value,
+                    "observed": authority.get(key, ""),
+                })
 
     if blockers:
         decision = "NOT_READY"
@@ -278,6 +306,7 @@ def build(repo_root=ROOT, matrix=None, task_status=None, risk_register=None,
         "risk_register_path": os.path.abspath(risk_register_path) if risk_register_path else "",
         "accepted_risks": accepted_risks,
         "blockers": blockers,
+        "production_release_authority": authority,
         "gate_statuses": {
             gate: str((payload or {}).get("status") or "INCOMPLETE").upper()
             for gate, payload in sorted((matrix.get("gates") or {}).items())
@@ -294,6 +323,7 @@ def main(argv=None):
     parser.add_argument("--risk-register", required=True)
     parser.add_argument("--output", default=".artifacts/vnext/release-readiness.json")
     parser.add_argument("--allow-not-ready", action="store_true")
+    parser.add_argument("--local-first", action="store_true")
     args = parser.parse_args(argv)
     repo_root = os.path.abspath(args.repo_root)
     matrix_path = os.path.abspath(args.matrix)
@@ -311,6 +341,7 @@ def main(argv=None):
             task_status_path=task_path,
             dod_status_path=dod_path,
             risk_register_path=risk_path,
+            local_first=args.local_first,
         )
     except (OSError, ValueError, TypeError) as exc:
         result = with_contract({

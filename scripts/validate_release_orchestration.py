@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static, offline validation of the R8 release orchestration contract.
+"""Static, offline validation of the local-first release contract.
 
 This checker is intentionally independent of vfoswind.  It verifies the
 source-level fail-closed boundaries, the complete evidence namespace, and an
@@ -21,6 +21,12 @@ REQUIRED_FILES = (
     "scripts/release/fos_r8_conductor.py",
     "scripts/release/build_oneclick_release.py",
     "scripts/release/build_flat_production_candidate_artifact.py",
+    "scripts/release/release_input_manifest.py",
+    "scripts/release/flat_candidate_operator_runtime.py",
+    "scripts/release/generate_flat_production_candidate_operator.py",
+    "scripts/release/local_release_gate.py",
+    "scripts/release/local_compatibility_gate.py",
+    "scripts/diagnostics/production_release_authority.py",
     "scripts/diagnostics/release_performance_revision.js",
     "scripts/upgrade/performance_evidence.py",
     "scripts/upgrade/run_upgrade.py",
@@ -96,15 +102,41 @@ def validate(repo_root, tool_path="", bundle_path=""):
     generator_path = os.path.join(
         repo_root, "scripts/release/build_oneclick_release.py"
     )
+    manifest_path = os.path.join(
+        repo_root, "scripts/release/release_input_manifest.py"
+    )
+    runtime_path = os.path.join(
+        repo_root, "scripts/release/flat_candidate_operator_runtime.py"
+    )
+    generic_generator_path = os.path.join(
+        repo_root, "scripts/release/generate_flat_production_candidate_operator.py"
+    )
+    local_gate_path = os.path.join(
+        repo_root, "scripts/release/local_release_gate.py"
+    )
+    compatibility_gate_path = os.path.join(
+        repo_root, "scripts/release/local_compatibility_gate.py"
+    )
+    authority_path = os.path.join(
+        repo_root, "scripts/diagnostics/production_release_authority.py"
+    )
     try:
         conductor = _read(conductor_path)
         run_upgrade = _read(run_upgrade_path)
         flat = _read(flat_path)
         perf = _read(perf_path)
         generator = _read(generator_path)
+        manifest = _read(manifest_path)
+        runtime = _read(runtime_path)
+        generic_generator = _read(generic_generator_path)
+        local_gate = _read(local_gate_path)
+        compatibility_gate = _read(compatibility_gate_path)
+        authority = _read(authority_path)
     except (OSError, IOError) as exc:
         failures.append(str(exc))
         conductor = run_upgrade = flat = perf = generator = ""
+        manifest = runtime = generic_generator = ""
+        local_gate = compatibility_gate = authority = ""
 
     evidence_match = re.search(r"EVIDENCE_NAMES\s*=\s*\((.*?)\)\s*\n", conductor,
                                re.DOTALL)
@@ -167,17 +199,40 @@ def validate(repo_root, tool_path="", bundle_path=""):
                   "PRE_CUTOVER_READY precedes APPLY R8 and Phase D"):
         failures.append("production mutation boundary ordering is invalid")
 
-    source_contract_ok = "git bundle" in generator and \
-        "git fsck" in generator and "PRODUCTION_MUTATION=NONE" in generator and \
-        "python3.6" in generator
-    if not _check(checks, "offline_source_transfer", source_contract_ok,
-                  "generator embeds bundle and performs local exact checkout checks"):
+    source_contract_ok = all(token in generic_generator for token in (
+        "release_input_manifest", "git", "bundle", "fsck",
+        "PRODUCTION_MUTATION=NONE",
+    )) and all(token in runtime for token in (
+        "release_input_manifest", "git", "bundle", "fsck",
+        "PRODUCTION_MUTATION=NONE", "Python 3.6",
+    )) and "canonical_json_bytes" in manifest
+    if not _check(checks, "generic_offline_source_transfer", source_contract_ok,
+                  "generic operator embeds manifest, bundles, and exact checkout checks"):
         failures.append("offline source-transfer contract is incomplete")
+
+    local_gate_ok = all(token in local_gate for token in (
+        "local_release_gate", "evidence_manifest.json", "SHA256SUMS",
+        "production_mutation", "targeted_tests", "compatibility",
+    )) and all(token in compatibility_gate for token in (
+        "PYTHON36_IMAGE", "MARIADB55_IMAGE", "--network", "NOT_VERIFIED",
+        "PYTHON36_COMPAT", "MARIADB55_COMPAT",
+    )) and all(token in authority for token in (
+        "PRODUCTION_RELEASE_AUTHORITY", "GITHUB_ACTIONS_REQUIRED",
+        "GITHUB_API_REQUIRED_FOR_READINESS", "PROTECTED_BUILDER_NEW_PUBLICATION_ALLOWED",
+    ))
+    if not _check(checks, "local_first_gate_contract", local_gate_ok,
+                  "local release, compatibility, and authority gates are present"):
+        failures.append("local-first gate contract is incomplete")
 
     for path, label in (
             (conductor_path, "conductor"), (run_upgrade_path, "upgrade"),
             (flat_path, "flat binding"), (perf_path, "performance join"),
-            (generator_path, "one-click generator")):
+            (generator_path, "one-click generator"), (manifest_path, "release input manifest"),
+            (runtime_path, "generic operator runtime"),
+            (generic_generator_path, "generic operator generator"),
+            (local_gate_path, "local release gate"),
+            (compatibility_gate_path, "local compatibility gate"),
+            (authority_path, "production release authority")):
         try:
             compile(_read(path), path, "exec")
             passed = True

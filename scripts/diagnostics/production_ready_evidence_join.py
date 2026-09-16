@@ -21,6 +21,7 @@ if ROOT not in sys.path:
 
 from app.candidate_artifact import (
     PRODUCTION_PROJECT_NAME, PRODUCTION_RELEASE_ARTIFACT_ROLE,
+    RELEASE_TRUST_MODE_OFFLINE_OPERATOR, RELEASE_TRUST_MODE_PROTECTED_BUILDER,
     SERVED_ROOT_PROVENANCE_FIELDS,
 )
 
@@ -173,7 +174,14 @@ def candidate_build_identity(commit_sha, artifact_sha256,
                              project_name=PRODUCTION_PROJECT_NAME,
                              previous_release_commit_sha="",
                              served_root_tree_sha256="",
-                             served_root_identity_sha256=""):
+                             served_root_identity_sha256="",
+                             release_trust_mode=RELEASE_TRUST_MODE_OFFLINE_OPERATOR):
+    if release_trust_mode == RELEASE_TRUST_MODE_PROTECTED_BUILDER:
+        raise ValueError(
+            "PROTECTED_BUILDER_CURRENT_PUBLICATION_ALLOWED=NO"
+        )
+    if release_trust_mode != RELEASE_TRUST_MODE_OFFLINE_OPERATOR:
+        raise ValueError("candidate build release_trust_mode must be offline_operator")
     if artifact_role != PRODUCTION_RELEASE_ARTIFACT_ROLE:
         raise ValueError(
             "trusted Candidate build is a validation fixture, not a production release"
@@ -190,6 +198,7 @@ def candidate_build_identity(commit_sha, artifact_sha256,
         "artifact_role": artifact_role,
         "production_publishable": production_publishable,
         "project_name": project_name,
+        "release_trust_mode": RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
     }
     for field, value in (
             ("previous_release_commit_sha", previous_release_commit_sha),
@@ -302,6 +311,12 @@ def main(argv=None):
     parser.add_argument("--production-candidate-previous-release-sha", default="")
     parser.add_argument("--production-candidate-served-root-tree-sha256", default="")
     parser.add_argument("--production-candidate-served-root-identity-sha256", default="")
+    parser.add_argument(
+        "--production-candidate-trust-mode",
+        default=RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+        choices=(RELEASE_TRUST_MODE_OFFLINE_OPERATOR,
+                 RELEASE_TRUST_MODE_PROTECTED_BUILDER),
+    )
     parser.add_argument("--browser-commit", default="")
     parser.add_argument("--browser-artifact", default="")
     parser.add_argument("--browser-served-root", default="")
@@ -336,6 +351,7 @@ def main(argv=None):
                 previous_release_commit_sha=args.production_candidate_previous_release_sha,
                 served_root_tree_sha256=args.production_candidate_served_root_tree_sha256,
                 served_root_identity_sha256=args.production_candidate_served_root_identity_sha256,
+                release_trust_mode=args.production_candidate_trust_mode,
             ),
             {
                 "commit_sha": _require_commit(args.browser_commit, "browser commit_sha"),

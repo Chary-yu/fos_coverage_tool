@@ -206,6 +206,21 @@ def _source_identity(repo_root, requested_sha, output):
     return source
 
 
+def _source_identity_ready(identity, requested_sha):
+    """Return whether the gate may trust the local source checkout identity."""
+    if not isinstance(identity, dict):
+        return False
+    requested_sha = str(requested_sha or "").strip().lower()
+    head_sha = str(identity.get("head_sha") or "").strip().lower()
+    tree_sha = str(identity.get("tree_sha") or "").strip().lower()
+    return bool(
+        SHA40.fullmatch(requested_sha) and requested_sha != "0" * 40 and
+        SHA40.fullmatch(head_sha) and head_sha == requested_sha and
+        SHA40.fullmatch(tree_sha) and identity.get("worktree_clean") is True and
+        identity.get("clean_checkout") is True
+    )
+
+
 def _environment_identity(repo_root):
     _git_code, git_version, _git_duration = _run(
         ("git", "--version"), cwd=repo_root
@@ -519,7 +534,8 @@ def run_gate(repo_root, source_sha, output, session_id="", test_modules=None):
     authority = evaluate(repo_root)
     authority_ok = authority.get("LOCAL_FIRST_AUTHORITY_READY") == "YES"
     local_status = "PASS"
-    if not authority_ok or not tests["passed"] or operator_record.get("status") != "PASS" or \
+    if not _source_identity_ready(source, source_sha) or not authority_ok or \
+            not tests["passed"] or operator_record.get("status") != "PASS" or \
             not security.get("status") == "PASS" or not regressions["passed"] or \
             not regression_suite["passed"]:
         local_status = "FAIL"
