@@ -46,6 +46,43 @@ CANDIDATE_ROOT="${FOS_VFOS_CANDIDATE_ROOT:-$EXPECTED_CANDIDATE_PARENT}"
 APPLICATION_ROOT="${FOS_VFOS_APPLICATION_ROOT:-$SOURCE_ROOT}"
 FAILURES=0
 
+usage() {
+  printf '%s\n' "usage: bash $0 [--source-root PATH] [--candidate-root PATH] [--application-root PATH] [--python36-bin PATH]"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --source-root)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      SOURCE_ROOT="$2"
+      shift 2
+      ;;
+    --candidate-root)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      CANDIDATE_ROOT="$2"
+      shift 2
+      ;;
+    --application-root)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      APPLICATION_ROOT="$2"
+      shift 2
+      ;;
+    --python36-bin)
+      [ "$#" -ge 2 ] || { usage >&2; exit 2; }
+      PYTHON36_BIN="$2"
+      shift 2
+      ;;
+    --help)
+      usage
+      exit 0
+      ;;
+    *)
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
 record() {
   printf '%s=%s\n' "$1" "$2"
 }

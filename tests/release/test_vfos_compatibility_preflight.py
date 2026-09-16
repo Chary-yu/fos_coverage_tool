@@ -103,6 +103,11 @@ class VfosCompatibilityPreflightGeneratorTests(unittest.TestCase):
             )
 
             self.assertNotEqual(run.returncode, 0)
+            self.assertIn("SOURCE_ROOT=" + source_root, run.stdout)
+            self.assertIn(
+                "CANDIDATE_ROOT=" + os.path.join(temp_dir, "candidate"),
+                run.stdout,
+            )
             self.assertIn("PYTHON36_COMPAT=FAIL", run.stdout)
             self.assertIn("READY_FOR_ISOLATED_CANDIDATE_STAGING=NO", run.stdout)
             self.assertIn("READY_FOR_PUBLICATION=NO", run.stdout)
