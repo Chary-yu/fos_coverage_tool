@@ -1,6 +1,6 @@
-import os
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -19,337 +19,43 @@ from scripts.upgrade.evidence_manifest import EvidenceManifestV2
 
 
 class ReleaseGovernanceToolsTest(unittest.TestCase):
-    @unittest.skip("retired GitHub Actions contract; local-first tests cover replacement")
-    def test_ci_has_manual_exact_sha_candidate_browser_lane(self):
-        with open(
-                os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
-                encoding="utf-8") as stream:
-            workflow = stream.read()
-        self.assertIn("real_browser_url:", workflow)
-        self.assertIn("real_browser_expected_revision:", workflow)
-        self.assertIn("real-browser-candidate:", workflow)
-        self.assertIn("real_browser_evidence.js", workflow)
-        self.assertIn("--browser-evidence-output", workflow)
-        self.assertIn("--evidence-output", workflow)
-        self.assertIn("gate_task_status.py", workflow)
-        self.assertIn("gate-task-status.json", workflow)
-        self.assertIn("dod_status.py", workflow)
-        self.assertIn("gate-dod-status.json", workflow)
-        self.assertIn("release_readiness.py", workflow)
-        self.assertIn("release-readiness.json", workflow)
-        self.assertIn("browser-fixture-regression:", workflow)
-        self.assertIn("build_browser_fixture_evidence.py", workflow)
-        self.assertIn("--workflow-path .github/workflows/ci.yml", workflow)
-        self.assertIn("--workflow-identity browser-fixture-regression", workflow)
-        self.assertIn("--digest-output", workflow)
-        self.assertIn("browser-fixture-evidence.json.sha256", workflow)
-        self.assertIn("browser-fixture-regression-${{ github.sha }}", workflow)
-        self.assertIn("actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808", workflow)
-        self.assertIn("fetch-depth: 0", workflow)
+    def test_github_actions_workflows_are_retired(self):
+        from scripts.diagnostics.production_release_authority import evaluate
 
-    @unittest.skip("retired GitHub Actions contract; local-first tests cover replacement")
-    def test_ci_has_required_candidate_release_lanes(self):
-        with open(
-                os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
-                encoding="utf-8") as stream:
-            workflow = stream.read()
-        self.assertIn("candidate-source-gate:", workflow)
-        self.assertIn("Candidate source gate (required source lanes)", workflow)
-        self.assertNotIn("candidate-release-gate:", workflow)
-        for lane in (
-                "semantic-migration-regression",
-                "mysql55-compatibility",
-                "py36-compat",
-                "specialist-regression",
-                "browser-fixture-regression"):
-            self.assertIn("- {}".format(lane), workflow)
-        with open("requirements-py36.txt", encoding="utf-8") as stream:
-            requirements = stream.read()
-        self.assertIn("PyMySQL==0.10.1", requirements)
-        self.assertIn(
-            "python -m pip install --no-cache-dir -r requirements-py36.txt",
-            workflow,
-        )
-        self.assertIn(
-            "pymysql.__version__ == '0.10.1'", workflow,
-        )
-        self.assertIn("Run MariaDB 5.5 rehearsal under Python 3.6", workflow)
-        self.assertIn("mariadb55_py36_compatibility.json", workflow)
-        self.assertIn("evidence['python_runtime'].startswith('3.6')", workflow)
-        self.assertIn(
-            "migration_ready = migration['checks']['file_state_ready_gate']",
-            workflow,
-        )
-        self.assertIn(
-            "2> .artifacts/mariadb55_py36_compatibility.stderr | tee "
-            ".artifacts/mariadb55_py36_compatibility.json",
-            workflow,
-        )
-        self.assertNotIn(
-            "bash -s <<'PY' 2>&1 | tee "
-            ".artifacts/mariadb55_py36_compatibility.json",
-            workflow,
-        )
-        self.assertIn("file_state = evidence['checks']['file_state_ready_gate']", workflow)
-        self.assertIn("for project in file_state[run]['projects'].values()", workflow)
-        self.assertIn(
-            "--manifest-output .artifacts/verified-production-mariadb55/evidence-manifest-v2.json",
-            workflow,
-        )
-        self.assertIn(
-            "manifest['evidence_schema_version'] == 2", workflow,
-        )
-        for test_module in (
-                "tests.vnext.test_reliability_repairs",
-                "tests.release.test_gate_matrix",
-                "tests.release.test_immutable_release_publication",
-                "tests.release.test_legacy_background_serialization",
-                "tests.release.test_legacy_flat_adoption",
-                "tests.release.test_validation_session",
-                "tests.release.test_verified_backup_rehearsal"):
-            self.assertIn(test_module, workflow)
-        for evidence_field in (
-                "evidence['checks']['file_state_ready_gate']",
-                "evidence['checks']['file_state_paged_reads']",
-                "evidence['checks']['transaction_rollback']"):
-            self.assertIn(evidence_field, workflow)
-        self.assertEqual(workflow.count("docker run --rm -i"), 2)
-        self.assertIn(".artifacts/py36-runtime-evidence.json", workflow)
-        self.assertIn("test -s .artifacts/py36-runtime-evidence.json", workflow)
-        self.assertIn("grep -q '\"tests_executed\": true' .artifacts/py36-runtime-evidence.json", workflow)
-        self.assertIn("grep -q '\"pymysql\": \"0.10.1\"' .artifacts/py36-runtime-evidence.json", workflow)
-        self.assertIn("assert int(aggregate['pending_total']) == (", workflow)
-        self.assertIn("int(aggregate['ordinary_pending_total'])", workflow)
-        self.assertIn("int(aggregate['inherited_pending_total'])", workflow)
-        self.assertIn("int(aggregate['manual_draft_pending_total'])", workflow)
+        for relative in (
+                ".github/workflows/ci.yml",
+                ".github/workflows/trusted-candidate-builder.yml",
+                ".github/workflows/trusted-production-candidate-builder.yml",
+                ".github/workflows/r8-production-compat-regression.yml",
+                ".github/workflows/r8-release-performance.yml"):
+            with self.subTest(path=relative):
+                self.assertFalse(os.path.exists(relative))
 
-    @unittest.skip("retired GitHub Actions contract; local-first tests cover replacement")
-    def test_ci_distinguishes_source_candidate_from_production_ready(self):
-        with open(
-                os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
-                encoding="utf-8") as stream:
-            workflow = stream.read()
-        self.assertIn("production-ready-gate:", workflow)
-        self.assertIn("Production READY gate (manual external evidence)", workflow)
-        self.assertIn("Production READY requires manual external evidence", workflow)
-        for lane in (
-                "verified-production-mariadb55",
-                "real-browser-candidate",
-                "cross-layer-performance"):
-            self.assertIn("- {}".format(lane), workflow)
-        self.assertIn("github.event_name == 'workflow_dispatch'", workflow)
+        contract = evaluate(os.getcwd())
+        self.assertEqual(contract["GITHUB_WORKFLOW_RESIDUE"], "NO")
+        self.assertEqual(contract["LOCAL_FIRST_AUTHORITY_READY"], "YES")
 
-    @unittest.skip("retired GitHub Actions contract; local-first tests cover replacement")
-    def test_production_ready_joins_exact_candidate_identity_across_lanes(self):
+    def test_local_governance_replaces_hosted_workflow_contract(self):
         with open(
-                os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
-                encoding="utf-8") as stream:
-            workflow = stream.read()
-        self.assertIn("production_ready_evidence_join.py", workflow)
-        self.assertIn(
-            "needs.production-candidate-build.outputs.candidate_artifact_sha256",
-            workflow,
-        )
-        self.assertIn("PRODUCTION_CANDIDATE_BUILD_ROLE", workflow)
-        self.assertIn("--production-candidate-role", workflow)
-        self.assertIn("needs.real-browser-candidate.outputs.served_root_sha256", workflow)
-        self.assertIn("needs.cross-layer-performance.outputs.release_validation_session_id", workflow)
+                "scripts/release/local_release_gate.py", encoding="utf-8"
+        ) as stream:
+            local_gate = stream.read()
         with open(
-                os.path.join(os.getcwd(), "scripts", "diagnostics",
-                             "production_ready_evidence_join.py"),
-                encoding="utf-8") as stream:
-            self.assertIn("observed_publication", stream.read())
-
-    @unittest.skip("retired GitHub Actions contract; local-first tests cover replacement")
-    def test_candidate_build_uses_pinned_independent_builder_workflow(self):
+                "scripts/release/local_compatibility_gate.py", encoding="utf-8"
+        ) as stream:
+            compatibility = stream.read()
         with open(
-                os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
-                encoding="utf-8") as stream:
-            caller = stream.read()
-        with open(
-                os.path.join(os.getcwd(), ".github", "workflows",
-                             "trusted-candidate-builder.yml"),
-                encoding="utf-8") as stream:
-            builder = stream.read()
-        with open(
-                os.path.join(os.getcwd(), "config",
-                             "coverage_config.staging.example.json"),
-                encoding="utf-8") as stream:
-            config = json.load(stream)
-        validation_sha = config["upgrade"][
-            "validation_candidate_builder_workflow_sha"
-        ]
-        production_sha = config["upgrade"][
-            "production_candidate_builder_workflow_sha"
-        ]
-        approved_builder_sha = (
-            "0f4009c9f8c253f42e60394841795522bbaaa24d"
-        )
-        self.assertRegex(validation_sha, r"^[0-9a-f]{40}$")
-        self.assertRegex(production_sha, r"^[0-9a-f]{40}$")
-        self.assertEqual(validation_sha, approved_builder_sha)
-        self.assertNotEqual(production_sha, validation_sha)
-        self.assertNotEqual(
-            production_sha, "d73753b4cf6d5d900e77035883adaf157b870903"
-        )
-        self.assertNotIn(
-            "d73753b4cf6d5d900e77035883adaf157b870903", caller
-        )
-        self.assertIn(
-            "trusted-candidate-builder.yml@{}".format(validation_sha), caller
-        )
-        self.assertIn("source_sha: ${{ inputs.source_sha }}", caller)
-        self.assertIn(
-            "builder_workflow_sha: {}".format(validation_sha), caller
-        )
-        self.assertIn(
-            "trusted-production-candidate-builder.yml@{}".format(production_sha),
-            caller,
-        )
-        self.assertIn("source_sha: ${{ inputs.source_sha }}", caller)
-        self.assertIn(
-            "builder_workflow_sha: {}".format(production_sha), caller
-        )
-        self.assertIn("source_sha:", caller)
-        self.assertIn("Candidate source identity gate", caller)
-        self.assertIn("REQUESTED_SOURCE_SHA", caller)
-        self.assertIn("needs.candidate_source_identity.result == 'success'", caller)
-        self.assertIn("environment: trusted-candidate-build", builder)
-        self.assertIn("actions/attest@", builder)
-        self.assertIn("BUILD_WORKFLOW_RUN_ATTEMPT", builder)
-        self.assertIn("workflow_call:", builder)
-        self.assertIn("value: ${{ jobs.build.outputs.candidate_artifact_sha256 }}", builder)
-        self.assertIn("payload['build_workflow_run_id']", builder)
-        self.assertNotIn("result['status']", builder)
-        self.assertIn("Verify non-publishable validation Candidate contract", builder)
-        self.assertIn("artifact_role'] == 'validation_fixture'", builder)
-        self.assertIn("production_publishable'] is False", builder)
-        self.assertIn("<pre class=\"source\"></pre>", builder)
-        self.assertIn("total_lines') or 0) == 100000", builder)
-        self.assertIn("function_ranges", builder)
-        self.assertIn("artifact_role", builder)
-        self.assertIn("production_publishable", builder)
-        self.assertIn("project_name", builder)
-        with open(
-                os.path.join(os.getcwd(), ".github", "workflows",
-                             "trusted-production-candidate-builder.yml"),
-                encoding="utf-8") as stream:
-            production_workflow = stream.read()
-        self.assertIn("Trusted Production Candidate Builder", production_workflow)
-        self.assertIn("runs-on: [self-hosted, coverage-production-builder]", production_workflow)
-        self.assertIn("trusted-production-candidate-builder", production_workflow)
-        self.assertIn("workflow_call:", production_workflow)
-        self.assertIn(
-            "PRODUCTION_PUBLISH_ROOT: ${{ vars.PRODUCTION_PUBLISH_ROOT }}",
-            production_workflow,
-        )
-        self.assertNotIn("inputs.publish_root", production_workflow)
-        self.assertIn("build_production_candidate_artifact.py", production_workflow)
-        self.assertIn("PRODUCTION_PROJECT_NAME", production_workflow)
-        self.assertIn("import os", production_workflow)
-        self.assertNotIn("result['status']", production_workflow)
-        self.assertIn(
-            "Protected verification lane — verify HMAC receipt and emit evidence",
-            production_workflow,
-        )
-        self.assertIn("verify_protected_candidate_receipt.py", production_workflow)
-        self.assertIn("protected_receipt_verification.json", production_workflow)
-        self.assertIn(
-            "protected_receipt_verification_attestation.bundle.json",
-            production_workflow,
-        )
-        self.assertIn("protected_receipt_verification_sha256", production_workflow)
-        with open(
-                os.path.join(os.getcwd(), "scripts", "release",
-                             "verify_protected_candidate_receipt.py"),
-                encoding="utf-8") as stream:
-            protected_verifier = stream.read()
-        self.assertIn("verify_candidate_build_receipt", protected_verifier)
-        self.assertIn("COVERAGE_BUILD_PROVENANCE_HMAC_KEY", protected_verifier)
-        self.assertIn("candidate_attestation_bundle_sha256", protected_verifier)
-        self.assertIn("production-candidate-build:", caller)
-        self.assertIn("production_candidate_build:", caller)
-        self.assertNotIn("production_publish_root:", caller)
-        self.assertNotIn("production_served_root:", caller)
-        self.assertEqual(
-            config["upgrade"]["production_candidate_builder_workflow_identity"],
-            "github-actions/trusted-production-candidate-builder",
-        )
-        self.assertEqual(
-            config["upgrade"]["production_candidate_builder_workflow_sha"],
-            production_sha,
-        )
-        with open(
-                os.path.join(os.getcwd(), "scripts", "release",
-                             "build_production_candidate_artifact.py"),
-                encoding="utf-8") as stream:
-            production_builder = stream.read()
-        self.assertIn("production_candidate_root", production_builder)
-        self.assertIn("PRODUCTION_RELEASE_ARTIFACT_ROLE", production_builder)
-        self.assertIn("validate_production_candidate_content", production_builder)
-        self.assertIn("_is_report_html", production_builder)
-        self.assertIn("manifest['artifact_role'] == 'production_candidate'", production_workflow)
-        self.assertNotIn("manifest['artifact_role'] == 'production_release'", production_workflow)
-        with open(
-                os.path.join(os.getcwd(), "scripts", "release",
-                             "prepare_legacy_flat_adoption.py"),
-                encoding="utf-8") as stream:
-            legacy_adoption = stream.read()
-        self.assertIn("LEGACY_STATIC", legacy_adoption)
-        self.assertIn("legacy_source_sha256", legacy_adoption)
-        self.assertIn("coverage-project", legacy_adoption)
-        self.assertIn("coverage-report-id", legacy_adoption)
-        self.assertIn("_scan_source_tree", legacy_adoption)
-        self.assertIn("release_asset_bindings", legacy_adoption)
-        self.assertIn("source_to_reports", legacy_adoption)
-        self.assertIn("source_scan", legacy_adoption)
-        self.assertIn("legacy_adoption_manifest.json", legacy_adoption)
-        with open(
-                os.path.join(os.getcwd(), "scripts", "release",
-                             "bootstrap_previous_release.py"),
-                encoding="utf-8") as stream:
-            bootstrap_previous_release = stream.read()
-        self.assertIn("validate_legacy_adoption_staging", bootstrap_previous_release)
-        self.assertIn("_validate_stage_tree", bootstrap_previous_release)
-        self.assertIn("_tree_inventory_sha256", bootstrap_previous_release)
-        self.assertIn("Candidate copy does not match", bootstrap_previous_release)
-        self.assertIn("frozen_source_tree_sha", bootstrap_previous_release)
-        self.assertIn("frozen_input_manifest_sha", bootstrap_previous_release)
-        self.assertIn("source root changed during Bootstrap validation", bootstrap_previous_release)
-        with open(
-                os.path.join(os.getcwd(), "docs", "operations",
-                             "gate-a-f-external-evidence-runbook.md"),
-                encoding="utf-8") as stream:
-            runbook = stream.read()
-        self.assertIn("prepare_legacy_flat_adoption.py", runbook)
-        self.assertIn("Legacy Flat Adoption", runbook)
-
-    @unittest.skip("retired GitHub Actions contract; local-first tests cover replacement")
-    def test_cross_layer_performance_consumes_browser_artifact(self):
-        with open(
-                os.path.join(os.getcwd(), ".github", "workflows", "ci.yml"),
-                encoding="utf-8") as stream:
-            workflow = stream.read()
-        self.assertNotIn("inputs.cross_layer_evidence", workflow)
-        self.assertIn(
-            "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
-            workflow,
-        )
-        self.assertIn("needs:\n      - real-browser-candidate", workflow)
-        self.assertIn(
-            "real-browser-candidate-evidence-${{ github.run_id }}-${{ github.run_attempt }}",
-            workflow,
-        )
-        self.assertIn(
-            "needs.real-browser-candidate.outputs.performance_evidence_sha256",
-            workflow,
-        )
-        self.assertIn("sha256sum", workflow)
-        self.assertIn("transfer-manifest.json", workflow)
-        self.assertIn(
-            "--path .artifacts/real-browser-candidate/performance-evidence.json",
-            workflow,
-        )
+                "scripts/release/compatibility_surface.py", encoding="utf-8"
+        ) as stream:
+            classifier = stream.read()
+        self.assertIn("evidence_manifest.json", local_gate)
+        self.assertIn("SHA256SUMS", local_gate)
+        self.assertIn("DEFERRED_TO_TARGET_RUNTIME", local_gate)
+        self.assertIn("NOT_APPLICABLE", compatibility)
+        self.assertIn("COMPATIBILITY_STATUSES", compatibility)
+        self.assertIn("classify_compatibility_surface", classifier)
+        self.assertNotIn("api.github.com", local_gate.lower())
+        self.assertNotIn("gh run", local_gate.lower())
 
     def test_candidate_manifest_helper_only_builds_manifest(self):
         completed = subprocess.run(
@@ -658,7 +364,7 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
                 }, raw, external_manifest)
                 os.environ["COVERAGE_GATE_F_INVENTORY_EVIDENCE"] = external_manifest
                 output_root = os.path.join(directory, "bundle")
-                result = build_gate_evidence(".", output_root, run_tests=False)
+                build_gate_evidence(".", output_root, run_tests=False)
                 with open(os.path.join(
                         output_root, "gate-f", "fresh_inventory", "summary.json"),
                         encoding="utf-8") as stream:
@@ -753,9 +459,3 @@ class ReleaseGovernanceToolsTest(unittest.TestCase):
                 "performance_metrics.json", fixture, {"status": "PASSED"}
             )
             self.assertEqual(status, "INCOMPLETE")
-            self.assertTrue(synthetic)
-            self.assertEqual(observed, "PASSED")
-
-
-if __name__ == "__main__":
-    unittest.main()
